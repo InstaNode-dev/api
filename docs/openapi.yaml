@@ -1,0 +1,864 @@
+openapi: "3.0.3"
+info:
+  title: instant.dev API
+  description: |
+    Zero-friction developer infrastructure. Provision databases, caches, document stores,
+    queues, object storage, and webhooks with a single HTTP call — no account required.
+
+    **Live endpoints (representative):**
+    - Postgres (`/db/new`), Redis (`/cache/new`), MongoDB (`/nosql/new`)
+    - NATS (`/queue/new`), storage (`/storage/new`), webhooks (`/webhook/new`)
+    - CLI device-flow auth (`/auth/cli`)
+
+    **Tiers:**
+    - `anonymous` — no account, 24h TTL, tier limits from `plans.yaml`
+    - `hobby` — free account, no expiry, shared infrastructure
+    - `pro` — paid, higher limits
+    - `team` — dedicated infrastructure, SLA
+
+    **Authentication:** Anonymous provisioning endpoints require no credentials.
+    Authenticated endpoints (`/api/v1/*`, `/billing/checkout`, `/auth/me`) require
+    `Authorization: Bearer <jwt>` obtained after OAuth or CLI device-flow login.
+  version: "1.1.0"
+  contact:
+    url: https://instant.dev
+
+servers:
+  - url: https://instant.dev
+    description: Production
+  - url: http://localhost:8080
+    description: Local (docker-compose)
+  - url: http://localhost:32108
+    description: Local (Rancher Desktop k8s)
+
+tags:
+  - name: Provisioning
+    description: |
+      Provision databases, caches, and document stores. No authentication required.
+      Anonymous resources expire after 24h; authenticated resources are permanent.
+      All endpoints accept optional `{"name": "..."}` body (max 120 chars).
+      All responses include `id` (stable UUID), `token`, `connection_url`, `tier`, `limits`, `note`.
+      The `X-Instant-Upgrade` response header always contains the upgrade CTA URL.
+  - name: Onboarding
+    description: Anonymous-to-registered conversion funnel.
+  - name: Auth
+    description: OAuth sign-in (GitHub, Google) and CLI device-flow login.
+  - name: Billing
+    description: Razorpay checkout and webhook ingestion.
+  - name: Resources
+    description: Authenticated resource management (list, get, delete).
+  - name: System
+    description: Health check and metrics.
+
+paths:
+
+  # ── Onboarding ───────────────────────────────────────────────────────────────
+
+  /start:
+    get:
+      tags: [Onboarding]
+      summary: Onboarding landing page
+      description: |
+        Validates the onboarding JWT issued when anonymous resources are provisioned
+        and returns the resource context for the pre-filled signup page.
+
+        The JWT is single-use: once `POST /claim` succeeds, this endpoint
+        returns 401 for the same JWT.
+      parameters:
+        - name: t
+          in: query
+          required: true
+          description: Onboarding JWT from the upgrade URL.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JWT valid, resource context returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StartLandingResponse"
+        "400":
+          description: JWT missing.
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: JWT invalid, expired, or already claimed.
+          $ref: "#/components/responses/Unauthorized"
+
+  /claim:
+    post:
+      tags: [Onboarding]
+      summary: Claim anonymous resources to account
+      description: |
+        Converts an anonymous session to a registered team. Creates a team,
+        user, and transfers all anonymous tokens from the JWT to the new team.
+        Starts a 14-day trial automatically. Sends a welcome email.
+
+        **Single-use:** the JWT can only be claimed once. Concurrent claims
+        with the same JWT result in exactly one success (201) and the rest 409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClaimRequest"
+      responses:
+        "201":
+          description: Account created, resources transferred, trial started.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClaimResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: This upgrade token has already been claimed.
+          $ref: "#/components/responses/Conflict"
+
+  # ── Provisioning ─────────────────────────────────────────────────────────────
+
+  /db/new:
+    post:
+      tags: [Provisioning]
+      summary: Provision Postgres database
+      description: |
+        Provisions an anonymous Postgres database (Phase 2). Returns a standard
+        `postgres://` connection string usable with any Postgres driver.
+
+        **Anonymous:** 24h expiry, 10MB storage, 2 connections, stub URL.
+        **Authenticated:** permanent, team plan limits apply.
+
+        **Feature flag:** requires `postgres` in `INSTANT_ENABLED_SERVICES`.
+        Returns `503` if not enabled.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProvisionRequest"
+      responses:
+        "201":
+          description: Database provisioned.
+          headers:
+            X-Instant-Upgrade:
+              $ref: "#/components/headers/XInstantUpgrade"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProvisionResponse"
+              example:
+                ok: true
+                id: "d290f1ee-6c54-4b01-90e6-d701748f0851"
+                token: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                name: "my-app-db"
+                connection_url: "postgres://usr_a1b2c3d4:pass_a1b2c3d4@shared.instant.dev/db_a1b2c3d4"
+                tier: "anonymous"
+                limits:
+                  storage_mb: 10
+                  connections: 2
+                  expires_in: "24h"
+                note: "Works now. Free forever with a free account: https://instant.dev/start?t=eyJ..."
+        "200":
+          description: Daily limit reached — returning existing resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProvisionResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /cache/new:
+    post:
+      tags: [Provisioning]
+      summary: Provision Redis cache
+      description: |
+        Provisions an anonymous Redis cache (Phase 3). Returns a standard
+        `redis://` connection string usable with any Redis client.
+
+        **Anonymous:** 24h expiry, 5MB memory, stub URL.
+        **Authenticated:** permanent, 25MB memory (hobby), 256MB (pro).
+
+        **Feature flag:** requires `redis` in `INSTANT_ENABLED_SERVICES`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProvisionRequest"
+      responses:
+        "201":
+          description: Cache provisioned.
+          headers:
+            X-Instant-Upgrade:
+              $ref: "#/components/headers/XInstantUpgrade"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProvisionResponse"
+              example:
+                ok: true
+                id: "e5f6a7b8-c9d0-1234-efab-567890abcdef"
+                token: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+                name: "session-cache"
+                connection_url: "redis://:pass_b2c3d4e5@shared.instant.dev:6379/0"
+                tier: "anonymous"
+                limits:
+                  memory_mb: 5
+                  expires_in: "24h"
+                note: "Works now. Free forever with a free account: https://instant.dev/start?t=eyJ..."
+        "200":
+          description: Daily limit reached — returning existing resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProvisionResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /nosql/new:
+    post:
+      tags: [Provisioning]
+      summary: Provision MongoDB database
+      description: |
+        Provisions an anonymous MongoDB database (Phase 4). Returns a standard
+        `mongodb://` connection string usable with any MongoDB driver.
+
+        **Anonymous:** 24h expiry, 5MB storage, 2 connections, stub URL.
+        **Authenticated:** permanent, 100MB storage, 5 connections (hobby).
+
+        **Feature flag:** requires `mongodb` in `INSTANT_ENABLED_SERVICES`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProvisionRequest"
+      responses:
+        "201":
+          description: MongoDB database provisioned.
+          headers:
+            X-Instant-Upgrade:
+              $ref: "#/components/headers/XInstantUpgrade"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProvisionResponse"
+              example:
+                ok: true
+                id: "f6a7b8c9-d0e1-2345-fab0-678901abcdef"
+                token: "c3d4e5f6-a7b8-9012-cdef-012345678902"
+                name: "events-db"
+                connection_url: "mongodb://usr_c3d4e5f6:pass_c3d4e5f6@shared.instant.dev:27017/db_c3d4e5f6"
+                tier: "anonymous"
+                limits:
+                  storage_mb: 5
+                  connections: 2
+                  expires_in: "24h"
+                note: "Works now. Free forever with a free account: https://instant.dev/start?t=eyJ..."
+        "200":
+          description: Daily limit reached — returning existing resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProvisionResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  # ── Auth ─────────────────────────────────────────────────────────────────────
+
+  /auth/cli:
+    post:
+      tags: [Auth]
+      summary: Create CLI device-flow session
+      description: |
+        Creates a pending CLI login session. The CLI polls `GET /auth/cli/:id` until
+        the user completes OAuth in their browser. Session is stored in Redis with a
+        10-minute TTL.
+
+        **Flow:**
+        1. CLI calls `POST /auth/cli` → gets `session_id` and `login_url`
+        2. CLI opens `login_url` in the user's browser
+        3. CLI polls `GET /auth/cli/:id` every 2s
+        4. User completes OAuth in browser → server writes JWT to Redis
+        5. Poll returns `{"ok": true, "token": "...", "status": "complete"}`
+        6. CLI saves the JWT to `~/.instant-config`
+      responses:
+        "201":
+          description: CLI session created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  session_id:
+                    type: string
+                    format: uuid
+                    description: Use this ID to poll for completion.
+                  auth_url:
+                    type: string
+                    description: Open this URL in a browser to complete OAuth login.
+                  expires_in:
+                    type: integer
+                    description: Session TTL in seconds (600).
+
+  /auth/cli/{id}:
+    get:
+      tags: [Auth]
+      summary: Poll CLI device-flow session
+      description: |
+        Returns the current state of a CLI login session. Poll every 2 seconds
+        until `status` is `complete` or `expired`.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Session ID from POST /auth/cli.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Session status.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  status:
+                    type: string
+                    enum: [pending, complete, expired]
+                  token:
+                    type: string
+                    description: Bearer JWT (only present when status=complete).
+                  email:
+                    type: string
+                    description: Authenticated user's email (only when complete).
+        "404":
+          description: Session not found or expired.
+          $ref: "#/components/responses/NotFound"
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Get current user
+      description: Returns the authenticated user's profile from their session JWT.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: User profile.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  user_id:
+                    type: string
+                    format: uuid
+                  team_id:
+                    type: string
+                    format: uuid
+                  email:
+                    type: string
+                  tier:
+                    type: string
+                    enum: [hobby, pro, team]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /auth/github:
+    post:
+      tags: [Auth]
+      summary: Sign in with GitHub
+      description: |
+        Exchange a GitHub OAuth code for an instant.dev session JWT.
+        Creates a new user on first sign-in; returns existing user on subsequent sign-ins.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  description: OAuth authorization code from GitHub.
+      responses:
+        "200":
+          $ref: "#/components/responses/AuthSuccess"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /auth/google:
+    post:
+      tags: [Auth]
+      summary: Sign in with Google
+      description: Exchange a Google OAuth code for an instant.dev session JWT.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  description: OAuth authorization code from Google.
+      responses:
+        "200":
+          $ref: "#/components/responses/AuthSuccess"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ── Billing ──────────────────────────────────────────────────────────────────
+
+  /billing/checkout:
+    post:
+      tags: [Billing]
+      summary: Create Razorpay checkout
+      description: |
+        Creates a Razorpay subscription checkout for the Pro or Team plan.
+        Requires authentication (`Authorization: Bearer <jwt>`).
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan]
+              properties:
+                plan:
+                  type: string
+                  enum: [pro, team]
+                  description: Plan to subscribe to.
+                success_url:
+                  type: string
+                  description: URL to redirect after successful payment.
+                cancel_url:
+                  type: string
+                  description: URL to redirect if checkout is cancelled.
+      responses:
+        "200":
+          description: Checkout session created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  short_url:
+                    type: string
+                    description: Open this Razorpay-hosted URL to complete checkout.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /razorpay/webhook:
+    post:
+      tags: [Billing]
+      summary: Razorpay webhook receiver
+      description: |
+        Receives Razorpay subscription events. Verified with `RAZORPAY_WEBHOOK_SECRET`.
+        Always returns 200 for verified payloads so Razorpay does not retry indefinitely.
+      responses:
+        "200":
+          description: Event received (regardless of processing outcome).
+
+  # ── Resources ────────────────────────────────────────────────────────────────
+
+  /api/v1/resources:
+    get:
+      tags: [Resources]
+      summary: List resources
+      description: Returns all resources belonging to the authenticated team.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Resource list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  items:
+                    type: array
+                    description: Array of resource objects.
+                    items:
+                      $ref: "#/components/schemas/Resource"
+                  total:
+                    type: integer
+                    description: Total count of returned resources.
+                    example: 3
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/resources/{id}:
+    get:
+      tags: [Resources]
+      summary: Get resource
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: Resource found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  item:
+                    $ref: "#/components/schemas/Resource"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    delete:
+      tags: [Resources]
+      summary: Delete resource
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: Resource deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OKEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ── System ───────────────────────────────────────────────────────────────────
+
+  /healthz:
+    get:
+      tags: [System]
+      summary: Health check
+      responses:
+        "200":
+          description: Service is healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+                  service:
+                    type: string
+                    example: "instant.dev"
+
+  /metrics:
+    get:
+      tags: [System]
+      summary: Prometheus metrics
+      description: Expose Prometheus-format metrics. Restrict access in production.
+      responses:
+        "200":
+          description: Prometheus text format.
+          content:
+            text/plain:
+              schema:
+                type: string
+
+# ── Components ──────────────────────────────────────────────────────────────────
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT obtained from POST /auth/github or POST /auth/google.
+
+  parameters:
+    id:
+      name: id
+      in: path
+      required: true
+      description: Resource UUID.
+      schema:
+        type: string
+        format: uuid
+
+  headers:
+    XRequestID:
+      description: Unique request identifier. Present on every response.
+      schema:
+        type: string
+        format: uuid
+
+    XInstantNotice:
+      description: |
+        Optional warning (throughput, storage, or other limits). Value is a human-readable string.
+      schema:
+        type: string
+        example: "Approaching daily command limit. Upgrade for higher quota."
+
+    XInstantUpgrade:
+      description: Upgrade CTA URL. Always the /start?t= landing page with a signed JWT.
+      schema:
+        type: string
+        example: "https://instant.dev/start?t=eyJ..."
+
+  schemas:
+    ProvisionRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          maxLength: 120
+          description: |
+            Optional human-readable label for this resource (max 120 chars).
+            Stored in the database and echoed in the response.
+            Use it to distinguish multiple resources of the same type —
+            e.g. `"users-db"`, `"session-cache"`, `"events-store"`.
+          example: "my-app-db"
+
+    ProvisionResponse:
+      allOf:
+        - $ref: "#/components/schemas/OKEnvelope"
+        - type: object
+          required: [id, token, connection_url, tier, limits, note]
+          properties:
+            id:
+              type: string
+              format: uuid
+              description: |
+                Stable resource UUID. Use this to reference the resource in
+                management API calls (`GET /api/v1/resources/:id`).
+                Survives token rotation.
+            token:
+              type: string
+              format: uuid
+              description: |
+                Public credential token embedded in `connection_url`.
+                Changes on credential rotation.
+            name:
+              type: string
+              description: Resource name (echoes the name sent in the request, or empty).
+            connection_url:
+              type: string
+              description: |
+                Standard protocol connection string (postgres://, redis://, mongodb://).
+                Usable immediately with any standard client library.
+            tier:
+              type: string
+              enum: [anonymous, hobby, pro, team]
+            limits:
+              type: object
+              description: Tier-specific resource limits.
+            note:
+              type: string
+              description: |
+                Human-readable message. For anonymous resources, includes the
+                upgrade URL to make it permanent. Appears in developer logs
+                and agent output.
+            upgrade:
+              type: string
+              description: Upgrade CTA URL (present when provisioning limit was hit).
+            warning:
+              type: string
+              description: Warning message (present when provisioning limit was hit).
+
+    OKEnvelope:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+
+    ErrorEnvelope:
+      type: object
+      required: [ok, error, message]
+      properties:
+        ok:
+          type: boolean
+          example: false
+        error:
+          type: string
+          description: Machine-readable error code.
+          example: "not_found"
+        message:
+          type: string
+          description: Human-readable explanation.
+          example: "Resource not found"
+
+    StartLandingResponse:
+      allOf:
+        - $ref: "#/components/schemas/OKEnvelope"
+        - type: object
+          required: [fingerprint, tokens, resource_types, suggested_plan, jti]
+          properties:
+            fingerprint:
+              type: string
+              description: Anonymized fingerprint from the original provision request.
+            country:
+              type: string
+              example: "US"
+            cloud_vendor:
+              type: string
+              example: "aws"
+            tokens:
+              type: array
+              items:
+                type: string
+                format: uuid
+              description: Anonymous token UUIDs to be claimed.
+            resource_types:
+              type: array
+              items:
+                type: string
+              example: ["postgres", "redis"]
+            suggested_plan:
+              type: string
+              enum: [hobby, pro, team]
+            jti:
+              type: string
+              description: JWT ID — matches the onboarding_events row.
+
+    ClaimRequest:
+      type: object
+      required: [jwt, email]
+      properties:
+        jwt:
+          type: string
+          description: Onboarding JWT from the upgrade URL.
+        email:
+          type: string
+          format: email
+          description: User's email address.
+        team_name:
+          type: string
+          description: Team name. Defaults to email if omitted.
+
+    ClaimResponse:
+      allOf:
+        - $ref: "#/components/schemas/OKEnvelope"
+        - type: object
+          required: [team_id, message]
+          properties:
+            team_id:
+              type: string
+              format: uuid
+            message:
+              type: string
+              example: "Account created. Your resources have been transferred."
+
+    Resource:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        token:
+          type: string
+          format: uuid
+        resource_type:
+          type: string
+          example: "postgres"
+        tier:
+          type: string
+          enum: [anonymous, hobby, pro, team]
+        status:
+          type: string
+          enum: [active, expiring, suspended, deleted]
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+  responses:
+    AuthSuccess:
+      description: OAuth successful — session JWT returned.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/OKEnvelope"
+              - type: object
+                properties:
+                  token:
+                    type: string
+                    description: Bearer JWT for authenticated endpoints.
+                  team_id:
+                    type: string
+                    format: uuid
+                  user_id:
+                    type: string
+                    format: uuid
+
+    BadRequest:
+      description: Invalid request — missing or malformed fields.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+
+    Unauthorized:
+      description: Missing, invalid, or expired credentials.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+
+    Conflict:
+      description: Conflict — e.g. token already claimed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+
+    Gone:
+      description: Resource expired and has been deleted.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/ErrorEnvelope"
+              - type: object
+                properties:
+                  upgrade:
+                    type: string
+                    description: URL to sign up and recreate the resource.
+
+    ServiceUnavailable:
+      description: Upstream dependency unavailable (DB, Redis). Retry with backoff.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"

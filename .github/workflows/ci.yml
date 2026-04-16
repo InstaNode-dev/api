@@ -1,0 +1,96 @@
+# instant.dev/api — CI
+#
+# Multi-repo note: go.mod uses `replace instant.dev/proto => ../proto`. The
+# "Checkout proto sibling" step clones the proto repo next to this checkout.
+# If your GitHub repo is not named `proto`, set the `PROTO_REPO` repository
+# variable (e.g. `myorg/instant-proto`) or fork/rename to match
+# `${{ github.repository_owner }}/proto`.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly — reserved for optional scheduled jobs (see e2e job).
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: instant_dev_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/instant_dev_test?sslmode=disable
+      TEST_REDIS_URL: redis://localhost:6379/15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout proto sibling (for go.mod replace ../proto)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: _proto_ci
+
+      - name: Place ../proto for Go replace directive
+        run: mv _proto_ci ../proto
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -v -race -count=1
+
+  # E2E requires a live Kubernetes stack (see repo CLAUDE.md). This job does not
+  # run on push/PR — only on schedule or manual dispatch — so default CI stays fast.
+  e2e:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout proto sibling
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: _proto_ci
+
+      - run: mv _proto_ci ../proto
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: E2E placeholder (wire to k8s / secrets)
+        run: |
+          echo "Configure services, secrets, and port-forwards, then run e.g.:"
+          echo "  go test ./e2e/... -tags e2e -count=1 -timeout 180s"
+          echo "See CLAUDE.md (Full-stack E2E) for required env vars."

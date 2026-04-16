@@ -1,0 +1,6 @@
+bin/
+*.exe
+GeoLite2-*.mmdb
+.env
+.env.*
+!.env.example

@@ -1,0 +1,17 @@
+{
+  "name": "instant-api-browser-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright browser tests for the instant.dev onboarding flow — hits real k8s cluster, no mocks",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:debug": "playwright test --debug",
+    "test:report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.43.1",
+    "@types/node": "^25.5.2",
+    "typescript": "^5.4.0"
+  }
+}

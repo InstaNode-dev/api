@@ -1,0 +1,623 @@
+// Package testhelpers provides shared utilities for integration tests across the instant.dev platform.
+// Tests run against real Postgres and Redis — set TEST_DATABASE_URL and TEST_REDIS_URL env vars.
+package testhelpers
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/golang-jwt/jwt/v4"
+	"github.com/google/uuid"
+	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
+
+	"instant.dev/internal/config"
+	"instant.dev/internal/crypto"
+	"instant.dev/internal/email"
+	"instant.dev/internal/handlers"
+	"instant.dev/internal/middleware"
+	"instant.dev/internal/plans"
+)
+
+const (
+	defaultTestDBURL              = "postgres://postgres:postgres@localhost:5432/instant_dev_test?sslmode=disable"
+	defaultTestRedisURL           = "redis://localhost:6379/15" // DB 15 = isolated test keyspace
+	defaultTestCustomersURL       = "postgres://instant_cust:instant_cust@localhost:5434/instant_customers?sslmode=disable"
+)
+
+// TestJWTSecret is the HMAC secret used by all test JWT helpers (≥32 bytes).
+const TestJWTSecret = "test-secret-that-is-at-least-32-bytes-long!!"
+
+// TestAESKeyHex is a 32-byte AES-256 key encoded as 64 hex characters.
+const TestAESKeyHex = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+
+// SetupTestDB opens a Postgres connection to the test database, runs migrations,
+// and returns the *sql.DB along with a cleanup function.
+// Override the DSN via TEST_DATABASE_URL.
+func SetupTestDB(t *testing.T) (*sql.DB, func()) {
+	t.Helper()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		dsn = defaultTestDBURL
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("testhelpers.SetupTestDB: open: %v", err)
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("testhelpers.SetupTestDB: ping failed: %v\n  (set TEST_DATABASE_URL or start postgres)", err)
+	}
+
+	runMigrations(t, db)
+
+	return db, func() { db.Close() }
+}
+
+// runMigrations applies the full platform schema.
+// Uses IF NOT EXISTS throughout, so safe to call repeatedly.
+func runMigrations(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS teams (
+			id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			name              TEXT,
+			plan_tier         TEXT NOT NULL DEFAULT 'hobby',
+			stripe_customer_id TEXT UNIQUE,
+			trial_ends_at     TIMESTAMPTZ,
+			created_at        TIMESTAMPTZ DEFAULT now()
+		)`,
+		`CREATE TABLE IF NOT EXISTS users (
+			id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id     UUID REFERENCES teams(id) ON DELETE CASCADE,
+			email       TEXT UNIQUE NOT NULL,
+			github_id   TEXT UNIQUE,
+			google_id   TEXT UNIQUE,
+			role        TEXT NOT NULL DEFAULT 'member',
+			created_at  TIMESTAMPTZ DEFAULT now()
+		)`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member'`,
+		`CREATE TABLE IF NOT EXISTS resources (
+			id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id          UUID REFERENCES teams(id) ON DELETE SET NULL,
+			token            UUID UNIQUE NOT NULL DEFAULT gen_random_uuid(),
+			resource_type    TEXT NOT NULL,
+			name             TEXT,
+			connection_url   TEXT,
+			tier             TEXT NOT NULL DEFAULT 'anonymous',
+			fingerprint      TEXT,
+			cloud_vendor     TEXT,
+			country_code     CHAR(2),
+			status           TEXT NOT NULL DEFAULT 'active',
+			migration_status TEXT,
+			expires_at       TIMESTAMPTZ,
+			storage_bytes    BIGINT DEFAULT 0,
+			created_request_id TEXT,
+			created_at       TIMESTAMPTZ DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_resources_token       ON resources(token)`,
+		`CREATE INDEX IF NOT EXISTS idx_resources_fingerprint ON resources(fingerprint) WHERE team_id IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_resources_expires     ON resources(expires_at) WHERE status = 'active'`,
+		`CREATE INDEX IF NOT EXISTS idx_resources_team        ON resources(team_id) WHERE team_id IS NOT NULL`,
+		`CREATE TABLE IF NOT EXISTS onboarding_events (
+			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			fingerprint     TEXT NOT NULL,
+			jwt_issued_at   TIMESTAMPTZ DEFAULT now(),
+			jwt_expires_at  TIMESTAMPTZ,
+			converted_at    TIMESTAMPTZ,
+			team_id         UUID REFERENCES teams(id),
+			resource_tokens UUID[],
+			jti             TEXT UNIQUE NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_onboarding_jti         ON onboarding_events(jti)`,
+		`CREATE INDEX IF NOT EXISTS idx_onboarding_fingerprint ON onboarding_events(fingerprint)`,
+		`UPDATE users u SET role = 'owner' FROM (
+			SELECT DISTINCT ON (team_id) id FROM users WHERE team_id IS NOT NULL ORDER BY team_id, created_at ASC
+		) AS first_user WHERE u.id = first_user.id AND u.role = 'member'`,
+		`CREATE TABLE IF NOT EXISTS team_invitations (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			email TEXT NOT NULL,
+			role TEXT NOT NULL DEFAULT 'member',
+			invited_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			status TEXT NOT NULL DEFAULT 'pending',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '7 days'
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_invitations_team ON team_invitations(team_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_invitations_email ON team_invitations(lower(email))`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_invitations_team_email_pending ON team_invitations (team_id, lower(email)) WHERE status = 'pending'`,
+		// 003_deployments — Phase 6 container deployments
+		`CREATE TABLE IF NOT EXISTS deployments (
+			id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			token          TEXT UNIQUE NOT NULL,
+			team_id        UUID REFERENCES teams(id) ON DELETE SET NULL,
+			namespace      TEXT NOT NULL,
+			image          TEXT NOT NULL,
+			container_port INT NOT NULL DEFAULT 8080,
+			app_url        TEXT NOT NULL,
+			tier           TEXT NOT NULL DEFAULT 'anonymous',
+			status         TEXT NOT NULL DEFAULT 'pending',
+			created_at     TIMESTAMPTZ DEFAULT now(),
+			deleted_at     TIMESTAMPTZ
+		)`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS token TEXT`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS namespace TEXT`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS image TEXT`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_port INT`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS app_url TEXT`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS tier TEXT`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`,
+		`CREATE INDEX IF NOT EXISTS idx_deployments_team  ON deployments(team_id) WHERE deleted_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_deployments_token ON deployments(token) WHERE token IS NOT NULL`,
+	}
+
+	for _, s := range stmts {
+		if _, err := db.Exec(s); err != nil {
+			t.Fatalf("testhelpers.runMigrations: %v\n  SQL: %.120s", err, s)
+		}
+	}
+}
+
+// SetupTestRedis connects to the test Redis (DB 15 by default), flushes the keyspace,
+// and returns the client along with a cleanup function.
+// Override via TEST_REDIS_URL.
+func SetupTestRedis(t *testing.T) (*redis.Client, func()) {
+	t.Helper()
+	rawURL := os.Getenv("TEST_REDIS_URL")
+	if rawURL == "" {
+		rawURL = defaultTestRedisURL
+	}
+
+	opts, err := redis.ParseURL(rawURL)
+	if err != nil {
+		t.Fatalf("testhelpers.SetupTestRedis: parse URL: %v", err)
+	}
+
+	rdb := redis.NewClient(opts)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		t.Fatalf("testhelpers.SetupTestRedis: ping failed: %v\n  (set TEST_REDIS_URL or start redis)", err)
+	}
+
+	rdb.FlushDB(context.Background())
+
+	return rdb, func() {
+		rdb.FlushDB(context.Background())
+		rdb.Close()
+	}
+}
+
+// testConfig returns a *config.Config suitable for tests.
+// It does NOT call config.Load() to avoid panicking on missing real env vars.
+func testConfig() *config.Config {
+	customersURL := os.Getenv("TEST_POSTGRES_CUSTOMERS_URL")
+	if customersURL == "" {
+		customersURL = defaultTestCustomersURL
+	}
+	return &config.Config{
+		Port:                    "8080",
+		DatabaseURL:             defaultTestDBURL,
+		RedisURL:                defaultTestRedisURL,
+		JWTSecret:               TestJWTSecret,
+		AESKey:                  TestAESKeyHex,
+		EnabledServices:         "redis",
+		Environment:             "test",
+		PostgresProvisionBackend: "local",
+		PostgresCustomersURL:    customersURL,
+	}
+}
+
+// NewTestApp creates a Fiber app wired to the provided DB and Redis clients
+// using the same handler/middleware chain as production (minus GeoIP lookup).
+// Routes registered: POST /cache/new, GET /start, POST /claim, /api/v1/resources.
+// Only the "redis" service is enabled. Use NewTestAppWithServices to enable others.
+func NewTestApp(t *testing.T, db *sql.DB, rdb *redis.Client) (*fiber.App, func()) {
+	t.Helper()
+	return NewTestAppWithServices(t, db, rdb, "redis")
+}
+
+// NewTestAppWithServices creates a Fiber app identical to NewTestApp but with
+// an explicit comma-separated list of enabled services (e.g. "postgres,redis,mongodb,queue,webhook,storage").
+// Use this in tests that exercise /db/new, /cache/new, or /nosql/new.
+func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, services string) (*fiber.App, func()) {
+	t.Helper()
+	cfg := testConfig()
+	cfg.EnabledServices = services
+	planReg := plans.Default()
+
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			code := fiber.StatusInternalServerError
+			if e, ok := err.(*fiber.Error); ok {
+				code = e.Code
+			}
+			return c.Status(code).JSON(fiber.Map{
+				"ok":      false,
+				"error":   "internal_error",
+				"message": err.Error(),
+			})
+		},
+		ProxyHeader: "X-Forwarded-For",
+	})
+
+	app.Use(middleware.RequestID())
+	// GeoEnrich is skipped in tests (no MaxMind DB in CI).
+	app.Use(middleware.Fingerprint())
+	app.Use(middleware.RateLimit(rdb, middleware.RateLimitConfig{
+		Limit:     provisionLimit,
+		KeyPrefix: "rl",
+	}))
+
+	onboardH := handlers.NewOnboardingHandler(db, cfg, email.New(""))
+	cliAuthH := handlers.NewCLIAuthHandler(db, rdb, cfg, planReg)
+	resourceH := handlers.NewResourceHandler(db, rdb, cfg, planReg, nil, nil)
+	dbH := handlers.NewDBHandler(db, rdb, cfg, nil, planReg)
+	cacheH := handlers.NewCacheHandler(db, rdb, cfg, nil, planReg)
+	nosqlH := handlers.NewNoSQLHandler(db, rdb, cfg, nil, planReg)
+
+	app.Get("/start", onboardH.StartLanding)
+	app.Post("/claim", onboardH.Claim)
+	app.Get("/auth/me", middleware.RequireAuth(cfg), cliAuthH.GetCurrentUser)
+
+	// Provisioning routes for Phase 2/3/4 services.
+	dbGroup := app.Group("/db", middleware.OptionalAuth(cfg))
+	dbGroup.Post("/new", dbH.NewDB)
+
+	cacheGroup := app.Group("/cache", middleware.OptionalAuth(cfg))
+	cacheGroup.Post("/new", cacheH.NewCache)
+
+	nosqlGroup := app.Group("/nosql", middleware.OptionalAuth(cfg))
+	nosqlGroup.Post("/new", nosqlH.NewNoSQL)
+
+	// Authenticated resource management (used by isolation tests)
+	// Phase 5 services: storage + webhook
+	storageH := handlers.NewStorageHandler(db, rdb, cfg, nil, planReg)
+	webhookH := handlers.NewWebhookHandler(db, rdb, cfg, planReg)
+	app.Post("/storage/new", middleware.OptionalAuth(cfg), storageH.NewStorage)
+	app.Post("/webhook/new", middleware.OptionalAuth(cfg), webhookH.NewWebhook)
+	app.Post("/webhook/receive/:token", webhookH.Receive)
+
+	// Phase 6: deploy
+	deployH := handlers.NewDeployHandler(db, rdb, cfg)
+	deployGroup := app.Group("/deploy", middleware.RequireAuth(cfg))
+	deployGroup.Post("/new", deployH.New)
+	deployGroup.Get("/:id", deployH.Get)
+	deployGroup.Get("/:id/logs", deployH.Logs)
+	deployGroup.Patch("/:id/env", deployH.UpdateEnv)
+	deployGroup.Delete("/:id", deployH.Delete)
+	deployGroup.Post("/:id/redeploy", deployH.Redeploy)
+
+	api := app.Group("/api/v1", middleware.RequireAuth(cfg))
+	api.Get("/resources", resourceH.List)
+	api.Get("/resources/:id", resourceH.Get)
+	api.Delete("/resources/:id", resourceH.Delete)
+	api.Post("/resources/:id/rotate-credentials", resourceH.RotateCredentials)
+	api.Get("/webhooks/:token/requests", webhookH.ListRequests)
+	api.Get("/deployments", deployH.List)
+	api.Get("/deployments/:id", deployH.Get)
+	api.Delete("/deployments/:id", deployH.Delete)
+
+	return app, func() { app.Shutdown() }
+}
+
+// MustProvisionDB POSTs to /db/new and returns the token.
+// The app must be created with NewTestAppWithServices(..., "postgres").
+// Skips the test gracefully if the postgres-customers backend is not reachable.
+func MustProvisionDB(t *testing.T, app *fiber.App, ip string) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/db/new", nil)
+	req.Header.Set("X-Forwarded-For", ip)
+
+	resp, err := app.Test(req, 5000)
+	if err != nil {
+		t.Fatalf("MustProvisionDB: app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		var errBody map[string]any
+		if jsonErr := json.Unmarshal(body, &errBody); jsonErr == nil {
+			if code, _ := errBody["error"].(string); code == "provision_failed" {
+				t.Skipf("MustProvisionDB: postgres-customers not reachable — skipping test (%s)", body)
+			}
+		}
+		t.Fatalf("MustProvisionDB: expected 201, got %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("MustProvisionDB: decode: %v", err)
+	}
+	if result.Token == "" {
+		t.Fatal("MustProvisionDB: token field is empty in response")
+	}
+	return result.Token
+}
+
+// MustProvisionCache POSTs to /cache/new and returns the token.
+// ip is passed directly as X-Forwarded-For; use FingerprintToIP(fp) to convert a label first.
+// The app must be created with NewTestAppWithServices(..., "redis").
+func MustProvisionCache(t *testing.T, app *fiber.App, ip string) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/cache/new", nil)
+	req.Header.Set("X-Forwarded-For", ip)
+
+	resp, err := app.Test(req, 5000)
+	if err != nil {
+		t.Fatalf("MustProvisionCache: app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("MustProvisionCache: expected 201/200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("MustProvisionCache: decode: %v", err)
+	}
+	if result.Token == "" {
+		t.Fatal("MustProvisionCache: token field is empty in response")
+	}
+	return result.Token
+}
+
+// MustProvisionNoSQL POSTs to /nosql/new and returns the token.
+// The app must be created with NewTestAppWithServices(..., "mongodb").
+func MustProvisionNoSQL(t *testing.T, app *fiber.App, ip string) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/nosql/new", nil)
+	req.Header.Set("X-Forwarded-For", ip)
+
+	resp, err := app.Test(req, 5000)
+	if err != nil {
+		t.Fatalf("MustProvisionNoSQL: app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		// Skip gracefully when MongoDB is not reachable in the test environment.
+		var errBody map[string]any
+		if jsonErr := json.Unmarshal(body, &errBody); jsonErr == nil {
+			if code, _ := errBody["error"].(string); code == "provision_failed" {
+				t.Skipf("MustProvisionNoSQL: MongoDB not reachable — skipping test (%s)", body)
+			}
+		}
+		t.Fatalf("MustProvisionNoSQL: expected 201, got %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("MustProvisionNoSQL: decode: %v", err)
+	}
+	if result.Token == "" {
+		t.Fatal("MustProvisionNoSQL: token field is empty in response")
+	}
+	return result.Token
+}
+
+// provisionLimit is the per-fingerprint daily provisioning cap used in test apps.
+// Must match the constant in the production router (currently 5).
+const provisionLimit = 5
+
+// ProvisionResult holds the parsed response from POST /cache/new (or any provision endpoint).
+type ProvisionResult struct {
+	Token string `json:"token"`
+	Note  string `json:"note"`
+	// JWT extracted from the upgrade URL in Note, e.g. "https://...?t=<jwt>"
+	JWT string
+}
+
+// MustProvisionCacheFull POSTs to /cache/new and returns the full parsed response,
+// including the onboarding JWT extracted from the upgrade URL in the note field.
+func MustProvisionCacheFull(t *testing.T, app *fiber.App, fingerprint string) ProvisionResult {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/cache/new", nil)
+	req.Header.Set("X-Forwarded-For", FingerprintToIP(fingerprint))
+
+	resp, err := app.Test(req, 5000)
+	if err != nil {
+		t.Fatalf("MustProvisionCacheFull: app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("MustProvisionCacheFull: expected 201/200, got %d: %s", resp.StatusCode, body)
+	}
+
+	var result ProvisionResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("MustProvisionCacheFull: decode: %v", err)
+	}
+	if result.Token == "" {
+		t.Fatal("MustProvisionCacheFull: token field is empty in response")
+	}
+
+	// Extract JWT from upgrade URL in note: "...?t=<jwt>"
+	if idx := strings.Index(result.Note, "?t="); idx != -1 {
+		raw := result.Note[idx+3:]
+		if sp := strings.IndexAny(raw, " \t\n"); sp != -1 {
+			raw = raw[:sp]
+		}
+		result.JWT = raw
+	}
+	return result
+}
+
+// ComputeTestFingerprint returns the middleware fingerprint hash that will be
+// computed when a request arrives with X-Forwarded-For set to FingerprintToIP(fp).
+// Use this to look up Redis keys produced by the provisioning handler (e.g. "prov:{hash}:{date}").
+func ComputeTestFingerprint(fp string) string {
+	ip := FingerprintToIP(fp)
+	hash, _ := crypto.FingerprintIP(ip, "")
+	return hash
+}
+
+// FingerprintToIP deterministically maps a fingerprint string to a unique IPv4
+// in the 10.255.X.Y range, staying within a /24 so all calls from the same
+// fingerprint land on the same fingerprint hash.
+func FingerprintToIP(fp string) string {
+	// Use a simple FNV-like fold to map to 10.255.X.0
+	var h uint32
+	for _, b := range []byte(fp) {
+		h = h*31 + uint32(b)
+	}
+	return fmt.Sprintf("10.255.%d.1", h%254+1)
+}
+
+// OnboardingClaims is a re-export so test files don't need to import crypto directly.
+type OnboardingClaims = crypto.OnboardingClaims
+
+// MustSignJWT signs an OnboardingClaims with TestJWTSecret and returns the token string.
+func MustSignJWT(t *testing.T, claims crypto.OnboardingClaims) string {
+	t.Helper()
+	signed, _, err := crypto.SignOnboardingJWT([]byte(TestJWTSecret), claims)
+	if err != nil {
+		t.Fatalf("MustSignJWT: %v", err)
+	}
+	return signed
+}
+
+// MustSignExpiredJWT creates an already-expired onboarding JWT.
+func MustSignExpiredJWT(t *testing.T, claims crypto.OnboardingClaims) string {
+	t.Helper()
+	// Temporarily set past timestamps on the registered claims.
+	past := time.Now().Add(-2 * time.Hour)
+	claims.RegisteredClaims = jwt.RegisteredClaims{
+		IssuedAt:  jwt.NewNumericDate(past),
+		ExpiresAt: jwt.NewNumericDate(past.Add(15 * time.Minute)),
+		ID:        uuid.NewString(),
+	}
+	// Sign directly with jwt package using past times (bypasses SignOnboardingJWT which sets its own times).
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := tok.SignedString([]byte(TestJWTSecret))
+	if err != nil {
+		t.Fatalf("MustSignExpiredJWT: %v", err)
+	}
+	return signed
+}
+
+// PostJSON POSTs a JSON body to the Fiber app under test.
+func PostJSON(t *testing.T, app *fiber.App, path string, body any) *http.Response {
+	t.Helper()
+	var buf bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			t.Fatalf("PostJSON: encode: %v", err)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, path, &buf)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, 5000)
+	if err != nil {
+		t.Fatalf("PostJSON: %v", err)
+	}
+	return resp
+}
+
+// GetReq sends a GET to the Fiber app under test.
+func GetReq(t *testing.T, app *fiber.App, path string) *http.Response {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	resp, err := app.Test(req, 5000)
+	if err != nil {
+		t.Fatalf("GetReq: %v", err)
+	}
+	return resp
+}
+
+// DecodeJSON decodes the response body into v and closes the body.
+func DecodeJSON(t *testing.T, resp *http.Response, v any) {
+	t.Helper()
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		t.Fatalf("DecodeJSON: %v", err)
+	}
+}
+
+// UniqueFingerprint returns a unique test fingerprint string.
+func UniqueFingerprint(t *testing.T) string {
+	t.Helper()
+	return "fp-" + uuid.NewString()
+}
+
+// UniqueEmail returns a unique email address for test user creation.
+func UniqueEmail(t *testing.T) string {
+	t.Helper()
+	return "test+" + uuid.NewString()[:8] + "@instant.dev"
+}
+
+// sessionClaimsForTest mirrors the payload issued by the auth handler.
+type sessionClaimsForTest struct {
+	UserID string `json:"uid"`
+	TeamID string `json:"tid"`
+	Email  string `json:"email"`
+	jwt.RegisteredClaims
+}
+
+// MustSignSessionJWT creates a valid session JWT (the kind issued after OAuth login)
+// signed with TestJWTSecret. Use this to test authenticated endpoints.
+func MustSignSessionJWT(t *testing.T, userID, teamID, email string) string {
+	t.Helper()
+	claims := sessionClaimsForTest{
+		UserID: userID,
+		TeamID: teamID,
+		Email:  email,
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+			ID:        uuid.NewString(),
+		},
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := tok.SignedString([]byte(TestJWTSecret))
+	if err != nil {
+		t.Fatalf("MustSignSessionJWT: %v", err)
+	}
+	return signed
+}
+
+// MustCreateTeamDB inserts a team with the given plan tier into the test database
+// and returns its UUID string.
+func MustCreateTeamDB(t *testing.T, db *sql.DB, planTier string) string {
+	t.Helper()
+	var id string
+	err := db.QueryRowContext(context.Background(), `
+		INSERT INTO teams (name, plan_tier) VALUES ($1, $2)
+		RETURNING id::text
+	`, "test-team-"+uuid.NewString()[:8], planTier).Scan(&id)
+	if err != nil {
+		t.Fatalf("MustCreateTeamDB: %v", err)
+	}
+	return id
+}

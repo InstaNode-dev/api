@@ -1,0 +1,138 @@
+# plans.yaml — plan definitions, limits, and pricing for instant.dev
+#
+# This file is the single source of truth for all plan configuration.
+# Edit it to change limits or prices without touching any Go code.
+#
+# Limits of -1 mean unlimited.
+# Prices are in cents (USD). 4900 = $49.00/month (Pro).
+
+plans:
+  anonymous:
+    display_name: "Anonymous"
+    price_monthly_cents: 0
+    trial_days: 0
+    limits:
+      provisions_per_day: 5
+      postgres_storage_mb: 10
+      postgres_connections: 2
+      redis_memory_mb: 5
+      redis_commands_per_day: 1000
+      mongodb_storage_mb: 5
+      mongodb_connections: 2
+      mongodb_ops_per_minute: 100
+      queue_storage_mb: 1024
+      storage_storage_mb: 10
+      webhook_requests_stored: 100
+      team_members: 1
+    features:
+      alerts: false
+      custom_domains: false
+      sla: false
+
+  hobby:
+    display_name: "Hobby"
+    price_monthly_cents: 900
+    trial_days: 14
+    limits:
+      provisions_per_day: -1
+      postgres_storage_mb: 500
+      postgres_connections: 5
+      redis_memory_mb: 25
+      redis_commands_per_day: 10000
+      mongodb_storage_mb: 100
+      mongodb_connections: 5
+      mongodb_ops_per_minute: 1000
+      queue_storage_mb: 5120
+      storage_storage_mb: 512
+      webhook_requests_stored: 1000
+      team_members: 1
+    features:
+      alerts: true
+      custom_domains: false
+      sla: false
+
+  pro:
+    display_name: "Pro"
+    price_monthly_cents: 4900
+    trial_days: 0
+    limits:
+      provisions_per_day: -1
+      postgres_storage_mb: 5120
+      postgres_connections: 20
+      redis_memory_mb: 256
+      redis_commands_per_day: 500000
+      mongodb_storage_mb: 2048
+      mongodb_connections: 20
+      mongodb_ops_per_minute: 10000
+      queue_storage_mb: 10240
+      storage_storage_mb: 10240
+      webhook_requests_stored: 10000
+      team_members: 5
+    features:
+      alerts: true
+      custom_domains: false
+      sla: false
+
+  team:
+    display_name: "Team"
+    price_monthly_cents: 19900
+    trial_days: 0
+    limits:
+      provisions_per_day: -1
+      postgres_storage_mb: -1
+      postgres_connections: -1
+      redis_memory_mb: -1
+      redis_commands_per_day: -1
+      mongodb_storage_mb: -1
+      mongodb_connections: -1
+      mongodb_ops_per_minute: -1
+      queue_storage_mb: -1
+      storage_storage_mb: -1
+      webhook_requests_stored: -1
+      team_members: -1
+    features:
+      alerts: true
+      custom_domains: true
+      sla: true
+
+  growth:
+    display_name: "Growth"
+    price_monthly_cents: 9900
+    trial_days: 0
+    limits:
+      provisions_per_day: -1
+      postgres_storage_mb: -1
+      postgres_connections: -1
+      redis_memory_mb: -1
+      redis_commands_per_day: -1
+      mongodb_storage_mb: -1
+      mongodb_connections: -1
+      mongodb_ops_per_minute: -1
+      queue_storage_mb: -1
+      storage_storage_mb: -1
+      webhook_requests_stored: -1
+      team_members: 10
+    features:
+      alerts: true
+      custom_domains: true
+      sla: false
+      dedicated: true
+
+# promotions — add codes here to offer discounts without code deploys.
+# Each code is validated at checkout time. Comment them out to disable.
+#
+# promotions:
+#   - code: "LAUNCH50"
+#     discount_percent: 50
+#     applies_to: ["pro", "team"]
+#     expires_at: "2026-12-31"
+#     max_uses: 1000
+#     description: "50% off Pro or Team for the first 1000 signups"
+#
+#   - code: "FRIEND"
+#     discount_percent: 20
+#     applies_to: ["pro"]
+#     expires_at: ""
+#     max_uses: -1
+#     description: "Friend referral — 20% off Pro, no expiry"
+promotions: []

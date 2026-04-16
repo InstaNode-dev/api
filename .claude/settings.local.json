@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Skill(plan-ceo-review)",
+      "Skill(plan-ceo-review:*)"
+    ]
+  }
+}
