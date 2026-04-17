@@ -1,4 +1,4 @@
-# instant.dev — User Stories
+# instanode.dev — User Stories
 
 **Goal:** Anonymous provisioning → upgrade URL in logs → claim → paid conversion, driven by real infrastructure (Postgres, Redis, MongoDB, queue, storage, webhooks).
 

@@ -2,7 +2,7 @@
 name: instant-e2e
 version: 1.0.0
 description: |
-  Run instant.dev E2E tests against the live server and report results.
+  Run instanode.dev E2E tests against the live server and report results.
   Auto-detects whether the server is running on k8s (NodePort) or docker-compose.
 allowed-tools:
   - Bash
@@ -11,7 +11,7 @@ allowed-tools:
 
 # /instant-e2e — Run E2E Tests
 
-You are running the instant.dev E2E test suite against the live server.
+You are running the instanode.dev E2E test suite against the live server.
 
 ---
 

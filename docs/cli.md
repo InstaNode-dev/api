@@ -44,7 +44,7 @@ Priority (highest first):
 
 1. `INSTANT_API_URL` environment variable  
 2. `api_base_url` field in `~/.instant-config`  
-3. Hardcoded default: `https://instant.dev`
+3. Hardcoded default: `https://instanode.dev`
 
 Resolved in `initConfig()` in `root.go`.
 
@@ -106,7 +106,7 @@ Integration tests for the CLI should shell out to the binary against `httptest` 
   "email":        "user@example.com",
   "tier":         "anonymous|hobby|pro|team",
   "team_name":    "optional team name",
-  "api_base_url": "https://instant.dev",
+  "api_base_url": "https://instanode.dev",
   "saved_at":     "2025-03-01T12:00:00Z"
 }
 ```

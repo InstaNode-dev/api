@@ -1,7 +1,7 @@
 import { defineConfig, devices } from '@playwright/test';
 
 /**
- * Browser E2E tests for the instant.dev onboarding flow.
+ * Browser E2E tests for the instanode.dev onboarding flow.
  *
  * These tests hit the REAL k8s cluster — no mocks, no Vite dev server.
  * The API must be running at E2E_API_URL (default: http://localhost:30080).

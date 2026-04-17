@@ -46,7 +46,7 @@ test('U1: onboarding page loads without JS errors', async ({ page }) => {
   // No JS errors.
   expect(consoleErrors, `JS errors on page: ${consoleErrors.join(', ')}`).toHaveLength(0);
 
-  // Page title includes instant.dev branding.
+  // Page title includes instanode.dev branding.
   const title = await page.title();
   expect(title.toLowerCase()).toContain('instant');
 });

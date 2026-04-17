@@ -2,7 +2,7 @@
 name: instant-ship
 version: 1.0.0
 description: |
-  instant.dev deploy pipeline: build → vet → unit tests → docker build → k8s rollout → E2E tests → health check.
+  instanode.dev deploy pipeline: build → vet → unit tests → docker build → k8s rollout → E2E tests → health check.
   Run this after any code change to ship to the local k8s cluster.
 allowed-tools:
   - Bash
@@ -12,9 +12,9 @@ allowed-tools:
 
 # /instant-ship — Deploy to Local Kubernetes
 
-You are running the instant.dev ship pipeline. This is **fully automated** — run straight through without asking for confirmation. Stop only on failures.
+You are running the instanode.dev ship pipeline. This is **fully automated** — run straight through without asking for confirmation. Stop only on failures.
 
-The working directory is the instant.dev project root (`~/Documents/learningProjects/instant/api`).
+The working directory is the instanode.dev project root (`~/Documents/learningProjects/instant/api`).
 
 ---
 

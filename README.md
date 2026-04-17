@@ -1,20 +1,20 @@
-# instant.dev — Agent API
+# instanode.dev — Agent API
 
 Zero-friction developer infrastructure. One HTTP call provisions a real database, cache, queue,
 webhook receiver, or object storage bucket — no account, no Docker, no setup.
 
 ```bash
 # Provision a Postgres database — no auth required
-curl -s -X POST https://instant.dev/db/new | jq .
+curl -s -X POST https://instanode.dev/db/new | jq .
 ```
 ```json
 {
   "ok": true,
   "token": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "connection_url": "postgres://usr_a1b2:pass_a1b2@shared.instant.dev/db_a1b2",
+  "connection_url": "postgres://usr_a1b2:pass_a1b2@shared.instanode.dev/db_a1b2",
   "tier": "anonymous",
   "limits": { "storage_mb": 10, "connections": 2, "expires_in": "24h" },
-  "note": "Works now. Free forever with a free account: https://instant.dev/start?t=eyJ..."
+  "note": "Works now. Free forever with a free account: https://instanode.dev/start?t=eyJ..."
 }
 ```
 

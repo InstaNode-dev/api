@@ -2,7 +2,7 @@
 name: instant-add-service
 version: 1.0.0
 description: |
-  Scaffold a new provisioning service for instant.dev (e.g., postgres, redis, mongodb).
+  Scaffold a new provisioning service for instanode.dev (e.g., postgres, redis, mongodb).
   Creates handler, model, route, migration, feature flag, metrics, tests, E2E, and docs.
   Run as: /instant-add-service postgres
 allowed-tools:
@@ -17,7 +17,7 @@ allowed-tools:
 
 # /instant-add-service — Add a New Provisioning Service
 
-You are scaffolding a new instant.dev provisioning service. The service name is the argument passed to this skill (e.g., `/instant-add-service postgres` → service = "postgres").
+You are scaffolding a new instanode.dev provisioning service. The service name is the argument passed to this skill (e.g., `/instant-add-service postgres` → service = "postgres").
 
 **If no service name is provided**, ask: "Which service are you adding? (e.g., postgres, redis, mongodb, nats, storage, webhook)"
 
@@ -105,7 +105,7 @@ func (h *{Name}Handler) New{Name}(c *fiber.Ctx) error {
 - Create the `onboarding_event` row in BOTH the new-resource path AND the limit-exceeded path.
 - Never return the raw `connection_url` from the DB — it is AES-encrypted at rest. Decrypt before returning (or return the plain value that was encrypted on write).
 - Fail open on Redis errors.
-- The `note` field must contain the full upgrade URL: `https://instant.dev/start?t={jwt}`.
+- The `note` field must contain the full upgrade URL: `https://instanode.dev/start?t={jwt}`.
 
 ---
 

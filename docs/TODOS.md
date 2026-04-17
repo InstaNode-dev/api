@@ -1,4 +1,4 @@
-# instant.dev — Task List
+# instanode.dev — Task List
 
 **Goal:** Ship anonymous provisioning of real infrastructure with upgrade → claim → Razorpay billing.
 

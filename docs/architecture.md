@@ -1,6 +1,6 @@
 # Architecture
 
-instant.dev is a Go + Fiber API server with Postgres, Redis, and background workers. This document covers the internal design decisions and data flows.
+instanode.dev is a Go + Fiber API server with Postgres, Redis, and background workers. This document covers the internal design decisions and data flows.
 
 ---
 

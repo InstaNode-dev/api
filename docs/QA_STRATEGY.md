@@ -1,4 +1,4 @@
-# QA Strategy — instant.dev
+# QA Strategy — instanode.dev
 
 > Owner: QA Engineering  
 > Last updated: 2026-04-16  

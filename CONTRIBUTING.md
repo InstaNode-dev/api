@@ -1,4 +1,4 @@
-# Contributing to instant.dev
+# Contributing to instanode.dev
 
 ## Prerequisites
 

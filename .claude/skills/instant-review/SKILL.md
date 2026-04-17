@@ -2,7 +2,7 @@
 name: instant-review
 version: 1.0.0
 description: |
-  Code review for instant.dev changes. Checks project-specific conventions:
+  Code review for instanode.dev changes. Checks project-specific conventions:
   fail-open Redis, atomic JWT single-use, typed errors, two-DB separation,
   no connection_url leakage, feature flags, E2E coverage gaps.
 allowed-tools:
@@ -13,9 +13,9 @@ allowed-tools:
   - AskUserQuestion
 ---
 
-# /instant-review — instant.dev Code Review
+# /instant-review — instanode.dev Code Review
 
-You are reviewing code changes in the instant.dev project. Apply the checklist below against the current diff. Read the full diff before flagging anything.
+You are reviewing code changes in the instanode.dev project. Apply the checklist below against the current diff. Read the full diff before flagging anything.
 
 ---
 
@@ -45,7 +45,7 @@ This prevents flagging things that are already established project patterns.
 
 ---
 
-## Step 3: Apply the instant.dev checklist
+## Step 3: Apply the instanode.dev checklist
 
 Work through each category. Flag issues with severity: **CRITICAL** or **INFO**.
 
@@ -158,7 +158,7 @@ New exported types, functions, and methods must have doc comments starting with 
 
 Format:
 ```
-instant.dev Code Review: N issues (X critical, Y informational)
+instanode.dev Code Review: N issues (X critical, Y informational)
 
 CRITICAL
 ─────────
@@ -171,7 +171,7 @@ INFO
     New queue provisioning handler has no provisions_total increment.
 ```
 
-If no issues: **"instant.dev Code Review: No issues found."**
+If no issues: **"instanode.dev Code Review: No issues found."**
 
 For each CRITICAL issue, use a separate AskUserQuestion:
 - Problem (file:line + description)

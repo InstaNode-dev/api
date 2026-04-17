@@ -1,4 +1,4 @@
-# instant.dev E2E Test Plan
+# instanode.dev E2E Test Plan
 ## Coverage for Agent 3-way changes: queue/new, storage quota, E2E cleanup
 
 ---

@@ -105,5 +105,5 @@ export function uniqueIP(): string {
  * Generate a unique test email.
  */
 export function uniqueEmail(): string {
-  return `browser-e2e-${Date.now()}-${Math.random().toString(36).slice(2, 8)}@instant.dev`;
+  return `browser-e2e-${Date.now()}-${Math.random().toString(36).slice(2, 8)}@instanode.dev`;
 }

@@ -1,6 +1,6 @@
-# instant.dev API Reference
+# instanode.dev API Reference
 
-**Base URL:** `https://instant.dev`
+**Base URL:** `https://instanode.dev`
 
 ---
 
@@ -113,7 +113,7 @@ Onboarding landing endpoint. Validates the onboarding JWT issued when anonymous 
 **Example:**
 
 ```bash
-curl "https://instant.dev/start?t=eyJ..."
+curl "https://instanode.dev/start?t=eyJ..."
 ```
 
 ---
@@ -160,7 +160,7 @@ Convert an anonymous session into a registered account. Transfers anonymous reso
 **Example:**
 
 ```bash
-curl -X POST https://instant.dev/claim \
+curl -X POST https://instanode.dev/claim \
   -H "Content-Type: application/json" \
   -d '{"jwt": "eyJ...", "email": "you@example.com", "team_name": "acme"}'
 ```
@@ -208,7 +208,7 @@ The `token` field is a 24-hour session JWT. Use it as a Bearer token on authenti
 **Example:**
 
 ```bash
-curl -X POST https://instant.dev/auth/github \
+curl -X POST https://instanode.dev/auth/github \
   -H "Content-Type: application/json" \
   -d '{"code": "abc123def456"}'
 ```
@@ -254,7 +254,7 @@ Verify a Google ID token and issue a session JWT.
 **Example:**
 
 ```bash
-curl -X POST https://instant.dev/auth/google \
+curl -X POST https://instanode.dev/auth/google \
   -H "Content-Type: application/json" \
   -d '{"id_token": "eyJ..."}'
 ```
@@ -307,7 +307,7 @@ Open `short_url` in the browser so the customer can complete payment on Razorpay
 **Example:**
 
 ```bash
-curl -X POST https://instant.dev/billing/checkout \
+curl -X POST https://instanode.dev/billing/checkout \
   -H "Authorization: Bearer eyJ..." \
   -H "Content-Type: application/json" \
   -d '{"plan": "pro"}'
@@ -388,7 +388,7 @@ Optional fields (`name`, `cloud_vendor`, `country_code`, `expires_at`, `team_id`
 **Example:**
 
 ```bash
-curl https://instant.dev/api/v1/resources \
+curl https://instanode.dev/api/v1/resources \
   -H "Authorization: Bearer eyJ..."
 ```
 
@@ -439,7 +439,7 @@ Get a single resource by its token UUID.
 **Example:**
 
 ```bash
-curl https://instant.dev/api/v1/resources/a1b2c3d4-e5f6-7890-abcd-ef1234567890 \
+curl https://instanode.dev/api/v1/resources/a1b2c3d4-e5f6-7890-abcd-ef1234567890 \
   -H "Authorization: Bearer eyJ..."
 ```
 
@@ -520,7 +520,7 @@ Soft-delete a resource. Credentials stop working immediately (status changes to 
 **Example:**
 
 ```bash
-curl -X DELETE https://instant.dev/api/v1/resources/a1b2c3d4-e5f6-7890-abcd-ef1234567890 \
+curl -X DELETE https://instanode.dev/api/v1/resources/a1b2c3d4-e5f6-7890-abcd-ef1234567890 \
   -H "Authorization: Bearer eyJ..."
 ```
 
@@ -540,14 +540,14 @@ Service health check.
 ```json
 {
   "ok": true,
-  "service": "instant.dev"
+  "service": "instanode.dev"
 }
 ```
 
 **Example:**
 
 ```bash
-curl https://instant.dev/healthz
+curl https://instanode.dev/healthz
 ```
 
 ---
@@ -597,14 +597,14 @@ Provision an anonymous Postgres database (Phase 2). No account required.
   "id": "d290f1ee-6c54-4b01-90e6-d701748f0851",
   "token": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "name": "my-app-db",
-  "connection_url": "postgres://usr_a1b2c3d4:pass_a1b2c3d4@shared.instant.dev/db_a1b2c3d4",
+  "connection_url": "postgres://usr_a1b2c3d4:pass_a1b2c3d4@shared.instanode.dev/db_a1b2c3d4",
   "tier": "anonymous",
   "limits": {
     "storage_mb": 10,
     "connections": 2,
     "expires_in": "24h"
   },
-  "note": "Works now. Free forever with a free account: https://instant.dev/start?t=<jwt>"
+  "note": "Works now. Free forever with a free account: https://instanode.dev/start?t=<jwt>"
 }
 ```
 
@@ -614,15 +614,15 @@ The `id` field is the stable UUID for this resource. Use it to reference the res
 
 ```bash
 # Anonymous provision
-curl -X POST https://instant.dev/db/new
+curl -X POST https://instanode.dev/db/new
 
 # With a name
-curl -X POST https://instant.dev/db/new \
+curl -X POST https://instanode.dev/db/new \
   -H "Content-Type: application/json" \
   -d '{"name": "my-app-db"}'
 
 # Authenticated provision (permanent, no expiry)
-curl -X POST https://instant.dev/db/new \
+curl -X POST https://instanode.dev/db/new \
   -H "Authorization: Bearer eyJ..."
 ```
 
@@ -654,13 +654,13 @@ Provision an anonymous Redis cache (Phase 3). No account required.
   "id": "e5f6a7b8-c9d0-1234-efab-567890abcdef",
   "token": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
   "name": "session-cache",
-  "connection_url": "redis://:pass_b2c3d4e5@shared.instant.dev:6379/0",
+  "connection_url": "redis://:pass_b2c3d4e5@shared.instanode.dev:6379/0",
   "tier": "anonymous",
   "limits": {
     "memory_mb": 5,
     "expires_in": "24h"
   },
-  "note": "Works now. Free forever with a free account: https://instant.dev/start?t=<jwt>"
+  "note": "Works now. Free forever with a free account: https://instanode.dev/start?t=<jwt>"
 }
 ```
 
@@ -668,15 +668,15 @@ Provision an anonymous Redis cache (Phase 3). No account required.
 
 ```bash
 # Anonymous provision
-curl -X POST https://instant.dev/cache/new
+curl -X POST https://instanode.dev/cache/new
 
 # With a name
-curl -X POST https://instant.dev/cache/new \
+curl -X POST https://instanode.dev/cache/new \
   -H "Content-Type: application/json" \
   -d '{"name": "session-cache"}'
 
 # Authenticated provision (permanent)
-curl -X POST https://instant.dev/cache/new \
+curl -X POST https://instanode.dev/cache/new \
   -H "Authorization: Bearer eyJ..."
 ```
 
@@ -708,14 +708,14 @@ Provision an anonymous MongoDB database (Phase 4). No account required.
   "id": "f6a7b8c9-d0e1-2345-fab0-678901abcdef",
   "token": "c3d4e5f6-a7b8-9012-cdef-012345678902",
   "name": "events-db",
-  "connection_url": "mongodb://usr_c3d4e5f6:pass_c3d4e5f6@shared.instant.dev:27017/db_c3d4e5f6",
+  "connection_url": "mongodb://usr_c3d4e5f6:pass_c3d4e5f6@shared.instanode.dev:27017/db_c3d4e5f6",
   "tier": "anonymous",
   "limits": {
     "storage_mb": 5,
     "connections": 2,
     "expires_in": "24h"
   },
-  "note": "Works now. Free forever with a free account: https://instant.dev/start?t=<jwt>"
+  "note": "Works now. Free forever with a free account: https://instanode.dev/start?t=<jwt>"
 }
 ```
 
@@ -723,15 +723,15 @@ Provision an anonymous MongoDB database (Phase 4). No account required.
 
 ```bash
 # Anonymous provision
-curl -X POST https://instant.dev/nosql/new
+curl -X POST https://instanode.dev/nosql/new
 
 # With a name
-curl -X POST https://instant.dev/nosql/new \
+curl -X POST https://instanode.dev/nosql/new \
   -H "Content-Type: application/json" \
   -d '{"name": "events-db"}'
 
 # Authenticated provision (permanent)
-curl -X POST https://instant.dev/nosql/new \
+curl -X POST https://instanode.dev/nosql/new \
   -H "Authorization: Bearer eyJ..."
 ```
 
@@ -752,7 +752,7 @@ Prometheus metrics endpoint. Returns metrics in the standard Prometheus text exp
 **Example:**
 
 ```bash
-curl https://instant.dev/metrics
+curl https://instanode.dev/metrics
 ```
 
 ---

@@ -7,7 +7,7 @@ Provision real **Postgres**, **Redis**, **MongoDB**, **NATS JetStream**, **S3-co
 ## 1. Provision a Postgres database
 
 ```bash
-curl -s -X POST https://instant.dev/db/new | jq .
+curl -s -X POST https://instanode.dev/db/new | jq .
 ```
 
 Example response:
@@ -17,14 +17,14 @@ Example response:
   "ok": true,
   "id": "d290f1ee-6c54-4b01-90e6-d701748f0851",
   "token": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "connection_url": "postgres://usr_a1b2c3d4:pass_a1b2c3d4@shared.instant.dev/db_a1b2c3d4",
+  "connection_url": "postgres://usr_a1b2c3d4:pass_a1b2c3d4@shared.instanode.dev/db_a1b2c3d4",
   "tier": "anonymous",
   "limits": {
     "storage_mb": 10,
     "connections": 2,
     "expires_in": "24h"
   },
-  "note": "Works now. Free forever with a free account: https://instant.dev/start?t=eyJ..."
+  "note": "Works now. Free forever with a free account: https://instanode.dev/start?t=eyJ..."
 }
 ```
 
@@ -33,7 +33,7 @@ Use `connection_url` with any Postgres client (`psql`, `libpq`, Drizzle, Prisma,
 Optional label:
 
 ```bash
-curl -s -X POST https://instant.dev/db/new \
+curl -s -X POST https://instanode.dev/db/new \
   -H "Content-Type: application/json" \
   -d '{"name": "my-app-db"}' | jq .
 ```
@@ -55,14 +55,14 @@ Same pattern: `POST` with optional `{"name": "..."}` body.
 | `POST /webhook/new` | Receiver URL for inbound HTTP |
 
 ```bash
-curl -s -X POST https://instant.dev/cache/new | jq .
-curl -s -X POST https://instant.dev/nosql/new | jq .
+curl -s -X POST https://instanode.dev/cache/new | jq .
+curl -s -X POST https://instanode.dev/nosql/new | jq .
 ```
 
 Authenticated calls (same endpoints, add header) create **permanent** resources tied to your team:
 
 ```bash
-curl -s -X POST https://instant.dev/db/new \
+curl -s -X POST https://instanode.dev/db/new \
   -H "Authorization: Bearer <session_jwt>" | jq .
 ```
 
@@ -70,7 +70,7 @@ curl -s -X POST https://instant.dev/db/new \
 
 ## 3. Keep resources after 24 hours (claim)
 
-Anonymous resources expire after **24 hours**. The `note` field includes an onboarding link (`https://instant.dev/start?t=...`).
+Anonymous resources expire after **24 hours**. The `note` field includes an onboarding link (`https://instanode.dev/start?t=...`).
 
 1. Open that URL in a browser (or send users through your product).
 2. Sign in (e.g. GitHub OAuth where enabled).
@@ -87,11 +87,11 @@ Exact numbers come from [`plans.yaml`](../plans.yaml). Typical anonymous Postgre
 ## 5. Health check
 
 ```bash
-curl -s https://instant.dev/healthz
+curl -s https://instanode.dev/healthz
 ```
 
 ```json
-{ "ok": true, "service": "instant.dev" }
+{ "ok": true, "service": "instanode.dev" }
 ```
 
 ---
