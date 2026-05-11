@@ -36,8 +36,11 @@ type K8sStackProvider struct {
 }
 
 // NewStackProvider creates a K8sStackProvider.
-func NewStackProvider(namespace string) (*K8sStackProvider, error) {
-	base, err := New(namespace)
+// buildCtx is the same MinIO/S3 config used by single-app deploys for kaniko
+// build context delivery. Pass a zero value to fall back to the legacy
+// 1 MiB Secret path.
+func NewStackProvider(namespace string, buildCtx BuildContextConfig) (*K8sStackProvider, error) {
+	base, err := New(namespace, buildCtx)
 	if err != nil {
 		return nil, fmt.Errorf("k8s.NewStackProvider: %w", err)
 	}

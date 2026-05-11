@@ -53,7 +53,7 @@ func NewDeployHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config) *Deploy
 	var cp compute.Provider
 	switch cfg.ComputeProvider {
 	case "k8s":
-		k8sProv, err := k8s.New(cfg.KubeNamespaceApps)
+		k8sProv, err := k8s.New(cfg.KubeNamespaceApps, buildContextConfigFromCfg(cfg))
 		if err != nil {
 			slog.Error("deploy: k8s provider init failed — falling back to noop", "error", err)
 			cp = noop.New()

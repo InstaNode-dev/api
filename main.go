@@ -97,7 +97,12 @@ func main() {
 
 	var stackProv compute.StackProvider
 	if cfg.ComputeProvider == "k8s" {
-		ksp, err := k8s.NewStackProvider(cfg.KubeNamespaceApps)
+		ksp, err := k8s.NewStackProvider(cfg.KubeNamespaceApps, k8s.BuildContextConfig{
+			Endpoint:   cfg.MinioEndpoint,
+			AccessKey:  cfg.MinioRootUser,
+			SecretKey:  cfg.MinioRootPassword,
+			BucketName: "instant-build-contexts",
+		})
 		if err != nil {
 			slog.Warn("dashboard_grpc.stack_k8s_unavailable", "error", err)
 			stackProv = noop.NewStack()

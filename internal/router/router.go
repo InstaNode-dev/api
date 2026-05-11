@@ -111,7 +111,9 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// until a future operator wires real k8s.
 	var customDomainK8s handlers.CustomDomainProvider
 	if cfg.ComputeProvider == "k8s" {
-		if csp, err := k8s.NewStackProvider(cfg.KubeNamespaceApps); err != nil {
+		// Custom-domain reconciliation doesn't trigger builds, so an empty
+		// BuildContextConfig is fine — the upload path is never reached here.
+		if csp, err := k8s.NewStackProvider(cfg.KubeNamespaceApps, k8s.BuildContextConfig{}); err != nil {
 			slog.Warn("custom_domain.k8s_provider_unavailable", "error", err)
 		} else {
 			customDomainK8s = csp
