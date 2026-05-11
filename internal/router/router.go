@@ -89,10 +89,20 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// Build storage provider once and share it with both StorageHandler and ResourceHandler
 	// so that DELETE /api/v1/resources/:id can deprovision MinIO IAM users.
 	var storageProv *storageprovider.Provider
-	if cfg.MinioEndpoint != "" {
-		if sp, err := storageprovider.New(cfg.MinioEndpoint, cfg.MinioPublicEndpoint, cfg.MinioRootUser, cfg.MinioRootPassword, cfg.MinioBucketName); err != nil {
-			slog.Warn("storage: MinIO provider init failed", "error", err)
+	if cfg.ObjectStoreEndpoint != "" {
+		backend := storageprovider.Backend(cfg.ObjectStoreBackend)
+		if sp, err := storageprovider.NewWithBackend(
+			backend,
+			cfg.ObjectStoreEndpoint,
+			cfg.ObjectStorePublicURL,
+			cfg.ObjectStoreAccessKey,
+			cfg.ObjectStoreSecretKey,
+			cfg.ObjectStoreBucket,
+			cfg.ObjectStoreSecure,
+		); err != nil {
+			slog.Warn("storage: provider init failed", "backend", backend, "error", err)
 		} else {
+			slog.Info("storage: provider initialized", "backend", backend, "endpoint", cfg.ObjectStoreEndpoint)
 			storageProv = sp
 		}
 	}
