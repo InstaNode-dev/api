@@ -47,12 +47,33 @@ type Config struct {
 	R2Endpoint               string // R2_ENDPOINT — R2 endpoint hostname (default: r2.instant.dev)
 	R2BucketName             string // R2_BUCKET_NAME — shared R2 bucket name (default: instant-shared)
 	R2APIToken               string // R2_API_TOKEN — Cloudflare API token; if empty, R2 is not used
-	// MinIO S3-compatible storage (local dev backend for /storage/new)
-	MinioEndpoint       string // MINIO_ENDPOINT — host:port used internally for bucket/IAM admin (e.g. minio.instant-data.svc.cluster.local:9000)
-	MinioPublicEndpoint string // MINIO_PUBLIC_ENDPOINT — host:port returned to customers in connection_url/endpoint (e.g. s3.instanode.dev:9000). Empty = fall back to MinioEndpoint.
-	MinioRootUser       string // MINIO_ROOT_USER — admin access key
-	MinioRootPassword   string // MINIO_ROOT_PASSWORD — admin secret key
-	MinioBucketName     string // MINIO_BUCKET_NAME — shared bucket (default: instant-shared)
+	// Object storage backend for /storage/new (provider-agnostic).
+	//
+	// ObjectStoreBackend selects the credential-issuance strategy:
+	//   "minio-admin" — self-hosted MinIO; uses madmin to mint per-customer
+	//                   IAM users with prefix-scoped policies (hard isolation).
+	//   "shared-key"  — DO Spaces / AWS S3 / GCS / R2 / B2 / Wasabi; returns
+	//                   the platform's master credentials + a per-customer
+	//                   prefix to every customer (trust-based isolation).
+	// Defaults to "minio-admin" when ObjectStoreBackend is empty AND the
+	// legacy MINIO_* env vars are set; otherwise "shared-key".
+	ObjectStoreBackend    string // OBJECT_STORE_BACKEND — "minio-admin" or "shared-key"
+	ObjectStoreEndpoint   string // OBJECT_STORE_ENDPOINT — host:port for admin/bucket ops
+	ObjectStorePublicURL  string // OBJECT_STORE_PUBLIC_URL — customer-facing base, e.g. "https://s3.instanode.dev"
+	ObjectStoreAccessKey  string // OBJECT_STORE_ACCESS_KEY — master access key
+	ObjectStoreSecretKey  string // OBJECT_STORE_SECRET_KEY — master secret key
+	ObjectStoreBucket     string // OBJECT_STORE_BUCKET — shared bucket (default: instant-shared)
+	ObjectStoreRegion     string // OBJECT_STORE_REGION — e.g. "nyc3" for DO Spaces, "us-east-1" for AWS S3
+	ObjectStoreSecure     bool   // OBJECT_STORE_SECURE — true for TLS-terminated endpoints (DO Spaces, AWS S3); default false for in-cluster MinIO
+
+	// Legacy MINIO_* env vars — kept as a fallback so old deployments keep
+	// working without an immediate env-var migration. New deployments should
+	// set the OBJECT_STORE_* vars above and leave these empty.
+	MinioEndpoint       string // MINIO_ENDPOINT — legacy alias for OBJECT_STORE_ENDPOINT
+	MinioPublicEndpoint string // MINIO_PUBLIC_ENDPOINT — legacy alias for OBJECT_STORE_PUBLIC_URL
+	MinioRootUser       string // MINIO_ROOT_USER — legacy alias for OBJECT_STORE_ACCESS_KEY
+	MinioRootPassword   string // MINIO_ROOT_PASSWORD — legacy alias for OBJECT_STORE_SECRET_KEY
+	MinioBucketName     string // MINIO_BUCKET_NAME — legacy alias for OBJECT_STORE_BUCKET
 	DeployDomain      string // DEPLOY_DOMAIN — base domain for container deployments (default: instant.dev)
 
 	// Compute provider for app hosting (Phase 6)
@@ -129,11 +150,50 @@ func Load() *Config {
 	cfg.R2Endpoint = getenv("R2_ENDPOINT", "r2.instant.dev")
 	cfg.R2BucketName = getenv("R2_BUCKET_NAME", "instant-shared")
 	cfg.R2APIToken = os.Getenv("R2_API_TOKEN")
+	// New provider-agnostic object-storage env vars. Fall back to the legacy
+	// MINIO_* names so deployments without OBJECT_STORE_* set keep working
+	// unchanged (the LoadFromEnv tail below resolves the effective values).
+	cfg.ObjectStoreBackend = os.Getenv("OBJECT_STORE_BACKEND")
+	cfg.ObjectStoreEndpoint = os.Getenv("OBJECT_STORE_ENDPOINT")
+	cfg.ObjectStorePublicURL = os.Getenv("OBJECT_STORE_PUBLIC_URL")
+	cfg.ObjectStoreAccessKey = os.Getenv("OBJECT_STORE_ACCESS_KEY")
+	cfg.ObjectStoreSecretKey = os.Getenv("OBJECT_STORE_SECRET_KEY")
+	cfg.ObjectStoreBucket = getenv("OBJECT_STORE_BUCKET", "instant-shared")
+	cfg.ObjectStoreRegion = os.Getenv("OBJECT_STORE_REGION")
+	cfg.ObjectStoreSecure = os.Getenv("OBJECT_STORE_SECURE") == "true"
+
 	cfg.MinioEndpoint = os.Getenv("MINIO_ENDPOINT")
 	cfg.MinioPublicEndpoint = os.Getenv("MINIO_PUBLIC_ENDPOINT")
 	cfg.MinioRootUser = os.Getenv("MINIO_ROOT_USER")
 	cfg.MinioRootPassword = os.Getenv("MINIO_ROOT_PASSWORD")
 	cfg.MinioBucketName = getenv("MINIO_BUCKET_NAME", "instant-shared")
+
+	// Effective object-storage config: prefer new OBJECT_STORE_* names;
+	// fall back to legacy MINIO_* for backward compat.
+	if cfg.ObjectStoreEndpoint == "" {
+		cfg.ObjectStoreEndpoint = cfg.MinioEndpoint
+	}
+	if cfg.ObjectStorePublicURL == "" {
+		cfg.ObjectStorePublicURL = cfg.MinioPublicEndpoint
+	}
+	if cfg.ObjectStoreAccessKey == "" {
+		cfg.ObjectStoreAccessKey = cfg.MinioRootUser
+	}
+	if cfg.ObjectStoreSecretKey == "" {
+		cfg.ObjectStoreSecretKey = cfg.MinioRootPassword
+	}
+	if cfg.ObjectStoreBucket == "instant-shared" && cfg.MinioBucketName != "" && cfg.MinioBucketName != "instant-shared" {
+		cfg.ObjectStoreBucket = cfg.MinioBucketName
+	}
+	if cfg.ObjectStoreBackend == "" {
+		// Default to minio-admin when the legacy MINIO_* vars are present
+		// (preserves existing behavior); shared-key otherwise.
+		if cfg.MinioEndpoint != "" {
+			cfg.ObjectStoreBackend = "minio-admin"
+		} else {
+			cfg.ObjectStoreBackend = "shared-key"
+		}
+	}
 	cfg.DeployDomain = getenv("DEPLOY_DOMAIN", "instant.dev")
 	cfg.ComputeProvider = getenv("COMPUTE_PROVIDER", "noop")
 	cfg.KubeNamespaceApps = getenv("KUBE_NAMESPACE_APPS", "instant-apps")
