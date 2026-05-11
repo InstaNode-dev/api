@@ -54,6 +54,49 @@ func TestOpenAPI_BearerAuthDocumentsClaimFlow(t *testing.T) {
 	}
 }
 
+// TestOpenAPI_ClaimPreviewEndpointDocumented guards friction #15: the
+// /claim/preview probe was implemented but undocumented, so agents had no
+// machine-readable signal that they could surface "what will I claim?" to
+// the user before they enter their email.
+func TestOpenAPI_ClaimPreviewEndpointDocumented(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	paths, _ := v["paths"].(map[string]any)
+	if _, ok := paths["/claim/preview"].(map[string]any); !ok {
+		t.Error("/claim/preview is missing from OpenAPI paths — agents cannot discover the no-side-effect probe of claimable resources")
+	}
+	if props, ok := digMap(v, "components", "schemas", "ClaimPreviewResponse", "properties"); ok {
+		for _, k := range []string{"ok", "token_valid", "resources", "expires_at"} {
+			if _, ok := props[k]; !ok {
+				t.Errorf("ClaimPreviewResponse.properties.%s missing", k)
+			}
+		}
+	} else {
+		t.Error("ClaimPreviewResponse schema missing")
+	}
+}
+
+// TestOpenAPI_ClaimRequestDocumentsUpgradeJWT guards friction #16 — the
+// ClaimRequest doc must point agents at the upgrade_jwt response field
+// rather than telling them to string-strip the upgrade URL.
+func TestOpenAPI_ClaimRequestDocumentsUpgradeJWT(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	props, ok := digMap(v, "components", "schemas", "ClaimRequest", "properties")
+	if !ok {
+		t.Fatal("ClaimRequest schema missing")
+	}
+	jwt, _ := props["jwt"].(map[string]any)
+	desc, _ := jwt["description"].(string)
+	if !strings.Contains(desc, "upgrade_jwt") {
+		t.Errorf("ClaimRequest.jwt description must mention the upgrade_jwt response field; got: %s", desc)
+	}
+}
+
 // TestOpenAPI_StacksEndpointsDocumented guards friction #1 — /stacks/new was
 // already implemented but undocumented, so agents reading the spec had no way
 // to discover the multi-service deploy primitive. This test ensures the path

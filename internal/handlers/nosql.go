@@ -67,7 +67,7 @@ func (h *NoSQLHandler) provisionNoSQL(ctx context.Context, token, tier string) (
 func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 	if !h.cfg.IsServiceEnabled("mongodb") {
 		return respondError(c, fiber.StatusServiceUnavailable, "service_disabled",
-			"MongoDB provisioning is coming in Phase 4. Sign up at https://instant.dev/start to be notified.")
+			"MongoDB provisioning is coming in Phase 4. Sign up at https://instanode.dev/start to be notified.")
 	}
 
 	start := time.Now()
@@ -94,7 +94,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 	// ── Dedicated requires authentication ─────────────────────────────────────
 	if body.Dedicated {
 		return respondError(c, fiber.StatusPaymentRequired, "auth_required",
-			"isolated resources require an authenticated team. Sign up at https://instant.dev/start")
+			"isolated resources require an authenticated team. Sign up at https://instanode.dev/start")
 	}
 
 	// ── Anonymous path ─────────────────────────────────────────────────────────
@@ -116,7 +116,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 			}
 			upgradeURL := ""
 			if jwtToken != "" {
-				upgradeURL = fmt.Sprintf("https://instant.dev/start?t=%s", jwtToken)
+				upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
 			// Decrypt the stored connection_url to return it in plaintext.
@@ -135,6 +135,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 					"limits":         nosqlAnonymousLimits(),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
+					"upgrade_jwt":    jwtToken,
 				})
 			}
 			// Empty connection_url means provisioning failed mid-flight on the existing
@@ -217,7 +218,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 
 	upgradeURL := ""
 	if jwtToken != "" {
-		upgradeURL = fmt.Sprintf("https://instant.dev/start?t=%s", jwtToken)
+		upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
 		c.Set("X-Instant-Upgrade", upgradeURL)
 	}
 

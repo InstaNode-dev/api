@@ -110,7 +110,7 @@ func webhookAnonLimits() fiber.Map {
 func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 	if !h.cfg.IsServiceEnabled("webhook") {
 		return respondError(c, fiber.StatusServiceUnavailable, "service_disabled",
-			"Webhook provisioning is coming soon. Sign up at https://instant.dev/start to be notified.")
+			"Webhook provisioning is coming soon. Sign up at https://instanode.dev/start to be notified.")
 	}
 
 	start := time.Now()
@@ -153,7 +153,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 			}
 			upgradeURL := ""
 			if jwtToken != "" {
-				upgradeURL = fmt.Sprintf("https://instant.dev/start?t=%s", jwtToken)
+				upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
 			metrics.FingerprintAbuseBlocked.Inc()
@@ -171,6 +171,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 				"limits":      webhookAnonLimits(),
 				"note":        limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 				"upgrade":     upgradeURL,
+				"upgrade_jwt": jwtToken,
 			}
 			if existing.ExpiresAt.Valid {
 				resp["expires_at"] = existing.ExpiresAt.Time
@@ -221,7 +222,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 
 	upgradeURL := ""
 	if jwtToken != "" {
-		upgradeURL = fmt.Sprintf("https://instant.dev/start?t=%s", jwtToken)
+		upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
 		c.Set("X-Instant-Upgrade", upgradeURL)
 	}
 
