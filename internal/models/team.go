@@ -163,7 +163,13 @@ func GetUserByGitHubID(ctx context.Context, db *sql.DB, githubID string) (*User,
 }
 
 // UpdateRazorpaySubscriptionID stores the Razorpay subscription ID on the team.
-// Uses the existing stripe_customer_id column (renamed at DB layer later if needed).
+//
+// TODO: rename column stripe_customer_id → razorpay_subscription_id in a
+// future migration. Stripe is not used anywhere in this codebase; the column
+// name is a vestige of the original Stripe integration before the switch to
+// Razorpay. Razorpay covers all payment surfaces we need (subscriptions,
+// webhooks, invoices, plan upgrades). Per the user's directive, treat any
+// remaining "stripe_*" string in the schema as legacy ballast to migrate.
 func UpdateRazorpaySubscriptionID(ctx context.Context, db *sql.DB, teamID uuid.UUID, subscriptionID string) error {
 	_, err := db.ExecContext(ctx, `
 		UPDATE teams SET stripe_customer_id = $1 WHERE id = $2

@@ -25,8 +25,8 @@ import (
 )
 
 const (
-	labelStack   = "instant.dev/stack"
-	stackIngHost = "instant.dev"
+	labelStack          = "instant.dev/stack"
+	stackIngHostDefault = "instant.dev"
 )
 
 // K8sStackProvider implements compute.StackProvider using the local k8s cluster.
@@ -44,9 +44,19 @@ func NewStackProvider(namespace string) (*K8sStackProvider, error) {
 	return &K8sStackProvider{K8sProvider: base}, nil
 }
 
-// stackImageTag returns the docker image tag for a stack service.
+// stackImageTag returns the docker image tag for a stack service. Honors
+// BUILD_IMAGE_REGISTRY env so kaniko pushes to a real registry instead of
+// the unqualified name (which kaniko interprets as docker.io/library/...).
 func stackImageTag(stackID, svcName string) string {
-	return "instant-stack-" + stackID + "-" + svcName + ":latest"
+	bare := "instant-stack-" + stackID + "-" + svcName + ":latest"
+	reg := os.Getenv("BUILD_IMAGE_REGISTRY")
+	if reg == "" {
+		return bare
+	}
+	for len(reg) > 0 && reg[len(reg)-1] == '/' {
+		reg = reg[:len(reg)-1]
+	}
+	return reg + "/" + bare
 }
 
 // DeployStack builds all images in parallel, creates the stack namespace with
@@ -87,7 +97,7 @@ func (p *K8sStackProvider) DeployStack(
 
 			onUpdate(svc.Name, "building", "", "")
 			tag := stackImageTag(opts.StackID, svc.Name)
-			if err := p.buildImage(buildCtx, svc.Name+"-"+opts.StackID, tag, svc.Tarball); err != nil {
+			if err := p.buildImage(buildCtx, stackNamespace, svc.Name+"-"+opts.StackID, tag, svc.Tarball); err != nil {
 				return fmt.Errorf("build %q: %w", svc.Name, err)
 			}
 			return nil
@@ -249,7 +259,7 @@ func (p *K8sStackProvider) RedeployStack(
 
 			onUpdate(svc.Name, "building", "", "")
 			tag := stackImageTag(stackID, svc.Name)
-			if err := p.buildImage(buildCtx, svc.Name+"-"+stackID, tag, svc.Tarball); err != nil {
+			if err := p.buildImage(buildCtx, stackNamespace, svc.Name+"-"+stackID, tag, svc.Tarball); err != nil {
 				return fmt.Errorf("rebuild %q: %w", svc.Name, err)
 			}
 			return nil
@@ -336,6 +346,9 @@ func (p *K8sStackProvider) createStackDeployment(
 				},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken: &saFalse,
+					ImagePullSecrets: []corev1.LocalObjectReference{
+						{Name: "ghcr-pull"}, // copied into the deploy ns by buildImage
+					},
 					Containers: []corev1.Container{
 						{
 							Name:            svcName,
@@ -472,20 +485,42 @@ func (p *K8sStackProvider) createNodePortService(ctx context.Context, ns, name s
 // createIngress creates a k8s Ingress for an exposed stack service.
 // Returns the app URL on success.
 func (p *K8sStackProvider) createIngress(ctx context.Context, ns, stackID, svcName string, port int) (string, error) {
-	host := svcName + "-" + stackID + "." + stackIngHost
-	appURL := "http://" + host
+	domain := os.Getenv("DEPLOY_DOMAIN")
+	if domain == "" {
+		domain = stackIngHostDefault
+	}
+	host := svcName + "-" + stackID + "." + domain
 	pathType := networkingv1.PathTypePrefix
+
+	// cert-manager wiring. If CERT_ISSUER is set, every ingress gets a TLS
+	// section + the cluster-issuer annotation, and cert-manager auto-issues
+	// a real cert via the configured ACME solver (HTTP-01 by default).
+	certIssuer := os.Getenv("CERT_ISSUER")
+	annotations := map[string]string{}
+	var tls []networkingv1.IngressTLS
+	scheme := "http"
+	if certIssuer != "" {
+		annotations["cert-manager.io/cluster-issuer"] = certIssuer
+		tls = []networkingv1.IngressTLS{{
+			Hosts:      []string{host},
+			SecretName: svcName + "-" + stackID + "-tls",
+		}}
+		scheme = "https"
+	}
+	appURL := scheme + "://" + host
 
 	ing := &networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      svcName,
-			Namespace: ns,
+			Name:        svcName,
+			Namespace:   ns,
+			Annotations: annotations,
 			Labels: map[string]string{
 				"app":      svcName,
 				labelStack: stackID,
 			},
 		},
 		Spec: networkingv1.IngressSpec{
+			TLS: tls,
 			Rules: []networkingv1.IngressRule{
 				{
 					Host: host,

@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"instant.dev/internal/config"
 	"instant.dev/internal/crypto"
@@ -60,7 +61,7 @@ func NewStorageHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, storag
 	if storageProvider != nil {
 		h.storageProvider = storageProvider
 	} else if cfg.MinioEndpoint != "" {
-		sp, err := storageprovider.New(cfg.MinioEndpoint, cfg.MinioRootUser, cfg.MinioRootPassword, cfg.MinioBucketName)
+		sp, err := storageprovider.New(cfg.MinioEndpoint, cfg.MinioPublicEndpoint, cfg.MinioRootUser, cfg.MinioRootPassword, cfg.MinioBucketName)
 		if err != nil {
 			slog.Warn("storage: MinIO provider init failed — /storage/new will return 503", "error", err)
 		} else {
@@ -93,9 +94,14 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 	_ = c.BodyParser(&body)
 	body.Name = sanitizeName(body.Name)
 
+	env, envErr := resolveEnv(c, body.Env)
+	if envErr != nil {
+		return envErr
+	}
+
 	// ── Authenticated path ────────────────────────────────────────────────────
 	if teamIDStr := middleware.GetTeamID(c); teamIDStr != "" {
-		return h.newStorageAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, start)
+		return h.newStorageAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, env, start)
 	}
 
 	// ── Anonymous path ─────────────────────────────────────────────────────────
@@ -132,6 +138,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 				"name":           existing.Name.String,
 				"connection_url": connectionURL,
 				"tier":           existing.Tier,
+				"env":            existing.Env,
 				"limits":         h.storageAnonymousLimits(),
 				"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 				"upgrade":        upgradeURL,
@@ -144,6 +151,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 		ResourceType:     "storage",
 		Name:             body.Name,
 		Tier:             "anonymous",
+		Env:              env,
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
@@ -230,6 +238,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 		"secret_access_key": creds.SecretAccessKey,
 		"prefix":            creds.Prefix,
 		"tier":              "anonymous",
+		"env":               resource.Env,
 		"limits":            h.storageAnonymousLimits(),
 		"note":              upgradeNote(upgradeURL),
 		"upgrade":           upgradeURL,
@@ -238,7 +247,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 }
 
 func (h *StorageHandler) newStorageAuthenticated(
-	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, start time.Time,
+	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, env string, start time.Time,
 ) error {
 	ctx := c.UserContext()
 	teamUUID, err := parseTeamID(teamIDStr)
@@ -272,6 +281,7 @@ func (h *StorageHandler) newStorageAuthenticated(
 		ResourceType:     "storage",
 		Name:             name,
 		Tier:             team.PlanTier,
+		Env:              env,
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
@@ -282,6 +292,18 @@ func (h *StorageHandler) newStorageAuthenticated(
 		slog.Error("storage.new.create_resource_failed_auth", "error", err, "team_id", teamIDStr, "request_id", requestID)
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision storage resource")
 	}
+
+	// Best-effort audit event; failures must never block the provision.
+	go func() {
+		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+			TeamID:       teamUUID,
+			Actor:        "agent",
+			Kind:         "provision",
+			ResourceType: "storage",
+			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
+			Summary:      "agent provisioned <strong>storage</strong> <code>" + resource.Token.String()[:8] + "</code>",
+		})
+	}()
 
 	tokenStr := resource.Token.String()
 
@@ -337,6 +359,7 @@ func (h *StorageHandler) newStorageAuthenticated(
 		"secret_access_key": creds.SecretAccessKey,
 		"prefix":            creds.Prefix,
 		"tier":              team.PlanTier,
+		"env":               resource.Env,
 		"limits": fiber.Map{
 			"storage_mb": h.plans.StorageLimitMB(team.PlanTier, "storage"),
 		},

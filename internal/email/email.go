@@ -260,6 +260,52 @@ https://instant.dev/billing/checkout
 	return c.send(ctx, to, subject, plain, html)
 }
 
+// SendMagicLink emails a one-click sign-in link to the user. The link MUST
+// already point at the API's /auth/email/callback endpoint — this function
+// does not construct it.
+//
+// The 15-minute expiry and single-use semantics are enforced by the
+// magic_links table; this email body just communicates them to the user.
+func (c *Client) SendMagicLink(ctx context.Context, toEmail, link string) error {
+	subject := "Sign in to instanode (expires in 15 min)"
+
+	plain := fmt.Sprintf(`Sign in to instanode.dev:
+
+%s
+
+This link expires in 15 minutes and can only be used once. If you didn't
+request this email, you can safely ignore it.
+
+— The instanode.dev team
+`, link)
+
+	safeLink := htmlEscape(link)
+	htmlBody := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#111;">
+  <h2>Sign in to instanode.dev</h2>
+  <p>Click the button below to sign in. This link expires in <strong>15 minutes</strong> and can only be used once.</p>
+  <p style="margin-top:32px;">
+    <a href="%s"
+       style="background:#111;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:bold;">
+      Sign in &rarr;
+    </a>
+  </p>
+  <p style="margin-top:24px;color:#666;font-size:13px;">
+    If the button doesn't work, copy this URL into your browser:<br>
+    <span style="color:#444;word-break:break-all;">%s</span>
+  </p>
+  <p style="margin-top:24px;color:#666;font-size:13px;">
+    If you didn't request this email, you can safely ignore it.
+  </p>
+  <p style="margin-top:40px;color:#666;font-size:13px;">— The instanode.dev team</p>
+</body>
+</html>`, safeLink, safeLink)
+
+	return c.send(ctx, toEmail, subject, plain, htmlBody)
+}
+
 // SendTeamInvite emails an invitation to join a team on instant.dev.
 func (c *Client) SendTeamInvite(ctx context.Context, toEmail, teamName, acceptURL string) error {
 	subject := "You've been invited to an instant.dev team"

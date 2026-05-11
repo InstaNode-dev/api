@@ -42,7 +42,7 @@ func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient *email.Client
 	return &BillingHandler{db: db, cfg: cfg, email: emailClient, migClient: migClient}
 }
 
-// checkoutRequest is the request body for POST /billing/checkout.
+// checkoutRequest is the request body for POST /api/v1/billing/checkout.
 type checkoutRequest struct {
 	Plan string `json:"plan"`
 }
@@ -76,10 +76,21 @@ func (h *BillingHandler) planIDToTier(planID string) string {
 	return "pro"
 }
 
-// CreateCheckout handles POST /billing/checkout.
-// Creates a Razorpay subscription and returns the hosted payment URL.
-// Requires a valid session JWT in the Authorization: Bearer header (enforced by RequireAuth middleware).
-func (h *BillingHandler) CreateCheckout(c *fiber.Ctx) error {
+// CreateCheckoutAPI handles POST /api/v1/billing/checkout (and the legacy
+// alias POST /billing/checkout). Creates a Razorpay subscription and returns
+// the hosted payment short_url plus the subscription_id.
+//
+// Requires a valid session JWT in the Authorization: Bearer header (enforced
+// by RequireAuth middleware).
+//
+// Response: {"ok": true, "short_url": "...", "subscription_id": "..."}
+//
+// Status codes:
+//   - 400  invalid plan / invalid body
+//   - 401  no/invalid session (RequireAuth handles this)
+//   - 502  Razorpay rejected the create-subscription call
+//   - 503  RAZORPAY_KEY_ID/SECRET or the requested tier's plan_id not configured
+func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 	teamIDStr := middleware.GetTeamID(c)
 
@@ -93,26 +104,46 @@ func (h *BillingHandler) CreateCheckout(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "invalid_body", "Request body must be valid JSON")
 	}
 
-	planIDs := h.razorpayPlanIDs()
-	planID, ok := planIDs[body.Plan]
-	if !ok {
-		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "plan must be 'hobby', 'pro', or 'team'")
+	plan := strings.ToLower(strings.TrimSpace(body.Plan))
+	var planID string
+	switch plan {
+	case "hobby":
+		planID = h.cfg.RazorpayPlanIDHobby
+	case "pro":
+		planID = h.cfg.RazorpayPlanIDPro
+	case "team":
+		// Team tier is under development — block customer-initiated
+		// subscribe via the public API. The internal /internal/set-tier
+		// endpoint still works for ops use. Drop this guard when team
+		// launches (and revert the public pricing UI).
+		return respondError(c, fiber.StatusBadRequest, "tier_unavailable",
+			"Team tier is under active development. Email support@instanode.dev to join the early access list.")
+	default:
+		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "plan must be 'hobby' or 'pro'")
 	}
 
-	if h.cfg.RazorpayKeyID == "" || h.cfg.RazorpayKeySecret == "" {
-		return respondError(c, fiber.StatusServiceUnavailable, "billing_not_configured", "Billing is not configured")
+	if h.cfg.RazorpayKeyID == "" || h.cfg.RazorpayKeySecret == "" || planID == "" {
+		slog.Warn("billing.checkout.not_configured",
+			"team_id", teamID,
+			"plan", plan,
+			"key_set", h.cfg.RazorpayKeyID != "",
+			"secret_set", h.cfg.RazorpayKeySecret != "",
+			"plan_id_set", planID != "",
+			"request_id", requestID,
+		)
+		return respondError(c, fiber.StatusServiceUnavailable, "billing_not_configured", "Razorpay credentials/plans not configured for this environment")
 	}
 
 	client := razorpay.NewClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
 
 	subBody := map[string]interface{}{
 		"plan_id":         planID,
-		"total_count":     120, // 10 years — cancel via subscription.cancelled webhook
+		"total_count":     12, // 12 billing cycles; cancel-at-cycle-end exits early via webhook
 		"quantity":        1,
 		"customer_notify": 1,
 		"notes": map[string]interface{}{
 			"team_id": teamID.String(),
-			"plan":    body.Plan,
+			"plan":    plan,
 		},
 	}
 
@@ -121,33 +152,49 @@ func (h *BillingHandler) CreateCheckout(c *fiber.Ctx) error {
 		slog.Error("billing.checkout.subscription_create_failed",
 			"error", err,
 			"team_id", teamID,
+			"plan", plan,
 			"request_id", requestID,
 		)
-		return respondError(c, fiber.StatusServiceUnavailable, "razorpay_error", "Failed to create subscription")
+		return respondError(c, fiber.StatusBadGateway, "razorpay_error", "Razorpay rejected the subscription create call: "+err.Error())
 	}
 
-	// Persist subscription ID early for traceability; non-fatal if it fails.
-	if subID, ok := sub["id"].(string); ok && subID != "" {
-		if updateErr := models.UpdateRazorpaySubscriptionID(c.Context(), h.db, teamID, subID); updateErr != nil {
-			slog.Error("billing.checkout.update_subscription_id_failed",
-				"error", updateErr,
-				"team_id", teamID,
-				"request_id", requestID,
-			)
-		}
-	}
-
+	subID, _ := sub["id"].(string)
 	shortURL, _ := sub["short_url"].(string)
+
+	if subID == "" || shortURL == "" {
+		slog.Error("billing.checkout.razorpay_response_incomplete",
+			"team_id", teamID,
+			"plan", plan,
+			"sub_id_set", subID != "",
+			"short_url_set", shortURL != "",
+			"request_id", requestID,
+		)
+		return respondError(c, fiber.StatusBadGateway, "razorpay_error", "Razorpay returned an incomplete subscription response")
+	}
+
+	// Persist subscription ID early for traceability; non-fatal if it fails — the
+	// subscription.charged webhook will fall back to notes.team_id (or a DB lookup
+	// by sub_id once persisted via that webhook path).
+	if updateErr := models.UpdateRazorpaySubscriptionID(c.Context(), h.db, teamID, subID); updateErr != nil {
+		slog.Error("billing.checkout.update_subscription_id_failed",
+			"error", updateErr,
+			"team_id", teamID,
+			"subscription_id", subID,
+			"request_id", requestID,
+		)
+	}
 
 	slog.Info("billing.checkout.created",
 		"team_id", teamID,
-		"plan", body.Plan,
+		"plan", plan,
+		"subscription_id", subID,
 		"request_id", requestID,
 	)
 
 	return c.JSON(fiber.Map{
-		"ok":           true,
-		"checkout_url": shortURL,
+		"ok":              true,
+		"short_url":       shortURL,
+		"subscription_id": subID,
 	})
 }
 
@@ -365,7 +412,9 @@ func resolveTeamFromNotes(ctx context.Context, h *BillingHandler, sub rzpSubscri
 			return id, nil
 		}
 	}
-	// Fallback: look up by subscription ID stored in stripe_customer_id column.
+	// Fallback: look up by Razorpay subscription ID. (The column is still named
+	// stripe_customer_id in the schema for legacy reasons — it now stores
+	// Razorpay subscription IDs. Rename pending — see TODO in models/team.go.)
 	if sub.ID != "" {
 		team, err := models.GetTeamByRazorpaySubscriptionID(ctx, h.db, sub.ID)
 		if err != nil {
@@ -584,6 +633,13 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 	planIDs := h.razorpayPlanIDs()
 	if _, ok := planIDs[target]; !ok {
 		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "target_plan must be hobby, pro, or team")
+	}
+	// Team tier is under development — block customer-initiated upgrades to
+	// team via the public API. The internal /internal/set-tier endpoint
+	// still works for ops use. Drop this guard when team launches.
+	if strings.EqualFold(target, "team") {
+		return respondError(c, fiber.StatusBadRequest, "tier_unavailable",
+			"Team tier is under active development. Email support@instanode.dev to join the early access list.")
 	}
 	portal := &razorpaybilling.Portal{DB: h.db, Cfg: h.cfg}
 	if _, err := portal.SubscriptionID(c.Context(), teamID); err != nil {

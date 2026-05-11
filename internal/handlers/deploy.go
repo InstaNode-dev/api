@@ -76,6 +76,12 @@ func generateAppID() (string, error) {
 }
 
 // deploymentToMap converts a Deployment to a JSON-friendly fiber.Map.
+//
+// Naming collision note: prior to multi-environment support the response field
+// "env" was already in use to expose the deployment's env_vars map. We keep
+// that meaning for backwards compatibility and add a separate "environment"
+// field for the new env scope (production / staging / dev / ...). Callers can
+// continue to read .env as a map of vars; .environment is the scope name.
 func deploymentToMap(d *models.Deployment) fiber.Map {
 	m := fiber.Map{
 		"id":          d.ID,
@@ -87,6 +93,7 @@ func deploymentToMap(d *models.Deployment) fiber.Map {
 		"tier":        d.Tier,
 		"status":      d.Status,
 		"env":         d.EnvVars,
+		"environment": d.Env,
 		"created_at":  d.CreatedAt,
 		"updated_at":  d.UpdatedAt,
 		"team_id":     d.TeamID,
@@ -128,9 +135,22 @@ func (h *DeployHandler) requireTeam(c *fiber.Ctx) (*models.Team, error) {
 
 // runDeploy is run in a goroutine after POST /deploy/new returns 202.
 // It calls the compute provider, then updates the deployment record in DB.
+//
+// Before the compute call, every "vault://KEY" entry in d.EnvVars is replaced
+// with the decrypted plaintext from the team's vault for d.Env. The plaintext
+// is passed to the compute provider but never written back to the deployments
+// row, so vault rotations take effect on the next redeploy.
 func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+
+	resolvedEnv, err := ResolveVaultRefs(ctx, h.db, h.cfg.AESKey, d.TeamID, d.Env, d.EnvVars)
+	if err != nil {
+		slog.Error("deploy.run_deploy.vault_resolve_failed",
+			"app_id", d.AppID, "team_id", d.TeamID, "env", d.Env, "error", err)
+		_ = models.UpdateDeploymentStatus(ctx, h.db, d.ID, "failed", err.Error())
+		return
+	}
 
 	opts := compute.DeployOptions{
 		AppID:   d.AppID,
@@ -138,7 +158,7 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 		Tarball: tarball,
 		Port:    d.Port,
 		Tier:    d.Tier,
-		EnvVars: d.EnvVars,
+		EnvVars: resolvedEnv,
 	}
 	result, err := h.compute.Deploy(ctx, opts)
 	if err != nil {
@@ -218,6 +238,18 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 			"Field 'port' must be between 1 and 65535")
 	}
 
+	// Optional environment scope: ?env=staging or multipart "env" field.
+	// Empty defaults to "production". Validation is centralised in
+	// models.NormalizeEnv via resolveEnv.
+	envBody := ""
+	if vals := form.Value["env"]; len(vals) > 0 {
+		envBody = vals[0]
+	}
+	environment, envErr := resolveEnv(c, envBody)
+	if envErr != nil {
+		return envErr
+	}
+
 	// Generate app ID.
 	appID, err := generateAppID()
 	if err != nil {
@@ -236,6 +268,7 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		AppID:   appID,
 		Port:    port,
 		Tier:    team.PlanTier,
+		Env:     environment,
 		EnvVars: initEnv,
 	})
 	if err != nil {

@@ -54,8 +54,9 @@ func (h *TeamMembersHandler) ListMembers(c *fiber.Ctx) error {
 	if err != nil {
 		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Valid session required")
 	}
+	// Any team member may list — owner, admin, developer, viewer, or legacy "member".
 	role, err := models.GetUserRole(c.Context(), h.db, teamID, userID)
-	if err != nil || (role != "owner" && role != "member") {
+	if err != nil || role == "" {
 		return respondError(c, fiber.StatusForbidden, "forbidden", "Not a member of this team")
 	}
 	members, err := models.ListTeamMembers(c.Context(), h.db, teamID)
@@ -70,10 +71,10 @@ func (h *TeamMembersHandler) ListMembers(c *fiber.Ctx) error {
 	items := make([]fiber.Map, 0, len(members))
 	for _, m := range members {
 		items = append(items, fiber.Map{
-			"id":         m.ID.String(),
-			"email":      m.Email,
-			"role":       m.Role,
-			"created_at": m.CreatedAt.UTC().Format(time.RFC3339),
+			"user_id":   m.ID.String(),
+			"email":     m.Email,
+			"role":      m.Role,
+			"joined_at": m.CreatedAt.UTC().Format(time.RFC3339),
 		})
 	}
 	return c.JSON(fiber.Map{"ok": true, "members": items, "member_limit": limit})
@@ -82,6 +83,16 @@ func (h *TeamMembersHandler) ListMembers(c *fiber.Ctx) error {
 type inviteBody struct {
 	Email string `json:"email"`
 	Role  string `json:"role"`
+}
+
+// allowedSimpleInviteRoles bounds the set of roles accepted by the simpler
+// /api/v1/team/members/invite endpoint. "member" is retained as a legacy
+// alias of the owner/member flow; admin/developer/viewer use the RBAC flow.
+var allowedSimpleInviteRoles = map[string]struct{}{
+	"admin":     {},
+	"developer": {},
+	"viewer":    {},
+	"member":    {},
 }
 
 // InviteMember handles POST /api/v1/team/members/invite
@@ -94,8 +105,14 @@ func (h *TeamMembersHandler) InviteMember(c *fiber.Ctx) error {
 	if err != nil {
 		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Valid session required")
 	}
-	if !h.requireOwner(c, teamID, userID) {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "Owner only")
+	// Owner OR admin may invite (legacy "owner" was sole inviter; RBAC adds admin).
+	actorRole, err := models.GetUserRole(c.Context(), h.db, teamID, userID)
+	if err != nil {
+		slog.Error("team_members.role_lookup", "error", err)
+		return respondError(c, fiber.StatusInternalServerError, "internal_error", "Request failed")
+	}
+	if actorRole != "owner" && actorRole != "admin" {
+		return respondError(c, fiber.StatusForbidden, "forbidden", "Owner or admin only")
 	}
 	var body inviteBody
 	if err := c.BodyParser(&body); err != nil {
@@ -109,23 +126,64 @@ func (h *TeamMembersHandler) InviteMember(c *fiber.Ctx) error {
 	if role == "" {
 		role = "member"
 	}
+	if _, ok := allowedSimpleInviteRoles[role]; !ok {
+		return respondError(c, fiber.StatusBadRequest, "invalid_role",
+			"role must be one of: admin, developer, viewer, member")
+	}
 	tier, err := h.teamPlanTier(c, teamID)
 	if err != nil {
 		return respondError(c, fiber.StatusInternalServerError, "tier_failed", "Failed to read team plan")
 	}
 	limit := h.plans.TeamMemberLimit(tier)
-	inv, err := models.InviteMember(c.Context(), h.db, teamID, email, role, userID, limit)
-	if err != nil {
-		return teamMembersModelError(c, err)
-	}
+
 	teamRow, _ := models.GetTeamByID(c.Context(), h.db, teamID)
 	teamName := ""
 	if teamRow != nil && teamRow.Name.Valid {
 		teamName = teamRow.Name.String
 	}
+	base := strings.TrimRight(h.cfg.DashboardBaseURL, "/")
+
+	// Legacy "member" role uses the owner/member flow with seat-limit enforcement.
+	// admin/developer/viewer use the RBAC token flow.
+	if role == "member" {
+		// Owner/member flow currently requires owner; admins fall back to the
+		// RBAC flow with role="developer" since legacy seats can't be granted
+		// by non-owners.
+		if actorRole != "owner" {
+			return respondError(c, fiber.StatusForbidden, "forbidden",
+				"Only the team owner can invite legacy members; use role=developer instead")
+		}
+		inv, err := models.InviteMember(c.Context(), h.db, teamID, email, role, userID, limit)
+		if err != nil {
+			return teamMembersModelError(c, err)
+		}
+		if h.mail != nil {
+			acceptURL := base + "/settings?section=team&invite=" + inv.ID.String()
+			if mailErr := h.mail.SendTeamInvite(c.Context(), inv.Email, teamName, acceptURL); mailErr != nil {
+				slog.Warn("team_members.invite_email_failed", "error", mailErr)
+			}
+		}
+		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+			"ok": true,
+			"invitation": fiber.Map{
+				"id":         inv.ID.String(),
+				"email":      inv.Email,
+				"role":       inv.Role,
+				"status":     inv.Status,
+				"invited_by": inv.InvitedBy.String(),
+				"created_at": inv.CreatedAt.UTC().Format(time.RFC3339),
+				"expires_at": inv.ExpiresAt.UTC().Format(time.RFC3339),
+			},
+		})
+	}
+
+	// RBAC flow: admin / developer / viewer — token-based single-use invite.
+	inv, err := models.CreateRBACInvitation(c.Context(), h.db, teamID, email, role, userID)
+	if err != nil {
+		return teamMembersModelError(c, err)
+	}
 	if h.mail != nil {
-		base := strings.TrimRight(h.cfg.DashboardBaseURL, "/")
-		acceptURL := base + "/settings?section=team&invite=" + inv.ID.String()
+		acceptURL := base + "/invitations/" + inv.Token + "/accept"
 		if mailErr := h.mail.SendTeamInvite(c.Context(), inv.Email, teamName, acceptURL); mailErr != nil {
 			slog.Warn("team_members.invite_email_failed", "error", mailErr)
 		}
@@ -136,7 +194,8 @@ func (h *TeamMembersHandler) InviteMember(c *fiber.Ctx) error {
 			"id":         inv.ID.String(),
 			"email":      inv.Email,
 			"role":       inv.Role,
-			"status":     inv.Status,
+			"token":      inv.Token,
+			"status":     inv.Status(),
 			"invited_by": inv.InvitedBy.String(),
 			"created_at": inv.CreatedAt.UTC().Format(time.RFC3339),
 			"expires_at": inv.ExpiresAt.UTC().Format(time.RFC3339),

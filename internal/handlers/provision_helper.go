@@ -8,6 +8,7 @@ package handlers
 //  2. Onboarding JWT issuance         (issueOnboardingJWT)
 //  3. Active-resource lookup          (models.GetActiveResourceByFingerprint)
 //  4. Onboarding event creation       (models.CreateOnboardingEvent)
+//  5. Environment selection           (resolveEnv — see provisionRequestBody.Env)
 //
 // provisionHelper embeds these shared behaviours so each handler
 // can embed it instead of duplicating the logic.
@@ -19,6 +20,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
@@ -218,6 +220,11 @@ type provisionRequestBody struct {
 	// own namespace, own PVC). Requires an authenticated team-tier token.
 	// Anonymous callers receive a 402 with an upgrade URL.
 	Dedicated bool `json:"dedicated"`
+
+	// Env scopes the resource to a named environment (dev/staging/production/...).
+	// Empty defaults to "production". Validated against ^[a-z0-9-]{1,32}$.
+	// Body field is overridden by the ?env= query string when both are set.
+	Env string `json:"env"`
 }
 
 func sanitizeName(name string) string {
@@ -225,4 +232,23 @@ func sanitizeName(name string) string {
 		return name[:120]
 	}
 	return name
+}
+
+// resolveEnv extracts the requested environment from the request, preferring
+// the ?env= query string over the JSON/form body field. Returns the normalised
+// env on success, or an empty string and a 400 response when validation fails.
+//
+// Empty input is treated as "production" — this preserves backwards compatibility
+// for every caller that pre-dates the env feature.
+func resolveEnv(c *fiber.Ctx, bodyEnv string) (string, error) {
+	raw := c.Query("env")
+	if raw == "" {
+		raw = bodyEnv
+	}
+	env, ok := models.NormalizeEnv(raw)
+	if !ok {
+		return "", respondError(c, fiber.StatusBadRequest, "invalid_env",
+			"env must match ^[a-z0-9-]{1,32}$ (lowercase letters, digits, dashes; max 32 chars)")
+	}
+	return env, nil
 }

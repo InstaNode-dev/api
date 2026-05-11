@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +22,81 @@ import (
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
 )
+
+// --- Browser OAuth flow shared helpers ---
+
+// defaultReturnTo is where we send a browser when ?return_to= is missing or
+// fails the allowlist check. It MUST be on an allowed origin (instanode.dev).
+const defaultReturnTo = "https://instanode.dev/login/callback"
+
+// canonicalAPIBase is the public-facing origin of the API. Used to build
+// OAuth redirect_uri values and the magic-link callback URL we email out.
+// Hardcoded rather than reading from cfg because the registered redirect_uri
+// at GitHub/Google is fixed at app-registration time — varying it per
+// deployment would require multiple OAuth apps.
+const canonicalAPIBase = "https://api.instanode.dev"
+
+// allowedReturnOrigins is the static allowlist for ?return_to= validation.
+// Anything not on this list collapses to defaultReturnTo. The list is
+// intentionally small and code-reviewable; do not load it from a config
+// flag, since an open-redirect bug here gives an attacker a phishing primitive
+// (we'd be appending a real session_token to a URL they control).
+var allowedReturnOrigins = []string{
+	"https://instanode.dev",
+	"https://www.instanode.dev",
+	"http://localhost:5173",
+	"http://localhost:3000",
+}
+
+// validateReturnTo accepts a raw ?return_to= value and returns either the
+// original (when its origin is on the allowlist) or defaultReturnTo. Empty,
+// malformed, or off-allowlist URLs collapse to the default — never error,
+// since the user is in the middle of an OAuth dance and a 400 here would
+// strand them.
+func validateReturnTo(raw string) string {
+	if raw == "" {
+		return defaultReturnTo
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return defaultReturnTo
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return defaultReturnTo
+	}
+	origin := u.Scheme + "://" + u.Host
+	for _, ok := range allowedReturnOrigins {
+		if origin == ok {
+			return raw
+		}
+	}
+	return defaultReturnTo
+}
+
+// generateOAuthState returns a cryptographically random 16-byte hex string
+// used as the OAuth `state` parameter to defend against CSRF.
+func generateOAuthState() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// appendSessionToken returns returnTo with ?session_token=<jwt> (or &) appended.
+// Preserves any existing query string on returnTo.
+func appendSessionToken(returnTo, sessionToken string) string {
+	u, err := url.Parse(returnTo)
+	if err != nil {
+		// Fallback: trust the default + token. validateReturnTo should make
+		// this branch unreachable in practice.
+		return defaultReturnTo + "?session_token=" + url.QueryEscape(sessionToken)
+	}
+	q := u.Query()
+	q.Set("session_token", sessionToken)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
 
 // AuthHandler handles OAuth login flows.
 type AuthHandler struct {
@@ -509,6 +586,287 @@ func fetchGoogleUserInfoOAuth2V2(ctx context.Context, accessToken string) (*goog
 		Email: payload.Email,
 		Name:  payload.Name,
 	}, nil
+}
+
+// FindOrCreateUserByEmail is the shared find-or-create path for email-only
+// flows (magic-link login). Identity-provider-bound flows (GitHub/Google)
+// keep their own helpers because they have an external ID to match on first.
+//
+// Tier behaviour: a fresh team gets the default tier set by the DB
+// (`teams.plan_tier` defaults to 'anonymous' per migration 001 and is
+// overridden to 'hobby' by StartTrial only when the user goes through
+// /claim). For a brand-new magic-link user with nothing to claim, we leave
+// them on the default; an explicit upgrade path (Razorpay or /internal/set-tier)
+// will move them off it. We do NOT auto-start a 14-day trial here because
+// the magic-link flow is just an authentication mechanism, not an
+// onboarding event — auto-starting would silently start the trial clock for
+// anyone who clicked a link, including users who only wanted to peek.
+func (h *AuthHandler) FindOrCreateUserByEmail(ctx context.Context, email string) (*models.User, *models.Team, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return nil, nil, fmt.Errorf("FindOrCreateUserByEmail: empty email")
+	}
+
+	user, err := models.GetUserByEmail(ctx, h.db, email)
+	if err == nil {
+		team, teamErr := models.GetTeamByID(ctx, h.db, user.TeamID.UUID)
+		if teamErr != nil {
+			return nil, nil, fmt.Errorf("FindOrCreateUserByEmail team lookup: %w", teamErr)
+		}
+		return user, team, nil
+	}
+
+	var notFound *models.ErrUserNotFound
+	if !errors.As(err, &notFound) {
+		return nil, nil, fmt.Errorf("FindOrCreateUserByEmail user lookup: %w", err)
+	}
+
+	// New user — create a team named after the local-part of the email.
+	teamName := strings.Split(email, "@")[0]
+	if teamName == "" {
+		teamName = "team"
+	}
+	team, err := models.CreateTeam(ctx, h.db, teamName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("FindOrCreateUserByEmail create team: %w", err)
+	}
+	user, err = models.CreateUser(ctx, h.db, team.ID, email, "", "", "owner")
+	if err != nil {
+		return nil, nil, fmt.Errorf("FindOrCreateUserByEmail create user: %w", err)
+	}
+	return user, team, nil
+}
+
+// IssueSessionJWT exposes the package-level signSessionJWT through the
+// handler so other handlers (magic-link) can mint tokens without importing
+// the package's unexported helpers.
+func (h *AuthHandler) IssueSessionJWT(user *models.User, team *models.Team) (string, error) {
+	return h.issueSessionJWT(user, team)
+}
+
+// --- Browser GET-based OAuth handlers (complement the existing POST API) ---
+
+const (
+	oauthStateCookie = "oauth_state"
+	oauthStateMaxAge = 5 * 60 // 5 minutes
+)
+
+// setOAuthStateCookie writes "<state>|<returnTo>" into a short-lived,
+// HTTP-only, SameSite=Lax cookie. The Lax policy lets the cookie ride along
+// with the redirect back from the OAuth provider while still blocking CSRF
+// from third-party origins.
+func setOAuthStateCookie(c *fiber.Ctx, secure bool, state, returnTo string) {
+	c.Cookie(&fiber.Cookie{
+		Name:     oauthStateCookie,
+		Value:    state + "|" + returnTo,
+		Path:     "/",
+		MaxAge:   oauthStateMaxAge,
+		Secure:   secure,
+		HTTPOnly: true,
+		SameSite: "Lax",
+	})
+}
+
+// readOAuthStateCookie returns (state, returnTo, ok). ok is false when the
+// cookie is missing or malformed.
+func readOAuthStateCookie(c *fiber.Ctx) (string, string, bool) {
+	raw := c.Cookies(oauthStateCookie)
+	if raw == "" {
+		return "", "", false
+	}
+	parts := strings.SplitN(raw, "|", 2)
+	if len(parts) != 2 || parts[0] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+// clearOAuthStateCookie expires the oauth_state cookie immediately.
+func clearOAuthStateCookie(c *fiber.Ctx) {
+	c.Cookie(&fiber.Cookie{
+		Name:     oauthStateCookie,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HTTPOnly: true,
+	})
+}
+
+// renderAuthError sends a 400 with a small HTML page so a browser landing on
+// a broken callback URL gets a readable message instead of raw JSON.
+func renderAuthError(c *fiber.Ctx, status int, headline, detail string) error {
+	c.Set("Content-Type", "text/html; charset=utf-8")
+	body := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>Sign-in error</title></head>
+<body style="font-family:sans-serif;max-width:480px;margin:48px auto;padding:24px;color:#111;">
+  <h2>%s</h2>
+  <p style="color:#444;">%s</p>
+  <p><a href="https://instanode.dev/login">Try signing in again &rarr;</a></p>
+</body>
+</html>`, headline, detail)
+	return c.Status(status).SendString(body)
+}
+
+// GitHubStart handles GET /auth/github/start?return_to=<url>.
+// Redirects the browser to GitHub's OAuth consent screen. The CSRF state and
+// the validated return_to are stashed in a short-lived cookie that the
+// callback handler reads.
+func (h *AuthHandler) GitHubStart(c *fiber.Ctx) error {
+	if h.cfg.GitHubClientID == "" {
+		return renderAuthError(c, fiber.StatusServiceUnavailable, "GitHub sign-in is not configured", "Ask the operator to set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET.")
+	}
+
+	state, err := generateOAuthState()
+	if err != nil {
+		return renderAuthError(c, fiber.StatusInternalServerError, "Could not start sign-in", "Random source unavailable.")
+	}
+	returnTo := validateReturnTo(c.Query("return_to"))
+	setOAuthStateCookie(c, h.cfg.Environment == "production", state, returnTo)
+
+	authURL := fmt.Sprintf(
+		"https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&state=%s&scope=%s",
+		url.QueryEscape(h.cfg.GitHubClientID),
+		url.QueryEscape(canonicalAPIBase+"/auth/github/callback"),
+		url.QueryEscape(state),
+		url.QueryEscape("user:email"),
+	)
+	return c.Redirect(authURL, fiber.StatusFound)
+}
+
+// GitHubCallback handles GET /auth/github/callback?code=...&state=...
+// Verifies state matches the cookie, exchanges the code for a user, mints a
+// session JWT, and 302s to <return_to>?session_token=<jwt>.
+func (h *AuthHandler) GitHubCallback(c *fiber.Ctx) error {
+	requestID := middleware.GetRequestID(c)
+
+	if h.cfg.GitHubClientID == "" || h.cfg.GitHubClientSecret == "" {
+		return renderAuthError(c, fiber.StatusServiceUnavailable, "GitHub sign-in is not configured", "")
+	}
+
+	code := strings.TrimSpace(c.Query("code"))
+	stateParam := strings.TrimSpace(c.Query("state"))
+	if code == "" || stateParam == "" {
+		return renderAuthError(c, fiber.StatusBadRequest, "Sign-in didn't complete", "Missing code or state from GitHub.")
+	}
+
+	cookieState, returnTo, ok := readOAuthStateCookie(c)
+	if !ok || cookieState != stateParam {
+		clearOAuthStateCookie(c)
+		return renderAuthError(c, fiber.StatusBadRequest, "Sign-in expired", "The sign-in link expired or was opened in a different browser. Please try again.")
+	}
+	clearOAuthStateCookie(c)
+
+	// Re-validate returnTo as defence-in-depth; the cookie isn't user-supplied
+	// but a copy-paste of an old cookie shouldn't be able to redirect off-domain.
+	returnTo = validateReturnTo(returnTo)
+
+	ghUser, err := exchangeGitHubCode(c.Context(), h.cfg.GitHubClientID, h.cfg.GitHubClientSecret, code)
+	if err != nil {
+		slog.Error("auth.github.start_callback.exchange_failed", "error", err, "request_id", requestID)
+		return renderAuthError(c, fiber.StatusUnauthorized, "GitHub sign-in failed", "We couldn't verify your GitHub account. Please try again.")
+	}
+
+	user, team, err := h.findOrCreateUserGitHub(c.Context(), ghUser)
+	if err != nil {
+		slog.Error("auth.github.start_callback.user_upsert_failed", "error", err, "github_id", ghUser.ID, "request_id", requestID)
+		return renderAuthError(c, fiber.StatusServiceUnavailable, "Sign-in failed", "Could not create your account.")
+	}
+
+	sessionToken, err := h.issueSessionJWT(user, team)
+	if err != nil {
+		slog.Error("auth.github.start_callback.jwt_failed", "error", err, "request_id", requestID)
+		return renderAuthError(c, fiber.StatusServiceUnavailable, "Sign-in failed", "Could not issue session token.")
+	}
+
+	slog.Info("auth.github.start_callback.success",
+		"user_id", user.ID, "team_id", team.ID, "request_id", requestID,
+	)
+
+	return c.Redirect(appendSessionToken(returnTo, sessionToken), fiber.StatusFound)
+}
+
+// GoogleStart handles GET /auth/google/start?return_to=<url>.
+func (h *AuthHandler) GoogleStart(c *fiber.Ctx) error {
+	if h.cfg.GoogleClientID == "" {
+		return renderAuthError(c, fiber.StatusServiceUnavailable, "Google sign-in is not configured", "Ask the operator to set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.")
+	}
+
+	state, err := generateOAuthState()
+	if err != nil {
+		return renderAuthError(c, fiber.StatusInternalServerError, "Could not start sign-in", "Random source unavailable.")
+	}
+	returnTo := validateReturnTo(c.Query("return_to"))
+	setOAuthStateCookie(c, h.cfg.Environment == "production", state, returnTo)
+
+	u, _ := url.Parse("https://accounts.google.com/o/oauth2/v2/auth")
+	q := u.Query()
+	q.Set("client_id", h.cfg.GoogleClientID)
+	q.Set("redirect_uri", canonicalAPIBase+"/auth/google/callback")
+	q.Set("response_type", "code")
+	q.Set("scope", "openid email profile")
+	q.Set("state", state)
+	q.Set("access_type", "online")
+	q.Set("include_granted_scopes", "true")
+	u.RawQuery = q.Encode()
+
+	return c.Redirect(u.String(), fiber.StatusFound)
+}
+
+// GoogleCallbackBrowser handles GET /auth/google/callback?code=...&state=...
+// Distinct from the existing POST GoogleCallback which serves the
+// programmatic / SPA flow with a body-supplied redirect_uri.
+func (h *AuthHandler) GoogleCallbackBrowser(c *fiber.Ctx) error {
+	requestID := middleware.GetRequestID(c)
+
+	if h.cfg.GoogleClientID == "" || h.cfg.GoogleClientSecret == "" {
+		return renderAuthError(c, fiber.StatusServiceUnavailable, "Google sign-in is not configured", "")
+	}
+
+	code := strings.TrimSpace(c.Query("code"))
+	stateParam := strings.TrimSpace(c.Query("state"))
+	if code == "" || stateParam == "" {
+		return renderAuthError(c, fiber.StatusBadRequest, "Sign-in didn't complete", "Missing code or state from Google.")
+	}
+
+	cookieState, returnTo, ok := readOAuthStateCookie(c)
+	if !ok || cookieState != stateParam {
+		clearOAuthStateCookie(c)
+		return renderAuthError(c, fiber.StatusBadRequest, "Sign-in expired", "The sign-in link expired or was opened in a different browser. Please try again.")
+	}
+	clearOAuthStateCookie(c)
+
+	returnTo = validateReturnTo(returnTo)
+
+	accessToken, err := exchangeGoogleAuthorizationCode(c.Context(), h.cfg.GoogleClientID, h.cfg.GoogleClientSecret, code, canonicalAPIBase+"/auth/google/callback")
+	if err != nil {
+		slog.Error("auth.google.start_callback.exchange_failed", "error", err, "request_id", requestID)
+		return renderAuthError(c, fiber.StatusUnauthorized, "Google sign-in failed", "We couldn't verify your Google account. Please try again.")
+	}
+
+	gUser, err := fetchGoogleUserInfoOAuth2V2(c.Context(), accessToken)
+	if err != nil {
+		slog.Error("auth.google.start_callback.userinfo_failed", "error", err, "request_id", requestID)
+		return renderAuthError(c, fiber.StatusUnauthorized, "Google sign-in failed", "We couldn't read your Google profile. Please try again.")
+	}
+
+	user, team, err := h.findOrCreateUserGoogle(c.Context(), gUser)
+	if err != nil {
+		slog.Error("auth.google.start_callback.user_upsert_failed", "error", err, "google_id", gUser.Sub, "request_id", requestID)
+		return renderAuthError(c, fiber.StatusServiceUnavailable, "Sign-in failed", "Could not create your account.")
+	}
+
+	sessionToken, err := h.issueSessionJWT(user, team)
+	if err != nil {
+		slog.Error("auth.google.start_callback.jwt_failed", "error", err, "request_id", requestID)
+		return renderAuthError(c, fiber.StatusServiceUnavailable, "Sign-in failed", "Could not issue session token.")
+	}
+
+	slog.Info("auth.google.start_callback.success",
+		"user_id", user.ID, "team_id", team.ID, "request_id", requestID,
+	)
+
+	return c.Redirect(appendSessionToken(returnTo, sessionToken), fiber.StatusFound)
 }
 
 func (h *AuthHandler) findOrCreateUserGoogle(ctx context.Context, g *googleUser) (*models.User, *models.Team, error) {

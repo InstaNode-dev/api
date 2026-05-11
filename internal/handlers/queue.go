@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"instant.dev/internal/config"
 	"instant.dev/internal/crypto"
@@ -60,10 +61,11 @@ func NewQueueHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, provClie
 }
 
 // provisionQueue provisions NATS credentials.
-// Growth, pro, and team tiers use the gRPC provisioner (isolated k8s NATS pod).
-// All other tiers use the local provider (shared NATS cluster).
+// When the gRPC provisioner is configured, every tier uses it — the provisioner
+// chooses local vs k8s-dedicated backend based on QUEUE_PROVISION_BACKEND.
+// Falls back to the local provider only when no provisioner client is wired.
 func (h *QueueHandler) provisionQueue(ctx context.Context, token, tier string) (*queueprovider.Credentials, error) {
-	if (tier == "pro" || tier == "team" || tier == "growth") && h.provClient != nil {
+	if h.provClient != nil {
 		creds, err := h.provClient.ProvisionQueue(ctx, token, tier)
 		if err != nil {
 			return nil, err
@@ -95,9 +97,14 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 	_ = c.BodyParser(&body)
 	body.Name = sanitizeName(body.Name)
 
+	env, envErr := resolveEnv(c, body.Env)
+	if envErr != nil {
+		return envErr
+	}
+
 	// ── Authenticated path ────────────────────────────────────────────────────
 	if teamIDStr := middleware.GetTeamID(c); teamIDStr != "" {
-		return h.newQueueAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, body.Dedicated, start)
+		return h.newQueueAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, body.Dedicated, env, start)
 	}
 
 	// ── Dedicated requires authentication ─────────────────────────────────────
@@ -139,6 +146,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 					"name":           existing.Name.String,
 					"connection_url": connectionURL,
 					"tier":           existing.Tier,
+					"env":            existing.Env,
 					"limits":         queueAnonymousLimits(),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
@@ -157,6 +165,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		ResourceType:     "queue",
 		Name:             body.Name,
 		Tier:             "anonymous",
+		Env:              env,
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
@@ -240,13 +249,14 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		"connection_url": creds.URL,
 		"subject_prefix": creds.SubjectPrefix,
 		"tier":           "anonymous",
+		"env":            resource.Env,
 		"limits":         queueAnonymousLimits(),
 		"note":           upgradeNote(upgradeURL),
 	})
 }
 
 func (h *QueueHandler) newQueueAuthenticated(
-	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, dedicated bool, start time.Time,
+	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, dedicated bool, env string, start time.Time,
 ) error {
 	ctx := c.UserContext()
 	teamUUID, err := parseTeamID(teamIDStr)
@@ -269,6 +279,7 @@ func (h *QueueHandler) newQueueAuthenticated(
 		ResourceType:     "queue",
 		Name:             name,
 		Tier:             tier,
+		Env:              env,
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
@@ -279,6 +290,18 @@ func (h *QueueHandler) newQueueAuthenticated(
 		slog.Error("queue.new.create_resource_failed_auth", "error", err, "team_id", teamIDStr, "request_id", requestID)
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision NATS resource")
 	}
+
+	// Best-effort audit event; failures must never block the provision.
+	go func() {
+		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+			TeamID:       teamUUID,
+			Actor:        "agent",
+			Kind:         "provision",
+			ResourceType: "queue",
+			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
+			Summary:      "agent provisioned <strong>queue</strong> <code>" + resource.Token.String()[:8] + "</code>",
+		})
+	}()
 
 	tokenStr := resource.Token.String()
 
@@ -339,6 +362,7 @@ func (h *QueueHandler) newQueueAuthenticated(
 		"connection_url": creds.URL,
 		"subject_prefix": creds.SubjectPrefix,
 		"tier":           tier,
+		"env":            resource.Env,
 		"dedicated":      dedicated,
 		"limits": fiber.Map{
 			"storage_mb": h.plans.StorageLimitMB(tier, "queue"),

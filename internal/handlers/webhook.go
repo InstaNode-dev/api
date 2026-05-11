@@ -124,9 +124,14 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 	_ = c.BodyParser(&body)
 	body.Name = sanitizeName(body.Name)
 
+	env, envErr := resolveEnv(c, body.Env)
+	if envErr != nil {
+		return envErr
+	}
+
 	// ── Authenticated path ───────────────────────────────────────────────────────
 	if teamIDStr := middleware.GetTeamID(c); teamIDStr != "" {
-		return h.newWebhookAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, start)
+		return h.newWebhookAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, env, start)
 	}
 
 	// ── Anonymous path ───────────────────────────────────────────────────────────
@@ -162,6 +167,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 				"token":       existing.Token.String(),
 				"receive_url": url,
 				"tier":        existing.Tier,
+				"env":         existing.Env,
 				"limits":      webhookAnonLimits(),
 				"note":        limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 				"upgrade":     upgradeURL,
@@ -180,6 +186,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 		ResourceType:     "webhook",
 		Name:             body.Name,
 		Tier:             "anonymous",
+		Env:              env,
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
@@ -236,6 +243,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 		"token":       tokenStr,
 		"receive_url": rURL,
 		"tier":        "anonymous",
+		"env":         resource.Env,
 		"limits":      webhookAnonLimits(),
 		"note":        upgradeNote(upgradeURL),
 		"expires_at":  expiresAt,
@@ -244,7 +252,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 
 // newWebhookAuthenticated handles the authenticated path for POST /webhook/new.
 func (h *WebhookHandler) newWebhookAuthenticated(
-	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, start time.Time,
+	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, env string, start time.Time,
 ) error {
 	ctx := c.UserContext()
 	teamUUID, err := parseTeamID(teamIDStr)
@@ -262,6 +270,7 @@ func (h *WebhookHandler) newWebhookAuthenticated(
 		ResourceType:     "webhook",
 		Name:             name,
 		Tier:             team.PlanTier,
+		Env:              env,
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
@@ -273,6 +282,18 @@ func (h *WebhookHandler) newWebhookAuthenticated(
 			"error", err, "team_id", teamIDStr, "request_id", requestID)
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision webhook resource")
 	}
+
+	// Best-effort audit event; failures must never block the provision.
+	go func() {
+		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+			TeamID:       teamUUID,
+			Actor:        "agent",
+			Kind:         "provision",
+			ResourceType: "webhook",
+			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
+			Summary:      "agent provisioned <strong>webhook</strong> <code>" + resource.Token.String()[:8] + "</code>",
+		})
+	}()
 
 	tokenStr := resource.Token.String()
 	rURL := receiveURL(c.BaseURL(), tokenStr)
@@ -300,6 +321,7 @@ func (h *WebhookHandler) newWebhookAuthenticated(
 		"token":       tokenStr,
 		"receive_url": rURL,
 		"tier":        team.PlanTier,
+		"env":         resource.Env,
 		"limits": fiber.Map{
 			"requests_stored": h.webhookMaxStored(team.PlanTier),
 		},
