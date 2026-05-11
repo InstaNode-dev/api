@@ -217,14 +217,29 @@ func (p *Portal) ChangePlan(ctx context.Context, teamID uuid.UUID, targetPlan st
 
 // SubscriptionDetails holds a subset of Razorpay subscription fields for billing UI.
 type SubscriptionDetails struct {
-	Status             string
-	CurrentPeriodEnd   time.Time
-	CancelAtPeriodEnd  bool
-	ShortURL           string
-	PaymentLast4       string
-	PaymentNetwork     string
-	PaymentExpMonth    int32
-	PaymentExpYear     int32
+	Status            string
+	CurrentPeriodEnd  time.Time
+	CancelAtPeriodEnd bool
+	ShortURL          string
+	PaymentLast4      string
+	PaymentNetwork    string
+	PaymentExpMonth   int32
+	PaymentExpYear    int32
+
+	// PaymentMethod is the Razorpay payment method type ("card" | "upi" |
+	// "netbanking" | "wallet" | "emi" | ""). Empty when no successful payment
+	// has been observed for the subscription yet (e.g. just-created subs
+	// awaiting the first charge).
+	PaymentMethod string
+	// PaymentVPA is the UPI VPA used (e.g. "name@hdfc") when PaymentMethod == "upi".
+	PaymentVPA string
+	// LatestPaidAmount is the most recent successful invoice amount, in the
+	// subscription currency's smallest unit (paise for INR). Zero when no
+	// paid invoice exists yet — callers should fall back to the plan price.
+	LatestPaidAmount int64
+	// LatestPaidCurrency is the ISO-4217 currency code of LatestPaidAmount
+	// ("INR", "USD", ...). Empty when LatestPaidAmount is zero.
+	LatestPaidCurrency string
 }
 
 // FetchSubscriptionDetails loads subscription from Razorpay and enriches payment method from latest paid invoice.
@@ -284,6 +299,13 @@ func (p *Portal) FetchSubscriptionDetails(subscriptionID string) (*SubscriptionD
 		if ts >= bestTS {
 			bestTS = ts
 			paymentID = pid
+			// Capture amount + currency from this invoice; the payment
+			// object's amount field is also available but invoice amount
+			// is what was actually charged for the cycle.
+			d.LatestPaidAmount = toInt64(m["amount"])
+			if cur, _ := m["currency"].(string); cur != "" {
+				d.LatestPaidCurrency = strings.ToUpper(cur)
+			}
 		}
 	}
 	if paymentID == "" {
@@ -293,15 +315,37 @@ func (p *Portal) FetchSubscriptionDetails(subscriptionID string) (*SubscriptionD
 	if err != nil {
 		return d, nil
 	}
+	if method, ok := pay["method"].(string); ok {
+		d.PaymentMethod = strings.ToLower(method)
+	}
+	// Card payment — last4 + network.
 	if card, ok := pay["card"].(map[string]interface{}); ok {
 		if last, ok := card["last4"].(string); ok {
 			d.PaymentLast4 = last
 		}
 		if net, ok := card["network"].(string); ok {
-			d.PaymentNetwork = net
+			d.PaymentNetwork = strings.ToLower(net)
 		}
 		d.PaymentExpMonth = int32(toInt64(card["exp_month"]))
 		d.PaymentExpYear = int32(toInt64(card["exp_year"]))
+	}
+	// UPI payment — VPA lives at top-level `vpa` (or inside an `upi` block on
+	// some webhook variants — handle both).
+	if vpa, ok := pay["vpa"].(string); ok && vpa != "" {
+		d.PaymentVPA = vpa
+	} else if upi, ok := pay["upi"].(map[string]interface{}); ok {
+		if v, ok := upi["vpa"].(string); ok {
+			d.PaymentVPA = v
+		}
+	}
+	// If LatestPaidAmount wasn't picked up from the invoice (rare — some
+	// Razorpay invoice records omit `amount` for non-INR or partially refunded
+	// cycles), fall back to the payment record's amount.
+	if d.LatestPaidAmount == 0 {
+		d.LatestPaidAmount = toInt64(pay["amount"])
+		if cur, _ := pay["currency"].(string); cur != "" && d.LatestPaidCurrency == "" {
+			d.LatestPaidCurrency = strings.ToUpper(cur)
+		}
 	}
 	return d, nil
 }
