@@ -365,7 +365,11 @@ const openAPISpec = `{
   },
   "components": {
     "securitySchemes": {
-      "bearerAuth": { "type": "http", "scheme": "bearer", "description": "Session JWT from /claim or /auth/github or /auth/google" }
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Session JWT for authenticated endpoints (deploy, vault, billing, team, custom-domain). Resource provisioning (POST /db/new, /cache/new, /nosql/new, /queue/new, /storage/new, /webhook/new) does NOT require this header — those endpoints are anonymous. How to obtain a JWT from an anonymous agent flow: (1) Call any provisioning endpoint anonymously — the response includes a start_url like https://api.instanode.dev/start?t=<onboarding-jwt>. (2) Visit that URL once (or POST { jti, email } to /claim directly) to attach the anonymous tokens to a real team. Email verification via magic link. (3) /claim returns a session JWT (24h) usable as the Authorization: Bearer header. For unattended agents, prefer POST /api/v1/api-keys (requires an existing session) which mints a long-lived bearer token tied to your team. Claim values: tid (team ID), uid (user ID), email, plus standard RFC 7519 claims. HS256-signed."
+      }
     },
     "schemas": {
       "HealthResponse": {
@@ -522,10 +526,11 @@ const openAPISpec = `{
       "DeployRequest": {
         "type": "object",
         "properties": {
-          "tarball": { "type": "string", "format": "binary", "description": "gzipped tar archive containing the Dockerfile + source (max 50 MB)" },
+          "tarball": { "type": "string", "format": "binary", "description": "gzipped tar archive containing the Dockerfile + source. NOTE: the effective cap is currently ~1 MiB because the build context is delivered to kaniko via a k8s Secret. See the deploy roadmap PR for the >1 MiB upgrade path." },
           "name": { "type": "string", "description": "Optional human-readable label" },
           "port": { "type": "integer", "description": "Container port (default 8080)" },
-          "env": { "type": "string", "description": "Environment scope (production / staging / dev / ...)" }
+          "env": { "type": "string", "description": "Environment scope (production / staging / dev / ...)" },
+          "env_vars": { "type": "string", "description": "Optional JSON object of env vars to inject into the deployed pod on the FIRST build — e.g. '{\"DATABASE_URL\":\"postgres://...\",\"REDIS_URL\":\"redis://...\"}'. Avoids the (POST /deploy/new) → (PATCH /env) → (POST /redeploy) round-trip pattern. Values may use 'vault://KEY' refs which resolve at deploy time. Keys starting with underscore are reserved and ignored." }
         },
         "required": ["tarball"]
       },

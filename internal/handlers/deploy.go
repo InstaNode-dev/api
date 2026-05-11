@@ -21,10 +21,12 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -261,6 +263,26 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 	initEnv := make(map[string]string)
 	if name != "" {
 		initEnv["_name"] = name
+	}
+
+	// Optional env_vars multipart field: a JSON object {KEY:"value", ...} that
+	// gets injected into the deployed pod on the FIRST build. Avoids the
+	// previous round-trip pattern of (POST /deploy/new) → wait → (PATCH /env) →
+	// (POST /redeploy) — agents can now ship a working app in one call.
+	// vault://KEY refs are resolved at deploy time (same as PATCH /env).
+	if vals := form.Value["env_vars"]; len(vals) > 0 {
+		var parsed map[string]string
+		if err := json.Unmarshal([]byte(vals[0]), &parsed); err != nil {
+			return respondError(c, fiber.StatusBadRequest, "invalid_env_vars",
+				"Field 'env_vars' must be a JSON object {KEY:\"value\", ...}")
+		}
+		for k, v := range parsed {
+			// Reserved underscore-prefixed keys are internal-only.
+			if strings.HasPrefix(k, "_") {
+				continue
+			}
+			initEnv[k] = v
+		}
 	}
 
 	saved, err := models.CreateDeployment(c.Context(), h.db, models.CreateDeploymentParams{

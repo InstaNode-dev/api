@@ -1,0 +1,67 @@
+package handlers
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+// TestOpenAPISpecParses ensures the embedded OpenAPI spec is valid JSON. Any
+// stray backtick or escape mistake in a description string causes the spec
+// to fail JSON parse, which produces a useless 500 at /openapi.json.
+func TestOpenAPISpecParses(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec is not valid JSON: %v", err)
+	}
+	if v["openapi"] != "3.1.0" {
+		t.Errorf("openapi version = %v; want 3.1.0", v["openapi"])
+	}
+}
+
+// TestOpenAPI_DeployRequestHasEnvVars guards the contract addition for friction
+// fix #11 (env vars in initial POST /deploy/new).
+func TestOpenAPI_DeployRequestHasEnvVars(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	props, ok := digMap(v, "components", "schemas", "DeployRequest", "properties")
+	if !ok {
+		t.Fatal("could not navigate to DeployRequest.properties in spec")
+	}
+	if _, ok := props["env_vars"]; !ok {
+		t.Error("DeployRequest.properties.env_vars is missing — agents have no machine-readable signal that env can be set on initial POST")
+	}
+}
+
+// TestOpenAPI_BearerAuthDocumentsClaimFlow guards the contract addition for
+// friction fix #2 (auth flow must be discoverable via OpenAPI).
+func TestOpenAPI_BearerAuthDocumentsClaimFlow(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	bearer, ok := digMap(v, "components", "securitySchemes", "bearerAuth")
+	if !ok {
+		t.Fatal("could not navigate to bearerAuth in spec")
+	}
+	desc, _ := bearer["description"].(string)
+	for _, must := range []string{"/claim", "anonymous", "api-keys"} {
+		if !strings.Contains(desc, must) {
+			t.Errorf("bearerAuth.description must mention %q so an agent reading the OpenAPI alone can discover the auth flow; got: %s", must, desc)
+		}
+	}
+}
+
+func digMap(root map[string]any, keys ...string) (map[string]any, bool) {
+	cur := root
+	for _, k := range keys {
+		next, ok := cur[k].(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		cur = next
+	}
+	return cur, true
+}
