@@ -526,7 +526,7 @@ const openAPISpec = `{
       "DeployRequest": {
         "type": "object",
         "properties": {
-          "tarball": { "type": "string", "format": "binary", "description": "gzipped tar archive containing the Dockerfile + source. NOTE: the effective cap is currently ~1 MiB because the build context is delivered to kaniko via a k8s Secret. See the deploy roadmap PR for the >1 MiB upgrade path." },
+          "tarball": { "type": "string", "format": "binary", "description": "gzipped tar archive containing the Dockerfile + source (max 50 MB). When MINIO_ENDPOINT is configured the build context is uploaded to MinIO and kaniko pulls it via the S3 path; otherwise it falls back to a k8s Secret which caps at ~1 MiB." },
           "name": { "type": "string", "description": "Optional human-readable label" },
           "port": { "type": "integer", "description": "Container port (default 8080)" },
           "env": { "type": "string", "description": "Environment scope (production / staging / dev / ...)" },
