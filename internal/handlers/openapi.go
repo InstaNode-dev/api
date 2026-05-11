@@ -519,6 +519,473 @@ const openAPISpec = `{
           "503": { "description": "Razorpay not configured" }
         }
       }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "Prometheus metrics scrape endpoint",
+        "description": "Exposes the standard Prometheus text-format metrics for the API process (Go runtime, HTTP request counters, provision counters, conversion funnel, Redis errors, etc.). When METRICS_TOKEN is set in config, the request must include 'Authorization: Bearer <METRICS_TOKEN>'. Open without auth in local dev.",
+        "responses": {
+          "200": { "description": "Prometheus text-format metrics", "content": { "text/plain": {} } },
+          "401": { "description": "METRICS_TOKEN is configured and the supplied bearer did not match" }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "Machine-readable OpenAPI 3.1 description of this API",
+        "description": "Returns this very document. Self-describing endpoint that agents can read to discover every other route.",
+        "responses": {
+          "200": { "description": "OpenAPI 3.1 JSON spec", "content": { "application/json": {} } }
+        }
+      }
+    },
+    "/storage/new": {
+      "post": {
+        "summary": "Provision S3-compatible object storage",
+        "description": "Returns S3-compatible credentials (access_key_id + secret_access_key) scoped to a per-token prefix inside a shared MinIO/R2 bucket. Anonymous tier: 1024MB, 24h TTL. Returns 503 service_disabled when MINIO_ENDPOINT / R2_API_TOKEN are not configured on the server.",
+        "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
+        "responses": {
+          "201": { "description": "Storage provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StorageProvisionResponse" } } } },
+          "429": { "description": "Anonymous fingerprint limit exceeded" },
+          "503": { "description": "Object storage is not configured on this environment" }
+        }
+      }
+    },
+    "/resources/{token}/logs": {
+      "get": {
+        "summary": "Stream pod logs for an isolated (growth-tier) resource",
+        "description": "Server-Sent Events stream of the last N log lines from the per-tenant pod that backs a growth-tier resource (postgres / cache / nosql / queue). The token IS the credential — no Bearer required, identical to /webhook/receive/{token}. Returns 400 not_growth for shared-tier resources (those run on platform pods shared across customers; use external log aggregation instead).",
+        "parameters": [
+          { "name": "token", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "tail", "in": "query", "required": false, "schema": { "type": "integer", "default": 100, "minimum": 1, "maximum": 500 } }
+        ],
+        "responses": {
+          "200": { "description": "text/event-stream of log lines terminated by 'data: [end]'" },
+          "400": { "description": "invalid_token, not_growth, or unsupported_type" },
+          "404": { "description": "Resource or backing pod not found" },
+          "409": { "description": "Resource has no provider namespace yet — still provisioning" },
+          "503": { "description": "Log streaming unavailable (no k8s client)" }
+        }
+      }
+    },
+    "/stacks/{slug}/logs/{svc}": {
+      "get": {
+        "summary": "Stream service logs from a stack (Server-Sent Events)",
+        "description": "Tails the named service's pod logs as text/event-stream. Anonymous-owned stacks are accessible without auth (token-style by slug); authenticated stacks require Bearer and team ownership.",
+        "parameters": [
+          { "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "svc", "in": "path", "required": true, "schema": { "type": "string", "description": "Service name from the manifest" } }
+        ],
+        "responses": {
+          "200": { "description": "text/event-stream of log lines terminated by 'data: [end]'" },
+          "404": { "description": "Stack not found" },
+          "503": { "description": "Compute backend log stream failed" }
+        }
+      }
+    },
+    "/stacks/{slug}/env": {
+      "patch": {
+        "summary": "Note env var overrides for a stack (applied on next redeploy)",
+        "description": "Accepts a map of env vars to be applied on the next call to POST /stacks/{slug}/redeploy. MVP: env vars are NOT persisted to the stacks table — the message in the response reminds the caller to issue a redeploy. Auth required: anonymous stacks cannot be mutated after creation.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["env"], "properties": { "env": { "type": "object", "additionalProperties": { "type": "string" } } } } } } },
+        "responses": {
+          "200": { "description": "Env vars noted" },
+          "400": { "description": "Body missing or env is empty" },
+          "401": { "description": "Unauthorized" },
+          "404": { "description": "Stack not found or not owned by this team" }
+        }
+      }
+    },
+    "/auth/github": {
+      "post": {
+        "summary": "Exchange a GitHub OAuth authorization code for a session JWT",
+        "description": "Programmatic / SPA flow. Body: {\"code\":\"<github-oauth-code>\"}. Returns 200 with a 24h session JWT plus user/team ids. Returns 503 oauth_not_configured when GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET are not set in the environment.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["code"], "properties": { "code": { "type": "string" } } } } } },
+        "responses": {
+          "200": { "description": "Session issued", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "token": { "type": "string" }, "user_id": { "type": "string", "format": "uuid" }, "team_id": { "type": "string", "format": "uuid" }, "email": { "type": "string", "format": "email" } } } } } },
+          "400": { "description": "Body invalid or missing code" },
+          "401": { "description": "GitHub rejected the authorization code" },
+          "503": { "description": "GitHub OAuth not configured / user upsert failed / JWT signing failed" }
+        }
+      }
+    },
+    "/auth/github/start": {
+      "get": {
+        "summary": "Browser-driven GitHub OAuth: stash CSRF cookie + 302 to GitHub",
+        "description": "Sets an HTTP-only state cookie binding ?return_to and a random state token, then 302-redirects the user agent to https://github.com/login/oauth/authorize. The dashboard's login page links here directly — there is no JSON contract. ?return_to is validated against the allowlist (instanode.dev, www.instanode.dev, http://localhost:5173, http://localhost:3000); off-list values collapse to https://instanode.dev/login/callback.",
+        "parameters": [{ "name": "return_to", "in": "query", "required": false, "schema": { "type": "string", "format": "uri" } }],
+        "responses": {
+          "302": { "description": "Redirect to GitHub authorize URL" },
+          "503": { "description": "GitHub OAuth not configured" }
+        }
+      }
+    },
+    "/auth/github/callback": {
+      "get": {
+        "summary": "Browser-driven GitHub OAuth: exchange code + 302 to <return_to>?session_token=<jwt>",
+        "description": "Verifies the state cookie matches the ?state query param, exchanges ?code with GitHub, finds-or-creates the user/team, mints a 24h session JWT, and 302-redirects to the validated return_to URL with session_token appended. On any error, renders an HTML error page.",
+        "parameters": [
+          { "name": "code", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "state", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "302": { "description": "Redirect to <return_to>?session_token=<jwt>" },
+          "400": { "description": "Missing code/state, or state mismatch / expired" },
+          "401": { "description": "GitHub rejected the code" },
+          "503": { "description": "OAuth not configured / user upsert / JWT signing failed" }
+        }
+      }
+    },
+    "/auth/email/start": {
+      "post": {
+        "summary": "Send a passwordless magic-link sign-in email",
+        "description": "Generates a single-use 15-minute token, stores its SHA-256 hash, emails the link, and returns 202 — always 202, even when the email isn't registered, to defeat user enumeration. The link points to GET /auth/email/callback?t=<token>.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["email"], "properties": { "email": { "type": "string", "format": "email" }, "return_to": { "type": "string", "format": "uri", "description": "Where to send the user after sign-in. Validated against the allowlist; off-list collapses to the default." } } } } } },
+        "responses": {
+          "202": { "description": "Magic link sent (or silently dropped — body is invariant by design)" },
+          "400": { "description": "Body invalid or email malformed" }
+        }
+      }
+    },
+    "/auth/email/callback": {
+      "get": {
+        "summary": "Consume a magic link, mint a session JWT, 302 to <return_to>",
+        "description": "Validates and atomically consumes the magic-link token, finds-or-creates the user/team, mints a 24h session JWT, and redirects to the original return_to with session_token appended. On any error renders an HTML error page (the user is in a browser).",
+        "parameters": [{ "name": "t", "in": "query", "required": true, "schema": { "type": "string", "description": "Plaintext magic-link token from the emailed URL" } }],
+        "responses": {
+          "302": { "description": "Redirect to <return_to>?session_token=<jwt>" },
+          "400": { "description": "Token missing, expired, already used, or invalid" },
+          "503": { "description": "Database / JWT signing failed" }
+        }
+      }
+    },
+    "/auth/cli": {
+      "post": {
+        "summary": "Start a CLI device-flow login session",
+        "description": "Creates a pending Redis-backed login session (10-minute TTL) and returns a browser URL the user must visit to complete OAuth. The CLI then polls GET /auth/cli/{id} for completion. Optional body: anon_tokens — anonymous resource tokens that the server will associate with the user's team once they sign in.",
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "type": "object", "properties": { "anon_tokens": { "type": "array", "items": { "type": "string", "format": "uuid" } } } } } } },
+        "responses": {
+          "201": { "description": "Session created", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "session_id": { "type": "string" }, "auth_url": { "type": "string", "format": "uri" }, "expires_in": { "type": "integer", "description": "Seconds (600)" } } } } } },
+          "500": { "description": "Failed to create login session" }
+        }
+      }
+    },
+    "/auth/cli/{id}": {
+      "get": {
+        "summary": "Poll a CLI device-flow login session for completion",
+        "description": "Returns 202 with {pending:true} while the user is still completing OAuth, or 200 with the issued API key and identity once they have. The session is single-use and is deleted on the first 200 response. After Redis expiry (or on lookup failure) the endpoint fails open with pending=true so the CLI keeps polling.",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Login complete", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "api_key": { "type": "string" }, "email": { "type": "string", "format": "email" }, "tier": { "type": "string" }, "team_name": { "type": "string" }, "claimed_tokens": { "type": "array", "items": { "type": "string", "format": "uuid" } } } } } } },
+          "202": { "description": "Still pending" },
+          "400": { "description": "Missing session id" },
+          "404": { "description": "Session not found or expired" }
+        }
+      }
+    },
+    "/billing/checkout": {
+      "post": {
+        "summary": "Legacy alias for POST /api/v1/billing/checkout",
+        "description": "Kept for backward compatibility with older dashboard/SDK clients. Identical contract to POST /api/v1/billing/checkout. New callers should use the /api/v1 path.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "pro"] } } } } } },
+        "responses": {
+          "200": { "description": "Subscription created — redirect user to short_url", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "short_url": { "type": "string", "format": "uri" }, "subscription_id": { "type": "string" } } } } } },
+          "400": { "description": "Invalid plan or tier_unavailable" },
+          "401": { "description": "Missing or invalid session token" },
+          "502": { "description": "Razorpay rejected the create-subscription call" },
+          "503": { "description": "Razorpay not configured on this environment" }
+        }
+      }
+    },
+    "/razorpay/webhook": {
+      "post": {
+        "summary": "Razorpay subscription event webhook (signature-verified)",
+        "description": "Receives Razorpay subscription lifecycle events: subscription.charged (payment confirmed → elevate team tier + elevate all permanent resources + trigger migrations for shared-infra resources), subscription.cancelled (downgrade team to hobby), payment.failed (record). The body's HMAC-SHA256 signature with RAZORPAY_WEBHOOK_SECRET must match the X-Razorpay-Signature header. Always returns 200 on success — Razorpay retries on non-2xx. Returns 400 invalid_signature when the HMAC check fails. NOT for direct caller use — Razorpay POSTs here.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "description": "Razorpay event payload (event, payload.subscription/payment.entity). See Razorpay webhook docs." } } } },
+        "responses": {
+          "200": { "description": "Event processed (or ignored for unhandled event types)" },
+          "400": { "description": "invalid_signature or invalid_payload" }
+        }
+      }
+    },
+    "/api/v1/resources/{id}/credentials": {
+      "get": {
+        "summary": "Read the decrypted connection_url for a resource",
+        "description": "Returns the AES-256-GCM-decrypted connection_url for the resource. The id path parameter is the resource's token (UUID). Mirrors the 'not 403, but 404' pattern: resources owned by other teams return 404, never confirming existence. Returns 400 no_connection_url for resources without a stored URL (e.g. storage resources expose access_key_id + secret_access_key elsewhere, not connection_url).",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Decrypted connection URL", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string", "format": "uuid" }, "token": { "type": "string", "format": "uuid" }, "resource_type": { "type": "string" }, "env": { "type": "string" }, "connection_url": { "type": "string" } } } } } },
+          "400": { "description": "Resource has no connection_url" },
+          "401": { "description": "Unauthorized" },
+          "404": { "description": "Resource not found (or owned by another team)" },
+          "500": { "description": "Encryption key invalid or decryption failed" }
+        }
+      }
+    },
+    "/api/v1/team/members": {
+      "get": {
+        "summary": "List members of the caller's team",
+        "description": "Any team member (owner/admin/developer/viewer/legacy member) may list. Returns each member's user_id, email, role, joined_at, plus the tier's member_limit.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Members + limit", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "members": { "type": "array", "items": { "type": "object", "properties": { "user_id": { "type": "string", "format": "uuid" }, "email": { "type": "string", "format": "email" }, "role": { "type": "string" }, "joined_at": { "type": "string", "format": "date-time" } } } }, "member_limit": { "type": "integer" } } } } } },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Not a member of this team" }
+        }
+      }
+    },
+    "/api/v1/team/members/invite": {
+      "post": {
+        "summary": "Invite a user to the team (owner or admin)",
+        "description": "Two flows under the same endpoint: role='member' uses the legacy owner-controlled seat flow (owner-only, enforces tier seat limit); role='admin'/'developer'/'viewer' uses the RBAC token flow (single-use token emailed out, accepted at POST /api/v1/invitations/{token}/accept).",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["email"], "properties": { "email": { "type": "string", "format": "email" }, "role": { "type": "string", "enum": ["admin", "developer", "viewer", "member"], "default": "member" } } } } } },
+        "responses": {
+          "201": { "description": "Invitation created" },
+          "400": { "description": "Body invalid, missing email, or invalid role" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Owner/admin role required" },
+          "409": { "description": "Member limit reached / duplicate / already-a-member" }
+        }
+      }
+    },
+    "/api/v1/team/members/leave": {
+      "post": {
+        "summary": "Leave the team",
+        "description": "Removes the caller from their current team. Owners cannot leave — transfer ownership first.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Left the team" },
+          "401": { "description": "Unauthorized" },
+          "409": { "description": "Owner cannot leave (failed_precondition)" }
+        }
+      }
+    },
+    "/api/v1/team/members/{user_id}": {
+      "delete": {
+        "summary": "Remove a member from the team (owner only)",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "user_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Member removed" },
+          "400": { "description": "Invalid user id" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Owner only" },
+          "404": { "description": "User not in team" },
+          "409": { "description": "Cannot remove the owner" }
+        }
+      }
+    },
+    "/api/v1/team/invitations": {
+      "get": {
+        "summary": "List pending invitations sent by this team (owner only)",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Invitation list" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Owner only" }
+        }
+      }
+    },
+    "/api/v1/team/invitations/{id}": {
+      "delete": {
+        "summary": "Revoke a pending invitation (owner only)",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Revoked" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Owner only or invitation belongs to another team" },
+          "404": { "description": "Invitation not found" }
+        }
+      }
+    },
+    "/api/v1/team/invitations/{id}/accept": {
+      "post": {
+        "summary": "Accept an invitation by its row id (authenticated user)",
+        "description": "Authenticated counterpart to POST /api/v1/invitations/{token}/accept — this one accepts by the invitation row id (UUID) and trusts the caller's session for identity. Use the token-based public endpoint when accepting from a link in an email.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Accepted" },
+          "401": { "description": "Unauthorized" },
+          "404": { "description": "Invitation not found" },
+          "409": { "description": "Expired, already used, or member-limit reached" }
+        }
+      }
+    },
+    "/api/v1/deployments": {
+      "get": {
+        "summary": "List all deployments owned by the caller's team",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Deployment list", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "items": { "type": "array", "items": { "$ref": "#/components/schemas/DeployItem" } }, "total": { "type": "integer" } } } } } },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/deployments/{id}": {
+      "get": {
+        "summary": "Get a deployment by id (alias of GET /deploy/{id})",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Deployment record", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Not your deployment" },
+          "404": { "description": "Not found" }
+        }
+      },
+      "delete": {
+        "summary": "Tear down + delete a deployment (alias of DELETE /deploy/{id})",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Deletion enqueued" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Not your deployment" }
+        }
+      }
+    },
+    "/api/v1/stacks": {
+      "get": {
+        "summary": "List all stacks owned by the caller's team",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Stack list", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "items": { "type": "array", "items": { "type": "object", "properties": { "stack_id": { "type": "string", "description": "Slug (same as path /stacks/{slug})" }, "name": { "type": "string" }, "status": { "type": "string" }, "tier": { "type": "string" }, "namespace": { "type": "string" }, "created_at": { "type": "string", "format": "date-time" } } } }, "total": { "type": "integer" } } } } } },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/stacks/{slug}/domains": {
+      "post": {
+        "summary": "Bind a custom hostname to a stack (Pro+)",
+        "description": "Pro tier or higher. Records the requested hostname against the caller's stack and emits a TXT-record DNS challenge. Status starts at 'pending_verification' until POST .../verify confirms the challenge. Returns 402 upgrade_required for Hobby/anonymous teams.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["hostname"], "properties": { "hostname": { "type": "string", "description": "Apex or subdomain, e.g. app.example.com" } } } } } },
+        "responses": {
+          "201": { "description": "Domain row created (pending verification)" },
+          "400": { "description": "Body invalid or hostname malformed" },
+          "401": { "description": "Unauthorized" },
+          "402": { "description": "upgrade_required — Pro plan or higher" },
+          "404": { "description": "Stack not found or not owned by this team" },
+          "409": { "description": "hostname_taken — bound to another team's stack" }
+        }
+      },
+      "get": {
+        "summary": "List custom domains bound to a stack",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Custom-domain list" },
+          "401": { "description": "Unauthorized" },
+          "404": { "description": "Stack not found or not owned by this team" }
+        }
+      }
+    },
+    "/api/v1/stacks/{slug}/domains/{id}/verify": {
+      "post": {
+        "summary": "Re-poll verification + ingress + certificate state for a custom domain (idempotent)",
+        "description": "Drives the state machine forward: pending_verification → verified (TXT check passes) → ingress_ready (Ingress + Certificate created) → cert_ready (cert-manager has issued the TLS cert). Each call advances at most one step; safe to call repeatedly.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "200": { "description": "Latest state after this call's mutations" },
+          "401": { "description": "Unauthorized" },
+          "404": { "description": "Stack or domain not found" }
+        }
+      }
+    },
+    "/api/v1/stacks/{slug}/domains/{id}": {
+      "delete": {
+        "summary": "Tear down the Ingress (best-effort) and remove the custom-domain binding",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "200": { "description": "Custom domain removed" },
+          "401": { "description": "Unauthorized" },
+          "404": { "description": "Custom domain not found" },
+          "503": { "description": "DB delete failed" }
+        }
+      }
+    },
+    "/api/v1/auth/api-keys": {
+      "post": {
+        "summary": "Mint a Personal Access Token (long-lived bearer for agents/CI)",
+        "description": "Creates a long-lived bearer token bound to the caller's team. The plaintext key is returned ONCE in the response and never shown again — the DB stores only its SHA-256 hash. PATs cannot mint other PATs (the request fails with 403 when the caller is themselves a PAT, not a user session). Scopes default to full team access; pass scopes:['read','write','admin'] to limit.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string", "maxLength": 120, "description": "Human-readable label, e.g. 'laptop' or 'github-actions'" }, "scopes": { "type": "array", "items": { "type": "string", "enum": ["read", "write", "admin"] } } } } } } },
+        "responses": {
+          "201": { "description": "Key created — plaintext returned exactly once", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string", "format": "uuid" }, "name": { "type": "string" }, "scopes": { "type": "array", "items": { "type": "string" } }, "created_at": { "type": "string", "format": "date-time" }, "key": { "type": "string", "description": "Plaintext bearer token — copy now, never shown again" }, "note": { "type": "string" } } } } } },
+          "400": { "description": "Body invalid, missing name, name too long, or invalid scope" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "PAT-creating-a-PAT is forbidden — use a user session" },
+          "503": { "description": "Token generation or DB write failed" }
+        }
+      },
+      "get": {
+        "summary": "List Personal Access Tokens for the team",
+        "description": "Returns metadata only — plaintext keys are never echoed back. Each item has id, name, scopes, created_at, last_used_at (nullable), and revoked.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "API key list (metadata only)", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "items": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string", "format": "uuid" }, "name": { "type": "string" }, "scopes": { "type": "array", "items": { "type": "string" } }, "created_at": { "type": "string", "format": "date-time" }, "last_used_at": { "type": ["string", "null"], "format": "date-time" }, "revoked": { "type": "boolean" } } } } } } } } },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/auth/api-keys/{id}": {
+      "delete": {
+        "summary": "Revoke a Personal Access Token",
+        "description": "Soft-deletes the key (sets revoked_at = now()). Tokens that have been revoked fail subsequent auth checks immediately.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Revoked", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string", "format": "uuid" } } } } } },
+          "400": { "description": "Path id is not a UUID" },
+          "401": { "description": "Unauthorized" },
+          "404": { "description": "Key not found" }
+        }
+      }
+    },
+    "/api/v1/audit": {
+      "get": {
+        "summary": "Per-team audit log (feeds the dashboard's Recent Activity panel)",
+        "description": "Returns up to ?limit (default 20, max 200) recent audit events for the caller's team, newest first. Optional ?kind filter (e.g. 'provision', 'delete', 'tier_change'). Each item has id, actor, kind, resource_type, resource_id (nullable), summary (HTML-safe), metadata (arbitrary JSON), at.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 20, "minimum": 1, "maximum": 200 } },
+          { "name": "kind", "in": "query", "required": false, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Audit event list", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "items": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string", "format": "uuid" }, "actor": { "type": "string" }, "kind": { "type": "string" }, "resource_type": { "type": "string" }, "resource_id": { "type": ["string", "null"], "format": "uuid" }, "summary": { "type": "string", "description": "HTML-safe summary; rendered via dangerouslySetInnerHTML in the dashboard" }, "metadata": { "type": ["object", "null"], "additionalProperties": true }, "at": { "type": "string", "format": "date-time" } } } } } } } } },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
+    "/internal/set-tier": {
+      "post": {
+        "summary": "Internal: forcibly elevate a team's tier (dev only)",
+        "description": "Internal-only — only enabled when ENVIRONMENT=development. Bypasses Razorpay entirely and writes the team's plan_tier directly. Also calls ElevateResourceTiersByTeam to bump every active permanent resource to the new tier immediately, and (when configured) fires migrator jobs to move shared-infra resources to isolated infra. Only upgrades are accepted: tier must be one of 'pro', 'team', 'growth'. Downgrades go through the real Razorpay cancellation flow.",
+        "x-instanode-internal": true,
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["team_id", "tier"], "properties": { "team_id": { "type": "string", "format": "uuid" }, "tier": { "type": "string", "enum": ["pro", "team", "growth"] } } } } } },
+        "responses": {
+          "200": { "description": "Tier updated", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "team_id": { "type": "string", "format": "uuid" }, "tier": { "type": "string" } } } } } },
+          "400": { "description": "Body invalid, team_id missing/malformed, or tier not an allowed upgrade target" },
+          "404": { "description": "Endpoint not registered (ENVIRONMENT != development)" },
+          "503": { "description": "DB update failed" }
+        }
+      }
     }
   },
   "components": {
@@ -599,6 +1066,38 @@ const openAPISpec = `{
           "tier": { "type": "string" },
           "expires_at": { "type": "string", "format": "date-time" },
           "note": { "type": "string" }
+        }
+      },
+      "StorageProvisionResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "id": { "type": "string", "format": "uuid", "description": "Resource row id" },
+          "token": { "type": "string", "format": "uuid" },
+          "name": { "type": "string" },
+          "connection_url": { "type": "string", "description": "Public bucket URL scoped to the per-token prefix" },
+          "endpoint": { "type": "string", "description": "S3-compatible endpoint host (e.g. minio.instant-data.svc.cluster.local:9000 / r2.instant.dev)" },
+          "access_key_id": { "type": "string" },
+          "secret_access_key": { "type": "string", "description": "Shown ONCE — store now; rotation requires re-provisioning" },
+          "prefix": { "type": "string", "description": "Object-key prefix all writes must use for isolation" },
+          "tier": { "type": "string" },
+          "env": { "type": "string" },
+          "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "expires_in": { "type": "string", "description": "Anonymous-only" } } }
+        }
+      },
+      "DeployItem": {
+        "type": "object",
+        "description": "Deployment row as returned in the list endpoint. Shape matches DeployResponse.item.",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "app_id": { "type": "string", "description": "8-char public identifier used in the URL" },
+          "url": { "type": "string" },
+          "status": { "type": "string", "enum": ["building", "healthy", "failed", "stopped"] },
+          "tier": { "type": "string" },
+          "environment": { "type": "string" },
+          "env": { "type": "object", "additionalProperties": { "type": "string" } },
+          "port": { "type": "integer" },
+          "team_id": { "type": "string", "format": "uuid" }
         }
       },
       "ClaimRequest": {
