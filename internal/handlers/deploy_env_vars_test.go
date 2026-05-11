@@ -67,10 +67,15 @@ func TestDeployNew_EnvVarsJSON_Parsed_Into_InitEnv(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
+	// Read the body once — require.NotEqual's message arg is evaluated
+	// unconditionally, so passing readBody(t, resp) there would consume the
+	// body before the success-path Decode can read it.
+	bodyBytes, _ := io.ReadAll(resp.Body)
+
 	// 202 (noop compute provider succeeds), 503 (service disabled) — both prove the
 	// parse path executed without 400. A 400 here is the regression we guard.
 	require.NotEqual(t, http.StatusBadRequest, resp.StatusCode,
-		"valid env_vars JSON must NOT return 400; got body: %s", readBody(t, resp))
+		"valid env_vars JSON must NOT return 400; got body: %s", string(bodyBytes))
 
 	if resp.StatusCode == http.StatusAccepted {
 		var created struct {
@@ -79,7 +84,7 @@ func TestDeployNew_EnvVarsJSON_Parsed_Into_InitEnv(t *testing.T) {
 				Env   map[string]string `json:"env"`
 			} `json:"item"`
 		}
-		require.NoError(t, json.NewDecoder(resp.Body).Decode(&created))
+		require.NoError(t, json.Unmarshal(bodyBytes, &created))
 		assert.Contains(t, created.Item.Env, "DATABASE_URL", "env_vars key must land in the deployment's env")
 		assert.Equal(t, "postgres://x/y", created.Item.Env["DATABASE_URL"])
 		assert.Contains(t, created.Item.Env, "CUSTOM")

@@ -17,6 +17,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -105,6 +106,9 @@ func newStackTestApp(t *testing.T, db *sql.DB) *fiber.App {
 
 	app := fiber.New(fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			if errors.Is(err, handlers.ErrResponseWritten) {
+				return nil
+			}
 			code := fiber.StatusInternalServerError
 			if e, ok := err.(*fiber.Error); ok {
 				code = e.Code
@@ -455,7 +459,7 @@ func TestStackNew_Anonymous_Returns202(t *testing.T) {
 	assert.NotEmpty(t, body.StackID)
 	assert.Equal(t, "anonymous", body.Tier)
 	assert.Equal(t, "24h", body.ExpiresIn)
-	assert.Contains(t, body.Note, "instant.dev/start", "upgrade URL must appear in note")
+	assert.Contains(t, body.Note, "instanode.dev/start", "upgrade URL must appear in note")
 
 	// Verify DB: stack has nil team_id and non-nil expires_at.
 	var teamIDNull sql.NullString

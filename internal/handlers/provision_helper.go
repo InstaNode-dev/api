@@ -246,6 +246,16 @@ func sanitizeName(name string) string {
 //
 // Empty input is treated as "production" — this preserves backwards compatibility
 // for every caller that pre-dates the env feature.
+// resolveEnv validates the env scope from the URL query (preferred) or
+// request body (fallback). On success returns (env, nil). On failure it
+// writes the 400 response via respondError and returns (\"\", ErrResponseWritten).
+// Callers use the standard pattern:
+//
+//	env, err := resolveEnv(c, body.Env)
+//	if err != nil { return err }
+//
+// The ErrResponseWritten sentinel propagates up; the ErrorHandler
+// recognises it and does not overwrite the response.
 func resolveEnv(c *fiber.Ctx, bodyEnv string) (string, error) {
 	raw := c.Query("env")
 	if raw == "" {
