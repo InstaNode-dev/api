@@ -247,6 +247,8 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 		"env":         resource.Env,
 		"limits":      webhookAnonLimits(),
 		"note":        upgradeNote(upgradeURL),
+		"upgrade":     upgradeURL,
+		"upgrade_jwt": jwtToken,
 		"expires_at":  expiresAt,
 	})
 }

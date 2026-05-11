@@ -248,6 +248,8 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 		"env":            resource.Env,
 		"limits":         nosqlAnonymousLimits(),
 		"note":           upgradeNote(upgradeURL),
+		"upgrade":        upgradeURL,
+		"upgrade_jwt":    jwtToken,
 	}
 	if nosqlStorageExceeded {
 		nosqlResp["warning"] = "Storage limit reached. Upgrade to continue."
