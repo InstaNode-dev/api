@@ -341,11 +341,24 @@ const openAPISpec = `{
     "/claim": {
       "post": {
         "summary": "Claim anonymous resources to a permanent account",
-        "description": "Converts anonymous resources to hobby tier (no expiry). Returns a session_token for immediate authenticated API use.",
+        "description": "Converts anonymous resources to hobby tier (no expiry). Sends a magic link to the supplied email; clicking the link sets a session JWT cookie and atomically transfers every resource token in the onboarding JWT to the new team.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClaimRequest" } } } },
         "responses": {
-          "201": { "description": "Account created, resources transferred", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClaimResponse" } } } },
-          "409": { "description": "JWT already used" }
+          "200": { "description": "Magic link sent to email", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClaimResponse" } } } },
+          "201": { "description": "Account created, resources transferred (legacy direct-claim flow)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClaimResponse" } } } },
+          "409": { "description": "JWT already used (single-use claim)" }
+        }
+      }
+    },
+    "/claim/preview": {
+      "get": {
+        "summary": "Preview which resources a claim would attach",
+        "description": "Decodes the onboarding JWT and returns the list of resources that would be transferred if /claim were posted with this token. Read-only; does not consume the JWT. Useful for showing the user what they're about to claim before they enter their email.",
+        "parameters": [{ "name": "t", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Signed onboarding JWT (the upgrade_jwt field from any anonymous provisioning response, or extracted from the upgrade URL)." }],
+        "responses": {
+          "200": { "description": "Preview of claimable resources", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClaimPreviewResponse" } } } },
+          "400": { "description": "Token missing or malformed" },
+          "401": { "description": "Token expired or signature invalid" }
         }
       }
     },
@@ -512,7 +525,7 @@ const openAPISpec = `{
         "type": "object",
         "required": ["jwt", "email"],
         "properties": {
-          "jwt": { "type": "string", "description": "Onboarding JWT from the note field upgrade URL (?t=...)" },
+          "jwt": { "type": "string", "description": "Onboarding JWT. Read this directly from the upgrade_jwt field of any anonymous provisioning response — no need to string-parse the upgrade URL." },
           "email": { "type": "string", "format": "email" }
         }
       },
@@ -524,6 +537,29 @@ const openAPISpec = `{
           "user_id": { "type": "string", "format": "uuid" },
           "session_token": { "type": "string", "description": "24h JWT for immediate authenticated API use" },
           "message": { "type": "string" }
+        }
+      },
+      "ClaimPreviewResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "token_valid": { "type": "boolean", "description": "True when the onboarding JWT is well-formed, unexpired, and not yet claimed." },
+          "expires_at": { "type": "string", "format": "date-time", "description": "When the onboarding JWT itself expires (typically 7 days from issue). Unrelated to per-resource 24h TTL." },
+          "resources": {
+            "type": "array",
+            "description": "All anonymous resources that this JWT would attach to the new team if /claim were posted.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string", "format": "uuid" },
+                "token": { "type": "string", "format": "uuid" },
+                "resource_type": { "type": "string", "enum": ["postgres", "redis", "mongodb", "nats", "webhook", "storage"] },
+                "tier": { "type": "string" },
+                "status": { "type": "string" },
+                "created_at": { "type": "string", "format": "date-time" }
+              }
+            }
+          }
         }
       },
       "AuthMeResponse": {
