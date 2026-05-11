@@ -115,7 +115,7 @@ func (h *DeployHandler) requireTeam(c *fiber.Ctx) (*models.Team, error) {
 	teamIDStr := middleware.GetTeamID(c)
 	if teamIDStr == "" {
 		return nil, respondError(c, fiber.StatusUnauthorized, "unauthorized",
-			"A session token is required to deploy. Sign in at https://instant.dev/start")
+			"A session token is required to deploy. Sign in at https://instanode.dev/start")
 	}
 	teamUUID, err := parseTeamID(teamIDStr)
 	if err != nil {
@@ -183,7 +183,7 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 func (h *DeployHandler) New(c *fiber.Ctx) error {
 	if !h.cfg.IsServiceEnabled("deploy") {
 		return respondError(c, fiber.StatusServiceUnavailable, "service_disabled",
-			"Container deployment is coming in Phase 6. Sign up at https://instant.dev/start to be notified.")
+			"Container deployment is coming in Phase 6. Sign up at https://instanode.dev/start to be notified.")
 	}
 
 	team, err := h.requireTeam(c)

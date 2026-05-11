@@ -173,11 +173,16 @@ func (h *provisionHelper) createOnboardingEvent(
 }
 
 // upgradeNote builds the note string for a freshly provisioned anonymous resource.
+//
+// Copy reflects the "anonymous is the trial" model: anonymous tier runs 24h
+// for free; claiming converts to a paid tier starting at $9/mo. There is no
+// 14-day trial on the paid tiers — the trial framing belongs only to the
+// anonymous slice.
 func upgradeNote(upgradeURL string) string {
 	if upgradeURL != "" {
-		return fmt.Sprintf("Works now. 14-day trial, then $9/mo: %s", upgradeURL)
+		return fmt.Sprintf("Works for 24h free. Claim to keep — from $9/mo: %s", upgradeURL)
 	}
-	return "Works now. 14-day trial, then $9/mo — sign up at https://instant.dev/start"
+	return "Works for 24h free. Claim to keep — from $9/mo: https://instanode.dev/start"
 }
 
 // limitExceededNote builds the note for the rate-limit-exceeded path.
@@ -189,9 +194,9 @@ func limitExceededNote(upgradeURL string, expiresAt time.Time) string {
 		expiry = fmt.Sprintf(" Expires in %s.", formatDuration(remaining))
 	}
 	if upgradeURL != "" {
-		return fmt.Sprintf("Returning your existing resource.%s 14-day trial, then $9/mo: %s", expiry, upgradeURL)
+		return fmt.Sprintf("Returning your existing resource.%s Claim to keep — from $9/mo: %s", expiry, upgradeURL)
 	}
-	return fmt.Sprintf("Returning your existing resource.%s 14-day trial, then $9/mo — sign up at https://instant.dev/start", expiry)
+	return fmt.Sprintf("Returning your existing resource.%s Claim to keep — from $9/mo: https://instanode.dev/start", expiry)
 }
 
 // formatDuration formats a duration as "Xh Ym" or "Xm".

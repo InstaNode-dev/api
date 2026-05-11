@@ -123,7 +123,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 			}
 			upgradeURL := ""
 			if jwtToken != "" {
-				upgradeURL = fmt.Sprintf("https://instant.dev/start?t=%s", jwtToken)
+				upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
 			metrics.FingerprintAbuseBlocked.Inc()
@@ -142,6 +142,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 				"limits":         h.storageAnonymousLimits(),
 				"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 				"upgrade":        upgradeURL,
+				"upgrade_jwt":    jwtToken,
 			})
 		}
 	}
@@ -211,7 +212,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 
 	upgradeURL := ""
 	if jwtToken != "" {
-		upgradeURL = fmt.Sprintf("https://instant.dev/start?t=%s", jwtToken)
+		upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
 		c.Set("X-Instant-Upgrade", upgradeURL)
 	}
 
@@ -242,6 +243,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 		"limits":            h.storageAnonymousLimits(),
 		"note":              upgradeNote(upgradeURL),
 		"upgrade":           upgradeURL,
+		"upgrade_jwt":       jwtToken,
 		"expires_at":        expiresAt.Format(time.RFC3339),
 	})
 }

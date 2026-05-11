@@ -84,7 +84,7 @@ func (h *StackHandler) requireStackTeam(c *fiber.Ctx) (*models.Team, error) {
 	teamIDStr := middleware.GetTeamID(c)
 	if teamIDStr == "" {
 		return nil, respondError(c, fiber.StatusUnauthorized, "unauthorized",
-			"A session token is required for this action. Sign in at https://instant.dev/start")
+			"A session token is required for this action. Sign in at https://instanode.dev/start")
 	}
 	teamUUID, err := parseTeamID(teamIDStr)
 	if err != nil {
@@ -355,7 +355,7 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
 				"ok":      false,
 				"error":   "rate_limit_exceeded",
-				"message": "Anonymous deploy limit reached. Upgrade at https://instant.dev/start",
+				"message": "Anonymous deploy limit reached. Upgrade at https://instanode.dev/start",
 			})
 		}
 	}
@@ -646,7 +646,7 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 	// Step 9: Return 202.
 	noteMsg := "Stack is building. Poll GET /stacks/" + slug + " for status."
 	if anon {
-		noteMsg += " Anonymous stacks expire in 24h. Upgrade at https://instant.dev/start"
+		noteMsg += " Anonymous stacks expire in 24h. Upgrade at https://instanode.dev/start"
 	}
 	if len(warnings) > 0 {
 		noteMsg = fmt.Sprintf("%d warning(s) from manifest parsing. %s", len(warnings), noteMsg)

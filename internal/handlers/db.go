@@ -79,7 +79,7 @@ func (h *DBHandler) provisionDB(ctx context.Context, token, tier string) (*dbpro
 func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 	if !h.cfg.IsServiceEnabled("postgres") {
 		return respondError(c, fiber.StatusServiceUnavailable, "service_disabled",
-			"Postgres provisioning is coming in Phase 2. Sign up at https://instant.dev/start to be notified.")
+			"Postgres provisioning is coming in Phase 2. Sign up at https://instanode.dev/start to be notified.")
 	}
 
 	start := time.Now()
@@ -106,7 +106,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 	// ── Dedicated requires authentication ─────────────────────────────────────
 	if body.Dedicated {
 		return respondError(c, fiber.StatusPaymentRequired, "auth_required",
-			"isolated resources require an authenticated team. Sign up at https://instant.dev/start")
+			"isolated resources require an authenticated team. Sign up at https://instanode.dev/start")
 	}
 
 	// ── Anonymous path ─────────────────────────────────────────────────────────
@@ -129,7 +129,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 			}
 			upgradeURL := ""
 			if jwtToken != "" {
-				upgradeURL = fmt.Sprintf("https://instant.dev/start?t=%s", jwtToken)
+				upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
 			// Decrypt the stored connection_url to return it in plaintext.
@@ -148,6 +148,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 					"limits":         dbAnonymousLimits(),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
+					"upgrade_jwt":    jwtToken,
 				})
 			}
 			// Empty connection_url means provisioning failed mid-flight on the existing
@@ -228,7 +229,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 
 	upgradeURL := ""
 	if jwtToken != "" {
-		upgradeURL = fmt.Sprintf("https://instant.dev/start?t=%s", jwtToken)
+		upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
 		c.Set("X-Instant-Upgrade", upgradeURL)
 	}
 
