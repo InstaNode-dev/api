@@ -31,6 +31,7 @@ import (
 	"instant.dev/internal/crypto"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
+	"instant.dev/internal/urls"
 )
 
 // provisionHelper holds the shared dependencies used by every provisioning handler.
@@ -182,7 +183,7 @@ func upgradeNote(upgradeURL string) string {
 	if upgradeURL != "" {
 		return fmt.Sprintf("Works for 24h free. Claim to keep — from $9/mo: %s", upgradeURL)
 	}
-	return "Works for 24h free. Claim to keep — from $9/mo: https://instanode.dev/start"
+	return "Works for 24h free. Claim to keep — from $9/mo: " + urls.StartURLPrefix
 }
 
 // limitExceededNote builds the note for the rate-limit-exceeded path.
@@ -196,7 +197,7 @@ func limitExceededNote(upgradeURL string, expiresAt time.Time) string {
 	if upgradeURL != "" {
 		return fmt.Sprintf("Returning your existing resource.%s Claim to keep — from $9/mo: %s", expiry, upgradeURL)
 	}
-	return fmt.Sprintf("Returning your existing resource.%s Claim to keep — from $9/mo: https://instanode.dev/start", expiry)
+	return fmt.Sprintf("Returning your existing resource.%s Claim to keep — from $9/mo: %s", expiry, urls.StartURLPrefix)
 }
 
 // formatDuration formats a duration as "Xh Ym" or "Xm".
