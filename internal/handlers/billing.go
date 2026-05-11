@@ -35,11 +35,24 @@ type BillingHandler struct {
 	cfg       *config.Config
 	email     *email.Client
 	migClient *migratorclient.Client
+
+	// FetchSubscriptionDetails fetches a Razorpay subscription + its latest
+	// paid invoice for billing-state aggregation. Set in tests to substitute
+	// a fake (the production default goes through razorpaybilling.Portal).
+	// Returning (nil, nil) is valid and means "no details available" —
+	// callers should default the relevant response fields.
+	FetchSubscriptionDetails func(subscriptionID string) (*razorpaybilling.SubscriptionDetails, error)
 }
 
 // NewBillingHandler constructs a BillingHandler.
 func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient *email.Client, migClient *migratorclient.Client) *BillingHandler {
-	return &BillingHandler{db: db, cfg: cfg, email: emailClient, migClient: migClient}
+	h := &BillingHandler{db: db, cfg: cfg, email: emailClient, migClient: migClient}
+	// Default to the real Razorpay portal; tests override this field directly.
+	h.FetchSubscriptionDetails = func(subID string) (*razorpaybilling.SubscriptionDetails, error) {
+		portal := &razorpaybilling.Portal{DB: h.db, Cfg: h.cfg}
+		return portal.FetchSubscriptionDetails(subID)
+	}
+	return h
 }
 
 // checkoutRequest is the request body for POST /api/v1/billing/checkout.
@@ -540,6 +553,201 @@ func (h *BillingHandler) CancelSubscriptionAPI(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadGateway, "razorpay_error", "Failed to cancel subscription")
 	}
 	return c.JSON(fiber.Map{"ok": true, "cancelled_at_cycle_end": true})
+}
+
+// monthlyAmountINRForTier returns the monthly subscription price in INR rupees
+// for a given plan tier. Used as a fallback when Razorpay has not reported a
+// paid invoice yet (e.g. brand-new subscription awaiting first charge). The
+// values mirror plans.yaml `price_monthly_cents` but in INR — Razorpay charges
+// in INR, the USD cents in plans.yaml are display-only.
+//
+// Returning 0 means "no charge" (anonymous / unrecognised tier) and callers
+// should serialise as JSON null.
+func monthlyAmountINRForTier(tier string) int64 {
+	switch strings.ToLower(strings.TrimSpace(tier)) {
+	case "hobby":
+		return 750
+	case "pro":
+		return 4100
+	case "team":
+		return 16500
+	case "growth":
+		return 8250
+	default:
+		return 0
+	}
+}
+
+// GetBillingState handles GET /api/v1/billing (session JWT).
+//
+// Aggregates the dashboard's billing view into one response: current tier,
+// Razorpay subscription status, next renewal timestamp, monthly amount, and
+// the payment method on file. The dashboard previously hard-coded these fields
+// from a fixture because no aggregator endpoint existed.
+//
+// For teams without a Razorpay subscription yet (anonymous-tier / freshly
+// claimed Hobby teams that haven't paid), the response still returns 200 with
+// sensibly-defaulted nulls — the caller can render the "no subscription" UI
+// without branching on error.
+func (h *BillingHandler) GetBillingState(c *fiber.Ctx) error {
+	teamIDStr := middleware.GetTeamID(c)
+	teamID, err := uuid.Parse(teamIDStr)
+	if err != nil {
+		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Valid session token required")
+	}
+
+	team, err := models.GetTeamByID(c.Context(), h.db, teamID)
+	if err != nil {
+		var notFound *models.ErrTeamNotFound
+		if errors.As(err, &notFound) {
+			return respondError(c, fiber.StatusNotFound, "team_not_found", "Team not found")
+		}
+		slog.Error("billing.state.team_lookup_failed", "error", err, "team_id", teamID)
+		return respondError(c, fiber.StatusInternalServerError, "db_error", "Failed to load team")
+	}
+
+	// billing_email: owner's email (best-effort — never fail the request if absent).
+	billingEmail := ""
+	if owner, err := models.GetUserByTeamID(c.Context(), h.db, teamID); err == nil && owner != nil {
+		billingEmail = owner.Email
+	}
+
+	// Default response: no subscription yet.
+	resp := fiber.Map{
+		"ok":                       true,
+		"tier":                     team.PlanTier,
+		"subscription_status":      "none",
+		"next_renewal_at":          nil,
+		"amount_inr":               nil,
+		"payment_method":           nil,
+		"billing_email":            billingEmail,
+		"razorpay_subscription_id": nil,
+		"razorpay_customer_id":     nil,
+	}
+
+	// Surface an in-flight trial as its own status — useful for the UI to
+	// distinguish "you're in a 14-day trial" from "you're on Hobby paid".
+	if team.TrialEndsAt.Valid && team.TrialEndsAt.Time.After(time.Now()) {
+		resp["subscription_status"] = "trial"
+		resp["next_renewal_at"] = team.TrialEndsAt.Time.UTC().Format(time.RFC3339Nano)
+	}
+
+	subID := ""
+	if team.RazorpaySubscriptionID.Valid {
+		subID = strings.TrimSpace(team.RazorpaySubscriptionID.String)
+	}
+	if subID == "" {
+		return c.JSON(resp)
+	}
+	resp["razorpay_subscription_id"] = subID
+
+	// Razorpay not configured in this environment — return what we know from
+	// the DB and skip the live fetch rather than erroring out. The dashboard
+	// can still show the current tier and "subscription id on file".
+	if h.cfg.RazorpayKeyID == "" || h.cfg.RazorpayKeySecret == "" {
+		resp["subscription_status"] = "active"
+		// Fall back to the tier-based monthly amount so the UI has a number to
+		// render instead of "—" when Razorpay is off.
+		if amt := monthlyAmountINRForTier(team.PlanTier); amt > 0 {
+			resp["amount_inr"] = amt
+		}
+		return c.JSON(resp)
+	}
+
+	details, err := h.FetchSubscriptionDetails(subID)
+	if err != nil {
+		slog.Warn("billing.state.razorpay_fetch_failed",
+			"error", err, "team_id", teamID, "subscription_id", subID)
+		// Fail open: the DB tier is authoritative. Better to show stale data
+		// than to break the billing page when Razorpay has a hiccup.
+		resp["subscription_status"] = "active"
+		if amt := monthlyAmountINRForTier(team.PlanTier); amt > 0 {
+			resp["amount_inr"] = amt
+		}
+		return c.JSON(resp)
+	}
+
+	if details != nil {
+		// Map Razorpay's subscription.status onto our four-value enum.
+		switch strings.ToLower(strings.TrimSpace(details.Status)) {
+		case "cancelled", "completed", "expired":
+			resp["subscription_status"] = "cancelled"
+		case "":
+			// no status from Razorpay → trust the DB tier
+			resp["subscription_status"] = "active"
+		default:
+			resp["subscription_status"] = "active"
+		}
+		if details.CancelAtPeriodEnd {
+			resp["subscription_status"] = "cancelled"
+		}
+		if !details.CurrentPeriodEnd.IsZero() {
+			resp["next_renewal_at"] = details.CurrentPeriodEnd.UTC().Format(time.RFC3339Nano)
+		}
+		// amount_inr — prefer the most recent paid invoice (converts paise→rupees).
+		// Fall back to the tier-derived price for brand-new subs that haven't been
+		// charged yet.
+		if details.LatestPaidAmount > 0 && (details.LatestPaidCurrency == "" || strings.EqualFold(details.LatestPaidCurrency, "INR")) {
+			resp["amount_inr"] = details.LatestPaidAmount / 100
+		} else if amt := monthlyAmountINRForTier(team.PlanTier); amt > 0 {
+			resp["amount_inr"] = amt
+		}
+		// payment_method — build a typed object from what Razorpay returned.
+		if pm := buildPaymentMethod(details); pm != nil {
+			resp["payment_method"] = pm
+		}
+	} else {
+		// Subscription stored on the team but Razorpay returned no details —
+		// behave as if the sub is active per the DB tier.
+		resp["subscription_status"] = "active"
+		if amt := monthlyAmountINRForTier(team.PlanTier); amt > 0 {
+			resp["amount_inr"] = amt
+		}
+	}
+
+	return c.JSON(resp)
+}
+
+// buildPaymentMethod converts portal SubscriptionDetails into the public
+// payment_method shape served by GET /api/v1/billing. Returns nil when no
+// payment method is on file yet (subscription created but never charged).
+func buildPaymentMethod(d *razorpaybilling.SubscriptionDetails) fiber.Map {
+	if d == nil {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(d.PaymentMethod)) {
+	case "card":
+		pm := fiber.Map{"type": "card", "vpa": nil}
+		if d.PaymentNetwork != "" {
+			pm["brand"] = d.PaymentNetwork
+		}
+		if d.PaymentLast4 != "" {
+			pm["last4"] = d.PaymentLast4
+		}
+		return pm
+	case "upi":
+		pm := fiber.Map{"type": "upi", "brand": nil, "last4": nil}
+		if d.PaymentVPA != "" {
+			pm["vpa"] = d.PaymentVPA
+		} else {
+			pm["vpa"] = nil
+		}
+		return pm
+	case "netbanking":
+		return fiber.Map{"type": "netbanking", "brand": nil, "last4": nil, "vpa": nil}
+	case "wallet":
+		return fiber.Map{"type": "wallet", "brand": nil, "last4": nil, "vpa": nil}
+	}
+	// Fallback: card data present but `method` not reported — assume card.
+	if d.PaymentLast4 != "" {
+		pm := fiber.Map{"type": "card", "vpa": nil}
+		if d.PaymentNetwork != "" {
+			pm["brand"] = d.PaymentNetwork
+		}
+		pm["last4"] = d.PaymentLast4
+		return pm
+	}
+	return nil
 }
 
 // ListInvoicesAPI handles GET /api/v1/billing/invoices (session JWT).
