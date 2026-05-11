@@ -62,7 +62,7 @@ type StackHandler struct {
 func NewStackHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, planRegistry *plans.Registry) *StackHandler {
 	var sp compute.StackProvider
 	if cfg.ComputeProvider == "k8s" {
-		ksp, err := k8s.NewStackProvider(cfg.KubeNamespaceApps)
+		ksp, err := k8s.NewStackProvider(cfg.KubeNamespaceApps, buildContextConfigFromCfg(cfg))
 		if err != nil {
 			slog.Warn("stack.k8s_provider_unavailable — using noop", "error", err)
 			sp = noop.NewStack()

@@ -38,16 +38,32 @@ const (
 	labelAppID    = "instant-app-id"
 )
 
+// BuildContextConfig holds the MinIO/S3 settings used to deliver the kaniko
+// build context. When Endpoint is empty, the K8sProvider falls back to the
+// legacy k8s-Secret delivery (capped at ~1 MiB by etcd's object size limit).
+// When set, the tarball is uploaded to MinIO and kaniko is pointed at the
+// resulting s3:// URL — lifting the practical cap to the multipart limit
+// enforced in the handler (currently 50 MiB).
+type BuildContextConfig struct {
+	Endpoint   string // host:port of MinIO server (e.g. "minio.instant-data.svc.cluster.local:9000")
+	AccessKey  string // MinIO admin access key
+	SecretKey  string // MinIO admin secret key
+	BucketName string // bucket for build contexts (e.g. "instant-build-contexts")
+	UseSSL     bool   // false for in-cluster MinIO; true for TLS-terminated endpoints
+}
+
 // K8sProvider implements compute.Provider using the local k8s cluster.
 type K8sProvider struct {
 	clientset kubernetes.Interface // accepts both *Clientset and *fake.Clientset (tests)
 	namespace string               // shared namespace (legacy fallback); per-deploy namespaces are preferred
+	buildCtx  BuildContextConfig   // MinIO settings for kaniko build context delivery
 }
 
 // New creates a K8sProvider targeting the given namespace.
+// buildCtx is optional — when unset, builds fall back to the 1 MiB Secret path.
 // Returns an error if the k8s clientset cannot be initialized; the caller
 // should fall back to noop in that case.
-func New(namespace string) (*K8sProvider, error) {
+func New(namespace string, buildCtx BuildContextConfig) (*K8sProvider, error) {
 	if namespace == "" {
 		namespace = "instant-apps"
 	}
@@ -58,6 +74,7 @@ func New(namespace string) (*K8sProvider, error) {
 	p := &K8sProvider{
 		clientset: cs,
 		namespace: namespace,
+		buildCtx:  buildCtx,
 	}
 	// Ensure the shared namespace exists (idempotent).
 	if err := p.ensureNamespace(context.Background()); err != nil {
@@ -691,9 +708,17 @@ func (p *K8sProvider) buildImage(ctx context.Context, ns, appID, imageTag string
 		return fmt.Errorf("k8s.buildImage: ensure namespace %q: %w", ns, err)
 	}
 
-	// 1. Tarball as a Secret (kaniko reads via tar:// context).
-	if err := p.upsertBuildContextSecret(ctx, ns, ctxSecret, tarball); err != nil {
-		return fmt.Errorf("k8s.buildImage: build-context secret: %w", err)
+	// 1. Tarball delivery. Prefer S3 when MinIO is configured (no 1 MiB cap);
+	//    fall back to the legacy Secret path when not.
+	s3URL, _, err := p.uploadBuildContext(ctx, appID, tarball)
+	if err != nil {
+		return fmt.Errorf("k8s.buildImage: upload build context: %w", err)
+	}
+	useSecret := s3URL == ""
+	if useSecret {
+		if err := p.upsertBuildContextSecret(ctx, ns, ctxSecret, tarball); err != nil {
+			return fmt.Errorf("k8s.buildImage: build-context secret: %w", err)
+		}
 	}
 
 	// 2. Ensure registry auth secret exists in this namespace (copied from instant ns).
@@ -706,7 +731,7 @@ func (p *K8sProvider) buildImage(ctx context.Context, ns, appID, imageTag string
 	_ = p.clientset.BatchV1().Jobs(ns).Delete(ctx, jobName, metav1.DeleteOptions{
 		PropagationPolicy: &prop,
 	})
-	if err := p.createKanikoJob(ctx, ns, jobName, ctxSecret, authSecret, imageTag); err != nil {
+	if err := p.createKanikoJob(ctx, ns, jobName, ctxSecret, authSecret, imageTag, s3URL); err != nil {
 		return fmt.Errorf("k8s.buildImage: create kaniko job: %w", err)
 	}
 
@@ -788,9 +813,55 @@ func (p *K8sProvider) ensureRegistryAuthInNS(ctx context.Context, ns, name strin
 }
 
 // createKanikoJob spawns a one-shot Job that builds and pushes the image.
-func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecret, authSecret, imageTag string) error {
+// When s3ContextURL is non-empty kaniko reads the build context directly from
+// MinIO via the S3 path (no 1 MiB cap); when empty it falls back to reading a
+// tar Secret mounted at /workspace.
+func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecret, authSecret, imageTag, s3ContextURL string) error {
 	backoff := int32(0)
 	ttl := int32(300)
+
+	useS3 := s3ContextURL != ""
+	contextArg := "--context=tar:///workspace/context.tar.gz"
+	if useS3 {
+		contextArg = "--context=" + s3ContextURL
+	}
+
+	// AWS env so kaniko's S3 reader talks to in-cluster MinIO rather than the
+	// AWS metadata endpoint. Honored only when --context=s3://, harmless
+	// otherwise — applied unconditionally to keep the spec simple.
+	envVars := []corev1.EnvVar{
+		{Name: "AWS_ACCESS_KEY_ID", Value: p.buildCtx.AccessKey},
+		{Name: "AWS_SECRET_ACCESS_KEY", Value: p.buildCtx.SecretKey},
+		{Name: "AWS_REGION", Value: "us-east-1"},
+		{Name: "S3_FORCE_PATH_STYLE", Value: "true"},
+		{Name: "AWS_S3_ENDPOINT", Value: "http://" + p.buildCtx.Endpoint},
+		{Name: "AWS_ENDPOINT_URL_S3", Value: "http://" + p.buildCtx.Endpoint},
+	}
+
+	volumes := []corev1.Volume{{
+		Name: "registry-auth",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: authSecret,
+				Items: []corev1.KeyToPath{
+					{Key: ".dockerconfigjson", Path: "config.json"},
+				},
+			},
+		},
+	}}
+	mounts := []corev1.VolumeMount{
+		{Name: "registry-auth", MountPath: "/kaniko/.docker"},
+	}
+	if !useS3 {
+		volumes = append(volumes, corev1.Volume{
+			Name: "build-context",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: ctxSecret},
+			},
+		})
+		mounts = append(mounts, corev1.VolumeMount{Name: "build-context", MountPath: "/workspace"})
+	}
+
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: jobName,
@@ -809,13 +880,14 @@ func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecre
 						Name:  "kaniko",
 						Image: "gcr.io/kaniko-project/executor:v1.23.2",
 						Args: []string{
-							"--context=tar:///workspace/context.tar.gz",
+							contextArg,
 							"--destination=" + imageTag,
 							"--snapshot-mode=redo",
 							"--cache=false",
 							"--single-snapshot",
 							"--cleanup",
 						},
+						Env: envVars,
 						// Explicit resources override the per-namespace LimitRange
 						// default (hobby tier defaults to 50m/256Mi which throttles
 						// kaniko + npm install to 5+ minutes). 250m/512Mi keeps a
@@ -832,30 +904,9 @@ func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecre
 								corev1.ResourceMemory: resource.MustParse("512Mi"),
 							},
 						},
-						VolumeMounts: []corev1.VolumeMount{
-							{Name: "build-context", MountPath: "/workspace"},
-							{Name: "registry-auth", MountPath: "/kaniko/.docker"},
-						},
+						VolumeMounts: mounts,
 					}},
-					Volumes: []corev1.Volume{
-						{
-							Name: "build-context",
-							VolumeSource: corev1.VolumeSource{
-								Secret: &corev1.SecretVolumeSource{SecretName: ctxSecret},
-							},
-						},
-						{
-							Name: "registry-auth",
-							VolumeSource: corev1.VolumeSource{
-								Secret: &corev1.SecretVolumeSource{
-									SecretName: authSecret,
-									Items: []corev1.KeyToPath{
-										{Key: ".dockerconfigjson", Path: "config.json"},
-									},
-								},
-							},
-						},
-					},
+					Volumes: volumes,
 				},
 			},
 		},
