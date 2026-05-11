@@ -2,6 +2,7 @@ package router
 
 import (
 	"database/sql"
+	"errors"
 	"log/slog"
 
 	"github.com/gofiber/contrib/otelfiber/v2"
@@ -27,6 +28,12 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app := fiber.New(fiber.Config{
 		// Disable default error handler — we write our own JSON errors
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			// respondError already wrote the body — must not overwrite, or
+			// every 400/403/etc. becomes a 500 "internal_error" via the
+			// generic path below. See handlers.ErrResponseWritten.
+			if errors.Is(err, handlers.ErrResponseWritten) {
+				return nil
+			}
 			code := fiber.StatusInternalServerError
 			if e, ok := err.(*fiber.Error); ok {
 				code = e.Code

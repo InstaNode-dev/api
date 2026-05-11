@@ -74,9 +74,13 @@ func grpcAuthCtx(t *testing.T, teamID, userID uuid.UUID) context.Context {
 	return metadata.NewOutgoingContext(context.Background(), metadata.Pairs("authorization", "Bearer "+tok))
 }
 
+// resourceSelectColumns mirrors models.resourceColumns. Keep in sync —
+// out-of-date column list here surfaces as "sql: expected N destination
+// arguments in Scan, not M" at runtime.
 func resourceSelectColumns() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "team_id", "token", "resource_type", "name", "connection_url", "key_prefix", "tier",
+		"env",
 		"fingerprint", "cloud_vendor", "country_code", "status", "migration_status",
 		"expires_at", "storage_bytes", "provider_resource_id", "created_request_id", "created_at",
 	})
@@ -232,6 +236,7 @@ func TestDeleteResource_Success(t *testing.T) {
 
 	rows := resourceSelectColumns().AddRow(
 		resID, teamID, tok, "webhook", nil, nil, nil, "hobby",
+		"production", // env (added by migration 009; column at position 9 in resourceSelectColumns)
 		nil, nil, nil, "active", nil,
 		nil, int64(0), nil, nil, created,
 	)
@@ -294,6 +299,7 @@ func TestRotateCredentials_Success(t *testing.T) {
 
 	rows := resourceSelectColumns().AddRow(
 		resID, teamID, tok, "queue", nil, enc, nil, "hobby",
+		"production", // env
 		nil, nil, nil, "active", nil,
 		nil, int64(0), nil, nil, created,
 	)
@@ -335,6 +341,7 @@ func TestRotateCredentials_NoConnectionURL(t *testing.T) {
 
 	rows := resourceSelectColumns().AddRow(
 		resID, teamID, tok, "queue", nil, nil, nil, "hobby",
+		"production", // env
 		nil, nil, nil, "active", nil,
 		nil, int64(0), nil, nil, created,
 	)
