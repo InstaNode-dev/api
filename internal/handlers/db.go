@@ -19,7 +19,6 @@ package handlers
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"log/slog"
 	"time"
 
@@ -30,6 +29,7 @@ import (
 	"instant.dev/internal/crypto"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
+	"instant.dev/internal/urls"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
 	dbprovider "instant.dev/internal/providers/db"
@@ -79,7 +79,7 @@ func (h *DBHandler) provisionDB(ctx context.Context, token, tier string) (*dbpro
 func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 	if !h.cfg.IsServiceEnabled("postgres") {
 		return respondError(c, fiber.StatusServiceUnavailable, "service_disabled",
-			"Postgres provisioning is coming in Phase 2. Sign up at https://instanode.dev/start to be notified.")
+			"Postgres provisioning is coming in Phase 2. Sign up at "+urls.StartURLPrefix+" to be notified.")
 	}
 
 	start := time.Now()
@@ -106,7 +106,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 	// ── Dedicated requires authentication ─────────────────────────────────────
 	if body.Dedicated {
 		return respondError(c, fiber.StatusPaymentRequired, "auth_required",
-			"isolated resources require an authenticated team. Sign up at https://instanode.dev/start")
+			"isolated resources require an authenticated team. Sign up at "+urls.StartURLPrefix)
 	}
 
 	// ── Anonymous path ─────────────────────────────────────────────────────────
@@ -129,7 +129,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 			}
 			upgradeURL := ""
 			if jwtToken != "" {
-				upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
+				upgradeURL = urls.UpgradeStartURL(jwtToken)
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
 			// Decrypt the stored connection_url to return it in plaintext.
@@ -229,7 +229,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 
 	upgradeURL := ""
 	if jwtToken != "" {
-		upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
+		upgradeURL = urls.UpgradeStartURL(jwtToken)
 		c.Set("X-Instant-Upgrade", upgradeURL)
 	}
 

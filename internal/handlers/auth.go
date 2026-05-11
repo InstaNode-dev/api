@@ -21,6 +21,7 @@ import (
 	"instant.dev/internal/config"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
+	"instant.dev/internal/urls"
 )
 
 // --- Browser OAuth flow shared helpers ---
@@ -34,7 +35,9 @@ const defaultReturnTo = "https://instanode.dev/login/callback"
 // Hardcoded rather than reading from cfg because the registered redirect_uri
 // at GitHub/Google is fixed at app-registration time — varying it per
 // deployment would require multiple OAuth apps.
-const canonicalAPIBase = "https://api.instanode.dev"
+// canonicalAPIBase is preserved as an alias of urls.PublicAPIBase so any
+// external reference keeps compiling. New code should use urls.PublicAPIBase.
+const canonicalAPIBase = urls.PublicAPIBase
 
 // allowedReturnOrigins is the static allowlist for ?return_to= validation.
 // Anything not on this list collapses to defaultReturnTo. The list is

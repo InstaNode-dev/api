@@ -9,7 +9,6 @@ package handlers
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"log/slog"
 	"time"
 
@@ -20,6 +19,7 @@ import (
 	"instant.dev/internal/crypto"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
+	"instant.dev/internal/urls"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
 	"instant.dev/internal/provisioner"
@@ -68,7 +68,7 @@ func (h *CacheHandler) provisionCache(ctx context.Context, token, tier string) (
 func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 	if !h.cfg.IsServiceEnabled("redis") {
 		return respondError(c, fiber.StatusServiceUnavailable, "service_disabled",
-			"Redis provisioning is coming in Phase 3. Sign up at https://instanode.dev/start to be notified.")
+			"Redis provisioning is coming in Phase 3. Sign up at "+urls.StartURLPrefix+" to be notified.")
 	}
 
 	start := time.Now()
@@ -95,7 +95,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 	// ── Dedicated requires authentication ─────────────────────────────────────
 	if body.Dedicated {
 		return respondError(c, fiber.StatusPaymentRequired, "auth_required",
-			"isolated resources require an authenticated team. Sign up at https://instanode.dev/start")
+			"isolated resources require an authenticated team. Sign up at "+urls.StartURLPrefix)
 	}
 
 	// ── Anonymous path ─────────────────────────────────────────────────────────
@@ -117,7 +117,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 			}
 			upgradeURL := ""
 			if jwtToken != "" {
-				upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
+				upgradeURL = urls.UpgradeStartURL(jwtToken)
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
 			// Decrypt the stored connection_url to return it in plaintext.
@@ -230,7 +230,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 
 	upgradeURL := ""
 	if jwtToken != "" {
-		upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
+		upgradeURL = urls.UpgradeStartURL(jwtToken)
 		c.Set("X-Instant-Upgrade", upgradeURL)
 	}
 

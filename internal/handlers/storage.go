@@ -38,6 +38,7 @@ import (
 	"instant.dev/internal/crypto"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
+	"instant.dev/internal/urls"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
 	storageprovider "instant.dev/internal/providers/storage"
@@ -123,7 +124,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 			}
 			upgradeURL := ""
 			if jwtToken != "" {
-				upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
+				upgradeURL = urls.UpgradeStartURL(jwtToken)
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
 			metrics.FingerprintAbuseBlocked.Inc()
@@ -212,7 +213,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 
 	upgradeURL := ""
 	if jwtToken != "" {
-		upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
+		upgradeURL = urls.UpgradeStartURL(jwtToken)
 		c.Set("X-Instant-Upgrade", upgradeURL)
 	}
 
