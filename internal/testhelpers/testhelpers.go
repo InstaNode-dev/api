@@ -308,6 +308,8 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	deployGroup.Post("/:id/redeploy", deployH.Redeploy)
 
 	api := app.Group("/api/v1", middleware.RequireAuth(cfg))
+	whoamiH := handlers.NewWhoamiHandler(db)
+	api.Get("/whoami", whoamiH.Get)
 	api.Get("/resources", resourceH.List)
 	api.Get("/resources/:id", resourceH.Get)
 	api.Delete("/resources/:id", resourceH.Delete)
