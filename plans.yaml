@@ -24,6 +24,9 @@ plans:
       storage_storage_mb: 10
       webhook_requests_stored: 100
       team_members: 1
+      vault_max_entries: 0
+      vault_envs_allowed: []
+      deployments_apps: 0
     features:
       alerts: false
       custom_domains: false
@@ -35,9 +38,9 @@ plans:
     trial_days: 14
     limits:
       provisions_per_day: -1
-      postgres_storage_mb: 500
-      postgres_connections: 5
-      redis_memory_mb: 25
+      postgres_storage_mb: 1024
+      postgres_connections: 8
+      redis_memory_mb: 50
       redis_commands_per_day: 10000
       mongodb_storage_mb: 100
       mongodb_connections: 5
@@ -46,6 +49,9 @@ plans:
       storage_storage_mb: 512
       webhook_requests_stored: 1000
       team_members: 1
+      vault_max_entries: 20
+      vault_envs_allowed: ["production"]
+      deployments_apps: 1
     features:
       alerts: true
       custom_domains: false
@@ -68,9 +74,12 @@ plans:
       storage_storage_mb: 10240
       webhook_requests_stored: 10000
       team_members: 5
+      vault_max_entries: 200
+      vault_envs_allowed: []
+      deployments_apps: 10
     features:
       alerts: true
-      custom_domains: false
+      custom_domains: true
       sla: false
 
   team:
@@ -90,6 +99,9 @@ plans:
       storage_storage_mb: -1
       webhook_requests_stored: -1
       team_members: -1
+      vault_max_entries: -1
+      vault_envs_allowed: []
+      deployments_apps: -1
     features:
       alerts: true
       custom_domains: true
@@ -101,9 +113,9 @@ plans:
     trial_days: 0
     limits:
       provisions_per_day: -1
-      postgres_storage_mb: -1
-      postgres_connections: -1
-      redis_memory_mb: -1
+      postgres_storage_mb: 5120
+      postgres_connections: 20
+      redis_memory_mb: 256
       redis_commands_per_day: -1
       mongodb_storage_mb: -1
       mongodb_connections: -1
@@ -112,6 +124,9 @@ plans:
       storage_storage_mb: -1
       webhook_requests_stored: -1
       team_members: 10
+      vault_max_entries: 200
+      vault_envs_allowed: []
+      deployments_apps: 5
     features:
       alerts: true
       custom_domains: true

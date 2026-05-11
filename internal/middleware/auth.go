@@ -2,6 +2,9 @@ package middleware
 
 import (
 	"errors"
+	"net/url"
+	"os"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v4"
@@ -13,13 +16,44 @@ const (
 	LocalKeyUserID = "auth_user_id"
 	// LocalKeyTeamID is the fiber.Locals key for the authenticated team ID.
 	LocalKeyTeamID = "auth_team_id"
+	// LocalKeyDPoPKeyThumbprint is set when the bearer token carries a DPoP
+	// proof-of-possession constraint (cnf.jkt). Consumed by RequireDPoP.
+	LocalKeyDPoPKeyThumbprint = "auth_dpop_jkt"
+
+	// audienceMismatchError is the error keyword used when an RFC 8707
+	// audience check fails. Distinct from the generic "unauthorized" so that
+	// agents can distinguish "wrong server" from "bad credentials".
+	audienceMismatchError = "invalid_token"
 )
 
+// defaultCanonicalResourceURL is the audience used when neither API_PUBLIC_URL
+// nor the live request host is available.
+const defaultCanonicalResourceURL = "https://api.instanode.dev"
+
+// confirmation captures the OAuth 2.0 PoP "cnf" claim shape (RFC 7800).
+// Currently only the JWK thumbprint variant ("jkt") used by DPoP is consumed.
+type confirmation struct {
+	JKT string `json:"jkt,omitempty"`
+}
+
 // sessionClaims mirrors the JWT payload issued by auth.go.
+//
+// Two extra claims back the agent-auth standards work:
+//
+//   - Audience (`aud`) — RFC 8707 Resource Indicators. A token MUST declare
+//     the canonical resource URL of this API. Missing/wrong audience → 401.
+//   - Confirmation (`cnf`) — RFC 7800. When present and JKT is populated the
+//     request MUST also carry a matching DPoP proof (enforced by RequireDPoP).
+//
+// The audience check is OPT-IN: if the JWT carries no `aud` claim at all the
+// request is allowed through (back-compat with existing dashboard tokens).
+// Once a token does declare an audience it MUST match the canonical URL of
+// this API; mismatched tokens are rejected.
 type sessionClaims struct {
-	UserID string `json:"uid"`
-	TeamID string `json:"tid"`
-	Email  string `json:"email"`
+	UserID       string        `json:"uid"`
+	TeamID       string        `json:"tid"`
+	Email        string        `json:"email"`
+	Confirmation *confirmation `json:"cnf,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -29,6 +63,70 @@ type sessionClaims struct {
 func (c sessionClaims) Valid() error {
 	c.RegisteredClaims.IssuedAt = nil
 	return c.RegisteredClaims.Valid()
+}
+
+// CanonicalResourceURLFor returns the canonical resource URL for an incoming
+// request. It is also used to populate the
+// `/.well-known/oauth-protected-resource` metadata document.
+//
+// Resolution order:
+//  1. API_PUBLIC_URL env var (when set and non-empty)
+//  2. X-Forwarded-Proto + Host headers from the live request
+//  3. defaultCanonicalResourceURL constant
+//
+// Exposed as a package-level variable so individual tests can override the
+// resolution without threading a dependency through call sites.
+var CanonicalResourceURLFor = func(c *fiber.Ctx) string {
+	if v := strings.TrimRight(os.Getenv("API_PUBLIC_URL"), "/"); v != "" {
+		return v
+	}
+	if c != nil {
+		host := c.Get("X-Forwarded-Host")
+		if host == "" {
+			host = c.Hostname()
+		}
+		scheme := c.Get("X-Forwarded-Proto")
+		if scheme == "" {
+			if p := c.Protocol(); p != "" {
+				scheme = p
+			} else {
+				scheme = "https"
+			}
+		}
+		if host != "" {
+			u := url.URL{Scheme: scheme, Host: host}
+			return strings.TrimRight(u.String(), "/")
+		}
+	}
+	return defaultCanonicalResourceURL
+}
+
+// audienceMatches reports whether the JWT `aud` claim contains the canonical
+// resource URL for this server. RFC 8707 §3 — the resource server MUST reject
+// tokens whose audience does not include its own resource indicator.
+func audienceMatches(aud jwt.ClaimStrings, canonical string) bool {
+	if canonical == "" {
+		return false
+	}
+	for _, a := range aud {
+		if a == canonical {
+			return true
+		}
+	}
+	return false
+}
+
+// rejectAudienceMismatch writes an RFC 6750 §3.1-style 401 with a structured
+// error keyword agents can branch on.
+func rejectAudienceMismatch(c *fiber.Ctx) error {
+	canonical := CanonicalResourceURLFor(c)
+	c.Set("WWW-Authenticate",
+		`Bearer realm="instanode", error="invalid_token", error_description="audience mismatch", resource="`+canonical+`"`)
+	return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+		"ok":                false,
+		"error":             audienceMismatchError,
+		"error_description": "audience mismatch",
+	})
 }
 
 // RequireAuth validates the Authorization: Bearer {jwt} header.
@@ -44,6 +142,20 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 			})
 		}
 		tokenStr := header[7:]
+
+		// Dispatch on token shape. PATs (ink_<base64>) hit the api_keys
+		// table; JWTs go through HMAC validation. Both populate the same
+		// auth_team_id / auth_user_id locals so handlers don't branch.
+		if IsAPIKey(tokenStr) {
+			ok, err := AuthenticateAPIKey(c, tokenStr)
+			if err != nil || !ok {
+				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+					"ok":    false,
+					"error": "unauthorized",
+				})
+			}
+			return c.Next()
+		}
 
 		claims := &sessionClaims{}
 		parsed, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
@@ -66,8 +178,21 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 			})
 		}
 
+		// RFC 8707 audience check — only enforced when the token actually
+		// declares an `aud` claim. Existing dashboard sessions issued before
+		// this change have no audience and continue to work; tokens that DO
+		// declare an audience must include the canonical resource URL.
+		if len(claims.Audience) > 0 {
+			if !audienceMatches(claims.Audience, CanonicalResourceURLFor(c)) {
+				return rejectAudienceMismatch(c)
+			}
+		}
+
 		c.Locals(LocalKeyUserID, claims.UserID)
 		c.Locals(LocalKeyTeamID, claims.TeamID)
+		if claims.Confirmation != nil && claims.Confirmation.JKT != "" {
+			c.Locals(LocalKeyDPoPKeyThumbprint, claims.Confirmation.JKT)
+		}
 		return c.Next()
 	}
 }
@@ -90,6 +215,16 @@ func GetTeamID(c *fiber.Ctx) string {
 	return ""
 }
 
+// GetDPoPKeyThumbprint returns the JWK thumbprint (`cnf.jkt`) bound to the
+// current bearer token, or "" if the token is not key-bound. Consumed by
+// RequireDPoP to decide whether to enforce DPoP for this request.
+func GetDPoPKeyThumbprint(c *fiber.Ctx) string {
+	if v, ok := c.Locals(LocalKeyDPoPKeyThumbprint).(string); ok {
+		return v
+	}
+	return ""
+}
+
 // OptionalAuth is like RequireAuth but does not return 401 when the header is absent or invalid.
 // If a valid bearer token is present it populates the same Fiber locals as RequireAuth.
 // Use on routes where anonymous access is allowed but authenticated users get elevated behaviour.
@@ -100,6 +235,12 @@ func OptionalAuth(cfg *config.Config) fiber.Handler {
 			return c.Next()
 		}
 		tokenStr := header[7:]
+
+		// PAT path: invalid PATs continue as anonymous (do NOT block in OptionalAuth).
+		if IsAPIKey(tokenStr) {
+			_, _ = AuthenticateAPIKey(c, tokenStr) //nolint:errcheck — drop on error
+			return c.Next()
+		}
 
 		claims := &sessionClaims{}
 		parsed, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
@@ -113,8 +254,18 @@ func OptionalAuth(cfg *config.Config) fiber.Handler {
 			return c.Next()
 		}
 
+		// RFC 8707 audience check (opt-in: only enforced if token has `aud`).
+		// In OptionalAuth a mismatch must NOT block the request — we just
+		// drop the credential and continue as anonymous.
+		if len(claims.Audience) > 0 && !audienceMatches(claims.Audience, CanonicalResourceURLFor(c)) {
+			return c.Next()
+		}
+
 		c.Locals(LocalKeyUserID, claims.UserID)
 		c.Locals(LocalKeyTeamID, claims.TeamID)
+		if claims.Confirmation != nil && claims.Confirmation.JKT != "" {
+			c.Locals(LocalKeyDPoPKeyThumbprint, claims.Confirmation.JKT)
+		}
 		return c.Next()
 	}
 }

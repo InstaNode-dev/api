@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"instant.dev/internal/config"
 	"instant.dev/internal/crypto"
@@ -54,8 +55,9 @@ func (h *NoSQLHandler) provisionNoSQL(ctx context.Context, token, tier string) (
 			return nil, err
 		}
 		return &nosqlprovider.Credentials{
-			URL:          creds.URL,
-			DatabaseName: creds.DatabaseName,
+			URL:                creds.URL,
+			DatabaseName:       creds.DatabaseName,
+			ProviderResourceID: creds.ProviderResourceID,
 		}, nil
 	}
 	return h.nosqlProvider.Provision(ctx, token, tier)
@@ -79,9 +81,14 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 	_ = c.BodyParser(&body)
 	body.Name = sanitizeName(body.Name)
 
+	env, envErr := resolveEnv(c, body.Env)
+	if envErr != nil {
+		return envErr
+	}
+
 	// ── Authenticated path ────────────────────────────────────────────────────
 	if teamIDStr := middleware.GetTeamID(c); teamIDStr != "" {
-		return h.newNoSQLAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, body.Dedicated, start)
+		return h.newNoSQLAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, body.Dedicated, env, start)
 	}
 
 	// ── Dedicated requires authentication ─────────────────────────────────────
@@ -123,6 +130,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 					"name":           existing.Name.String,
 					"connection_url": connectionURL,
 					"tier":           existing.Tier,
+					"env":            existing.Env,
 					"limits":         nosqlAnonymousLimits(),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
@@ -141,6 +149,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 		ResourceType:     "mongodb",
 		Name:             body.Name,
 		Tier:             "anonymous",
+		Env:              env,
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
@@ -188,6 +197,13 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 		}
 	}
 
+	// Persist provider_resource_id (k8s namespace for dedicated MongoDB pods).
+	if creds.ProviderResourceID != "" {
+		if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
+			slog.Error("nosql.new.update_provider_resource_id_failed", "error", upErr, "request_id", requestID)
+		}
+	}
+
 	jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "mongodb", []string{tokenStr})
 	if jwtErr != nil {
 		slog.Error("nosql.new.jwt_issue_failed", "error", jwtErr, "request_id", requestID)
@@ -226,6 +242,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
 		"tier":           "anonymous",
+		"env":            resource.Env,
 		"limits":         nosqlAnonymousLimits(),
 		"note":           upgradeNote(upgradeURL),
 	}
@@ -237,7 +254,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 }
 
 func (h *NoSQLHandler) newNoSQLAuthenticated(
-	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, dedicated bool, start time.Time,
+	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, dedicated bool, env string, start time.Time,
 ) error {
 	ctx := c.UserContext()
 	teamUUID, err := parseTeamID(teamIDStr)
@@ -260,6 +277,7 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 		ResourceType:     "mongodb",
 		Name:             name,
 		Tier:             tier,
+		Env:              env,
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
@@ -270,6 +288,18 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 		slog.Error("nosql.new.create_resource_failed_auth", "error", err, "team_id", teamIDStr, "request_id", requestID)
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision MongoDB resource")
 	}
+
+	// Best-effort audit event; failures must never block the provision.
+	go func() {
+		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+			TeamID:       teamUUID,
+			Actor:        "agent",
+			Kind:         "provision",
+			ResourceType: "mongodb",
+			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
+			Summary:      "agent provisioned <strong>mongodb</strong> <code>" + resource.Token.String()[:8] + "</code>",
+		})
+	}()
 
 	tokenStr := resource.Token.String()
 
@@ -304,6 +334,13 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 		}
 	}
 
+	// Persist provider_resource_id (k8s namespace for dedicated MongoDB pods).
+	if creds.ProviderResourceID != "" {
+		if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
+			slog.Error("nosql.new.update_provider_resource_id_failed_auth", "error", upErr, "request_id", requestID)
+		}
+	}
+
 	slog.Info("provision.success",
 		"service", "mongodb",
 		"token", tokenStr,
@@ -324,6 +361,7 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
 		"tier":           tier,
+		"env":            resource.Env,
 		"limits": fiber.Map{
 			"storage_mb":  nosqlAuthStorageLimitMB,
 			"connections": h.plans.ConnectionsLimit(tier, "mongodb"),

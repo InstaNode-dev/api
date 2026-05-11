@@ -91,6 +91,199 @@ const openAPISpec = `{
         }
       }
     },
+    "/.well-known/oauth-protected-resource": {
+      "get": {
+        "summary": "OAuth 2.0 Protected Resource Metadata (RFC 9728)",
+        "description": "Discovery document used by MCP clients to obtain authorization metadata. Public, no auth required.",
+        "responses": {
+          "200": { "description": "Metadata document", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OAuthProtectedResourceMetadata" } } } }
+        }
+      }
+    },
+    "/deploy/new": {
+      "post": {
+        "summary": "Deploy a container application",
+        "description": "Builds a Docker image from the supplied tarball (or pulls an existing image) and rolls it out behind a public HTTPS URL on *.deployment.instanode.dev. Env vars may use the value 'vault://KEY' to reference a secret stored via /api/v1/vault — the plaintext is resolved at deploy time and never persisted in plaintext.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "multipart/form-data": { "schema": { "$ref": "#/components/schemas/DeployRequest" } } } },
+        "responses": {
+          "202": { "description": "Deployment accepted, building", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
+          "401": { "description": "Unauthorized" },
+          "503": { "description": "Compute backend unavailable or service disabled" }
+        }
+      }
+    },
+    "/deploy/{id}": {
+      "get": {
+        "summary": "Get deployment status",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Deployment record", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Not your deployment" },
+          "404": { "description": "Not found" }
+        }
+      },
+      "delete": {
+        "summary": "Tear down and delete a deployment",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Deletion enqueued" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Not your deployment" }
+        }
+      }
+    },
+    "/deploy/{id}/env": {
+      "patch": {
+        "summary": "Update env vars (redeploy required to apply)",
+        "description": "Merges the supplied env vars with the existing ones. Values prefixed with 'vault://' are stored verbatim and resolved at the next redeploy. Plaintext is never logged.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "env": { "type": "object", "additionalProperties": { "type": "string" } } } } } } },
+        "responses": {
+          "200": { "description": "Env vars updated", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } }
+        }
+      }
+    },
+    "/deploy/{id}/logs": {
+      "get": {
+        "summary": "Stream deployment logs (Server-Sent Events)",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "text/event-stream of log lines, terminated by 'data: [end]'" },
+          "409": { "description": "Deployment still building" }
+        }
+      }
+    },
+    "/deploy/{id}/redeploy": {
+      "post": {
+        "summary": "Redeploy with the latest stored env vars",
+        "description": "Re-resolves any vault:// references and rolls out a new revision. Use after PATCH /deploy/{id}/env or after rotating a vault secret.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "202": { "description": "Redeploy accepted" }
+        }
+      }
+    },
+    "/api/v1/vault/{env}/{key}": {
+      "put": {
+        "summary": "Store an encrypted secret",
+        "description": "Encrypts the supplied value with AES-256-GCM and stores it as a new version. Subsequent PUTs of the same key create v2, v3, ... — old versions remain queryable until DELETE.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "env", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Environment scope (production, staging, dev, ...)" },
+          { "name": "key", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Secret key (e.g. RAZORPAY_KEY_SECRET)" }
+        ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["value"], "properties": { "value": { "type": "string" } } } } } },
+        "responses": {
+          "201": { "description": "Secret stored", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VaultPutResponse" } } } },
+          "401": { "description": "Unauthorized" }
+        }
+      },
+      "get": {
+        "summary": "Read a secret (decrypted)",
+        "description": "Returns the latest version's plaintext. Pass ?version=N to read a specific historical version. Every read writes a row to vault_audit_log.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "env", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "key", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "version", "in": "query", "required": false, "schema": { "type": "integer" } }
+        ],
+        "responses": {
+          "200": { "description": "Secret returned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VaultGetResponse" } } } },
+          "404": { "description": "Secret not found for this team / env / key" }
+        }
+      },
+      "delete": {
+        "summary": "Hard delete every version of a secret",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "env", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "204": { "description": "Deleted" },
+          "404": { "description": "Not found (idempotent)" }
+        }
+      }
+    },
+    "/api/v1/vault/{env}/{key}/rotate": {
+      "post": {
+        "summary": "Rotate a secret (new value, version + 1)",
+        "description": "Convenience for PUT — preserves history but bumps the version visibly. Existing deployments continue to read v(N-1) until they redeploy.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "env", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["value"], "properties": { "value": { "type": "string" } } } } } },
+        "responses": {
+          "200": { "description": "Rotated", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VaultPutResponse" } } } }
+        }
+      }
+    },
+    "/api/v1/vault/{env}": {
+      "get": {
+        "summary": "List keys stored in an environment",
+        "description": "Returns key names only — values are NEVER returned by this endpoint. Use GET /api/v1/vault/{env}/{key} to read a value.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "env", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "List of keys", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "keys": { "type": "array", "items": { "type": "string" } } } } } } }
+        }
+      }
+    },
+    "/api/v1/teams/{team_id}/invitations": {
+      "post": {
+        "summary": "Invite a user to the team (admin or owner only)",
+        "description": "Creates a single-use token tied to the invitee's email. The token is delivered out-of-band (email) and exchanged at POST /api/v1/invitations/{token}/accept.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "team_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["email", "role"], "properties": { "email": { "type": "string", "format": "email" }, "role": { "type": "string", "enum": ["admin", "developer", "viewer", "member"] } } } } } },
+        "responses": {
+          "201": { "description": "Invitation created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/InvitationResponse" } } } },
+          "403": { "description": "Forbidden — admin role required" }
+        }
+      },
+      "get": {
+        "summary": "List pending invitations for a team (admin or owner only)",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "team_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Invitations", "content": { "application/json": { "schema": { "type": "object", "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/InvitationResponse" } } } } } } }
+        }
+      }
+    },
+    "/api/v1/teams/{team_id}/invitations/{id}": {
+      "delete": {
+        "summary": "Revoke a pending invitation",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "team_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "204": { "description": "Revoked" }
+        }
+      }
+    },
+    "/api/v1/invitations/{token}/accept": {
+      "post": {
+        "summary": "Accept an invitation by token (no auth required — token IS the auth)",
+        "description": "Public endpoint. The token is single-use and ties the accepting user's session to the invited team and role.",
+        "parameters": [{ "name": "token", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Accepted", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "team_id": { "type": "string", "format": "uuid" }, "role": { "type": "string" } } } } } },
+          "404": { "description": "Token not found" },
+          "410": { "description": "Token already used or expired" }
+        }
+      }
+    },
     "/claim": {
       "post": {
         "summary": "Claim anonymous resources to a permanent account",
@@ -181,7 +374,10 @@ const openAPISpec = `{
       },
       "ProvisionRequest": {
         "type": "object",
-        "properties": { "name": { "type": "string", "description": "Optional human-readable label (max 120 chars)" } }
+        "properties": {
+          "name": { "type": "string", "description": "Optional human-readable label (max 120 chars)" },
+          "env": { "type": "string", "description": "Optional environment scope (production / staging / dev / ...). Anonymous tier is always 'production'.", "default": "production" }
+        }
       },
       "DBProvisionResponse": {
         "type": "object",
@@ -283,11 +479,82 @@ const openAPISpec = `{
           "token": { "type": "string", "format": "uuid" },
           "resource_type": { "type": "string", "enum": ["postgres", "redis", "mongodb", "nats", "webhook", "storage"] },
           "name": { "type": "string" },
+          "env": { "type": "string", "description": "Environment scope (production / staging / dev / ...)" },
           "tier": { "type": "string" },
           "status": { "type": "string" },
           "storage_bytes": { "type": "integer" },
           "expires_at": { "type": "string", "format": "date-time", "nullable": true },
           "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "OAuthProtectedResourceMetadata": {
+        "type": "object",
+        "properties": {
+          "resource": { "type": "string", "description": "Canonical URL of this protected resource" },
+          "authorization_servers": { "type": "array", "items": { "type": "string" } },
+          "bearer_methods_supported": { "type": "array", "items": { "type": "string", "enum": ["header"] } },
+          "resource_documentation": { "type": "string" }
+        }
+      },
+      "VaultPutResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "key": { "type": "string" },
+          "env": { "type": "string" },
+          "version": { "type": "integer" }
+        }
+      },
+      "VaultGetResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "key": { "type": "string" },
+          "env": { "type": "string" },
+          "version": { "type": "integer" },
+          "value": { "type": "string", "description": "Decrypted plaintext" }
+        }
+      },
+      "DeployRequest": {
+        "type": "object",
+        "properties": {
+          "tarball": { "type": "string", "format": "binary", "description": "gzipped tar archive containing the Dockerfile + source (max 50 MB)" },
+          "name": { "type": "string", "description": "Optional human-readable label" },
+          "port": { "type": "integer", "description": "Container port (default 8080)" },
+          "env": { "type": "string", "description": "Environment scope (production / staging / dev / ...)" }
+        },
+        "required": ["tarball"]
+      },
+      "DeployResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "item": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string", "format": "uuid" },
+              "app_id": { "type": "string", "description": "8-char public identifier used in the URL" },
+              "url": { "type": "string", "description": "Live HTTPS URL (set once status=healthy)" },
+              "status": { "type": "string", "enum": ["building", "healthy", "failed", "stopped"] },
+              "tier": { "type": "string" },
+              "environment": { "type": "string", "description": "Env scope (production/staging/dev). Note: 'env' on this object is the env_vars map, not the scope." },
+              "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Env vars map — vault://KEY references resolve at deploy time" },
+              "port": { "type": "integer" },
+              "team_id": { "type": "string", "format": "uuid" }
+            }
+          },
+          "note": { "type": "string" }
+        }
+      },
+      "InvitationResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "id": { "type": "string", "format": "uuid" },
+          "team_id": { "type": "string", "format": "uuid" },
+          "email": { "type": "string", "format": "email" },
+          "role": { "type": "string", "enum": ["admin", "developer", "viewer", "member"] },
+          "expires_at": { "type": "string", "format": "date-time" }
         }
       }
     }

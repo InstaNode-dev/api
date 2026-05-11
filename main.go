@@ -88,7 +88,7 @@ func main() {
 
 	var storageProv *storageprovider.Provider
 	if cfg.MinioEndpoint != "" {
-		if sp, err := storageprovider.New(cfg.MinioEndpoint, cfg.MinioRootUser, cfg.MinioRootPassword, cfg.MinioBucketName); err != nil {
+		if sp, err := storageprovider.New(cfg.MinioEndpoint, cfg.MinioPublicEndpoint, cfg.MinioRootUser, cfg.MinioRootPassword, cfg.MinioBucketName); err != nil {
 			slog.Warn("dashboard_grpc: MinIO provider init failed", "error", err)
 		} else {
 			storageProv = sp

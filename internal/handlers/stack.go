@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"strings"
 	"time"
 
@@ -167,6 +168,64 @@ func stackOwnerCheck(c *fiber.Ctx, stack *models.Stack, team *models.Team) error
 		}
 	}
 	return nil
+}
+
+// rewriteToInternalURL replaces the host:port of a customer-facing connection
+// URL with the cluster-internal FQDN of the dedicated pod, so stack workloads
+// can reach their `needs:` resources without going through the LoadBalancer.
+//
+// Why this is needed: customer URLs use K8S_EXTERNAL_HOST (e.g. pg.instanode.dev)
+// + a per-resource port. From outside the cluster they work. From INSIDE the
+// cluster, the LoadBalancer doesn't hairpin reliably on DOKS, so a stack pod
+// trying to reach pg.instanode.dev:5432 just times out.
+//
+// Resource → internal FQDN mapping:
+//
+//	postgres  → instant-pg-proxy.instant.svc.cluster.local:5432
+//	            (the proxy routes by db name in the startup packet)
+//	redis     → redis.<provider_resource_id>.svc.cluster.local:6379
+//	mongodb   → mongo.<provider_resource_id>.svc.cluster.local:27017
+//	queue     → nats.<provider_resource_id>.svc.cluster.local:4222
+//
+// If providerResourceID is empty (legacy / non-dedicated resource), the URL is
+// returned unchanged. Callers should still log a warning in that case.
+func rewriteToInternalURL(publicURL, resourceType, providerResourceID string) string {
+	if publicURL == "" {
+		return publicURL
+	}
+	parsed, err := url.Parse(publicURL)
+	if err != nil || parsed.Host == "" {
+		return publicURL
+	}
+
+	var newHost string
+	switch resourceType {
+	case "postgres":
+		// Always route via the cluster-internal pg-proxy. The proxy reads the
+		// database name from the Postgres startup packet and forwards to the
+		// dedicated pod — works for every customer DB without per-resource state.
+		newHost = "instant-pg-proxy.instant.svc.cluster.local:5432"
+	case "redis":
+		if providerResourceID == "" {
+			return publicURL
+		}
+		newHost = "redis." + providerResourceID + ".svc.cluster.local:6379"
+	case "mongodb":
+		if providerResourceID == "" {
+			return publicURL
+		}
+		newHost = "mongo." + providerResourceID + ".svc.cluster.local:27017"
+	case "queue":
+		if providerResourceID == "" {
+			return publicURL
+		}
+		newHost = "nats." + providerResourceID + ".svc.cluster.local:4222"
+	default:
+		return publicURL
+	}
+
+	parsed.Host = newHost
+	return parsed.String()
 }
 
 // resourceEnvKey returns the canonical env var name for a resource type.
@@ -422,6 +481,22 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 					"token", res.Token, "error", decErr)
 				plainURL = res.ConnectionURL.String
 			}
+			// Rewrite the customer-facing URL (LB external host + NodePort or proxy
+			// port) to the in-cluster FQDN. Stack pods must connect via cluster DNS
+			// because DOKS LoadBalancers don't reliably hairpin and the public IP
+			// route adds latency + crosses the namespace egress firewall.
+			//
+			// Customer's dashboard / `connection_url` field still shows the public URL
+			// — only the env injected into in-cluster stack pods is rewritten.
+			// Fallback: redis/mongo/queue handlers don't all persist provider_resource_id
+			// today (cache.go and nosql.go are missing the UpdateProviderResourceID call).
+			// Derive the namespace from the token using the same convention the k8s
+			// backends use ("instant-customer-<token>") so the rewrite still works.
+			prid := res.ProviderResourceID.String
+			if prid == "" || prid == "local:0" {
+				prid = "instant-customer-" + res.Token.String()
+			}
+			plainURL = rewriteToInternalURL(plainURL, res.ResourceType, prid)
 			key := resourceEnvKey(res.ResourceType, idx)
 			env[key] = plainURL
 		}
@@ -498,6 +573,12 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 	}
 
 	// Step 7: Build StackDeployOptions.
+	//
+	// Per-service env vars may include "vault://KEY" references. We resolve
+	// them here against the team's vault for the production env (stack
+	// deploys do not yet expose multi-env scoping; this matches the
+	// per-deployment behaviour). Anonymous stacks cannot use vault refs
+	// because there is no team to look up.
 	services := make([]compute.StackServiceDef, 0, len(m.Services))
 	for svcName, svc := range m.Services {
 		// Merge: needs env first (low priority), then service-defined env (high priority).
@@ -508,6 +589,28 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		for k, v := range svc.Env {
 			envVars[k] = v
 		}
+
+		// Resolve vault:// refs (authenticated only).
+		if !anon {
+			resolved, vaultErr := ResolveVaultRefs(c.Context(), h.db, h.cfg.AESKey, team.ID, "production", envVars)
+			if vaultErr != nil {
+				slog.Error("stack.new.vault_resolve_failed",
+					"error", vaultErr, "slug", slug, "service", svcName,
+					"team_id", team.ID, "request_id", middleware.GetRequestID(c))
+				return respondError(c, fiber.StatusBadRequest, "vault_ref_failed",
+					"Failed to resolve vault reference for "+svcName+": "+vaultErr.Error())
+			}
+			envVars = resolved
+		} else {
+			// Reject vault refs from anonymous callers — fail loud, not silent.
+			for k, v := range envVars {
+				if strings.HasPrefix(v, vaultRefPrefix) {
+					return respondError(c, fiber.StatusForbidden, "vault_requires_auth",
+						"vault:// references require authentication: "+svcName+"."+k)
+				}
+			}
+		}
+
 		services = append(services, compute.StackServiceDef{
 			Name:    svcName,
 			Tarball: tarballs[svcName],
@@ -846,15 +949,27 @@ func (h *StackHandler) Redeploy(c *fiber.Ctx) error {
 		tarballs[name] = data
 	}
 
-	// Build service defs.
+	// Build service defs. Resolve "vault://KEY" references in env vars
+	// before passing to the compute provider — same semantics as the
+	// initial /stacks/new path. Redeploy is always authenticated, so
+	// no anonymous-rejection branch is needed here.
 	services := make([]compute.StackServiceDef, 0, len(m.Services))
 	for svcName, svc := range m.Services {
+		envVars := svc.Env
+		resolved, vaultErr := ResolveVaultRefs(c.Context(), h.db, h.cfg.AESKey, team.ID, "production", envVars)
+		if vaultErr != nil {
+			slog.Error("stack.redeploy.vault_resolve_failed",
+				"error", vaultErr, "slug", slug, "service", svcName,
+				"team_id", team.ID, "request_id", middleware.GetRequestID(c))
+			return respondError(c, fiber.StatusBadRequest, "vault_ref_failed",
+				"Failed to resolve vault reference for "+svcName+": "+vaultErr.Error())
+		}
 		services = append(services, compute.StackServiceDef{
 			Name:    svcName,
 			Tarball: tarballs[svcName],
 			Port:    svc.Port,
 			Expose:  svc.Expose,
-			EnvVars: svc.Env,
+			EnvVars: resolved,
 		})
 	}
 

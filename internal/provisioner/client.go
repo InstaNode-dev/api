@@ -66,13 +66,16 @@ func (c *Client) ctxWithAuth(ctx context.Context) context.Context {
 }
 
 // provisionTimeout returns the gRPC timeout for a provisioning call.
-// Pro and team tiers create a dedicated k8s pod per token; pod startup can take 1-3 minutes.
-// All other tiers provision on shared infrastructure in < 1 second.
+// Every tier now provisions a dedicated k8s pod (since the dedicated-infra-for-
+// every-tier change). PVC bind + image pull + postgres init can take 30-90s on
+// a cold node, so 10s (the old anonymous default) drops the connection while
+// the pod is still coming up. Anonymous gets a tight 4m budget; pro/team get
+// 5m for larger images and bigger PVCs.
 func provisionTimeout(tier string) time.Duration {
 	if tier == "pro" || tier == "team" || tier == "growth" {
 		return 5 * time.Minute
 	}
-	return 10 * time.Second
+	return 4 * time.Minute
 }
 
 // ProvisionPostgres provisions a new Postgres database.

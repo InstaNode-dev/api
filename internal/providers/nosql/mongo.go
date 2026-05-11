@@ -30,6 +30,11 @@ type Credentials struct {
 
 	// DatabaseName is the name of the provisioned database.
 	DatabaseName string
+
+	// ProviderResourceID is the backend-specific resource identifier.
+	// For k8s-dedicated backend: the namespace name "instant-customer-<token>".
+	// Empty for the shared local backend.
+	ProviderResourceID string
 }
 
 // Provider manages MongoDB provisioning.

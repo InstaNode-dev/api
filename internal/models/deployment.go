@@ -22,6 +22,7 @@ type Deployment struct {
 	EnvVars      map[string]string
 	Port         int
 	Tier         string
+	Env          string // dev | staging | production | <custom>; defaults to "production"
 	ErrorMessage string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
@@ -34,6 +35,7 @@ type CreateDeploymentParams struct {
 	AppID      string
 	Port       int
 	Tier       string
+	Env        string // empty string is normalised to EnvProduction
 	EnvVars    map[string]string
 }
 
@@ -45,6 +47,10 @@ type ErrDeploymentNotFound struct {
 func (e *ErrDeploymentNotFound) Error() string {
 	return fmt.Sprintf("deployment not found: %s", e.ID)
 }
+
+// deploymentColumns is the canonical column list shared by all deployment SELECTs.
+const deploymentColumns = `id, team_id, resource_id, app_id, provider_id, status, app_url,
+       env_vars, port, tier, env, error_message, created_at, updated_at`
 
 // scanDeployment reads a single deployments row into a Deployment struct.
 // env_vars is stored as JSONB; error_message, provider_id, and app_url are nullable.
@@ -59,7 +65,7 @@ func scanDeployment(row interface {
 	if err := row.Scan(
 		&d.ID, &d.TeamID, &resourceID, &d.AppID,
 		&providerID, &d.Status, &appURL,
-		&envVarsRaw, &d.Port, &d.Tier, &errorMessage,
+		&envVarsRaw, &d.Port, &d.Tier, &d.Env, &errorMessage,
 		&d.CreatedAt, &d.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -103,13 +109,17 @@ func CreateDeployment(ctx context.Context, db *sql.DB, p CreateDeploymentParams)
 		return nil, fmt.Errorf("models.CreateDeployment: marshal env_vars: %w", err)
 	}
 
+	env := p.Env
+	if env == "" {
+		env = EnvProduction
+	}
+
 	row := db.QueryRowContext(ctx, `
 		INSERT INTO deployments
-			(team_id, resource_id, app_id, port, tier, env_vars)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id, team_id, resource_id, app_id, provider_id, status, app_url,
-		          env_vars, port, tier, error_message, created_at, updated_at
-	`, p.TeamID, resourceID, p.AppID, port, p.Tier, envVarsJSON)
+			(team_id, resource_id, app_id, port, tier, env, env_vars)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING `+deploymentColumns,
+		p.TeamID, resourceID, p.AppID, port, p.Tier, env, envVarsJSON)
 
 	d, err := scanDeployment(row)
 	if err != nil {
@@ -119,12 +129,10 @@ func CreateDeployment(ctx context.Context, db *sql.DB, p CreateDeploymentParams)
 }
 
 // GetDeploymentByAppID fetches a deployment by its app_id slug (the short public token).
+// app_id is unique across all envs — the same app name in dev vs prod must use distinct
+// app_ids (the deploy handler generates a fresh one per call).
 func GetDeploymentByAppID(ctx context.Context, db *sql.DB, appID string) (*Deployment, error) {
-	row := db.QueryRowContext(ctx, `
-		SELECT id, team_id, resource_id, app_id, provider_id, status, app_url,
-		       env_vars, port, tier, error_message, created_at, updated_at
-		FROM deployments WHERE app_id = $1
-	`, appID)
+	row := db.QueryRowContext(ctx, `SELECT `+deploymentColumns+` FROM deployments WHERE app_id = $1`, appID)
 
 	d, err := scanDeployment(row)
 	if err == sql.ErrNoRows {
@@ -138,11 +146,7 @@ func GetDeploymentByAppID(ctx context.Context, db *sql.DB, appID string) (*Deplo
 
 // GetDeploymentByID fetches a deployment by primary key UUID.
 func GetDeploymentByID(ctx context.Context, db *sql.DB, id uuid.UUID) (*Deployment, error) {
-	row := db.QueryRowContext(ctx, `
-		SELECT id, team_id, resource_id, app_id, provider_id, status, app_url,
-		       env_vars, port, tier, error_message, created_at, updated_at
-		FROM deployments WHERE id = $1
-	`, id)
+	row := db.QueryRowContext(ctx, `SELECT `+deploymentColumns+` FROM deployments WHERE id = $1`, id)
 
 	d, err := scanDeployment(row)
 	if err == sql.ErrNoRows {
@@ -154,11 +158,11 @@ func GetDeploymentByID(ctx context.Context, db *sql.DB, id uuid.UUID) (*Deployme
 	return d, nil
 }
 
-// GetDeploymentsByTeam returns all deployments for a team, ordered by creation time descending.
+// GetDeploymentsByTeam returns all deployments for a team across every environment,
+// ordered by creation time descending.
 func GetDeploymentsByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]*Deployment, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT id, team_id, resource_id, app_id, provider_id, status, app_url,
-		       env_vars, port, tier, error_message, created_at, updated_at
+		SELECT `+deploymentColumns+`
 		FROM deployments
 		WHERE team_id = $1
 		ORDER BY created_at DESC
@@ -178,6 +182,37 @@ func GetDeploymentsByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("models.GetDeploymentsByTeam rows: %w", err)
+	}
+	return results, nil
+}
+
+// GetDeploymentsByTeamAndEnv returns deployments for a team scoped to a single
+// environment. Empty env is normalised to "production".
+func GetDeploymentsByTeamAndEnv(ctx context.Context, db *sql.DB, teamID uuid.UUID, env string) ([]*Deployment, error) {
+	if env == "" {
+		env = EnvProduction
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT `+deploymentColumns+`
+		FROM deployments
+		WHERE team_id = $1 AND env = $2
+		ORDER BY created_at DESC
+	`, teamID, env)
+	if err != nil {
+		return nil, fmt.Errorf("models.GetDeploymentsByTeamAndEnv: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*Deployment
+	for rows.Next() {
+		d, err := scanDeployment(rows)
+		if err != nil {
+			return nil, fmt.Errorf("models.GetDeploymentsByTeamAndEnv scan: %w", err)
+		}
+		results = append(results, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("models.GetDeploymentsByTeamAndEnv rows: %w", err)
 	}
 	return results, nil
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"instant.dev/internal/config"
 	"instant.dev/internal/crypto"
@@ -55,8 +56,9 @@ func (h *CacheHandler) provisionCache(ctx context.Context, token, tier string) (
 			return nil, err
 		}
 		return &cacheprovider.Credentials{
-			URL:       creds.URL,
-			KeyPrefix: creds.KeyPrefix,
+			URL:                creds.URL,
+			KeyPrefix:          creds.KeyPrefix,
+			ProviderResourceID: creds.ProviderResourceID,
 		}, nil
 	}
 	return h.cacheProvider.Provision(ctx, token, tier)
@@ -80,9 +82,14 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 	_ = c.BodyParser(&body)
 	body.Name = sanitizeName(body.Name)
 
+	env, envErr := resolveEnv(c, body.Env)
+	if envErr != nil {
+		return envErr
+	}
+
 	// ── Authenticated path ────────────────────────────────────────────────────
 	if teamIDStr := middleware.GetTeamID(c); teamIDStr != "" {
-		return h.newCacheAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, body.Dedicated, start)
+		return h.newCacheAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, body.Dedicated, env, start)
 	}
 
 	// ── Dedicated requires authentication ─────────────────────────────────────
@@ -124,6 +131,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 					"name":           existing.Name.String,
 					"connection_url": connectionURL,
 					"tier":           existing.Tier,
+					"env":            existing.Env,
 					"limits":         cacheAnonymousLimits(),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
@@ -146,6 +154,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 		ResourceType:     "redis",
 		Name:             body.Name,
 		Tier:             "anonymous",
+		Env:              env,
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
@@ -200,6 +209,13 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 		}
 	}
 
+	// Persist provider_resource_id (k8s namespace for dedicated Redis pods).
+	if creds.ProviderResourceID != "" {
+		if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
+			slog.Error("cache.new.update_provider_resource_id_failed", "error", upErr, "request_id", requestID)
+		}
+	}
+
 	jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "redis", []string{tokenStr})
 	if jwtErr != nil {
 		slog.Error("cache.new.jwt_issue_failed", "error", jwtErr, "request_id", requestID)
@@ -238,6 +254,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
 		"tier":           "anonymous",
+		"env":            resource.Env,
 		"limits":         cacheAnonymousLimits(),
 		"note":           upgradeNote(upgradeURL),
 	}
@@ -252,7 +269,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 }
 
 func (h *CacheHandler) newCacheAuthenticated(
-	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, dedicated bool, start time.Time,
+	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, dedicated bool, env string, start time.Time,
 ) error {
 	ctx := c.UserContext()
 	teamUUID, err := parseTeamID(teamIDStr)
@@ -275,6 +292,7 @@ func (h *CacheHandler) newCacheAuthenticated(
 		ResourceType:     "redis",
 		Name:             name,
 		Tier:             tier,
+		Env:              env,
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
@@ -285,6 +303,18 @@ func (h *CacheHandler) newCacheAuthenticated(
 		slog.Error("cache.new.create_resource_failed_auth", "error", err, "team_id", teamIDStr, "request_id", requestID)
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision Redis resource")
 	}
+
+	// Best-effort audit event; failures must never block the provision.
+	go func() {
+		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+			TeamID:       teamUUID,
+			Actor:        "agent",
+			Kind:         "provision",
+			ResourceType: "redis",
+			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
+			Summary:      "agent provisioned <strong>redis</strong> <code>" + resource.Token.String()[:8] + "</code>",
+		})
+	}()
 
 	tokenStr := resource.Token.String()
 
@@ -326,6 +356,13 @@ func (h *CacheHandler) newCacheAuthenticated(
 		}
 	}
 
+	// Persist provider_resource_id (k8s namespace for dedicated Redis pods).
+	if creds.ProviderResourceID != "" {
+		if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
+			slog.Error("cache.new.update_provider_resource_id_failed_auth", "error", upErr, "request_id", requestID)
+		}
+	}
+
 	slog.Info("provision.success",
 		"service", "redis",
 		"token", tokenStr,
@@ -347,6 +384,7 @@ func (h *CacheHandler) newCacheAuthenticated(
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
 		"tier":           tier,
+		"env":            resource.Env,
 		"dedicated":      dedicated,
 		"limits": fiber.Map{
 			"memory_mb": cacheAuthStorageLimitMB,
