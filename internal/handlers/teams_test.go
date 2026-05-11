@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -44,7 +45,20 @@ func teamsApp(t *testing.T, db *sql.DB, actorUserID, actorTeamID, actorRole stri
 	}
 	mail := email.New("") // noop client — never actually sends
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		// respondError already wrote the body — short-circuit so the
+		// generic ErrorHandler does not overwrite 4xx with 500.
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			if errors.Is(err, handlers.ErrResponseWritten) {
+				return nil
+			}
+			code := fiber.StatusInternalServerError
+			if e, ok := err.(*fiber.Error); ok {
+				code = e.Code
+			}
+			return c.Status(code).JSON(fiber.Map{"ok": false, "error": "internal_error", "message": err.Error()})
+		},
+	})
 
 	// Fake auth: inject user/team/role into Locals so RequireRole can decide.
 	fakeAuth := func(c *fiber.Ctx) error {

@@ -18,6 +18,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -112,6 +113,9 @@ func vaultTestApp(t *testing.T, db *sql.DB) *fiber.App {
 	}
 	app := fiber.New(fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			if errors.Is(err, handlers.ErrResponseWritten) {
+				return nil
+			}
 			code := fiber.StatusInternalServerError
 			if e, ok := err.(*fiber.Error); ok {
 				code = e.Code
@@ -471,7 +475,11 @@ func TestVault_Validation(t *testing.T) {
 		want int
 	}{
 		// Path params can't be empty in fiber routes; use illegal characters instead.
-		{"bad-key-with-slash", "/api/v1/vault/production/foo bar", http.StatusBadRequest},
+		// Pre-encode the space (%20) so httptest.NewRequest accepts the URL —
+		// Go 1.26+ panics on unescaped spaces (older Go silently encoded them).
+		// The fiber handler decodes back to "foo bar" and the validator rejects
+		// the space — exactly what we want to assert.
+		{"bad-key-with-space", "/api/v1/vault/production/foo%20bar", http.StatusBadRequest},
 		{"bad-key-too-long", "/api/v1/vault/production/" + longString(300), http.StatusBadRequest},
 		{"bad-env-with-special", "/api/v1/vault/prod!ction/X", http.StatusBadRequest},
 	}

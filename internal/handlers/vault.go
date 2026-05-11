@@ -239,11 +239,34 @@ func (h *VaultHandler) upsertSecret(c *fiber.Ctx, action string) error {
 				"error", terr, "team_id", teamID,
 				"request_id", middleware.GetRequestID(c))
 		} else if team != nil {
-			// On rotate, we already require an existing key (rotate of a missing
-			// key is rejected by upsertSecret semantics). For PUT/set we must
-			// allow updating an existing key without burning a quota slot.
+			// Tier checks run in this order (most-restrictive first) so the
+			// reported error tells the caller what to upgrade:
+			//   1. env allowlist (403 vault_env_not_allowed)
+			//   2. quota cap     (402 vault_quota_exceeded)
+			//   3. availability  (403 vault_not_available) — handled inside quota
 			//
-			// Tier check 1: vault availability + quota (skip on rotate — count
+			// Pre-fix the env check ran second; a hobby-tier caller at quota
+			// who PUT to staging got 402 quota_exceeded instead of 403
+			// env_not_allowed — misleading, since adding seats wouldn't help.
+
+			// Tier check 1: env restriction (applies to both PUT and rotate).
+			allowed := h.plans.VaultEnvsAllowed(team.PlanTier)
+			if len(allowed) > 0 {
+				envOK := false
+				for _, a := range allowed {
+					if a == env {
+						envOK = true
+						break
+					}
+				}
+				if !envOK {
+					return respondError(c, fiber.StatusForbidden, vaultErrEnvNotAllowed,
+						fmt.Sprintf("Plan %q only allows vault env %v; got %q. Upgrade to Pro for multi-env vault.",
+							team.PlanTier, allowed, env))
+				}
+			}
+
+			// Tier check 2: vault availability + quota (skip on rotate — count
 			// can only stay flat or shrink).
 			if action != "rotate" {
 				maxEntries := h.plans.VaultMaxEntries(team.PlanTier)
@@ -267,23 +290,6 @@ func (h *VaultHandler) upsertSecret(c *fiber.Ctx, action string) error {
 									team.PlanTier, maxEntries, n))
 						}
 					}
-				}
-			}
-
-			// Tier check 2: env restriction (applies to both PUT and rotate).
-			allowed := h.plans.VaultEnvsAllowed(team.PlanTier)
-			if len(allowed) > 0 {
-				envOK := false
-				for _, a := range allowed {
-					if a == env {
-						envOK = true
-						break
-					}
-				}
-				if !envOK {
-					return respondError(c, fiber.StatusForbidden, vaultErrEnvNotAllowed,
-						fmt.Sprintf("Plan %q only allows vault env %v; got %q. Upgrade to Pro for multi-env vault.",
-							team.PlanTier, allowed, env))
 				}
 			}
 		}

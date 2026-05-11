@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -247,6 +248,12 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 
 	app := fiber.New(fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			// respondError already wrote the body — short-circuit so we
+			// don't overwrite. Matches the production ErrorHandler in
+			// router/router.go.
+			if errors.Is(err, handlers.ErrResponseWritten) {
+				return nil
+			}
 			code := fiber.StatusInternalServerError
 			if e, ok := err.(*fiber.Error); ok {
 				code = e.Code
