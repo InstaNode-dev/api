@@ -439,6 +439,18 @@ const openAPISpec = `{
           "200": { "description": "List of stored requests with headers and body" }
         }
       }
+    },
+    "/api/v1/billing": {
+      "get": {
+        "summary": "Aggregated billing state for the authenticated team",
+        "description": "One-shot fetch that powers the dashboard's billing view: current tier, Razorpay subscription status, next renewal timestamp, monthly amount, and the payment method on file. Returns 200 with sensibly-defaulted nulls for teams without a Razorpay subscription yet — callers can render the 'no subscription' UI without branching on error.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Aggregated billing state", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BillingStateResponse" } } } },
+          "401": { "description": "Missing or invalid session token" },
+          "404": { "description": "Team not found" }
+        }
+      }
     }
   },
   "components": {
@@ -711,6 +723,33 @@ const openAPISpec = `{
           "role": { "type": "string", "enum": ["admin", "developer", "viewer", "member"] },
           "expires_at": { "type": "string", "format": "date-time" }
         }
+      },
+      "BillingPaymentMethod": {
+        "type": "object",
+        "description": "Payment method on file. null when the team has no Razorpay subscription, or has a subscription but no successful charge yet.",
+        "properties": {
+          "type": { "type": "string", "enum": ["card", "upi", "netbanking", "wallet"], "description": "Razorpay payment method type" },
+          "brand": { "type": ["string", "null"], "description": "Card network (e.g. 'visa', 'mastercard') — present only for type=card" },
+          "last4": { "type": ["string", "null"], "description": "Last 4 digits — present only for type=card" },
+          "vpa": { "type": ["string", "null"], "description": "UPI VPA (e.g. 'name@hdfc') — present only for type=upi" }
+        },
+        "required": ["type"]
+      },
+      "BillingStateResponse": {
+        "type": "object",
+        "description": "Aggregated billing state served by GET /api/v1/billing.",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "tier": { "type": "string", "enum": ["anonymous", "hobby", "pro", "team"], "description": "Current plan tier from the team record" },
+          "subscription_status": { "type": "string", "enum": ["none", "active", "cancelled", "trial"], "description": "'none' when no Razorpay subscription exists; 'trial' when trial_ends_at is in the future; 'cancelled' when Razorpay reports cancelled / completed / expired or cancel_at_cycle_end=true; 'active' otherwise" },
+          "next_renewal_at": { "type": ["string", "null"], "format": "date-time", "description": "ISO timestamp for next renewal (Razorpay current_end). null when no active subscription" },
+          "amount_inr": { "type": ["integer", "null"], "description": "Monthly subscription amount in INR rupees (not paise). Sourced from the most recent paid invoice when available; falls back to the tier-derived price for brand-new subscriptions. null when no subscription on file" },
+          "payment_method": { "oneOf": [{ "$ref": "#/components/schemas/BillingPaymentMethod" }, { "type": "null" }] },
+          "billing_email": { "type": "string", "description": "Owner's email — best-effort; empty string when no owner user row exists" },
+          "razorpay_subscription_id": { "type": ["string", "null"], "description": "Razorpay subscription id (sub_xxx). null until the team starts a checkout flow. Useful for support tickets" },
+          "razorpay_customer_id": { "type": ["string", "null"], "description": "Razorpay customer id. Reserved for future use — always null today (Razorpay subscriptions don't require a pre-created customer record)" }
+        },
+        "required": ["ok", "tier", "subscription_status", "billing_email"]
       }
     }
   }

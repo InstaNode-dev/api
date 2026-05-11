@@ -259,6 +259,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Delete("/team/invitations/:id", teamMembersH.RevokeInvitation)
 	api.Post("/team/invitations/:id/accept", teamMembersH.AcceptInvitation)
 
+	api.Get("/billing", billing.GetBillingState)
 	api.Post("/billing/checkout", billing.CreateCheckoutAPI)
 	api.Post("/billing/cancel", billing.CancelSubscriptionAPI)
 	api.Get("/billing/invoices", billing.ListInvoicesAPI)
