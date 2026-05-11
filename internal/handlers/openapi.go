@@ -312,6 +312,17 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/whoami": {
+      "get": {
+        "summary": "Identity probe — confirms the bearer token is valid and returns the team it grants access to",
+        "description": "Lightweight endpoint for agents to verify their bearer token works and discover their team_id / plan_tier without an extra DB hop. Returns 401 on invalid/missing token, 200 with identity on success.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Identity confirmed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WhoamiResponse" } } } },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
     "/api/v1/resources": {
       "get": {
         "summary": "List all resources for the authenticated team",
@@ -471,6 +482,17 @@ const openAPISpec = `{
           "tier": { "type": "string", "enum": ["hobby", "pro", "team"] },
           "trial_ends_at": { "type": "string", "format": "date-time", "nullable": true }
         }
+      },
+      "WhoamiResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "user_id": { "type": "string", "format": "uuid" },
+          "team_id": { "type": "string", "format": "uuid" },
+          "team_name": { "type": "string", "description": "Present only when the team has a non-empty name" },
+          "plan_tier": { "type": "string", "enum": ["anonymous", "hobby", "pro", "team"], "description": "Best-effort enrichment from the teams table; absent on DB lookup failure" }
+        },
+        "required": ["ok", "user_id", "team_id"]
       },
       "ResourceListResponse": {
         "type": "object",
