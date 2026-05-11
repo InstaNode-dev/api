@@ -100,6 +100,60 @@ const openAPISpec = `{
         }
       }
     },
+    "/stacks/new": {
+      "post": {
+        "summary": "Deploy a multi-service stack",
+        "description": "Like POST /deploy/new but for an instant.yaml manifest declaring multiple services. Each service has its own build context (tarball), port, optional Ingress (expose:true), and optional list of resource tokens (needs:). Cross-service references use service://<name> in env values — these resolve to cluster-internal http://<name>:<port> URLs at deploy time, so service A can call service B without knowing its public hostname. OptionalAuth: anonymous stacks are supported (24h TTL, rate-limited by fingerprint).",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": { "$ref": "#/components/schemas/StackRequest" }
+            }
+          }
+        },
+        "responses": {
+          "202": { "description": "Stack accepted, building", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StackResponse" } } } },
+          "400": { "description": "Invalid manifest, missing tarball for a declared service, or unresolved service:// reference" },
+          "429": { "description": "Anonymous rate limit exceeded" },
+          "503": { "description": "Compute backend unavailable" }
+        }
+      }
+    },
+    "/stacks/{slug}": {
+      "get": {
+        "summary": "Get stack status",
+        "description": "Returns per-service status. The overall stack status is 'healthy' only when every service is healthy.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Stack record", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StackResponse" } } } },
+          "404": { "description": "Stack not found" }
+        }
+      },
+      "delete": {
+        "summary": "Tear down and delete a stack",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Deletion enqueued" },
+          "404": { "description": "Stack not found" }
+        }
+      }
+    },
+    "/stacks/{slug}/redeploy": {
+      "post": {
+        "summary": "Rebuild + rolling update for one or more services in the stack",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "202": { "description": "Redeploy accepted" },
+          "401": { "description": "Unauthorized — redeploy mutates the stack and requires a session" },
+          "404": { "description": "Stack not found" }
+        }
+      }
+    },
     "/deploy/new": {
       "post": {
         "summary": "Deploy a container application",
@@ -481,6 +535,40 @@ const openAPISpec = `{
           "email": { "type": "string" },
           "tier": { "type": "string", "enum": ["hobby", "pro", "team"] },
           "trial_ends_at": { "type": "string", "format": "date-time", "nullable": true }
+        }
+      },
+      "StackRequest": {
+        "type": "object",
+        "description": "Multipart form. The 'manifest' field is the YAML instant.yaml text; each service declared under services: must have a matching multipart field named after the service whose content is a gzipped tar archive of that service's build context.",
+        "properties": {
+          "manifest": { "type": "string", "description": "instant.yaml contents. Example: services:\\n  api:\\n    build: ./api\\n    port: 8080\\n  web:\\n    build: ./web\\n    port: 8080\\n    expose: true\\n    env: { API_URL: service://api }" },
+          "<service-name>": { "type": "string", "format": "binary", "description": "One field per service declared in the manifest, named after the service. Value is a gzipped tar archive containing that service's Dockerfile + source. Total request body cap is 200 MB." }
+        },
+        "required": ["manifest"]
+      },
+      "StackResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "stack_id": { "type": "string", "description": "Format: stk-<8-char-hex>. Use this for GET /stacks/{slug}." },
+          "status": { "type": "string", "enum": ["building", "deploying", "healthy", "failed", "stopped"], "description": "Overall stack status. 'healthy' only when every service is healthy." },
+          "tier": { "type": "string" },
+          "name": { "type": "string", "description": "Optional human-readable label (from manifest.name)" },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string", "description": "Service name from the manifest" },
+                "status": { "type": "string", "enum": ["building", "deploying", "healthy", "failed", "stopped"] },
+                "port": { "type": "integer" },
+                "expose": { "type": "boolean" },
+                "url": { "type": "string", "description": "Empty unless expose:true. Public HTTPS URL on *.deployment.instanode.dev — only the exposed service gets one; other services are reachable in-cluster only via http://<service-name>:<port>." }
+              }
+            }
+          },
+          "expires_in": { "type": "string", "description": "Anonymous stacks have a 24h TTL; authenticated stacks return empty." },
+          "note": { "type": "string" }
         }
       },
       "WhoamiResponse": {

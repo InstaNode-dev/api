@@ -54,6 +54,32 @@ func TestOpenAPI_BearerAuthDocumentsClaimFlow(t *testing.T) {
 	}
 }
 
+// TestOpenAPI_StacksEndpointsDocumented guards friction #1 — /stacks/new was
+// already implemented but undocumented, so agents reading the spec had no way
+// to discover the multi-service deploy primitive. This test ensures the path
+// stays in the spec and a future cleanup doesn't accidentally drop it.
+func TestOpenAPI_StacksEndpointsDocumented(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	paths, _ := v["paths"].(map[string]any)
+	for _, p := range []string{"/stacks/new", "/stacks/{slug}", "/stacks/{slug}/redeploy"} {
+		if _, ok := paths[p].(map[string]any); !ok {
+			t.Errorf("OpenAPI is missing path %q — agents cannot discover the multi-service deploy primitive from the spec alone", p)
+		}
+	}
+	// StackResponse schema must describe the array-of-services shape so agents
+	// know how to read the status of each service after deploy.
+	if props, ok := digMap(v, "components", "schemas", "StackResponse", "properties"); ok {
+		if _, ok := props["services"]; !ok {
+			t.Error("StackResponse schema missing 'services' field — agents have no machine-readable signal that per-service status is reported as an array")
+		}
+	} else {
+		t.Error("StackResponse schema missing entirely")
+	}
+}
+
 func digMap(root map[string]any, keys ...string) (map[string]any, bool) {
 	cur := root
 	for _, k := range keys {
