@@ -230,6 +230,14 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	middleware.SetRoleLookupDB(db) // populate auth_team_role on every RequireAuth
 	middleware.SetAPIKeyDB(db)     // enable PAT auth path in RequireAuth
 	api := app.Group("/api/v1", middleware.RequireAuth(cfg), middleware.PopulateTeamRole())
+
+	// /whoami — identity probe for agents. Returning 401 here is the canonical
+	// "your token is bad"; returning anything else from this endpoint means
+	// the token works. Reaching for arbitrary paths like /api/v1/team gave
+	// 404 instead of 401, leading to wasted token-mint retry cycles.
+	whoamiH := handlers.NewWhoamiHandler(db)
+	api.Get("/whoami", whoamiH.Get)
+
 	api.Get("/resources", resourceH.List)
 	api.Get("/resources/:id", resourceH.Get)
 	api.Get("/resources/:id/credentials", resourceH.GetCredentials)
