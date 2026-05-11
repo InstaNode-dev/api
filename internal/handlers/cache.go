@@ -260,6 +260,8 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 		"env":            resource.Env,
 		"limits":         cacheAnonymousLimits(),
 		"note":           upgradeNote(upgradeURL),
+		"upgrade":        upgradeURL,
+		"upgrade_jwt":    jwtToken,
 	}
 	if creds.KeyPrefix != "" {
 		resp["key_prefix"] = creds.KeyPrefix

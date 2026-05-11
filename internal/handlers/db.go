@@ -260,6 +260,8 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 		"env":            resource.Env,
 		"limits":         dbAnonymousLimits(),
 		"note":           upgradeNote(upgradeURL),
+		"upgrade":        upgradeURL,
+		"upgrade_jwt":    jwtToken,
 	}
 	if storageExceeded {
 		resp["warning"] = "Storage limit reached. Upgrade to continue."

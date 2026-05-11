@@ -255,6 +255,8 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		"env":            resource.Env,
 		"limits":         queueAnonymousLimits(),
 		"note":           upgradeNote(upgradeURL),
+		"upgrade":        upgradeURL,
+		"upgrade_jwt":    jwtToken,
 	})
 }
 
