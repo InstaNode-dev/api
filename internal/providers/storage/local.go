@@ -49,14 +49,21 @@ type Credentials struct {
 
 // Provider manages MinIO storage provisioning.
 type Provider struct {
-	madmClient *madmin.AdminClient
-	endpoint   string // host:port, e.g. "minio.instant-data.svc.cluster.local:9000"
-	bucketName string // e.g. "instant-shared"
+	madmClient     *madmin.AdminClient
+	endpoint       string // internal host:port for admin/bucket ops, e.g. "minio.instant-data.svc.cluster.local:9000"
+	publicEndpoint string // host:port returned to customers (falls back to endpoint when empty)
+	bucketName     string // e.g. "instant-shared"
 }
 
 // New creates a Provider backed by a MinIO admin client.
-// endpoint is "host:port", rootUser/rootPassword are the MinIO root credentials.
-func New(endpoint, rootUser, rootPassword, bucketName string) (*Provider, error) {
+//
+// endpoint is the cluster-internal "host:port" used for IAM/bucket admin calls.
+// publicEndpoint is the customer-reachable address returned in BucketURL/Endpoint.
+// Accepts either bare "host[:port]" (defaults to http://) or a scheme-prefixed
+// "https://host" / "http://host[:port]" form for TLS-terminated public hostnames.
+// When empty, it falls back to endpoint (legacy in-cluster behavior).
+// rootUser/rootPassword are the MinIO root credentials.
+func New(endpoint, publicEndpoint, rootUser, rootPassword, bucketName string) (*Provider, error) {
 	if endpoint == "" {
 		return nil, fmt.Errorf("storage: MinIO endpoint is required (MINIO_ENDPOINT)")
 	}
@@ -70,10 +77,38 @@ func New(endpoint, rootUser, rootPassword, bucketName string) (*Provider, error)
 	}
 
 	return &Provider{
-		madmClient: madmClient,
-		endpoint:   endpoint,
-		bucketName: bucketName,
+		madmClient:     madmClient,
+		endpoint:       endpoint,
+		publicEndpoint: publicEndpoint,
+		bucketName:     bucketName,
 	}, nil
+}
+
+// customerEndpoint returns the host[:port] to surface to customers, stripped of
+// any scheme. Falls back to the internal endpoint when no public override is set.
+func (p *Provider) customerEndpoint() string {
+	raw := p.publicEndpoint
+	if raw == "" {
+		raw = p.endpoint
+	}
+	// Strip a leading scheme if present (e.g. "https://s3.instanode.dev" → "s3.instanode.dev").
+	if i := strings.Index(raw, "://"); i >= 0 {
+		raw = raw[i+3:]
+	}
+	return strings.TrimRight(raw, "/")
+}
+
+// customerScheme returns the URL scheme to surface to customers ("http" or "https").
+// Derived from publicEndpoint when it carries an explicit scheme; otherwise "http"
+// to preserve in-cluster legacy behavior.
+func (p *Provider) customerScheme() string {
+	if p.publicEndpoint == "" {
+		return "http"
+	}
+	if strings.HasPrefix(p.publicEndpoint, "https://") {
+		return "https"
+	}
+	return "http"
 }
 
 // Provision creates a MinIO IAM user scoped to a per-token prefix and returns
@@ -119,8 +154,10 @@ func (p *Provider) Provision(ctx context.Context, token, tier string) (*Credenti
 		return nil, fmt.Errorf("storage.Provision: SetPolicy %q → %q: %w", policyName, accessKeyID, err)
 	}
 
-	bucketURL := fmt.Sprintf("http://%s/%s/%s", p.endpoint, p.bucketName, objectPrefix)
-	endpoint := fmt.Sprintf("http://%s", p.endpoint)
+	customerHost := p.customerEndpoint()
+	scheme := p.customerScheme()
+	bucketURL := fmt.Sprintf("%s://%s/%s/%s", scheme, customerHost, p.bucketName, objectPrefix)
+	endpoint := fmt.Sprintf("%s://%s", scheme, customerHost)
 
 	slog.Info("storage.Provision: MinIO user created",
 		"token", token,

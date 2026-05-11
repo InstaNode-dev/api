@@ -26,6 +26,11 @@ type Credentials struct {
 	// Clients must prefix all keys with this value to stay in their namespace.
 	// Empty when ACL-based isolation is used.
 	KeyPrefix string
+
+	// ProviderResourceID is the backend-specific resource identifier.
+	// For k8s-dedicated backend: the namespace name "instant-customer-<token>".
+	// Empty for the shared local backend.
+	ProviderResourceID string
 }
 
 // Provider manages Redis namespace provisioning.

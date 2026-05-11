@@ -4,3 +4,4 @@ GeoLite2-*.mmdb
 .env
 .env.*
 !.env.example
+node_modules

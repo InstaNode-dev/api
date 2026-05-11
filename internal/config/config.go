@@ -48,10 +48,11 @@ type Config struct {
 	R2BucketName             string // R2_BUCKET_NAME — shared R2 bucket name (default: instant-shared)
 	R2APIToken               string // R2_API_TOKEN — Cloudflare API token; if empty, R2 is not used
 	// MinIO S3-compatible storage (local dev backend for /storage/new)
-	MinioEndpoint     string // MINIO_ENDPOINT — host:port (e.g. minio.instant-data.svc.cluster.local:9000)
-	MinioRootUser     string // MINIO_ROOT_USER — admin access key
-	MinioRootPassword string // MINIO_ROOT_PASSWORD — admin secret key
-	MinioBucketName   string // MINIO_BUCKET_NAME — shared bucket (default: instant-shared)
+	MinioEndpoint       string // MINIO_ENDPOINT — host:port used internally for bucket/IAM admin (e.g. minio.instant-data.svc.cluster.local:9000)
+	MinioPublicEndpoint string // MINIO_PUBLIC_ENDPOINT — host:port returned to customers in connection_url/endpoint (e.g. s3.instanode.dev:9000). Empty = fall back to MinioEndpoint.
+	MinioRootUser       string // MINIO_ROOT_USER — admin access key
+	MinioRootPassword   string // MINIO_ROOT_PASSWORD — admin secret key
+	MinioBucketName     string // MINIO_BUCKET_NAME — shared bucket (default: instant-shared)
 	DeployDomain      string // DEPLOY_DOMAIN — base domain for container deployments (default: instant.dev)
 
 	// Compute provider for app hosting (Phase 6)
@@ -93,8 +94,8 @@ func Load() *Config {
 		DatabaseURL:              require("DATABASE_URL"),
 		CustomerDatabaseURL:      getenv("CUSTOMER_DATABASE_URL", ""),
 		RedisURL:                 getenv("REDIS_URL", "redis://localhost:6379"),
-		JWTSecret:                require("JWT_SECRET"),
-		AESKey:                   require("AES_KEY"),
+		JWTSecret:                strings.TrimSpace(require("JWT_SECRET")),
+		AESKey:                   strings.TrimSpace(require("AES_KEY")),
 		MaxMindLicenseKey:        os.Getenv("MAXMIND_LICENSE_KEY"),
 		GeoLite2DBPath:           getenv("GEOLITE2_DB_PATH", "./GeoLite2-City.mmdb"),
 		RazorpayKeyID:            os.Getenv("RAZORPAY_KEY_ID"),
@@ -129,6 +130,7 @@ func Load() *Config {
 	cfg.R2BucketName = getenv("R2_BUCKET_NAME", "instant-shared")
 	cfg.R2APIToken = os.Getenv("R2_API_TOKEN")
 	cfg.MinioEndpoint = os.Getenv("MINIO_ENDPOINT")
+	cfg.MinioPublicEndpoint = os.Getenv("MINIO_PUBLIC_ENDPOINT")
 	cfg.MinioRootUser = os.Getenv("MINIO_ROOT_USER")
 	cfg.MinioRootPassword = os.Getenv("MINIO_ROOT_PASSWORD")
 	cfg.MinioBucketName = getenv("MINIO_BUCKET_NAME", "instant-shared")
@@ -186,6 +188,7 @@ func logStartupConfig(cfg *Config) {
 		"r2_endpoint", cfg.R2Endpoint,
 		"r2_bucket_name", cfg.R2BucketName,
 		"minio_endpoint", cfg.MinioEndpoint,
+		"minio_public_endpoint", cfg.MinioPublicEndpoint,
 		"minio_bucket_name", cfg.MinioBucketName,
 		"deploy_domain", cfg.DeployDomain,
 		"compute_provider", cfg.ComputeProvider,

@@ -212,6 +212,69 @@ func (h *ResourceHandler) Delete(c *fiber.Ctx) error {
 	})
 }
 
+// GetCredentials handles GET /api/v1/resources/:id/credentials.
+// Returns the plaintext connection URL for the team's own resource — same
+// auth boundary as RotateCredentials, but does NOT change the password.
+// Used by `instant up` to re-emit URLs into .env on subsequent runs.
+func (h *ResourceHandler) GetCredentials(c *fiber.Ctx) error {
+	requestID := middleware.GetRequestID(c)
+
+	teamID, err := parseTeamID(middleware.GetTeamID(c))
+	if err != nil {
+		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Valid session token required")
+	}
+
+	tokenStr := c.Params("id")
+	token, parseErr := uuid.Parse(tokenStr)
+	if parseErr != nil {
+		return respondError(c, fiber.StatusBadRequest, "invalid_id", "Resource ID must be a valid UUID")
+	}
+
+	resource, err := models.GetResourceByToken(c.Context(), h.db, token)
+	if err != nil {
+		var notFound *models.ErrResourceNotFound
+		if errors.As(err, &notFound) {
+			return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
+		}
+		slog.Error("resource.credentials.lookup_failed",
+			"error", err, "token", tokenStr, "request_id", requestID)
+		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch resource")
+	}
+
+	if !resource.TeamID.Valid || resource.TeamID.UUID != teamID {
+		// Mirror "404 not 403" pattern used elsewhere — never confirm the
+		// existence of resources owned by other teams.
+		return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
+	}
+
+	if !resource.ConnectionURL.Valid || resource.ConnectionURL.String == "" {
+		return respondError(c, fiber.StatusBadRequest, "no_connection_url",
+			"This resource does not have a connection URL")
+	}
+
+	aesKey, err := crypto.ParseAESKey(h.cfg.AESKey)
+	if err != nil {
+		slog.Error("resource.credentials.aes_key_invalid",
+			"error", err, "request_id", requestID)
+		return respondError(c, fiber.StatusInternalServerError, "internal_error", "Encryption configuration error")
+	}
+	plain, err := crypto.Decrypt(aesKey, resource.ConnectionURL.String)
+	if err != nil {
+		slog.Error("resource.credentials.decrypt_failed",
+			"error", err, "resource_id", resource.ID, "request_id", requestID)
+		return respondError(c, fiber.StatusInternalServerError, "internal_error", "Failed to decrypt connection URL")
+	}
+
+	return c.JSON(fiber.Map{
+		"ok":             true,
+		"id":             resource.ID,
+		"token":          resource.Token,
+		"resource_type":  resource.ResourceType,
+		"env":            resource.Env,
+		"connection_url": plain,
+	})
+}
+
 // RotateCredentials handles POST /api/v1/resources/:id/rotate-credentials.
 // Generates a new password, re-encrypts the connection URL, persists it, and
 // returns the new plaintext URL — this is the only endpoint that exposes connection_url.
@@ -366,6 +429,7 @@ func resourceToMap(r *models.Resource) fiber.Map {
 		"id":            r.ID,
 		"token":         r.Token,
 		"resource_type": r.ResourceType,
+		"env":           r.Env,
 		"tier":          r.Tier,
 		"status":        r.Status,
 		"created_at":    r.CreatedAt,

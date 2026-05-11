@@ -48,6 +48,15 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// e2eTestToken returns the shared secret used to override the production
+// fingerprint middleware's source-IP selection (see middleware/fingerprint.go).
+// When E2E_TEST_TOKEN is set on both the cluster (env) and the test runner,
+// the test runner's X-Forwarded-For is honored as the leftmost entry,
+// restoring per-test fingerprint isolation against the live cluster.
+func e2eTestToken() string {
+	return os.Getenv("E2E_TEST_TOKEN")
+}
+
 // ipSeq is an atomic counter incremented per uniqueSubnet/uniqueIP call.
 // It guarantees distinct /24 subnets within a single binary run.
 var ipSeq atomic.Int64
@@ -114,6 +123,15 @@ func getNoRedirect(t *testing.T, path string, headers ...string) *http.Response 
 	for i := 0; i+1 < len(headers); i += 2 {
 		req.Header.Set(headers[i], headers[i+1])
 	}
+	if tok := e2eTestToken(); tok != "" && req.Header.Get("X-E2E-Test-Token") == "" {
+		req.Header.Set("X-E2E-Test-Token", tok)
+		// Mirror X-Forwarded-For onto X-E2E-Source-IP because ingress-nginx
+		// overwrites XFF by default. The bypass middleware reads X-E2E-Source-IP
+		// when the trust token is valid, so the test's chosen IP survives.
+		if xff := req.Header.Get("X-Forwarded-For"); xff != "" && req.Header.Get("X-E2E-Source-IP") == "" {
+			req.Header.Set("X-E2E-Source-IP", xff)
+		}
+	}
 	resp, err := noRedirectClient.Do(req)
 	if err != nil {
 		t.Fatalf("getNoRedirect %s: %v", path, err)
@@ -130,6 +148,15 @@ func get(t *testing.T, path string, headers ...string) *http.Response {
 	}
 	for i := 0; i+1 < len(headers); i += 2 {
 		req.Header.Set(headers[i], headers[i+1])
+	}
+	if tok := e2eTestToken(); tok != "" && req.Header.Get("X-E2E-Test-Token") == "" {
+		req.Header.Set("X-E2E-Test-Token", tok)
+		// Mirror X-Forwarded-For onto X-E2E-Source-IP because ingress-nginx
+		// overwrites XFF by default. The bypass middleware reads X-E2E-Source-IP
+		// when the trust token is valid, so the test's chosen IP survives.
+		if xff := req.Header.Get("X-Forwarded-For"); xff != "" && req.Header.Get("X-E2E-Source-IP") == "" {
+			req.Header.Set("X-E2E-Source-IP", xff)
+		}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -162,6 +189,15 @@ func postCtx(t *testing.T, ctx context.Context, path string, body any, headers .
 	req.Header.Set("Content-Type", "application/json")
 	for i := 0; i+1 < len(headers); i += 2 {
 		req.Header.Set(headers[i], headers[i+1])
+	}
+	if tok := e2eTestToken(); tok != "" && req.Header.Get("X-E2E-Test-Token") == "" {
+		req.Header.Set("X-E2E-Test-Token", tok)
+		// Mirror X-Forwarded-For onto X-E2E-Source-IP because ingress-nginx
+		// overwrites XFF by default. The bypass middleware reads X-E2E-Source-IP
+		// when the trust token is valid, so the test's chosen IP survives.
+		if xff := req.Header.Get("X-Forwarded-For"); xff != "" && req.Header.Get("X-E2E-Source-IP") == "" {
+			req.Header.Set("X-E2E-Source-IP", xff)
+		}
 	}
 	resp, err := client.Do(req)
 	if err != nil {

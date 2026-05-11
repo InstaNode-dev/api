@@ -17,6 +17,7 @@ import (
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/migratorclient"
 	"instant.dev/internal/plans"
+	"instant.dev/internal/providers/compute/k8s"
 	storageprovider "instant.dev/internal/providers/storage"
 	"instant.dev/internal/provisioner"
 )
@@ -58,9 +59,13 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		EnableStackTrace: cfg.Environment == "development",
 	}))
 	app.Use(fiberCORS.New(fiberCORS.Config{
-		AllowOrigins:  "*",
-		AllowMethods:  "GET,POST,PATCH,DELETE,OPTIONS",
-		AllowHeaders:  "Content-Type,Authorization,X-Request-ID",
+		// Production origin (GitHub Pages serves instanode.dev) + every
+		// reasonable local-dev port. The wildcard would still work for
+		// bearer-token traffic (no cookies in flight) but an explicit
+		// allowlist makes the policy auditable. Add origins as needed.
+		AllowOrigins:  "https://instanode.dev,https://www.instanode.dev,http://localhost:5173,http://localhost:3000,http://localhost:5174",
+		AllowMethods:  "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+		AllowHeaders:  "Content-Type,Authorization,X-Request-ID,X-E2E-Test-Token,X-E2E-Source-IP",
 		ExposeHeaders: "X-Request-ID,X-Instant-Upgrade,X-Instant-Notice",
 	}))
 	app.Use(middleware.GeoEnrich(geoDbs))
@@ -78,7 +83,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// so that DELETE /api/v1/resources/:id can deprovision MinIO IAM users.
 	var storageProv *storageprovider.Provider
 	if cfg.MinioEndpoint != "" {
-		if sp, err := storageprovider.New(cfg.MinioEndpoint, cfg.MinioRootUser, cfg.MinioRootPassword, cfg.MinioBucketName); err != nil {
+		if sp, err := storageprovider.New(cfg.MinioEndpoint, cfg.MinioPublicEndpoint, cfg.MinioRootUser, cfg.MinioRootPassword, cfg.MinioBucketName); err != nil {
 			slog.Warn("storage: MinIO provider init failed", "error", err)
 		} else {
 			storageProv = sp
@@ -97,6 +102,23 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	deployH := handlers.NewDeployHandler(db, rdb, cfg)
 	stackH := handlers.NewStackHandler(db, rdb, cfg, planRegistry)
 
+	// Custom-domain handler shares the k8s stack provider so EnsureCustomDomainIngress
+	// can update the same Ingress namespace the stack lives in. We construct a
+	// dedicated *k8s.K8sStackProvider here (rather than reaching into stackH) so
+	// the dependency surface stays explicit. When ComputeProvider != "k8s" the
+	// pointer is left nil and the handler skips ingress work — verification still
+	// progresses through TXT and the row stays at "verified" / "ingress_ready"
+	// until a future operator wires real k8s.
+	var customDomainK8s handlers.CustomDomainProvider
+	if cfg.ComputeProvider == "k8s" {
+		if csp, err := k8s.NewStackProvider(cfg.KubeNamespaceApps); err != nil {
+			slog.Warn("custom_domain.k8s_provider_unavailable", "error", err)
+		} else {
+			customDomainK8s = csp
+		}
+	}
+	customDomainH := handlers.NewCustomDomainHandler(db, cfg, planRegistry, customDomainK8s)
+
 	// ── Routes ───────────────────────────────────────────────────────────────
 
 	// Health check
@@ -106,6 +128,9 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 
 	// OpenAPI spec — machine-readable description of the agent-facing API
 	app.Get("/openapi.json", handlers.ServeOpenAPI)
+
+	// MCP authorization profile — RFC 8414 / OAuth 2.0 Protected Resource Metadata.
+	app.Get("/.well-known/oauth-protected-resource", handlers.ServeOAuthProtectedResourceMetadata)
 
 	// Prometheus metrics — gated by METRICS_TOKEN when set (open in local dev).
 	app.Get("/metrics", func(c *fiber.Ctx) error {
@@ -155,11 +180,23 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Patch("/stacks/:slug/env", middleware.RequireAuth(cfg), stackH.UpdateEnv)
 	app.Post("/stacks/:slug/redeploy", middleware.RequireAuth(cfg), stackH.Redeploy)
 
-	// OAuth
+	// OAuth — POST handler serves the existing programmatic / SPA flow.
+	// Google login is intentionally NOT supported; if you need it, register
+	// the routes here and wire GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET.
 	app.Post("/auth/github", authH.GitHub)
-	app.Post("/auth/google", authH.Google)
-	app.Post("/auth/google/callback", authH.GoogleCallback)
-	app.Get("/auth/google/url", authH.GoogleAuthURL)
+
+	// Browser OAuth flows (GET-based, redirect-driven). The dashboard's
+	// login page links to /auth/github/start directly; it stashes a CSRF
+	// state cookie, hands off to GitHub, and 302s back to
+	// <return_to>?session_token=<jwt> after exchanging the code.
+	app.Get("/auth/github/start", authH.GitHubStart)
+	app.Get("/auth/github/callback", authH.GitHubCallback)
+
+	// Magic-link email login. Start is POST (the dashboard's login form
+	// submits to it); Callback is GET (the user's email client links to it).
+	mlH := handlers.NewMagicLinkHandler(db, cfg, emailClient, authH)
+	app.Post("/auth/email/start", mlH.Start)
+	app.Get("/auth/email/callback", mlH.Callback)
 
 	// CLI device-flow login — POST creates session, GET polls for completion
 	app.Post("/auth/cli", cliAuthH.CreateCLISession)
@@ -172,17 +209,28 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		migClient = migratorclient.New(cfg.MigratorAddr, cfg.MigratorSecret)
 	}
 	billing := handlers.NewBillingHandler(db, cfg, emailClient, migClient)
-	app.Post("/billing/checkout", middleware.RequireAuth(cfg), billing.CreateCheckout)
+	// Legacy alias kept for backward compatibility; canonical path is
+	// /api/v1/billing/checkout (registered under the /api/v1 group below).
+	app.Post("/billing/checkout", middleware.RequireAuth(cfg), billing.CreateCheckoutAPI)
 	app.Post("/razorpay/webhook", billing.RazorpayWebhook)
 
 	// Public webhook request listing — token IS the credential (no session needed).
 	// Authenticated callers use the same handler; it additionally verifies team ownership.
 	app.Get("/api/v1/webhooks/:token/requests", middleware.OptionalAuth(cfg), webhookH.ListRequests)
 
+	// Public token-based invitation accept — must be registered BEFORE the
+	// /api/v1 auth group so the group middleware doesn't catch it.
+	// (Token IS the auth here — no Bearer required.)
+	teamsHPublic := handlers.NewTeamsHandler(db, cfg, emailClient)
+	app.Post("/api/v1/invitations/:token/accept", teamsHPublic.AcceptInvitation)
+
 	// Authenticated resource management
-	api := app.Group("/api/v1", middleware.RequireAuth(cfg))
+	middleware.SetRoleLookupDB(db) // populate auth_team_role on every RequireAuth
+	middleware.SetAPIKeyDB(db)     // enable PAT auth path in RequireAuth
+	api := app.Group("/api/v1", middleware.RequireAuth(cfg), middleware.PopulateTeamRole())
 	api.Get("/resources", resourceH.List)
 	api.Get("/resources/:id", resourceH.Get)
+	api.Get("/resources/:id/credentials", resourceH.GetCredentials)
 	api.Delete("/resources/:id", resourceH.Delete)
 	api.Post("/resources/:id/rotate-credentials", resourceH.RotateCredentials)
 
@@ -194,6 +242,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Delete("/team/invitations/:id", teamMembersH.RevokeInvitation)
 	api.Post("/team/invitations/:id/accept", teamMembersH.AcceptInvitation)
 
+	api.Post("/billing/checkout", billing.CreateCheckoutAPI)
 	api.Post("/billing/cancel", billing.CancelSubscriptionAPI)
 	api.Get("/billing/invoices", billing.ListInvoicesAPI)
 	api.Post("/billing/update-payment", billing.UpdatePaymentMethodAPI)
@@ -206,6 +255,39 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 
 	// Stack management endpoints — Phase 6 (under /api/v1)
 	api.Get("/stacks", stackH.List)
+
+	// Custom domains — Pro+ "bring your own hostname" for stacks. All routes
+	// require auth (the /api/v1 group middleware) and additionally enforce
+	// stack ownership inside the handler.
+	api.Post("/stacks/:slug/domains", customDomainH.Create)
+	api.Get("/stacks/:slug/domains", customDomainH.List)
+	api.Post("/stacks/:slug/domains/:id/verify", customDomainH.Verify)
+	api.Delete("/stacks/:slug/domains/:id", customDomainH.Delete)
+
+	// Personal Access Tokens — long-lived bearer tokens for agents/CI.
+	apiKeysH := handlers.NewAPIKeysHandler(db)
+	api.Post("/auth/api-keys", apiKeysH.Create)
+	api.Get("/auth/api-keys", apiKeysH.List)
+	api.Delete("/auth/api-keys/:id", apiKeysH.Revoke)
+
+	// Per-team audit log — feeds the dashboard's Recent Activity panel.
+	auditH := handlers.NewAuditHandler(db)
+	api.Get("/audit", auditH.List)
+
+	// Vault — per-team encrypted secret storage (Phase 1: Heroku-shape platform).
+	vaultH := handlers.NewVaultHandler(db, cfg, planRegistry)
+	api.Put("/vault/:env/:key", vaultH.PutSecret)
+	api.Get("/vault/:env/:key", vaultH.GetSecret)
+	api.Get("/vault/:env", vaultH.ListKeys)
+	api.Delete("/vault/:env/:key", vaultH.DeleteSecret)
+	api.Post("/vault/:env/:key/rotate", vaultH.RotateSecret)
+
+	// Teams + RBAC invitation flow (Phase 3). Public accept route is
+	// registered above the api group so the auth middleware doesn't catch it.
+	teamsH := teamsHPublic // reuse the same handler instance
+	api.Post("/teams/:team_id/invitations", middleware.RequireRole("admin"), teamsH.CreateInvitation)
+	api.Get("/teams/:team_id/invitations", middleware.RequireRole("admin"), teamsH.ListInvitations)
+	api.Delete("/teams/:team_id/invitations/:id", middleware.RequireRole("admin"), teamsH.RevokeInvitation)
 
 	// Internal dev-only endpoints — only registered in development environment.
 	// These bypass Razorpay and directly mutate DB state. Never expose in production.

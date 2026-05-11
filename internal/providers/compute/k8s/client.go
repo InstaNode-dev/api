@@ -13,12 +13,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -156,6 +156,12 @@ func (p *K8sProvider) createDeployNamespace(ctx context.Context, appID, tier str
 	return p.setupTenantNamespace(ctx, deployNamespace(appID), appID, tier)
 }
 
+// ptrProto / ptrPort — addressable temporaries for inline NetworkPolicyPort literals.
+// Avoids the "address of unaddressable value" compile error when building Protocol/Port
+// pointer fields without naming each one separately.
+func ptrProto(p corev1.Protocol) *corev1.Protocol { return &p }
+func ptrPort(p int) *intstr.IntOrString          { v := intstr.FromInt(p); return &v }
+
 // createNetworkPolicyInNS installs a default-deny NetworkPolicy in the given namespace
 // and adds targeted allow rules:
 //   - Allow DNS egress to kube-system (UDP+TCP port 53) — required for hostname resolution
@@ -214,6 +220,21 @@ func (p *K8sProvider) createNetworkPolicyInNS(ctx context.Context, ns string) er
 					},
 				},
 				{
+					// Allow ingress from nginx-ingress namespace. Required because
+					// Cilium-backed clusters (DOKS default) do NOT match in-cluster
+					// pod IPs against an "0.0.0.0/0" ipBlock — nginx-ingress traffic
+					// would otherwise be blocked.
+					From: []networkingv1.NetworkPolicyPeer{
+						{
+							NamespaceSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{
+									"kubernetes.io/metadata.name": "ingress-nginx",
+								},
+							},
+						},
+					},
+				},
+				{
 					// Allow external ingress (NodePort traffic from the host / Lima VM).
 					// Required when STACK_EXPOSE_VIA=nodeport; harmless when using Ingress.
 					From: []networkingv1.NetworkPolicyPeer{
@@ -233,6 +254,48 @@ func (p *K8sProvider) createNetworkPolicyInNS(ctx context.Context, ns string) er
 						{
 							PodSelector: &metav1.LabelSelector{},
 						},
+					},
+				},
+				{
+					// Allow egress to dedicated DB pods in customer-resource namespaces
+					// on the data ports. Each /db/new, /cache/new, etc. creates a namespace
+					// labelled "instant.dev/role=customer-resource" — this rule lets the
+					// stack's app pods reach the postgres/redis/mongo/nats pod they `needs:`.
+					// Without this, Cilium-backed clusters (DOKS) silently drop service-IP
+					// traffic even though the broad `0.0.0.0/0` rule below ought to cover it.
+					To: []networkingv1.NetworkPolicyPeer{
+						{
+							NamespaceSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{
+									"instant.dev/role": "customer-resource",
+								},
+							},
+						},
+					},
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(5432)},  // postgres
+						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(6379)},  // redis
+						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(27017)}, // mongo
+						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(4222)},  // nats
+					},
+				},
+				{
+					// Allow egress to the `instant` namespace on data ports, so stacks can
+					// reach the in-cluster pg-proxy (and future redis/mongo/nats proxies).
+					To: []networkingv1.NetworkPolicyPeer{
+						{
+							NamespaceSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{
+									"kubernetes.io/metadata.name": "instant",
+								},
+							},
+						},
+					},
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(5432)},
+						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(6379)},
+						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(27017)},
+						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(4222)},
 					},
 				},
 				{
@@ -289,26 +352,27 @@ func (p *K8sProvider) createDefaultDenyNetworkPolicy(ctx context.Context, appID 
 }
 
 // createResourceQuotaInNS installs a ResourceQuota in the given namespace.
-// Limits vary by tier:
-//   - hobby: 256Mi RAM, 250m CPU, 5 pods max
-//   - pro:   512Mi RAM, 500m CPU, 10 pods max
-//   - team:  2Gi RAM,   2 CPU,    20 pods max
+// Limits include headroom (~256Mi + 1 pod) for cert-manager HTTP-01 ACME
+// solver pods that spawn briefly when issuing/renewing TLS certs.
+//   - hobby: 512Mi RAM, 500m CPU, 6 pods max
+//   - pro:   1Gi RAM,   1 CPU,    11 pods max
+//   - team:  3Gi RAM,   3 CPU,    21 pods max
 func (p *K8sProvider) createResourceQuotaInNS(ctx context.Context, ns, tier string) error {
 	var memLimit, cpuLimit string
 	var maxPods string
 	switch tier {
 	case "pro":
+		memLimit = "1Gi"
+		cpuLimit = "1"
+		maxPods = "11"
+	case "team":
+		memLimit = "3Gi"
+		cpuLimit = "3"
+		maxPods = "21"
+	default: // hobby + anonymous
 		memLimit = "512Mi"
 		cpuLimit = "500m"
-		maxPods = "10"
-	case "team":
-		memLimit = "2Gi"
-		cpuLimit = "2"
-		maxPods = "20"
-	default: // hobby + anonymous
-		memLimit = "256Mi"
-		cpuLimit = "250m"
-		maxPods = "5"
+		maxPods = "6"
 	}
 
 	quota := &corev1.ResourceQuota{
@@ -399,7 +463,7 @@ func (p *K8sProvider) Deploy(ctx context.Context, opts compute.DeployOptions) (*
 	ns := deployNamespace(opts.AppID)
 
 	// Step 1: Build the Docker image from the tarball.
-	if err := p.buildImage(ctx, opts.AppID, imageTag, opts.Tarball); err != nil {
+	if err := p.buildImage(ctx, deployNamespace(opts.AppID), opts.AppID, imageTag, opts.Tarball); err != nil {
 		return nil, fmt.Errorf("k8s.Deploy: build image: %w", err)
 	}
 
@@ -424,17 +488,31 @@ func (p *K8sProvider) Deploy(ctx context.Context, opts compute.DeployOptions) (*
 		return nil, fmt.Errorf("k8s.Deploy: apply service: %w", err)
 	}
 
+	// Step 8: Create Ingress (+ cert-manager TLS) when DEPLOY_DOMAIN is set.
+	// Falls back to the NodePort URL on local clusters that don't have an
+	// ingress controller or public domain configured.
+	ingressURL, err := p.applyIngressForDeploy(ctx, ns, svcName, opts.AppID, opts.Port)
+	if err != nil {
+		return nil, fmt.Errorf("k8s.Deploy: apply ingress: %w", err)
+	}
+
+	publicURL := ingressURL
+	if publicURL == "" {
+		publicURL = appURL(nodePort)
+	}
+
 	slog.Info("k8s.Deploy: deployment created",
 		"app_id", opts.AppID,
 		"image", imageTag,
 		"namespace", ns,
 		"node_port", nodePort,
+		"ingress_url", ingressURL,
+		"url", publicURL,
 	)
 
-	appURL := appURL(nodePort)
 	return &compute.AppDeployment{
 		ProviderID: deployName,
-		AppURL:     appURL,
+		AppURL:     publicURL,
 		Status:     "building",
 		UpdatedAt:  time.Now(),
 	}, nil
@@ -469,9 +547,16 @@ func (p *K8sProvider) Status(ctx context.Context, providerID string) (*compute.A
 		nodePort = int(svc.Spec.Ports[0].NodePort)
 	}
 
+	// Prefer the public Ingress URL when DEPLOY_DOMAIN is configured; fall
+	// back to the NodePort URL for local dev.
+	publicURL := deployIngressURL(appID)
+	if publicURL == "" {
+		publicURL = appURL(nodePort)
+	}
+
 	return &compute.AppDeployment{
 		ProviderID: providerID,
-		AppURL:     appURL(nodePort),
+		AppURL:     publicURL,
 		Status:     status,
 		UpdatedAt:  deploy.CreationTimestamp.Time,
 	}, nil
@@ -528,7 +613,7 @@ func (p *K8sProvider) Redeploy(ctx context.Context, providerID string, tarball [
 	imageTag := imageName(appID)
 	ns := deployNamespace(appID)
 
-	if err := p.buildImage(ctx, appID, imageTag, tarball); err != nil {
+	if err := p.buildImage(ctx, deployNamespace(appID), appID, imageTag, tarball); err != nil {
 		return nil, fmt.Errorf("k8s.Redeploy: build image: %w", err)
 	}
 
@@ -561,46 +646,233 @@ func (p *K8sProvider) Redeploy(ctx context.Context, providerID string, tarball [
 		nodePort = int(svc.Spec.Ports[0].NodePort)
 	}
 
+	// Prefer the public Ingress URL when DEPLOY_DOMAIN is configured.
+	publicURL := deployIngressURL(appID)
+	if publicURL == "" {
+		publicURL = appURL(nodePort)
+	}
+
 	slog.Info("k8s.Redeploy: rolling update triggered",
 		"provider_id", providerID,
 		"namespace", ns,
+		"url", publicURL,
 	)
 
 	return &compute.AppDeployment{
 		ProviderID: providerID,
-		AppURL:     appURL(nodePort),
+		AppURL:     publicURL,
 		Status:     "deploying",
 		UpdatedAt:  time.Now(),
 	}, nil
 }
 
-// buildImage extracts the tarball to a temp directory and runs docker build.
-// Works on Rancher Desktop because k3s and Docker share the same image store.
-func (p *K8sProvider) buildImage(ctx context.Context, appID, imageTag string, tarball []byte) error {
-	dir, err := os.MkdirTemp("", "instant-build-"+appID+"-*")
+// buildImage builds the user's container image using kaniko inside k8s and
+// pushes it to the configured registry. Works on any k8s cluster (containerd,
+// docker, etc.) because the build runs as a Pod, not a subprocess on a node.
+//
+// Caller passes ns explicitly because the stack flow uses
+// "instant-stack-<id>" while the single-app flow uses "instant-deploy-<id>".
+func (p *K8sProvider) buildImage(ctx context.Context, ns, appID, imageTag string, tarball []byte) error {
+	jobName := "build-" + sanitizeName(appID)
+	ctxSecret := "build-ctx-" + sanitizeName(appID)
+	authSecret := "ghcr-pull"
+
+	slog.Info("k8s.buildImage: starting kaniko build",
+		"app_id", appID, "image", imageTag, "namespace", ns)
+
+	// 0. Ensure the namespace exists. The stack pipeline normally creates it
+	//    via setupTenantNamespace AFTER the build step, so we need to be the
+	//    first to bring it up. Idempotent.
+	nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name:   ns,
+		Labels: map[string]string{"managed-by": "instant.dev", "instant.dev/component": "build-staging"},
+	}}
+	if _, err := p.clientset.CoreV1().Namespaces().Create(ctx, nsObj, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("k8s.buildImage: ensure namespace %q: %w", ns, err)
+	}
+
+	// 1. Tarball as a Secret (kaniko reads via tar:// context).
+	if err := p.upsertBuildContextSecret(ctx, ns, ctxSecret, tarball); err != nil {
+		return fmt.Errorf("k8s.buildImage: build-context secret: %w", err)
+	}
+
+	// 2. Ensure registry auth secret exists in this namespace (copied from instant ns).
+	if err := p.ensureRegistryAuthInNS(ctx, ns, authSecret); err != nil {
+		return fmt.Errorf("k8s.buildImage: registry auth: %w", err)
+	}
+
+	// 3. Create the kaniko Job (delete first if it exists from a previous attempt).
+	prop := metav1.DeletePropagationBackground
+	_ = p.clientset.BatchV1().Jobs(ns).Delete(ctx, jobName, metav1.DeleteOptions{
+		PropagationPolicy: &prop,
+	})
+	if err := p.createKanikoJob(ctx, ns, jobName, ctxSecret, authSecret, imageTag); err != nil {
+		return fmt.Errorf("k8s.buildImage: create kaniko job: %w", err)
+	}
+
+	// 4. Wait for Job completion (poll status).
+	if err := p.waitForJobComplete(ctx, ns, jobName, 10*time.Minute); err != nil {
+		return fmt.Errorf("k8s.buildImage: kaniko job: %w", err)
+	}
+
+	slog.Info("k8s.buildImage: kaniko build complete", "app_id", appID, "image", imageTag)
+	return nil
+}
+
+// sanitizeName lowercases and DNS-1123-cleans an appID for use in resource names.
+func sanitizeName(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z':
+			out = append(out, c+32)
+		case (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-':
+			out = append(out, c)
+		default:
+			out = append(out, '-')
+		}
+	}
+	return string(out)
+}
+
+// upsertBuildContextSecret writes the tarball into a Secret under key "context.tar.gz".
+func (p *K8sProvider) upsertBuildContextSecret(ctx context.Context, ns, name string, tarball []byte) error {
+	sec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "instant",
+				"instant.dev/component":        "build-context",
+			},
+		},
+		Data: map[string][]byte{"context.tar.gz": tarball},
+		Type: corev1.SecretTypeOpaque,
+	}
+	_, err := p.clientset.CoreV1().Secrets(ns).Create(ctx, sec, metav1.CreateOptions{})
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	existing, err := p.clientset.CoreV1().Secrets(ns).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("create temp dir: %w", err)
+		return fmt.Errorf("get existing: %w", err)
 	}
-	defer os.RemoveAll(dir)
+	existing.Data = sec.Data
+	_, err = p.clientset.CoreV1().Secrets(ns).Update(ctx, existing, metav1.UpdateOptions{})
+	return err
+}
 
-	if err := extractTarGz(tarball, dir); err != nil {
-		return fmt.Errorf("extract tarball: %w", err)
+// ensureRegistryAuthInNS copies the dockerconfigjson auth secret from the
+// "instant" namespace into the deploy namespace if missing.
+func (p *K8sProvider) ensureRegistryAuthInNS(ctx context.Context, ns, name string) error {
+	if _, err := p.clientset.CoreV1().Secrets(ns).Get(ctx, name, metav1.GetOptions{}); err == nil {
+		return nil
 	}
-
-	cmd := exec.CommandContext(ctx, "docker", "build", "-t", imageTag, dir)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	slog.Info("k8s.buildImage: running docker build",
-		"app_id", appID,
-		"image", imageTag,
-		"dir", dir,
-	)
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("docker build: %w", err)
+	src, err := p.clientset.CoreV1().Secrets("instant").Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("source registry-auth secret %q in instant ns: %w", name, err)
+	}
+	dst := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Type:       src.Type,
+		Data:       src.Data,
+	}
+	_, err = p.clientset.CoreV1().Secrets(ns).Create(ctx, dst, metav1.CreateOptions{})
+	if err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
 	}
 	return nil
+}
+
+// createKanikoJob spawns a one-shot Job that builds and pushes the image.
+func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecret, authSecret, imageTag string) error {
+	backoff := int32(0)
+	ttl := int32(300)
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: jobName,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "instant",
+				"instant.dev/component":        "build",
+			},
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit:            &backoff,
+			TTLSecondsAfterFinished: &ttl,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{{
+						Name:  "kaniko",
+						Image: "gcr.io/kaniko-project/executor:v1.23.2",
+						Args: []string{
+							"--context=tar:///workspace/context.tar.gz",
+							"--destination=" + imageTag,
+							"--snapshot-mode=redo",
+							"--cache=false",
+							"--single-snapshot",
+							"--cleanup",
+						},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "build-context", MountPath: "/workspace"},
+							{Name: "registry-auth", MountPath: "/kaniko/.docker"},
+						},
+					}},
+					Volumes: []corev1.Volume{
+						{
+							Name: "build-context",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{SecretName: ctxSecret},
+							},
+						},
+						{
+							Name: "registry-auth",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: authSecret,
+									Items: []corev1.KeyToPath{
+										{Key: ".dockerconfigjson", Path: "config.json"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	_, err := p.clientset.BatchV1().Jobs(ns).Create(ctx, job, metav1.CreateOptions{})
+	return err
+}
+
+// waitForJobComplete polls a Job until success or failure.
+func (p *K8sProvider) waitForJobComplete(ctx context.Context, ns, jobName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("job %q timed out after %s", jobName, timeout)
+		}
+		job, err := p.clientset.BatchV1().Jobs(ns).Get(ctx, jobName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("poll job: %w", err)
+		}
+		for _, c := range job.Status.Conditions {
+			if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
+				return nil
+			}
+			if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
+				return fmt.Errorf("job %q failed: %s", jobName, c.Message)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
 }
 
 // applyDeploymentInNS creates or updates the k8s Deployment for an app in the
@@ -643,6 +915,9 @@ func (p *K8sProvider) applyDeploymentInNS(
 				Spec: corev1.PodSpec{
 					// Disable service account token auto-mount for security.
 					AutomountServiceAccountToken: &saFalse,
+					ImagePullSecrets: []corev1.LocalObjectReference{
+						{Name: "ghcr-pull"},
+					},
 					Containers: []corev1.Container{
 						{
 							Name:            "app",
@@ -738,6 +1013,105 @@ func (p *K8sProvider) applyServiceInNS(ctx context.Context, ns, name, deployName
 	return nodePort, nil
 }
 
+// applyIngressForDeploy creates an Ingress for a single-service /deploy/new app.
+//
+// Mirrors the pattern used by K8sStackProvider.createIngress: when DEPLOY_DOMAIN
+// is set, the ingress is exposed at "<app-id>.<DEPLOY_DOMAIN>" and (if CERT_ISSUER
+// is set) annotated for cert-manager so a Let's Encrypt cert is issued via the
+// configured cluster-issuer (HTTP-01 by default). When DEPLOY_DOMAIN is empty
+// (e.g. local Rancher Desktop), no ingress is created and the caller falls back
+// to the NodePort URL.
+//
+// Returns the public URL on success, or "" if no ingress was created (callers
+// should then fall back to the NodePort URL).
+func (p *K8sProvider) applyIngressForDeploy(ctx context.Context, ns, svcName, appID string, port int) (string, error) {
+	domain := os.Getenv("DEPLOY_DOMAIN")
+	if domain == "" {
+		// No public domain configured — skip ingress creation (local dev path).
+		return "", nil
+	}
+	host := appID + "." + domain
+	pathType := networkingv1.PathTypePrefix
+
+	annotations := map[string]string{}
+	var tls []networkingv1.IngressTLS
+	scheme := "http"
+	if certIssuer := os.Getenv("CERT_ISSUER"); certIssuer != "" {
+		annotations["cert-manager.io/cluster-issuer"] = certIssuer
+		tls = []networkingv1.IngressTLS{{
+			Hosts:      []string{host},
+			SecretName: "app-" + appID + "-tls",
+		}}
+		scheme = "https"
+	}
+	publicURL := scheme + "://" + host
+
+	ing := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "app-" + appID,
+			Namespace:   ns,
+			Annotations: annotations,
+			Labels: map[string]string{
+				labelApp:   "true",
+				labelAppID: appID,
+			},
+		},
+		Spec: networkingv1.IngressSpec{
+			TLS: tls,
+			Rules: []networkingv1.IngressRule{
+				{
+					Host: host,
+					IngressRuleValue: networkingv1.IngressRuleValue{
+						HTTP: &networkingv1.HTTPIngressRuleValue{
+							Paths: []networkingv1.HTTPIngressPath{
+								{
+									Path:     "/",
+									PathType: &pathType,
+									Backend: networkingv1.IngressBackend{
+										Service: &networkingv1.IngressServiceBackend{
+											Name: svcName,
+											Port: networkingv1.ServiceBackendPort{
+												Number: int32(port),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := p.clientset.NetworkingV1().Ingresses(ns).Create(ctx, ing, metav1.CreateOptions{})
+	if err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return publicURL, nil
+		}
+		if apierrors.IsForbidden(err) {
+			return "", fmt.Errorf("create ingress %q in %q: RBAC forbidden — ensure the service account has networking.k8s.io/ingresses create permission: %w", "app-"+appID, ns, err)
+		}
+		return "", fmt.Errorf("create ingress %q in %q: %w", "app-"+appID, ns, err)
+	}
+	return publicURL, nil
+}
+
+// deployIngressURL returns the public Ingress URL for an appID if DEPLOY_DOMAIN
+// is configured. Caller uses this to compute the AppURL during Status/Redeploy
+// without re-querying the k8s API (the value is deterministic from env + appID).
+func deployIngressURL(appID string) string {
+	domain := os.Getenv("DEPLOY_DOMAIN")
+	if domain == "" {
+		return ""
+	}
+	scheme := "http"
+	if os.Getenv("CERT_ISSUER") != "" {
+		scheme = "https"
+	}
+	return scheme + "://" + appID + "." + domain
+}
+
 // deploymentStatus translates k8s Deployment conditions and replica counts into
 // one of: building|deploying|healthy|failed|stopped.
 func deploymentStatus(deploy *appsv1.Deployment) string {
@@ -827,7 +1201,15 @@ func envVarsToK8s(vars map[string]string) []corev1.EnvVar {
 
 func deploymentName(appID string) string { return "app-" + appID }
 func serviceName(appID string) string    { return "svc-" + appID }
-func imageName(appID string) string      { return imageRegistry + "/" + appID + ":latest" }
+func imageName(appID string) string {
+	if reg := os.Getenv("BUILD_IMAGE_REGISTRY"); reg != "" {
+		for len(reg) > 0 && reg[len(reg)-1] == '/' {
+			reg = reg[:len(reg)-1]
+		}
+		return reg + "/" + appID + ":latest"
+	}
+	return imageRegistry + "/" + appID + ":latest"
+}
 
 func appIDFromDeployName(name string) string {
 	if len(name) > 4 && name[:4] == "app-" {

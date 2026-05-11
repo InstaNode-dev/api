@@ -11,6 +11,7 @@ package handlers
 //	  "name":           "my-db",
 //	  "connection_url": "postgres://usr_<token>:<pass>@postgres-customers:5432/db_<token>",
 //	  "tier":           "anonymous",
+//	  "env":            "production",
 //	  "limits":         { "storage_mb": 10, "connections": 3, "expires_in": "24h" },
 //	  "note":           "Works now. Free forever with a free account: <url>"
 //	}
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"instant.dev/internal/config"
 	"instant.dev/internal/crypto"
@@ -91,9 +93,14 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 	_ = c.BodyParser(&body)
 	body.Name = sanitizeName(body.Name)
 
+	env, envErr := resolveEnv(c, body.Env)
+	if envErr != nil {
+		return envErr
+	}
+
 	// ── Authenticated path ────────────────────────────────────────────────────
 	if teamIDStr := middleware.GetTeamID(c); teamIDStr != "" {
-		return h.newDBAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, body.Dedicated, start)
+		return h.newDBAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, body.Dedicated, env, start)
 	}
 
 	// ── Dedicated requires authentication ─────────────────────────────────────
@@ -136,6 +143,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 					"name":           existing.Name.String,
 					"connection_url": connectionURL,
 					"tier":           existing.Tier,
+					"env":            existing.Env,
 					"limits":         dbAnonymousLimits(),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
@@ -155,6 +163,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 		ResourceType:     "postgres",
 		Name:             body.Name,
 		Tier:             "anonymous",
+		Env:              env,
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
@@ -245,6 +254,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
 		"tier":           "anonymous",
+		"env":            resource.Env,
 		"limits":         dbAnonymousLimits(),
 		"note":           upgradeNote(upgradeURL),
 	}
@@ -256,7 +266,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 }
 
 func (h *DBHandler) newDBAuthenticated(
-	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, dedicated bool, start time.Time,
+	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, dedicated bool, env string, start time.Time,
 ) error {
 	ctx := c.UserContext()
 	teamUUID, err := parseTeamID(teamIDStr)
@@ -279,6 +289,7 @@ func (h *DBHandler) newDBAuthenticated(
 		ResourceType:     "postgres",
 		Name:             name,
 		Tier:             tier,
+		Env:              env,
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
@@ -289,6 +300,18 @@ func (h *DBHandler) newDBAuthenticated(
 		slog.Error("db.new.create_resource_failed_auth", "error", err, "team_id", teamIDStr, "request_id", requestID)
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision Postgres resource")
 	}
+
+	// Best-effort audit event; failures must never block the provision.
+	go func() {
+		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+			TeamID:       teamUUID,
+			Actor:        "agent",
+			Kind:         "provision",
+			ResourceType: "postgres",
+			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
+			Summary:      "agent provisioned <strong>postgres</strong> <code>" + resource.Token.String()[:8] + "</code>",
+		})
+	}()
 
 	tokenStr := resource.Token.String()
 
@@ -349,6 +372,7 @@ func (h *DBHandler) newDBAuthenticated(
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
 		"tier":           tier,
+		"env":            resource.Env,
 		"dedicated":      dedicated,
 		"limits": fiber.Map{
 			"storage_mb":  authStorageLimitMB,
