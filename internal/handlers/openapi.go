@@ -384,7 +384,8 @@ const openAPISpec = `{
         "properties": {
           "ok": { "type": "boolean" },
           "token": { "type": "string", "format": "uuid" },
-          "connection_url": { "type": "string", "description": "postgres:// connection string with pgvector pre-installed" },
+          "connection_url": { "type": "string", "description": "postgres:// connection string with pgvector pre-installed. Use this from external callers." },
+          "internal_url": { "type": "string", "description": "Cluster-internal postgres:// URL routed via instant-pg-proxy. Use this when calling from a workload deployed inside the instanode cluster (e.g. an app started by /deploy/new) — the public hostname does not hairpin reliably." },
           "tier": { "type": "string" },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "note": { "type": "string" }
@@ -395,7 +396,8 @@ const openAPISpec = `{
         "properties": {
           "ok": { "type": "boolean" },
           "token": { "type": "string", "format": "uuid" },
-          "connection_url": { "type": "string", "description": "redis:// connection string with ACL namespace isolation" },
+          "connection_url": { "type": "string", "description": "redis:// connection string with ACL namespace isolation. Use this from external callers." },
+          "internal_url": { "type": "string", "description": "Cluster-internal redis:// URL routed via instant-redis-proxy. Use this when calling from a workload deployed inside the instanode cluster." },
           "key_prefix": { "type": "string", "description": "All keys must use this prefix for namespace isolation" },
           "tier": { "type": "string" },
           "limits": { "type": "object", "properties": { "memory_mb": { "type": "integer" }, "expires_in": { "type": "string" } } },
@@ -407,7 +409,8 @@ const openAPISpec = `{
         "properties": {
           "ok": { "type": "boolean" },
           "token": { "type": "string", "format": "uuid" },
-          "connection_url": { "type": "string", "description": "mongodb:// connection string scoped to a per-token database" },
+          "connection_url": { "type": "string", "description": "mongodb:// connection string scoped to a per-token database. Use this from external callers." },
+          "internal_url": { "type": "string", "description": "Cluster-internal mongodb:// URL routed via instant-mongo-proxy. Use this when calling from a workload deployed inside the instanode cluster." },
           "tier": { "type": "string" },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "note": { "type": "string" }
@@ -418,7 +421,8 @@ const openAPISpec = `{
         "properties": {
           "ok": { "type": "boolean" },
           "token": { "type": "string", "format": "uuid" },
-          "connection_url": { "type": "string", "description": "nats:// connection string with per-account subject isolation" },
+          "connection_url": { "type": "string", "description": "nats:// connection string with per-account subject isolation. Use this from external callers." },
+          "internal_url": { "type": "string", "description": "Cluster-internal nats:// URL routed via instant-nats-proxy. Use this when calling from a workload deployed inside the instanode cluster." },
           "tier": { "type": "string" },
           "limits": { "type": "object" },
           "note": { "type": "string" }

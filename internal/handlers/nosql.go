@@ -129,6 +129,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 					"token":          existing.Token.String(),
 					"name":           existing.Name.String,
 					"connection_url": connectionURL,
+					"internal_url":   proxiedInternalURL(connectionURL, "mongodb"),
 					"tier":           existing.Tier,
 					"env":            existing.Env,
 					"limits":         nosqlAnonymousLimits(),
@@ -241,6 +242,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 		"token":          tokenStr,
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
+		"internal_url":   proxiedInternalURL(creds.URL, "mongodb"),
 		"tier":           "anonymous",
 		"env":            resource.Env,
 		"limits":         nosqlAnonymousLimits(),
@@ -360,6 +362,7 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 		"token":          resource.Token.String(),
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
+		"internal_url":   proxiedInternalURL(creds.URL, "mongodb"),
 		"tier":           tier,
 		"env":            resource.Env,
 		"limits": fiber.Map{
