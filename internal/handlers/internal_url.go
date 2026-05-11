@@ -1,6 +1,10 @@
 package handlers
 
-import "net/url"
+import (
+	"net/url"
+
+	"instant.dev/internal/urls"
+)
 
 // proxiedInternalURL rewrites a customer-facing public URL to the cluster-internal
 // address of the per-protocol proxy. Workloads deployed inside the same cluster
@@ -26,13 +30,13 @@ func proxiedInternalURL(publicURL, resourceType string) string {
 	}
 	switch resourceType {
 	case "postgres":
-		parsed.Host = "instant-pg-proxy.instant.svc.cluster.local:5432"
+		parsed.Host = urls.InternalPGProxy
 	case "redis":
-		parsed.Host = "instant-redis-proxy.instant.svc.cluster.local:6379"
+		parsed.Host = urls.InternalRedisProxy
 	case "mongodb":
-		parsed.Host = "instant-mongo-proxy.instant.svc.cluster.local:27017"
+		parsed.Host = urls.InternalMongoProxy
 	case "queue":
-		parsed.Host = "instant-nats-proxy.instant.svc.cluster.local:4222"
+		parsed.Host = urls.InternalNATSProxy
 	default:
 		return publicURL
 	}

@@ -9,6 +9,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v4"
 	"instant.dev/internal/config"
+	"instant.dev/internal/urls"
 )
 
 const (
@@ -27,8 +28,9 @@ const (
 )
 
 // defaultCanonicalResourceURL is the audience used when neither API_PUBLIC_URL
-// nor the live request host is available.
-const defaultCanonicalResourceURL = "https://api.instanode.dev"
+// nor the live request host is available. Aliased to urls.PublicAPIBase to
+// keep the literal "https://api.instanode.dev" in exactly one place.
+const defaultCanonicalResourceURL = urls.PublicAPIBase
 
 // confirmation captures the OAuth 2.0 PoP "cnf" claim shape (RFC 7800).
 // Currently only the JWK thumbprint variant ("jkt") used by DPoP is consumed.

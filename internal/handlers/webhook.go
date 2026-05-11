@@ -34,6 +34,7 @@ import (
 	"instant.dev/internal/crypto"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
+	"instant.dev/internal/urls"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
 )
@@ -110,7 +111,7 @@ func webhookAnonLimits() fiber.Map {
 func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 	if !h.cfg.IsServiceEnabled("webhook") {
 		return respondError(c, fiber.StatusServiceUnavailable, "service_disabled",
-			"Webhook provisioning is coming soon. Sign up at https://instanode.dev/start to be notified.")
+			"Webhook provisioning is coming soon. Sign up at "+urls.StartURLPrefix+" to be notified.")
 	}
 
 	start := time.Now()
@@ -153,7 +154,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 			}
 			upgradeURL := ""
 			if jwtToken != "" {
-				upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
+				upgradeURL = urls.UpgradeStartURL(jwtToken)
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
 			metrics.FingerprintAbuseBlocked.Inc()
@@ -222,7 +223,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 
 	upgradeURL := ""
 	if jwtToken != "" {
-		upgradeURL = fmt.Sprintf("https://instanode.dev/start?t=%s", jwtToken)
+		upgradeURL = urls.UpgradeStartURL(jwtToken)
 		c.Set("X-Instant-Upgrade", upgradeURL)
 	}
 
