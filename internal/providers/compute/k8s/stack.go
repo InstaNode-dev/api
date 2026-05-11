@@ -318,7 +318,9 @@ func (p *K8sStackProvider) createStackDeployment(
 	memReq, memLimit, cpuReq string,
 ) error {
 	replicas := int32(1)
-	pullPolicy := corev1.PullIfNotPresent
+	// PullAlways for the same reason as client.go: images are pushed under
+	// :latest, so without Always, redeploys silently serve cached old images.
+	pullPolicy := corev1.PullAlways
 	saFalse := false
 
 	desired := &appsv1.Deployment{

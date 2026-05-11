@@ -40,8 +40,8 @@ const (
 
 // K8sProvider implements compute.Provider using the local k8s cluster.
 type K8sProvider struct {
-	clientset *kubernetes.Clientset
-	namespace string // shared namespace (legacy fallback); per-deploy namespaces are preferred
+	clientset kubernetes.Interface // accepts both *Clientset and *fake.Clientset (tests)
+	namespace string               // shared namespace (legacy fallback); per-deploy namespaces are preferred
 }
 
 // New creates a K8sProvider targeting the given namespace.
@@ -816,6 +816,22 @@ func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecre
 							"--single-snapshot",
 							"--cleanup",
 						},
+						// Explicit resources override the per-namespace LimitRange
+						// default (hobby tier defaults to 50m/256Mi which throttles
+						// kaniko + npm install to 5+ minutes). 250m/512Mi keeps a
+						// medium npm install under a minute without inflating the
+						// app's own quota: builds run as a Job, not part of the
+						// app's permanent footprint.
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("250m"),
+								corev1.ResourceMemory: resource.MustParse("256Mi"),
+							},
+							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("1"),
+								corev1.ResourceMemory: resource.MustParse("512Mi"),
+							},
+						},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "build-context", MountPath: "/workspace"},
 							{Name: "registry-auth", MountPath: "/kaniko/.docker"},
@@ -885,7 +901,10 @@ func (p *K8sProvider) applyDeploymentInNS(
 	memReq, memLimit, cpuReq string,
 ) error {
 	replicas := int32(1)
-	pullPolicy := corev1.PullIfNotPresent
+	// PullAlways because images are pushed under a single :latest tag — without
+	// Always, k8s caches the old image on nodes and redeploys silently serve
+	// stale content. Future: sha-pin the tag and switch back to IfNotPresent.
+	pullPolicy := corev1.PullAlways
 	saFalse := false
 	appID := appIDFromDeployName(name)
 
