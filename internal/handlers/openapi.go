@@ -451,6 +451,74 @@ const openAPISpec = `{
           "404": { "description": "Team not found" }
         }
       }
+    },
+    "/api/v1/billing/checkout": {
+      "post": {
+        "summary": "Create a Razorpay subscription and return its hosted-page URL",
+        "description": "Mints a Razorpay subscription for the requested plan (hobby or pro) tied to the authenticated team. The dashboard redirects the user to the returned short_url to complete payment; on success Razorpay fires subscription.activated to /razorpay/webhook and the team's plan_tier is elevated atomically. The Team tier currently returns 400 tier_unavailable — only ops can set it via /internal/set-tier.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "pro"] } } } } } },
+        "responses": {
+          "200": { "description": "Subscription created — redirect user to short_url", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "short_url": { "type": "string", "format": "uri" }, "subscription_id": { "type": "string" } } } } } },
+          "400": { "description": "Invalid plan or tier_unavailable" },
+          "401": { "description": "Missing or invalid session token" },
+          "502": { "description": "Razorpay rejected the create-subscription call" },
+          "503": { "description": "Razorpay not configured on this environment" }
+        }
+      }
+    },
+    "/api/v1/billing/cancel": {
+      "post": {
+        "summary": "Cancel the team's active Razorpay subscription",
+        "description": "Triggers a cancellation on Razorpay's side. Razorpay processes the cancellation asynchronously and emits subscription.cancelled to /razorpay/webhook, which downgrades the team to Hobby. The cancel call returns 200 immediately; the dashboard should re-fetch /api/v1/billing after a few seconds to see the updated state.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Cancel request accepted by Razorpay" },
+          "401": { "description": "Missing or invalid session token" },
+          "404": { "description": "No active subscription to cancel" },
+          "502": { "description": "Razorpay rejected the cancel call" },
+          "503": { "description": "Razorpay not configured on this environment" }
+        }
+      }
+    },
+    "/api/v1/billing/invoices": {
+      "get": {
+        "summary": "List the team's invoices",
+        "description": "Returns up to the last 24 invoices from Razorpay for the team's subscription, newest first. Each entry includes id, amount (paise), currency, and status. Returns an empty array when the team has no subscription yet.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Invoice list", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "invoices": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "amount": { "type": "integer", "description": "Amount in paise (INR×100)" }, "currency": { "type": "string" }, "status": { "type": "string" } } } } } } } } },
+          "401": { "description": "Missing or invalid session token" },
+          "503": { "description": "Razorpay not configured on this environment" }
+        }
+      }
+    },
+    "/api/v1/billing/update-payment": {
+      "post": {
+        "summary": "Return a Razorpay hosted-page URL the user can use to update their card on file",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Hosted page URL", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "short_url": { "type": "string", "format": "uri" } } } } } },
+          "401": { "description": "Missing or invalid session token" },
+          "404": { "description": "No active subscription" },
+          "503": { "description": "Razorpay not configured" }
+        }
+      }
+    },
+    "/api/v1/billing/change-plan": {
+      "post": {
+        "summary": "Switch the team's subscription to a different tier",
+        "description": "Hobby↔Pro on the same Razorpay subscription. Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. Team tier is currently not customer-changeable — returns 400 tier_unavailable.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "pro"] } } } } } },
+        "responses": {
+          "200": { "description": "Plan change accepted by Razorpay" },
+          "400": { "description": "Invalid plan or tier_unavailable" },
+          "401": { "description": "Missing or invalid session token" },
+          "404": { "description": "No active subscription" },
+          "503": { "description": "Razorpay not configured" }
+        }
+      }
     }
   },
   "components": {
