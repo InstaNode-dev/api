@@ -48,11 +48,20 @@ func TestKanikoJobHasExplicitResources(t *testing.T) {
 	}
 }
 
-// TestKanikoJobUsesS3ContextWhenURLSet guards the build-context lift past the
-// k8s Secret's ~1 MiB cap (etcd object size limit). When s3ContextURL is set,
-// kaniko's --context arg becomes the s3:// URL and the build-context Secret
-// volume is absent; AWS env vars are set so kaniko's S3 reader talks to MinIO.
-func TestKanikoJobUsesS3ContextWhenURLSet(t *testing.T) {
+// TestKanikoJobUsesInitContainerWhenHTTPURLSet guards the build-context lift
+// past the k8s Secret's ~1 MiB cap. When httpContextURL is set, the Job grows
+// an initContainer that curls the presigned URL into a shared emptyDir; the
+// main kaniko container then reads the tarball via the standard tar://
+// volume path.
+//
+// Earlier attempts (s3:// and tar.gz+http://) failed live because:
+//   - AWS SDK v2 ignores S3_FORCE_PATH_STYLE → vhost-style DNS lookup against
+//     in-cluster MinIO fails.
+//   - kaniko v1.23 doesn't accept tar.gz+ scheme prefix.
+//   - kaniko's HTTPS context fetcher rejects plaintext http://.
+// The init-container path sidesteps all three: curl handles the HTTP fetch,
+// kaniko sees only a local file.
+func TestKanikoJobUsesInitContainerWhenHTTPURLSet(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	p := &K8sProvider{
 		clientset: cs,
@@ -65,8 +74,8 @@ func TestKanikoJobUsesS3ContextWhenURLSet(t *testing.T) {
 	}
 
 	const ns, jobName = "instant-deploy-test", "build-test"
-	s3URL := "s3://instant-build-contexts/abc/20260511T000000Z.tar.gz"
-	if err := p.createKanikoJob(context.Background(), ns, jobName, "ctx-sec", "auth-sec", "ghcr.io/x/y:latest", s3URL); err != nil {
+	httpURL := "http://minio.test:9000/instant-build-contexts/abc/20260511T000000Z.tar.gz?X-Amz-Signature=fake"
+	if err := p.createKanikoJob(context.Background(), ns, jobName, "ctx-sec", "auth-sec", "ghcr.io/x/y:latest", httpURL); err != nil {
 		t.Fatalf("createKanikoJob: %v", err)
 	}
 
@@ -74,40 +83,55 @@ func TestKanikoJobUsesS3ContextWhenURLSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get job: %v", err)
 	}
-	c := job.Spec.Template.Spec.Containers[0]
+	podSpec := job.Spec.Template.Spec
 
-	// --context arg points at the s3:// URL, not the tar:// volume mount.
-	hasS3Context := false
+	// Init-container exists, uses curl, and points at the URL.
+	if len(podSpec.InitContainers) != 1 {
+		t.Fatalf("expected 1 init-container (curl fetch); got %d", len(podSpec.InitContainers))
+	}
+	ic := podSpec.InitContainers[0]
+	if ic.Image == "" || ic.Image[:7] != "curlima" {
+		t.Errorf("init-container image %q does not look like a curl image", ic.Image)
+	}
+	gotURL := ""
+	for _, e := range ic.Env {
+		if e.Name == "URL" {
+			gotURL = e.Value
+		}
+	}
+	if gotURL != httpURL {
+		t.Errorf("init-container URL env = %q; want %q", gotURL, httpURL)
+	}
+
+	// Main kaniko reads from the local tar volume.
+	c := podSpec.Containers[0]
+	hasTarContext := false
 	for _, a := range c.Args {
-		if a == "--context="+s3URL {
-			hasS3Context = true
-		}
 		if a == "--context=tar:///workspace/context.tar.gz" {
-			t.Errorf("kaniko still references tar:// mount when s3ContextURL is set; args=%v", c.Args)
+			hasTarContext = true
 		}
 	}
-	if !hasS3Context {
-		t.Errorf("kaniko --context flag missing for s3URL %q; args=%v", s3URL, c.Args)
+	if !hasTarContext {
+		t.Errorf("kaniko must read --context=tar:///workspace/context.tar.gz when init-container delivers the tarball; got args=%v", c.Args)
 	}
 
-	// AWS env so kaniko talks to MinIO, not the AWS metadata endpoint.
-	env := map[string]string{}
-	for _, e := range c.Env {
-		env[e.Name] = e.Value
-	}
-	for _, must := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_S3_ENDPOINT", "S3_FORCE_PATH_STYLE"} {
-		if env[must] == "" {
-			t.Errorf("kaniko env var %s is empty — S3 reader will fall back to AWS metadata", must)
-		}
-	}
-	if got := env["AWS_S3_ENDPOINT"]; got != "http://minio.test:9000" {
-		t.Errorf("AWS_S3_ENDPOINT = %q; want http://minio.test:9000", got)
-	}
-
-	// No build-context Secret volume when using S3.
-	for _, v := range job.Spec.Template.Spec.Volumes {
+	// build-context volume is emptyDir, not a Secret.
+	for _, v := range podSpec.Volumes {
 		if v.Name == "build-context" {
-			t.Errorf("build-context Secret volume should be absent when using S3, but found one")
+			if v.EmptyDir == nil {
+				t.Errorf("build-context volume must be emptyDir under the init-container path; got %#v", v.VolumeSource)
+			}
+			if v.Secret != nil {
+				t.Errorf("build-context volume must not be a Secret under the init-container path")
+			}
+		}
+	}
+
+	// No AWS_ env vars on the main kaniko container — they were the failed v1
+	// switches and serve no purpose in the init-container path.
+	for _, e := range c.Env {
+		if e.Name == "AWS_ACCESS_KEY_ID" || e.Name == "S3_FORCE_PATH_STYLE" {
+			t.Errorf("kaniko env should not include legacy AWS S3 envs; found %s", e.Name)
 		}
 	}
 }

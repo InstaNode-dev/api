@@ -813,30 +813,21 @@ func (p *K8sProvider) ensureRegistryAuthInNS(ctx context.Context, ns, name strin
 }
 
 // createKanikoJob spawns a one-shot Job that builds and pushes the image.
-// When s3ContextURL is non-empty kaniko reads the build context directly from
-// MinIO via the S3 path (no 1 MiB cap); when empty it falls back to reading a
-// tar Secret mounted at /workspace.
-func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecret, authSecret, imageTag, s3ContextURL string) error {
+// When httpContextURL is non-empty an initContainer curls the build context
+// from MinIO into a shared emptyDir; kaniko then reads via the standard
+// tar:// path. When empty it falls back to a tar Secret mounted at /workspace.
+//
+// Why not --context=s3://: kaniko v1.23 ships AWS SDK v2 which only resolves
+// S3 endpoints in vhost style; the path-style env switches are SDK v1 and
+// silently ignored, so the bucket name resolves as a non-existent subdomain.
+// Why not --context=https://: MinIO is plaintext HTTP in-cluster, kaniko's
+// HTTP context list does not include http://. The init-container sidesteps
+// both — we control the fetch, kaniko sees a local tar volume.
+func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecret, authSecret, imageTag, httpContextURL string) error {
 	backoff := int32(0)
 	ttl := int32(300)
 
-	useS3 := s3ContextURL != ""
-	contextArg := "--context=tar:///workspace/context.tar.gz"
-	if useS3 {
-		contextArg = "--context=" + s3ContextURL
-	}
-
-	// AWS env so kaniko's S3 reader talks to in-cluster MinIO rather than the
-	// AWS metadata endpoint. Honored only when --context=s3://, harmless
-	// otherwise — applied unconditionally to keep the spec simple.
-	envVars := []corev1.EnvVar{
-		{Name: "AWS_ACCESS_KEY_ID", Value: p.buildCtx.AccessKey},
-		{Name: "AWS_SECRET_ACCESS_KEY", Value: p.buildCtx.SecretKey},
-		{Name: "AWS_REGION", Value: "us-east-1"},
-		{Name: "S3_FORCE_PATH_STYLE", Value: "true"},
-		{Name: "AWS_S3_ENDPOINT", Value: "http://" + p.buildCtx.Endpoint},
-		{Name: "AWS_ENDPOINT_URL_S3", Value: "http://" + p.buildCtx.Endpoint},
-	}
+	useHTTP := httpContextURL != ""
 
 	volumes := []corev1.Volume{{
 		Name: "registry-auth",
@@ -852,7 +843,37 @@ func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecre
 	mounts := []corev1.VolumeMount{
 		{Name: "registry-auth", MountPath: "/kaniko/.docker"},
 	}
-	if !useS3 {
+
+	var initContainers []corev1.Container
+	if useHTTP {
+		// Shared emptyDir between init-container (curl) and main kaniko container.
+		volumes = append(volumes, corev1.Volume{
+			Name:         "build-context",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		})
+		mounts = append(mounts, corev1.VolumeMount{Name: "build-context", MountPath: "/workspace"})
+
+		initContainers = []corev1.Container{{
+			Name:    "fetch-context",
+			Image:   "curlimages/curl:8.10.1",
+			Command: []string{"sh", "-c", "curl --fail --silent --show-error --max-time 120 -o /workspace/context.tar.gz \"$URL\""},
+			Env:     []corev1.EnvVar{{Name: "URL", Value: httpContextURL}},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "build-context", MountPath: "/workspace"},
+			},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("50m"),
+					corev1.ResourceMemory: resource.MustParse("32Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("250m"),
+					corev1.ResourceMemory: resource.MustParse("64Mi"),
+				},
+			},
+		}}
+	} else {
+		// Legacy Secret path (≤1 MiB).
 		volumes = append(volumes, corev1.Volume{
 			Name: "build-context",
 			VolumeSource: corev1.VolumeSource{
@@ -875,19 +896,19 @@ func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecre
 			TTLSecondsAfterFinished: &ttl,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
+					RestartPolicy:  corev1.RestartPolicyNever,
+					InitContainers: initContainers,
 					Containers: []corev1.Container{{
 						Name:  "kaniko",
 						Image: "gcr.io/kaniko-project/executor:v1.23.2",
 						Args: []string{
-							contextArg,
+							"--context=tar:///workspace/context.tar.gz",
 							"--destination=" + imageTag,
 							"--snapshot-mode=redo",
 							"--cache=false",
 							"--single-snapshot",
 							"--cleanup",
 						},
-						Env: envVars,
 						// Explicit resources override the per-namespace LimitRange
 						// default (hobby tier defaults to 50m/256Mi which throttles
 						// kaniko + npm install to 5+ minutes). 250m/512Mi keeps a
