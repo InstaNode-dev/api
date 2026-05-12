@@ -57,6 +57,15 @@ var (
 		Help: "Requests blocked by fingerprint rate limiting",
 	})
 
+	// RecycleGateBlocked counts anonymous provision attempts blocked by the
+	// free-tier recycle gate (Option B from FREE-TIER-RECYCLE-2026-05-12).
+	// Labelled by resource_type so we can see which services see the most
+	// recycle attempts.
+	RecycleGateBlocked = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_recycle_gate_blocked_total",
+		Help: "Anonymous provisions blocked by free-tier recycle email gate",
+	}, []string{"resource_type"})
+
 	// ConversionFunnel counts conversion funnel steps:
 	// provision, jwt_issued, landing_viewed, claimed, paid.
 	ConversionFunnel = promauto.NewCounterVec(prometheus.CounterOpts{

@@ -30,10 +30,71 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"instant.dev/internal/config"
 	"instant.dev/internal/crypto"
+	"instant.dev/internal/metrics"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
 	"instant.dev/internal/urls"
 )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Free-tier recycle gate (Option B from FREE-TIER-RECYCLE-2026-05-12.md)
+//
+// The "wedge" of instanode is: an agent's very first POST /db/new (or any
+// /{service}/new) succeeds with zero auth and returns real credentials in
+// seconds. We MUST preserve that. The abuse surface this gate closes is the
+// *second* POST from the same fingerprint after the previous free-tier
+// resource expired — without this gate, that path returns a fresh 24h
+// anonymous resource forever, indefinitely. With this gate, the second
+// (recycle) POST is required to claim with email first; the user then falls
+// into the existing `free` tier in plans.yaml.
+//
+// Mechanics:
+//   - When an anonymous provision succeeds we SET recycle_seen:<fp> with a
+//     30-day TTL. (Set-after-success preserves the wedge — the first
+//     anonymous POST has no key, so it can never be gated.)
+//   - On every subsequent anonymous POST we read recycle_seen:<fp>. If it
+//     exists AND no active anonymous resource is present for the
+//     fingerprint, we return 402 free_tier_recycle_requires_claim with a
+//     claim URL. The customer claims with email and gets a JWT; the JWT
+//     bypasses the gate entirely (auth path skips this check).
+//   - 30 days is intentional: long enough that a recycler coming back
+//     "next week" is still gated, short enough that an accidental
+//     fingerprint hit (e.g. someone moved offices) decays on its own.
+//
+// Note: the spec lists worker/internal/jobs/expire.go as the trigger, but
+// setting the key on PROVISION instead of EXPIRY has identical semantics
+// (the key only matters when (a) it exists and (b) no active resource is
+// present — both conditions are reached the moment a previously-provisioned
+// anonymous resource ages out) and keeps the gate fully inside the api
+// module without cross-module coordination. This is the api-side
+// implementation of Option B.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// RecycleSeenKeyPrefix is the Redis key prefix recording "this fingerprint
+// has provisioned anonymously before." Format: recycle_seen:<fingerprint>.
+const RecycleSeenKeyPrefix = "recycle_seen:"
+
+// RecycleSeenTTL is the lifetime of the recycle_seen marker.
+const RecycleSeenTTL = 30 * 24 * time.Hour
+
+// RecycleGateErrorCode is the stable machine-readable error code the gate
+// returns. Programmatic clients should branch on this exact string.
+const RecycleGateErrorCode = "free_tier_recycle_requires_claim"
+
+// RecycleGateClaimURL is the URL the agent should send the user to in order
+// to clear the gate. Both upgrade_url and claim_url fields point at it.
+const RecycleGateClaimURL = "https://instanode.dev/claim"
+
+// RecycleGateAgentAction is the verbatim sentence the calling agent surfaces
+// to the human user when the gate fires.
+const RecycleGateAgentAction = "Tell the user their previous free resource expired. " +
+	"Free tier resources require a one-time email claim before provisioning a replacement. " +
+	"Have them claim at https://instanode.dev/claim — takes 30 seconds, no card."
+
+// RecycleGateMessage is the human-readable explanation accompanying the
+// machine error code.
+const RecycleGateMessage = "Your previous free resource expired. " +
+	"Free tier resources require a one-time email claim before provisioning a replacement."
 
 // provisionHelper holds the shared dependencies used by every provisioning handler.
 type provisionHelper struct {
@@ -100,6 +161,101 @@ func (h *provisionHelper) checkProvisionLimit(ctx context.Context, fp string) (b
 		return false, fmt.Errorf("checkProvisionLimit incr result: %w", err)
 	}
 	return count > int64(h.plans.ProvisionLimit("anonymous")), nil
+}
+
+// recycleSeen returns true if the recycle_seen:<fp> marker exists for this
+// fingerprint. On Redis error this returns (false, err); callers MUST fail
+// open — a Redis outage must never block the magic-first-touch wedge.
+func (h *provisionHelper) recycleSeen(ctx context.Context, fp string) (bool, error) {
+	if fp == "" {
+		return false, nil
+	}
+	exists, err := h.rdb.Exists(ctx, RecycleSeenKeyPrefix+fp).Result()
+	if err != nil {
+		return false, fmt.Errorf("recycleSeen: %w", err)
+	}
+	return exists > 0, nil
+}
+
+// markRecycleSeen sets recycle_seen:<fp> with the standard TTL. Called by
+// every anonymous-path handler immediately after a successful provision.
+// Errors are returned but callers should log+continue — the gate is a
+// best-effort defence and a Redis blip must not block a successful provision.
+func (h *provisionHelper) markRecycleSeen(ctx context.Context, fp string) error {
+	if fp == "" {
+		return nil
+	}
+	if err := h.rdb.Set(ctx, RecycleSeenKeyPrefix+fp, "1", RecycleSeenTTL).Err(); err != nil {
+		return fmt.Errorf("markRecycleSeen: %w", err)
+	}
+	return nil
+}
+
+// recycleGate returns true and writes a 402 response when the anonymous
+// caller is attempting to recycle the free tier after a prior expiry on the
+// same fingerprint. Returns false (and does NOT write a response) when the
+// caller is allowed to proceed — either because this is the first
+// anonymous touch on this fingerprint (no marker), or because there is
+// already an active resource of ANY type (the caller is still inside
+// their original 24h session and just adding a complementary service).
+//
+// Always read AFTER checkProvisionLimit so the daily-cap dedup branch
+// still wins on its existing path. The recycle gate only fires when:
+//
+//   (a) the recycle_seen:<fp> marker is present, AND
+//   (b) ZERO active anonymous resources exist for this fingerprint
+//       (across all service types — not just the requested one).
+//
+// (b) is cross-service on purpose: provisioning 5 Postgres then a Redis is
+// a single agent session, not a recycle. A recycle is specifically the
+// shape "I had something yesterday, it aged out, give me a new one today" —
+// which only matches when the resource lookup returns zero rows.
+//
+// Fails OPEN: Redis errors or lookup errors return (false, nil) — the
+// magic-first-touch wedge is non-negotiable. We'd rather miss a recycle
+// than 402 an honest first-time caller.
+func (h *provisionHelper) recycleGate(c *fiber.Ctx, fp, resourceType string) bool {
+	ctx := c.UserContext()
+	seen, err := h.recycleSeen(ctx, fp)
+	if err != nil {
+		slog.Warn("provision.recycle_gate.redis_failed",
+			"error", err, "fingerprint", fp, "resource_type", resourceType)
+		metrics.RedisErrors.WithLabelValues("recycle_gate").Inc()
+		return false
+	}
+	if !seen {
+		return false
+	}
+
+	// Marker exists. If ANY active anonymous resource is still around we
+	// let the existing dedup / multi-service path handle it. The gate
+	// fires only when this fingerprint has zero live resources of any
+	// type and is asking for a new one.
+	existing, lookupErr := models.GetAllActiveResourcesByFingerprint(ctx, h.db, fp)
+	if lookupErr != nil {
+		// A real DB error — fail open. We are not going to 402 an honest
+		// caller just because Postgres blipped.
+		slog.Warn("provision.recycle_gate.lookup_failed",
+			"error", lookupErr, "fingerprint", fp, "resource_type", resourceType)
+		return false
+	}
+	if len(existing) > 0 {
+		return false // still mid-session across one or more services; not a recycle
+	}
+
+	// Confirmed recycle: marker set, no active row. Gate.
+	metrics.RecycleGateBlocked.WithLabelValues(resourceType).Inc()
+	slog.Info("provision.recycle_gate.blocked",
+		"fingerprint", fp, "resource_type", resourceType)
+	_ = c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
+		"ok":           false,
+		"error":        RecycleGateErrorCode,
+		"message":      RecycleGateMessage,
+		"agent_action": RecycleGateAgentAction,
+		"upgrade_url":  RecycleGateClaimURL,
+		"claim_url":    RecycleGateClaimURL,
+	})
+	return true
 }
 
 // issueOnboardingJWT signs a short-lived JWT for the upgrade CTA.
