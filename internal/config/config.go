@@ -20,9 +20,15 @@ type Config struct {
 	RazorpayKeyID            string // RAZORPAY_KEY_ID — API key ID (used server-side)
 	RazorpayKeySecret        string // RAZORPAY_KEY_SECRET — API key secret
 	RazorpayWebhookSecret    string // RAZORPAY_WEBHOOK_SECRET — webhook signature verification
-	RazorpayPlanIDHobby      string // RAZORPAY_PLAN_ID_HOBBY — plan_id for hobby tier
-	RazorpayPlanIDPro        string // RAZORPAY_PLAN_ID_PRO — plan_id for pro tier
-	RazorpayPlanIDTeam       string // RAZORPAY_PLAN_ID_TEAM — plan_id for team tier
+	RazorpayPlanIDHobby      string // RAZORPAY_PLAN_ID_HOBBY — plan_id for hobby tier (monthly)
+	RazorpayPlanIDPro        string // RAZORPAY_PLAN_ID_PRO — plan_id for pro tier (monthly)
+	RazorpayPlanIDTeam       string // RAZORPAY_PLAN_ID_TEAM — plan_id for team tier (monthly)
+	// Yearly billing variants. When unset, the corresponding yearly checkout
+	// returns 503 billing_not_configured so partial rollout (monthly already
+	// live, yearly plans not yet created in Razorpay dashboard) is safe.
+	RazorpayPlanIDHobbyYearly string // RAZORPAY_PLAN_ID_HOBBY_YEARLY — plan_id for hobby tier (yearly)
+	RazorpayPlanIDProYearly   string // RAZORPAY_PLAN_ID_PRO_YEARLY — plan_id for pro tier (yearly)
+	RazorpayPlanIDTeamYearly  string // RAZORPAY_PLAN_ID_TEAM_YEARLY — plan_id for team tier (yearly)
 	ResendAPIKey             string
 	GitHubClientID           string
 	GitHubClientSecret       string
@@ -127,9 +133,12 @@ func Load() *Config {
 		RazorpayKeyID:            os.Getenv("RAZORPAY_KEY_ID"),
 		RazorpayKeySecret:        os.Getenv("RAZORPAY_KEY_SECRET"),
 		RazorpayWebhookSecret:    os.Getenv("RAZORPAY_WEBHOOK_SECRET"),
-		RazorpayPlanIDHobby:      os.Getenv("RAZORPAY_PLAN_ID_HOBBY"),
-		RazorpayPlanIDPro:        os.Getenv("RAZORPAY_PLAN_ID_PRO"),
-		RazorpayPlanIDTeam:       os.Getenv("RAZORPAY_PLAN_ID_TEAM"),
+		RazorpayPlanIDHobby:       os.Getenv("RAZORPAY_PLAN_ID_HOBBY"),
+		RazorpayPlanIDPro:         os.Getenv("RAZORPAY_PLAN_ID_PRO"),
+		RazorpayPlanIDTeam:        os.Getenv("RAZORPAY_PLAN_ID_TEAM"),
+		RazorpayPlanIDHobbyYearly: os.Getenv("RAZORPAY_PLAN_ID_HOBBY_YEARLY"),
+		RazorpayPlanIDProYearly:   os.Getenv("RAZORPAY_PLAN_ID_PRO_YEARLY"),
+		RazorpayPlanIDTeamYearly:  os.Getenv("RAZORPAY_PLAN_ID_TEAM_YEARLY"),
 		ResendAPIKey:             os.Getenv("RESEND_API_KEY"),
 		GitHubClientID:           os.Getenv("GITHUB_CLIENT_ID"),
 		GitHubClientSecret:       os.Getenv("GITHUB_CLIENT_SECRET"),
