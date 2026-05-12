@@ -361,7 +361,7 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	app.Post("/webhook/receive/:token", webhookH.Receive)
 
 	// Phase 6: deploy
-	deployH := handlers.NewDeployHandler(db, rdb, cfg)
+	deployH := handlers.NewDeployHandler(db, rdb, cfg, planReg)
 	deployGroup := app.Group("/deploy", middleware.RequireAuth(cfg))
 	deployGroup.Post("/new", deployH.New)
 	deployGroup.Get("/:id", deployH.Get)

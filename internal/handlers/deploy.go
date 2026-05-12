@@ -35,6 +35,7 @@ import (
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/urls"
 	"instant.dev/internal/models"
+	"instant.dev/internal/plans"
 	"instant.dev/internal/providers/compute"
 	"instant.dev/internal/providers/compute/k8s"
 	"instant.dev/internal/providers/compute/noop"
@@ -42,15 +43,19 @@ import (
 
 // DeployHandler handles all /deploy endpoints.
 type DeployHandler struct {
-	db      *sql.DB
-	rdb     *redis.Client
-	cfg     *config.Config
-	compute compute.Provider
+	db           *sql.DB
+	rdb          *redis.Client
+	cfg          *config.Config
+	compute      compute.Provider
+	planRegistry *plans.Registry
 }
 
 // NewDeployHandler initialises the handler and selects the compute backend based on
 // cfg.ComputeProvider. Falls back to noop if k8s init fails.
-func NewDeployHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config) *DeployHandler {
+//
+// planRegistry supplies tier-specific limits (deployments_apps from plans.yaml).
+// It is required — pass plans.Default() in tests if you don't have a loaded registry.
+func NewDeployHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, planRegistry *plans.Registry) *DeployHandler {
 	var cp compute.Provider
 	switch cfg.ComputeProvider {
 	case "k8s":
@@ -64,7 +69,7 @@ func NewDeployHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config) *Deploy
 	default:
 		cp = noop.New()
 	}
-	return &DeployHandler{db: db, rdb: rdb, cfg: cfg, compute: cp}
+	return &DeployHandler{db: db, rdb: rdb, cfg: cfg, compute: cp, planRegistry: planRegistry}
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -283,6 +288,34 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 				continue
 			}
 			initEnv[k] = v
+		}
+	}
+
+	// ── Tier-limit enforcement (plans.yaml: deployments_apps) ────────────────
+	//
+	// Count the team's currently-active deployments and reject when over the
+	// per-tier cap. A limit of -1 means unlimited (team tier). A limit of 0
+	// means the tier cannot deploy at all (anonymous / free) — natural
+	// fall-through because existing (≥ 0) is always ≥ 0.
+	if h.planRegistry != nil {
+		existing, err := models.CountActiveDeploymentsByTeam(c.Context(), h.db, team.ID)
+		if err != nil {
+			slog.Error("deploy.new.count_failed",
+				"error", err, "team_id", team.ID,
+				"request_id", middleware.GetRequestID(c))
+			return respondError(c, fiber.StatusServiceUnavailable, "count_failed",
+				"Failed to check deployment quota")
+		}
+		limit := h.planRegistry.DeploymentsAppsLimit(team.PlanTier)
+		if limit >= 0 && existing >= limit {
+			agentAction := fmt.Sprintf(
+				"Tell the user they've hit the %s tier deployment cap (%d apps). Upgrade them to Pro for 10 medium deploys: https://instanode.dev/start?t=...",
+				team.PlanTier, limit)
+			return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired,
+				"deployment_limit_reached",
+				fmt.Sprintf("Your %s tier allows %d deployment(s).", team.PlanTier, limit),
+				agentAction,
+				"https://instanode.dev/pricing")
 		}
 	}
 
