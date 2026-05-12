@@ -614,6 +614,45 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/billing/usage": {
+      "get": {
+        "summary": "Aggregated usage metrics for the authenticated team (cached)",
+        "description": "One-shot fetch that powers the dashboard's BillingPage Usage panel. Replaces the prior pattern of summing storage_bytes per type in the browser after pulling the full /resources list. The aggregation runs once per team per 30s cache window and is shared across every surface (BillingPage today, future MCP agent_usage_summary tool). Real-time provisioning paths (POST /db/new etc.) MUST NOT use this aggregate — they read fresh DB state. Response shape: { ok, freshness_seconds, as_of, usage: { postgres, redis, mongodb, deployments, webhooks, vault, members } }. Storage services carry { bytes, limit_bytes }; count services carry { count, limit }. -1 in any limit field means 'unlimited' (matches plans.yaml). Cache-Control: private, max-age=30, stale-while-revalidate=60 — browsers + intermediate proxies honour the same window without hammering the API.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Aggregated usage payload",
+            "headers": {
+              "Cache-Control": {
+                "schema": { "type": "string", "example": "private, max-age=30, stale-while-revalidate=60" },
+                "description": "Per-team payload — private (no shared proxies). 30s max-age matches the server-side cache; 60s SWR gives the browser a grace window where stale values render while a background refresh runs."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BillingUsageResponse" },
+                "example": {
+                  "ok": true,
+                  "freshness_seconds": 30,
+                  "as_of": "2026-05-12T00:00:00Z",
+                  "usage": {
+                    "postgres":    { "bytes": 12582912,  "limit_bytes": 524288000 },
+                    "redis":       { "bytes": 0,         "limit_bytes": 26214400 },
+                    "mongodb":     { "bytes": 0,         "limit_bytes": 104857600 },
+                    "deployments": { "count": 1, "limit": 1 },
+                    "webhooks":    { "count": 3, "limit": 1000 },
+                    "vault":       { "count": 5, "limit": 50 },
+                    "members":     { "count": 1, "limit": 1 }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "description": "Missing or invalid session token. Response includes agent_action pointing the user at https://instanode.dev/login.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "500": { "description": "Failed to compute usage (transient DB error). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      }
+    },
     "/metrics": {
       "get": {
         "summary": "Prometheus metrics scrape endpoint",
@@ -821,6 +860,43 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/team/summary": {
+      "get": {
+        "summary": "Aggregated team counts for the dashboard sidebar (cached)",
+        "description": "One-shot fetch the dashboard sidebar uses to render SidebarUpgradeCard + per-nav-row badge numbers (Resources · 7, Deployments · 2, etc.). Replaces the prior pattern where every <NavRow> page-load triggered its own /api/v1/resources scan to compute a single number. Aggregation runs once per team per 5-min cache window — long enough that one signed-in user opening every dashboard page across a session triggers ~1 aggregate per surface, short enough that a provision/delete is visible within minutes. Eventual-consistent by design (per the §13 freshness matrix); do NOT use this for quota gate decisions. Response shape: { ok, freshness_seconds, as_of, tier, counts: { resources: { total, postgres, redis, mongodb, webhook, queue, storage, other }, deployments, members, vault_keys } }. Unknown resource_type rows fold into counts.resources.other so the total stays accurate even when the per-type breakdown lags a newly-shipped service. Cache-Control: private, max-age=300.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Aggregated team summary",
+            "headers": {
+              "Cache-Control": {
+                "schema": { "type": "string", "example": "private, max-age=300" },
+                "description": "Per-team payload — private (no shared proxies). 5-min max-age matches the server-side cache. No stale-while-revalidate because the window is already wide."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TeamSummaryResponse" },
+                "example": {
+                  "ok": true,
+                  "freshness_seconds": 300,
+                  "as_of": "2026-05-12T00:00:00Z",
+                  "tier": "hobby",
+                  "counts": {
+                    "resources": { "total": 7, "postgres": 2, "redis": 1, "mongodb": 1, "webhook": 2, "queue": 0, "storage": 1, "other": 0 },
+                    "deployments": 1,
+                    "members": 1,
+                    "vault_keys": 5
+                  }
+                }
+              }
+            }
+          },
+          "401": { "description": "Missing or invalid session token. Response includes agent_action pointing the user at https://instanode.dev/login.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "500": { "description": "Failed to compute summary (transient DB error). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      }
+    },
     "/api/v1/team/members": {
       "get": {
         "summary": "List members of the caller's team",
@@ -949,10 +1025,57 @@ const openAPISpec = `{
     "/api/v1/stacks": {
       "get": {
         "summary": "List all stacks owned by the caller's team",
+        "description": "Returns one row per stack, including its env (production/staging/dev/...) and parent_stack_id linkage so the dashboard can render the Environments grid without an extra round-trip per stack. For grouped env-sibling views call GET /api/v1/stacks/{slug}/family instead.",
         "security": [{ "bearerAuth": [] }],
         "responses": {
-          "200": { "description": "Stack list", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "items": { "type": "array", "items": { "type": "object", "properties": { "stack_id": { "type": "string", "description": "Slug (same as path /stacks/{slug})" }, "name": { "type": "string" }, "status": { "type": "string" }, "tier": { "type": "string" }, "namespace": { "type": "string" }, "created_at": { "type": "string", "format": "date-time" } } } }, "total": { "type": "integer" } } } } } },
+          "200": { "description": "Stack list", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "items": { "type": "array", "items": { "type": "object", "properties": { "stack_id": { "type": "string", "description": "Slug (same as path /stacks/{slug})" }, "name": { "type": "string" }, "status": { "type": "string" }, "tier": { "type": "string" }, "namespace": { "type": "string" }, "env": { "type": "string", "description": "Deployment env (production / staging / dev / ...). Defaults to 'production' for legacy stacks pre-dating migration 015." }, "parent_stack_id": { "type": "string", "description": "Root stack id when this is a promoted child. Empty string for the root." }, "created_at": { "type": "string", "format": "date-time" } } } }, "total": { "type": "integer" } } } } } },
           "401": { "description": "Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/stacks/{slug}/family": {
+      "get": {
+        "summary": "Get every env sibling of a stack (Pro+)",
+        "description": "Returns the production / staging / dev variants of the same app as a flat list, with the root first. The 'family' is resolved by walking parent_stack_id up to the root, then collecting every direct child. Pro / Team / Growth only — Hobby callers receive 402 with agent_action because they can't create siblings. Includes a per-env URL derived from the primary exposed service's app_url so the dashboard can render clickable env tiles. Response carries Cache-Control: private, max-age=60 — short enough to stay fresh across promotes/redeploys.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "slug", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Any member of the family (root or child) — the handler walks up to the root and back down." }],
+        "responses": {
+          "200": {
+            "description": "Family list (root first)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok":    { "type": "boolean" },
+                    "slug":  { "type": "string", "description": "Echo of the requested slug." },
+                    "family": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "slug":            { "type": "string" },
+                          "name":            { "type": "string" },
+                          "env":             { "type": "string" },
+                          "status":          { "type": "string" },
+                          "tier":            { "type": "string" },
+                          "url":             { "type": "string", "description": "Best-effort: first exposed service's app_url, else first service URL, else empty." },
+                          "is_root":         { "type": "boolean", "description": "True for the family root (parent_stack_id is null)." },
+                          "parent_stack_id": { "type": "string", "description": "Empty string for the root; otherwise the root's id." },
+                          "last_deploy_at":  { "type": "string", "format": "date-time" },
+                          "created_at":      { "type": "string", "format": "date-time" }
+                        }
+                      }
+                    },
+                    "total": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "description": "Unauthorized — session required" },
+          "402": { "description": "Upgrade required — team is not on pro/team/growth. Response carries upgrade_url + agent_action." },
+          "404": { "description": "Stack not found or not owned by this team" }
         }
       }
     },
@@ -1412,6 +1535,76 @@ const openAPISpec = `{
           "razorpay_customer_id": { "type": ["string", "null"], "description": "Razorpay customer id. Reserved for future use — always null today (Razorpay subscriptions don't require a pre-created customer record)" }
         },
         "required": ["ok", "tier", "subscription_status", "billing_email"]
+      },
+      "BillingUsageResponse": {
+        "type": "object",
+        "description": "Cached aggregate served by GET /api/v1/billing/usage. Replaces the prior client-side summation across /resources. Shared payload type for the cache layer (Redis JSON) and the public HTTP response, so a deploy-time shape change naturally invalidates older cache entries. -1 in any limit_bytes / limit field means 'unlimited' (matches the plans.yaml convention).",
+        "properties": {
+          "ok":                { "type": "boolean", "enum": [true] },
+          "freshness_seconds": { "type": "integer", "description": "Cache TTL window in seconds. Today 30 — matches the §13 freshness target and the Cache-Control max-age. Tune in one place: this field follows the server-side const." },
+          "as_of":             { "type": "string", "format": "date-time", "description": "When the aggregation was computed. Useful for stale-while-revalidate displays and for debugging cache-vs-live discrepancies." },
+          "usage": {
+            "type": "object",
+            "description": "Per-service metrics. Storage services carry { bytes, limit_bytes }. Count services carry { count, limit }. Fields are omitempty so the irrelevant one for each kind stays off the wire.",
+            "properties": {
+              "postgres":    { "$ref": "#/components/schemas/UsageMetric" },
+              "redis":       { "$ref": "#/components/schemas/UsageMetric" },
+              "mongodb":     { "$ref": "#/components/schemas/UsageMetric" },
+              "deployments": { "$ref": "#/components/schemas/UsageMetric" },
+              "webhooks":    { "$ref": "#/components/schemas/UsageMetric" },
+              "vault":       { "$ref": "#/components/schemas/UsageMetric" },
+              "members":     { "$ref": "#/components/schemas/UsageMetric" }
+            }
+          }
+        },
+        "required": ["ok", "freshness_seconds", "as_of", "usage"]
+      },
+      "UsageMetric": {
+        "type": "object",
+        "description": "One service's slice of the usage aggregate. Either bytes/limit_bytes (storage services) or count/limit (deployments, webhooks, vault, members). -1 in a limit field means 'unlimited'.",
+        "properties": {
+          "bytes":       { "type": "integer", "format": "int64", "description": "Current storage usage in bytes. Present on postgres/redis/mongodb." },
+          "limit_bytes": { "type": "integer", "format": "int64", "description": "Storage cap in bytes (plans.yaml storage_mb × 1024 × 1024). -1 = unlimited." },
+          "count":       { "type": "integer", "description": "Current count. Present on deployments/webhooks/vault/members." },
+          "limit":       { "type": "integer", "description": "Count cap from plans.yaml. -1 = unlimited." }
+        }
+      },
+      "TeamSummaryResponse": {
+        "type": "object",
+        "description": "Cached aggregate served by GET /api/v1/team/summary. Powers the dashboard sidebar's SidebarUpgradeCard and per-nav-row badge numbers. Eventual-consistent on purpose (5-min window) — do NOT use for quota gate decisions. Shared payload type for the Redis cache and the public response; a JSON shape change naturally invalidates older cache entries.",
+        "properties": {
+          "ok":                { "type": "boolean", "enum": [true] },
+          "freshness_seconds": { "type": "integer", "description": "Cache TTL window in seconds. Today 300 — matches the server-side const and the Cache-Control max-age." },
+          "as_of":             { "type": "string", "format": "date-time", "description": "When the aggregation was computed." },
+          "tier":              { "type": "string", "description": "Current plan tier from the team record. Mirrored here so the sidebar doesn't need a second /billing fetch just to render the upgrade card.", "enum": ["anonymous", "free", "hobby", "pro", "team"] },
+          "counts": {
+            "type": "object",
+            "description": "Per-area counts. resources.total is the sum of every typed bucket plus 'other' — saves the dashboard from re-adding.",
+            "properties": {
+              "resources":   { "$ref": "#/components/schemas/TeamSummaryResourceCounts" },
+              "deployments": { "type": "integer", "description": "Active deployments. Excludes status IN ('deleted','stopped') — matches the dashboard's 'active deployments' framing." },
+              "members":     { "type": "integer", "description": "Team member count (including the caller)." },
+              "vault_keys":  { "type": "integer", "description": "Total vault entries across every env this team owns." }
+            },
+            "required": ["resources", "deployments", "members", "vault_keys"]
+          }
+        },
+        "required": ["ok", "freshness_seconds", "as_of", "tier", "counts"]
+      },
+      "TeamSummaryResourceCounts": {
+        "type": "object",
+        "description": "Per-type breakdown of active resources for one team. Produced by a single SELECT resource_type, COUNT(*) GROUP BY resource_type — cheaper than six separate COUNTs. Unknown resource_type rows fold into 'other' so the total stays accurate when a freshly-shipped service hasn't gotten a typed bucket yet.",
+        "properties": {
+          "total":    { "type": "integer", "description": "Sum across every bucket (typed + other)." },
+          "postgres": { "type": "integer" },
+          "redis":    { "type": "integer" },
+          "mongodb":  { "type": "integer" },
+          "webhook":  { "type": "integer" },
+          "queue":    { "type": "integer" },
+          "storage":  { "type": "integer" },
+          "other":    { "type": "integer", "description": "Catch-all for resource_type values this build doesn't recognise (e.g. a service shipped after the dashboard's TS types were generated). Always included in total." }
+        },
+        "required": ["total"]
       },
       "ErrorResponse": {
         "type": "object",

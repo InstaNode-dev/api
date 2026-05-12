@@ -298,6 +298,13 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// router doesn't have to know the policy.
 	api.Post("/stacks/:slug/promote", stackH.Promote)
 
+	// Env family — Pro+ "show me production + staging + dev variants of
+	// this app side-by-side." Same tier gate as promote (handler-enforced).
+	// Read-only; the handler emits a short Cache-Control: private, max-age=60
+	// since family metadata is read-only and per-team-scoped but must NOT
+	// be cached across promotes/redeploys.
+	api.Get("/stacks/:slug/family", stackH.Family)
+
 	// Custom domains — Pro+ "bring your own hostname" for stacks. All routes
 	// require auth (the /api/v1 group middleware) and additionally enforce
 	// stack ownership inside the handler.
