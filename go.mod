@@ -29,7 +29,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.39.0
 	go.temporal.io/sdk v1.42.0
 	golang.org/x/sync v0.19.0
-	google.golang.org/grpc v1.79.3
+	google.golang.org/grpc v1.80.0
 	gopkg.in/yaml.v3 v3.0.1
 	instant.dev/common v0.0.0-00010101000000-000000000000
 	instant.dev/proto v0.0.0
@@ -88,6 +88,7 @@ require (
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
 	github.com/montanaflynn/stats v0.7.1 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/newrelic/go-agent/v3 v3.43.3 // indirect
 	github.com/nexus-rpc/sdk-go v0.6.0 // indirect
 	github.com/philhofer/fwd v1.1.3-0.20240916144458-20a13a1f6b7c // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
