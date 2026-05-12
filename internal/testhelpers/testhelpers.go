@@ -119,11 +119,15 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS env TEXT NOT NULL DEFAULT 'production'`,
 		// provider_resource_id — tracked by some scanners; safe default
 		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS provider_resource_id TEXT`,
+		// 018_resource_family — env-twin linkage (slice 2 of env-aware deployments)
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS parent_resource_id UUID REFERENCES resources(id) ON DELETE SET NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_token       ON resources(token)`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_fingerprint ON resources(fingerprint) WHERE team_id IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_expires     ON resources(expires_at) WHERE status = 'active'`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_team        ON resources(team_id) WHERE team_id IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_team_env    ON resources(team_id, env)`,
+		`CREATE INDEX IF NOT EXISTS idx_resources_family      ON resources(parent_resource_id) WHERE parent_resource_id IS NOT NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_resources_family_env ON resources(parent_resource_id, env) WHERE parent_resource_id IS NOT NULL`,
 		`CREATE TABLE IF NOT EXISTS onboarding_events (
 			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			fingerprint     TEXT NOT NULL,
@@ -374,6 +378,11 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	whoamiH := handlers.NewWhoamiHandler(db)
 	api.Get("/whoami", whoamiH.Get)
 	api.Get("/resources", resourceH.List)
+	// /families and /:id/family must register BEFORE /:id so Fiber routes
+	// the literal segments instead of binding them to the :id wildcard.
+	// Matches the production order in internal/router/router.go.
+	api.Get("/resources/families", resourceH.ListFamilies)
+	api.Get("/resources/:id/family", resourceH.Family)
 	api.Get("/resources/:id", resourceH.Get)
 	api.Delete("/resources/:id", resourceH.Delete)
 	api.Post("/resources/:id/rotate-credentials", resourceH.RotateCredentials)

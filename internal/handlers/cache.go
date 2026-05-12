@@ -89,7 +89,13 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 
 	// ── Authenticated path ────────────────────────────────────────────────────
 	if teamIDStr := middleware.GetTeamID(c); teamIDStr != "" {
-		return h.newCacheAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, body.Dedicated, env, start)
+		return h.newCacheAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, body.Dedicated, env, body.ParentResourceID, start)
+	}
+
+	// Anonymous callers cannot family-link.
+	if body.ParentResourceID != "" {
+		return respondError(c, fiber.StatusPaymentRequired, "auth_required",
+			"parent_resource_id requires an authenticated team. Sign up at "+urls.StartURLPrefix)
 	}
 
 	// ── Dedicated requires authentication ─────────────────────────────────────
@@ -274,7 +280,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 }
 
 func (h *CacheHandler) newCacheAuthenticated(
-	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, dedicated bool, env string, start time.Time,
+	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, dedicated bool, env, parentResourceID string, start time.Time,
 ) error {
 	ctx := c.UserContext()
 	teamUUID, err := parseTeamID(teamIDStr)
@@ -292,9 +298,14 @@ func (h *CacheHandler) newCacheAuthenticated(
 		tier = "growth"
 	}
 
+	parentRootID, perr := resolveFamilyParent(c, h.db, parentResourceID, teamUUID, models.ResourceTypeRedis, env)
+	if perr != nil {
+		return perr
+	}
+
 	resource, err := models.CreateResource(ctx, h.db, models.CreateResourceParams{
 		TeamID:           &teamUUID,
-		ResourceType:     "redis",
+		ResourceType:     models.ResourceTypeRedis,
 		Name:             name,
 		Tier:             tier,
 		Env:              env,
@@ -303,6 +314,7 @@ func (h *CacheHandler) newCacheAuthenticated(
 		CountryCode:      country,
 		ExpiresAt:        nil,
 		CreatedRequestID: requestID,
+		ParentResourceID: parentRootID,
 	})
 	if err != nil {
 		slog.Error("cache.new.create_resource_failed_auth", "error", err, "team_id", teamIDStr, "request_id", requestID)
