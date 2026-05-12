@@ -12,8 +12,8 @@ import (
 
 	"github.com/newrelic/go-agent/v3/newrelic"
 	"google.golang.org/grpc"
-	"instant.dev/internal/obsstubs/buildinfo"
-	"instant.dev/internal/obsstubs/logctx"
+	"instant.dev/common/buildinfo"
+	"instant.dev/common/logctx"
 	"instant.dev/internal/config"
 	"instant.dev/internal/db"
 	"instant.dev/internal/email"
