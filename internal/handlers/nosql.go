@@ -152,6 +152,11 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 		}
 	}
 
+	// Free-tier recycle gate (see provision_helper.go for rationale).
+	if h.recycleGate(c, fp, "mongodb") {
+		return nil
+	}
+
 	expiresAt := time.Now().UTC().Add(24 * time.Hour)
 	resource, err := models.CreateResource(ctx, h.db, models.CreateResourceParams{
 		ResourceType:     "mongodb",
@@ -239,6 +244,12 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 	)
 	metrics.ProvisionsTotal.WithLabelValues("mongodb", "anonymous").Inc()
 	metrics.ConversionFunnel.WithLabelValues("provision").Inc()
+
+	if markErr := h.markRecycleSeen(ctx, fp); markErr != nil {
+		slog.Warn("nosql.new.mark_recycle_seen_failed",
+			"error", markErr, "fingerprint", fp, "request_id", requestID)
+		metrics.RedisErrors.WithLabelValues("recycle_mark").Inc()
+	}
 
 	nosqlStorageLimitMB := h.plans.StorageLimitMB("anonymous", "mongodb")
 	_, nosqlStorageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, nosqlStorageLimitMB)

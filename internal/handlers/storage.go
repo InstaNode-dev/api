@@ -148,6 +148,11 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 		}
 	}
 
+	// Free-tier recycle gate (see provision_helper.go for rationale).
+	if h.recycleGate(c, fp, "storage") {
+		return nil
+	}
+
 	expiresAt := time.Now().UTC().Add(24 * time.Hour)
 	resource, err := models.CreateResource(ctx, h.db, models.CreateResourceParams{
 		ResourceType:     "storage",
@@ -228,6 +233,12 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 	)
 	metrics.ProvisionsTotal.WithLabelValues("storage", "anonymous").Inc()
 	metrics.ConversionFunnel.WithLabelValues("provision").Inc()
+
+	if markErr := h.markRecycleSeen(ctx, fp); markErr != nil {
+		slog.Warn("storage.new.mark_recycle_seen_failed",
+			"error", markErr, "fingerprint", fp, "request_id", requestID)
+		metrics.RedisErrors.WithLabelValues("recycle_mark").Inc()
+	}
 
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"ok":                true,

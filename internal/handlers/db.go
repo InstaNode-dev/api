@@ -166,6 +166,16 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 		}
 	}
 
+	// Free-tier recycle gate (Option B / FREE-TIER-RECYCLE-2026-05-12). If
+	// this fingerprint has provisioned anonymously before AND no active row
+	// exists today, require a one-time email claim instead of silently
+	// handing out another 24h free resource. Anonymous-only — the
+	// authenticated path returned above. Fails open on Redis/DB errors so
+	// the magic-first-touch wedge is never collateral damage.
+	if h.recycleGate(c, fp, "postgres") {
+		return nil
+	}
+
 	// Provision new anonymous Postgres resource (expires in 24h).
 	expiresAt := time.Now().UTC().Add(24 * time.Hour)
 	resource, err := models.CreateResource(ctx, h.db, models.CreateResourceParams{
@@ -252,6 +262,16 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 
 	metrics.ProvisionsTotal.WithLabelValues("postgres", "anonymous").Inc()
 	metrics.ConversionFunnel.WithLabelValues("provision").Inc()
+
+	// Record this fingerprint as having had at least one anonymous touch.
+	// The next anonymous POST after this resource expires will hit the
+	// recycle gate above and require an email claim. Best-effort: log on
+	// failure but never block the response.
+	if markErr := h.markRecycleSeen(ctx, fp); markErr != nil {
+		slog.Warn("db.new.mark_recycle_seen_failed",
+			"error", markErr, "fingerprint", fp, "request_id", requestID)
+		metrics.RedisErrors.WithLabelValues("recycle_mark").Inc()
+	}
 
 	storageLimitMB := h.plans.StorageLimitMB("anonymous", "postgres")
 	_, storageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
