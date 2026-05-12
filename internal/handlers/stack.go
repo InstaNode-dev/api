@@ -1313,7 +1313,7 @@ func respondMultiEnvUpgradeRequired(c *fiber.Ctx, currentTier string) error {
 		"error":        "upgrade_required",
 		"message":      "Multi-env workflows require the Pro plan or higher. Your team is on the " + currentTier + " plan.",
 		"upgrade_url":  "https://instanode.dev/pricing",
-		"agent_action": "Tell user to upgrade to Pro at https://instanode.dev/pricing to unlock multi-env workflows.",
+		"agent_action": AgentActionMultiEnvUpgradeRequired,
 	})
 	return ErrResponseWritten
 }
@@ -1533,7 +1533,7 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 				"ok":           false,
 				"error":        "missing_image_ref",
 				"message":      "Source stack service " + ss.Name + " has no recorded image_ref; promote cannot deploy a cached image.",
-				"agent_action": "This stack predates the image-ref persistence migration. Redeploy the source stack first so its image is cached, then promote.",
+				"agent_action": AgentActionStackPromoteMissingImageRef,
 			})
 			return ErrResponseWritten
 		}
