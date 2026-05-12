@@ -65,14 +65,26 @@ func stackImageTag(stackID, svcName string) string {
 // DeployStack builds all images in parallel, creates the stack namespace with
 // security primitives, deploys all Deployments/Services/Ingresses, then waits
 // until all pods are healthy (up to 10 minutes).
+//
+// When a service has SkipBuild=true and a non-empty ImageRef, the build step
+// is bypassed for that service and the provided ImageRef is used directly
+// for the Deployment. This is the path the /promote endpoint takes when a
+// target sibling is created from a source stack's cached image — no tarball,
+// no kaniko, just a pull-and-deploy.
+//
+// onImageBuilt is called once per service with the image reference the
+// provider will use for the Deployment (either freshly built or the
+// pass-through ImageRef). Persist it into stack_services.image_ref so
+// subsequent /promote calls can reuse this image.
 func (p *K8sStackProvider) DeployStack(
 	ctx context.Context,
 	opts compute.StackDeployOptions,
 	onUpdate func(svcName, status, appURL, errMsg string),
+	onImageBuilt func(svcName, imageRef string),
 ) error {
 	stackNamespace := compute.StackNamespace(opts.StackID)
 
-	// ── Step 1: Parallel image builds ────────────────────────────────────────
+	// ── Step 1: Parallel image builds (skipped per-service when SkipBuild) ─
 
 	maxConcurrent := runtime.NumCPU() / 2
 	if maxConcurrent < 1 {
@@ -92,6 +104,16 @@ func (p *K8sStackProvider) DeployStack(
 
 	for _, svc := range opts.Services {
 		svc := svc // capture
+		// /promote path: deploy a cached image instead of rebuilding. Fire
+		// onImageBuilt synchronously so the handler can persist the same
+		// ref it just copied off the source — keeps image_ref in sync even
+		// when no real build happened.
+		if svc.SkipBuild && svc.ImageRef != "" {
+			if onImageBuilt != nil {
+				onImageBuilt(svc.Name, svc.ImageRef)
+			}
+			continue
+		}
 		eg.Go(func() error {
 			if err := sem.Acquire(buildCtx, 1); err != nil {
 				return err
@@ -102,6 +124,13 @@ func (p *K8sStackProvider) DeployStack(
 			tag := stackImageTag(opts.StackID, svc.Name)
 			if err := p.buildImage(buildCtx, stackNamespace, svc.Name+"-"+opts.StackID, tag, svc.Tarball); err != nil {
 				return fmt.Errorf("build %q: %w", svc.Name, err)
+			}
+			// Build succeeded — surface the image ref so the handler can
+			// persist it BEFORE the Deployment is created. If the namespace
+			// or Deployment step fails afterwards, image_ref is still set
+			// and a subsequent redeploy can short-circuit the rebuild.
+			if onImageBuilt != nil {
+				onImageBuilt(svc.Name, tag)
 			}
 			return nil
 		})
@@ -139,7 +168,14 @@ func (p *K8sStackProvider) DeployStack(
 			port = 8080
 		}
 
+		// Use the pre-built image ref on the /promote path, otherwise the
+		// tag the provider just built. Falling back to stackImageTag for the
+		// build path keeps the existing behaviour exact — kaniko pushes that
+		// tag and the Deployment immediately references it.
 		tag := stackImageTag(opts.StackID, svc.Name)
+		if svc.SkipBuild && svc.ImageRef != "" {
+			tag = svc.ImageRef
+		}
 
 		// Deployment
 		if err := p.createStackDeployment(ctx, stackNamespace, opts.StackID, svc.Name, tag, port, svc.EnvVars, memReq, memLimit, cpuReq); err != nil {
@@ -232,6 +268,7 @@ func (p *K8sStackProvider) RedeployStack(
 	stackNamespace string,
 	services []compute.StackServiceDef,
 	onUpdate func(svcName, status, appURL, errMsg string),
+	onImageBuilt func(svcName, imageRef string),
 ) error {
 	// Derive stackID from namespace name: "instant-stack-{stackID}"
 	stackID := strings.TrimPrefix(stackNamespace, "instant-stack-")
@@ -254,6 +291,16 @@ func (p *K8sStackProvider) RedeployStack(
 
 	for _, svc := range services {
 		svc := svc
+		// Promote-style "deploy cached image" path: no rebuild; just deploy
+		// the supplied ImageRef. Surface it so the handler can keep
+		// image_ref in sync (the handler also already inserted the same ref
+		// when creating the row — this is belt-and-braces).
+		if svc.SkipBuild && svc.ImageRef != "" {
+			if onImageBuilt != nil {
+				onImageBuilt(svc.Name, svc.ImageRef)
+			}
+			continue
+		}
 		eg.Go(func() error {
 			if err := sem.Acquire(buildCtx, 1); err != nil {
 				return err
@@ -264,6 +311,9 @@ func (p *K8sStackProvider) RedeployStack(
 			tag := stackImageTag(stackID, svc.Name)
 			if err := p.buildImage(buildCtx, stackNamespace, svc.Name+"-"+stackID, tag, svc.Tarball); err != nil {
 				return fmt.Errorf("rebuild %q: %w", svc.Name, err)
+			}
+			if onImageBuilt != nil {
+				onImageBuilt(svc.Name, tag)
 			}
 			return nil
 		})
@@ -276,6 +326,9 @@ func (p *K8sStackProvider) RedeployStack(
 	// Patch each Deployment to force a rolling update.
 	for _, svc := range services {
 		tag := stackImageTag(stackID, svc.Name)
+		if svc.SkipBuild && svc.ImageRef != "" {
+			tag = svc.ImageRef
+		}
 
 		deploy, err := p.clientset.AppsV1().Deployments(stackNamespace).Get(ctx, svc.Name, metav1.GetOptions{})
 		if err != nil {

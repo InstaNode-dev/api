@@ -35,11 +35,19 @@ type Stack struct {
 }
 
 // StackService represents a single service within a Stack.
+//
+// ImageRef is the fully-qualified image reference returned by the build
+// provider after a successful build (e.g. "ghcr.io/instanode/instant-stack-
+// stk-abc-api:latest"). Persisted in migration 017_stack_image_ref.sql so the
+// /promote endpoint can re-use a source stack's built image when deploying a
+// target sibling — no tarball, no rebuild. Empty string for pre-migration
+// rows; promote rejects those with 412.
 type StackService struct {
 	ID        uuid.UUID
 	StackID   uuid.UUID
 	Name      string
 	ImageTag  string
+	ImageRef  string
 	Status    string // building|deploying|healthy|failed|stopped
 	Expose    bool
 	Port      int
@@ -64,11 +72,18 @@ type CreateStackParams struct {
 }
 
 // CreateStackServiceParams holds fields for inserting a new stack_service row.
+//
+// ImageRef is optional. The standard /stacks/new path leaves it empty (the
+// build pipeline populates it later via UpdateStackServiceImageRef). The
+// /promote path passes the source service's image_ref directly so the target
+// row is created with the cached reference already populated and the deploy
+// goroutine can skip the build step.
 type CreateStackServiceParams struct {
-	StackID uuid.UUID
-	Name    string
-	Expose  bool
-	Port    int
+	StackID  uuid.UUID
+	Name     string
+	Expose   bool
+	Port     int
+	ImageRef string // optional; non-empty for promote-copied rows
 }
 
 // ErrStackNotFound is returned when a stack lookup yields no rows.
@@ -128,19 +143,26 @@ func scanStack(row interface {
 }
 
 // scanStackService reads a single stack_services row into a StackService struct.
+//
+// Column order is fixed to:
+//   id, stack_id, name, image_tag, image_ref, status, expose, port, app_url,
+//   error_msg, created_at
+// — every query in this file must SELECT in this order so the scan offsets
+// stay aligned.
 func scanStackService(row interface {
 	Scan(dest ...any) error
 }) (*StackService, error) {
 	ss := &StackService{}
-	var imageTag, appURL, errorMsg sql.NullString
+	var imageTag, imageRef, appURL, errorMsg sql.NullString
 	if err := row.Scan(
 		&ss.ID, &ss.StackID, &ss.Name,
-		&imageTag, &ss.Status, &ss.Expose, &ss.Port,
+		&imageTag, &imageRef, &ss.Status, &ss.Expose, &ss.Port,
 		&appURL, &errorMsg, &ss.CreatedAt,
 	); err != nil {
 		return nil, err
 	}
 	ss.ImageTag = imageTag.String
+	ss.ImageRef = imageRef.String
 	ss.AppURL = appURL.String
 	ss.ErrorMsg = errorMsg.String
 	return ss, nil
@@ -392,17 +414,27 @@ func DeleteStack(ctx context.Context, db *sql.DB, id uuid.UUID) error {
 }
 
 // CreateStackService inserts a new stack_service row.
+//
+// When ImageRef is non-empty (the /promote copy path) it is inserted directly
+// so the deploy goroutine can skip the build step. The standard /stacks/new
+// path leaves it NULL and the build pipeline back-fills it via
+// UpdateStackServiceImageRef.
 func CreateStackService(ctx context.Context, db *sql.DB, p CreateStackServiceParams) (*StackService, error) {
 	port := p.Port
 	if port == 0 {
 		port = 8080
 	}
 
+	var imageRefVal interface{}
+	if p.ImageRef != "" {
+		imageRefVal = p.ImageRef
+	}
+
 	row := db.QueryRowContext(ctx, `
-		INSERT INTO stack_services (stack_id, name, expose, port)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id, stack_id, name, image_tag, status, expose, port, app_url, error_msg, created_at
-	`, p.StackID, p.Name, p.Expose, port)
+		INSERT INTO stack_services (stack_id, name, expose, port, image_ref)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, stack_id, name, image_tag, image_ref, status, expose, port, app_url, error_msg, created_at
+	`, p.StackID, p.Name, p.Expose, port, imageRefVal)
 
 	ss, err := scanStackService(row)
 	if err != nil {
@@ -414,7 +446,7 @@ func CreateStackService(ctx context.Context, db *sql.DB, p CreateStackServicePar
 // GetStackServicesByStack returns all services for a stack, ordered by name.
 func GetStackServicesByStack(ctx context.Context, db *sql.DB, stackID uuid.UUID) ([]*StackService, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT id, stack_id, name, image_tag, status, expose, port, app_url, error_msg, created_at
+		SELECT id, stack_id, name, image_tag, image_ref, status, expose, port, app_url, error_msg, created_at
 		FROM stack_services
 		WHERE stack_id = $1
 		ORDER BY name
@@ -466,6 +498,23 @@ func UpdateStackServiceImageTag(ctx context.Context, db *sql.DB, id uuid.UUID, i
 	`, imageTag, id)
 	if err != nil {
 		return fmt.Errorf("models.UpdateStackServiceImageTag: %w", err)
+	}
+	return nil
+}
+
+// UpdateStackServiceImageRef persists the image reference returned by the
+// build provider after a successful build (migration 017_stack_image_ref.sql).
+//
+// The /promote endpoint reads back this column to decide whether the source
+// stack can be re-deployed onto a target sibling without re-building. A NULL
+// value means the row predates the migration — promote returns 412 in that
+// case and asks the caller to redeploy the source first.
+func UpdateStackServiceImageRef(ctx context.Context, db *sql.DB, id uuid.UUID, imageRef string) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE stack_services SET image_ref = $1 WHERE id = $2
+	`, imageRef, id)
+	if err != nil {
+		return fmt.Errorf("models.UpdateStackServiceImageRef: %w", err)
 	}
 	return nil
 }

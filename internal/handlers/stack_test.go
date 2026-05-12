@@ -78,6 +78,7 @@ func ensureStackTables(t *testing.T, db *sql.DB) {
 			stack_id    UUID NOT NULL REFERENCES stacks(id) ON DELETE CASCADE,
 			name        TEXT NOT NULL,
 			image_tag   TEXT,
+			image_ref   TEXT,
 			status      TEXT NOT NULL DEFAULT 'building',
 			expose      BOOLEAN NOT NULL DEFAULT FALSE,
 			port        INT NOT NULL DEFAULT 8080,
@@ -86,9 +87,13 @@ func ensureStackTables(t *testing.T, db *sql.DB) {
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
 			UNIQUE(stack_id, name)
 		)`,
+		// Idempotent ALTER for environments where stack_services already
+		// existed before migration 017_stack_image_ref.sql.
+		`ALTER TABLE stack_services ADD COLUMN IF NOT EXISTS image_ref TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_stacks_team_id     ON stacks(team_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_stacks_slug        ON stacks(slug)`,
 		`CREATE INDEX IF NOT EXISTS idx_stack_services_stack ON stack_services(stack_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_stack_services_image_ref ON stack_services (image_ref) WHERE image_ref IS NOT NULL`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
