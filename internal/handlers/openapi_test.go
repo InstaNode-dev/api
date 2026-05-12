@@ -123,6 +123,96 @@ func TestOpenAPI_StacksEndpointsDocumented(t *testing.T) {
 	}
 }
 
+// TestOpenAPI_MultiEnvEndpointsDocumented guards RETRO-2026-05-12 §10.17:
+// the env-promotion endpoints (POST /api/v1/stacks/:slug/promote and
+// POST /api/v1/vault/copy) must be discoverable in the spec, and both must
+// document the 402 upgrade_required response so agents know the tier gate
+// exists and what error code to expect on free / hobby tiers.
+func TestOpenAPI_MultiEnvEndpointsDocumented(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	paths, _ := v["paths"].(map[string]any)
+	for _, p := range []string{
+		"/api/v1/stacks/{slug}/promote",
+		"/api/v1/vault/copy",
+	} {
+		op, ok := paths[p].(map[string]any)
+		if !ok {
+			t.Errorf("OpenAPI is missing path %q — agents cannot discover the multi-env workflow endpoints", p)
+			continue
+		}
+		post, ok := op["post"].(map[string]any)
+		if !ok {
+			t.Errorf("path %q missing POST operation", p)
+			continue
+		}
+		responses, _ := post["responses"].(map[string]any)
+		if _, ok := responses["402"]; !ok {
+			t.Errorf("path %q must document the 402 upgrade_required response — agents need to know the tier gate exists", p)
+		}
+	}
+}
+
+// TestOpenAPI_ErrorResponseSchemaDocumented guards RETRO-2026-05-12 §10.15:
+// the canonical ErrorResponse schema (with agent_action and upgrade_url)
+// must be discoverable in the spec, and the agent-relevant provisioning
+// endpoints must reference it on 4xx/5xx responses so agents reading the
+// spec alone know to expect agent_action copy.
+func TestOpenAPI_ErrorResponseSchemaDocumented(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	schema, ok := digMap(v, "components", "schemas", "ErrorResponse")
+	if !ok {
+		t.Fatal("components.schemas.ErrorResponse missing — agents cannot discover the canonical error shape")
+	}
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("ErrorResponse.properties missing")
+	}
+	for _, k := range []string{"ok", "error", "message", "agent_action", "upgrade_url"} {
+		if _, ok := props[k]; !ok {
+			t.Errorf("ErrorResponse.properties.%s missing — agents need this field documented to know it's optional and what to do with it", k)
+		}
+	}
+	// The description must teach agents what agent_action means — otherwise
+	// they'll ignore it the same way they'd ignore any unknown field.
+	actionDesc, _ := props["agent_action"].(map[string]any)
+	desc, _ := actionDesc["description"].(string)
+	if !strings.Contains(strings.ToLower(desc), "agent") || !strings.Contains(strings.ToLower(desc), "user") {
+		t.Errorf("ErrorResponse.properties.agent_action.description should explain it's a sentence the agent shows the user; got: %s", desc)
+	}
+
+	// Provisioning endpoints must reference ErrorResponse on 402 so agents
+	// reading the spec know agent_action is on the wire for quota walls.
+	paths, _ := v["paths"].(map[string]any)
+	for _, p := range []string{"/db/new", "/cache/new", "/nosql/new", "/queue/new", "/storage/new"} {
+		ep, ok := paths[p].(map[string]any)
+		if !ok {
+			continue // some envs may not register a path; that's a different test's concern
+		}
+		post, ok := ep["post"].(map[string]any)
+		if !ok {
+			continue
+		}
+		responses, _ := post["responses"].(map[string]any)
+		r402, ok := responses["402"].(map[string]any)
+		if !ok {
+			t.Errorf("%s POST must document a 402 response with ErrorResponse so agents know to expect agent_action on quota walls", p)
+			continue
+		}
+		body, _ := digMap(r402, "content", "application/json")
+		schemaRef, _ := body["schema"].(map[string]any)
+		ref, _ := schemaRef["$ref"].(string)
+		if !strings.HasSuffix(ref, "/ErrorResponse") {
+			t.Errorf("%s 402 should $ref ErrorResponse; got %q", p, ref)
+		}
+	}
+}
+
 func digMap(root map[string]any, keys ...string) (map[string]any, bool) {
 	cur := root
 	for _, k := range keys {

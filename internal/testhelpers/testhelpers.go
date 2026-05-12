@@ -113,10 +113,17 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			created_request_id TEXT,
 			created_at       TIMESTAMPTZ DEFAULT now()
 		)`,
+		// 006_key_prefix — provisioner key prefix per resource (Redis dedup path)
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS key_prefix TEXT NOT NULL DEFAULT ''`,
+		// 009_env_column — env scoping for multi-env support
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS env TEXT NOT NULL DEFAULT 'production'`,
+		// provider_resource_id — tracked by some scanners; safe default
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS provider_resource_id TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_token       ON resources(token)`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_fingerprint ON resources(fingerprint) WHERE team_id IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_expires     ON resources(expires_at) WHERE status = 'active'`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_team        ON resources(team_id) WHERE team_id IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_resources_team_env    ON resources(team_id, env)`,
 		`CREATE TABLE IF NOT EXISTS onboarding_events (
 			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			fingerprint     TEXT NOT NULL,
@@ -145,6 +152,36 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`CREATE INDEX IF NOT EXISTS idx_invitations_team ON team_invitations(team_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_invitations_email ON team_invitations(lower(email))`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_invitations_team_email_pending ON team_invitations (team_id, lower(email)) WHERE status = 'pending'`,
+		// 010_team_invitations — RBAC + token-based accept
+		`CREATE EXTENSION IF NOT EXISTS pgcrypto`,
+		`ALTER TABLE team_invitations ADD COLUMN IF NOT EXISTS token TEXT`,
+		`ALTER TABLE team_invitations ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_invitations_token ON team_invitations (token)`,
+		// 008_vault — per-team encrypted secret storage
+		`CREATE TABLE IF NOT EXISTS vault_secrets (
+			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id         UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			env             TEXT NOT NULL DEFAULT 'production',
+			key             TEXT NOT NULL,
+			encrypted_value BYTEA NOT NULL,
+			version         INT NOT NULL DEFAULT 1,
+			created_by      UUID REFERENCES users(id) ON DELETE SET NULL,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (team_id, env, key, version)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_vault_secrets_lookup ON vault_secrets (team_id, env, key)`,
+		`CREATE TABLE IF NOT EXISTS vault_audit_log (
+			id          BIGSERIAL PRIMARY KEY,
+			team_id     UUID NOT NULL,
+			user_id     UUID,
+			action      TEXT NOT NULL,
+			env         TEXT NOT NULL,
+			secret_key  TEXT NOT NULL,
+			ip          TEXT,
+			ts          TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_vault_audit_team_ts ON vault_audit_log (team_id, ts DESC)`,
 		// 003_deployments — Phase 6 container deployments
 		`CREATE TABLE IF NOT EXISTS deployments (
 			id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -166,8 +203,27 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS app_url TEXT`,
 		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS tier TEXT`,
 		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`,
+		// Drop NOT NULL on token / namespace / image / container_port / app_url
+		// (real schema uses app_id; these legacy fields aren't populated by current models).
+		`ALTER TABLE deployments ALTER COLUMN token DROP NOT NULL`,
+		`ALTER TABLE deployments ALTER COLUMN namespace DROP NOT NULL`,
+		`ALTER TABLE deployments ALTER COLUMN image DROP NOT NULL`,
+		`ALTER TABLE deployments ALTER COLUMN container_port DROP NOT NULL`,
+		`ALTER TABLE deployments ALTER COLUMN app_url DROP NOT NULL`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS resource_id UUID REFERENCES resources(id) ON DELETE SET NULL`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS env TEXT NOT NULL DEFAULT 'production'`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS env_vars JSONB NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS app_id TEXT`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provider_id TEXT`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS port INT NOT NULL DEFAULT 8080`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS error_message TEXT`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_deployments_app_id ON deployments(app_id) WHERE app_id IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_deployments_status ON deployments(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_deployments_team  ON deployments(team_id) WHERE deleted_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_deployments_token ON deployments(token) WHERE token IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_deployments_resource_id ON deployments(resource_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_deployments_team_env ON deployments(team_id, env)`,
 	}
 
 	for _, s := range stmts {

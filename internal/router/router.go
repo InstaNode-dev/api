@@ -16,7 +16,6 @@ import (
 	"instant.dev/internal/email"
 	"instant.dev/internal/handlers"
 	"instant.dev/internal/middleware"
-	"instant.dev/internal/migratorclient"
 	"instant.dev/internal/plans"
 	"instant.dev/internal/providers/compute/k8s"
 	storageprovider "instant.dev/internal/providers/storage"
@@ -223,11 +222,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Get("/auth/me", middleware.RequireAuth(cfg), cliAuthH.GetCurrentUser)
 
 	// Billing
-	var migClient *migratorclient.Client
-	if cfg.MigratorAddr != "" {
-		migClient = migratorclient.New(cfg.MigratorAddr, cfg.MigratorSecret)
-	}
-	billing := handlers.NewBillingHandler(db, cfg, emailClient, migClient)
+	billing := handlers.NewBillingHandler(db, cfg, emailClient)
 	// Legacy alias kept for backward compatibility; canonical path is
 	// /api/v1/billing/checkout (registered under the /api/v1 group below).
 	app.Post("/billing/checkout", middleware.RequireAuth(cfg), billing.CreateCheckoutAPI)
@@ -284,6 +279,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// Stack management endpoints — Phase 6 (under /api/v1)
 	api.Get("/stacks", stackH.List)
 
+	// Env promotion — Pro+ "promote staging → production" + sibling envs.
+	// Tier gate (pro/team/growth) is enforced inside the handler so the
+	// router doesn't have to know the policy.
+	api.Post("/stacks/:slug/promote", stackH.Promote)
+
 	// Custom domains — Pro+ "bring your own hostname" for stacks. All routes
 	// require auth (the /api/v1 group middleware) and additionally enforce
 	// stack ownership inside the handler.
@@ -309,6 +309,10 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Get("/vault/:env", vaultH.ListKeys)
 	api.Delete("/vault/:env/:key", vaultH.DeleteSecret)
 	api.Post("/vault/:env/:key/rotate", vaultH.RotateSecret)
+	// Vault env-to-env bulk copy (Pro+ tier-gated inside the handler) —
+	// pairs with POST /api/v1/stacks/:slug/promote for the dashboard's
+	// "promote staging → production" flow.
+	api.Post("/vault/copy", vaultH.CopySecrets)
 
 	// Teams + RBAC invitation flow (Phase 3). Public accept route is
 	// registered above the api group so the auth middleware doesn't catch it.
@@ -321,7 +325,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// These bypass Razorpay and directly mutate DB state. Never expose in production.
 	if cfg.Environment == "development" {
 		internal := app.Group("/internal")
-		internal.Post("/set-tier", handlers.NewSetTierHandler(db, cfg.AESKey, migClient))
+		internal.Post("/set-tier", handlers.NewSetTierHandler(db, cfg.AESKey))
 	}
 
 	return app

@@ -819,7 +819,9 @@ All limits are defined in [`plans.yaml`](../plans.yaml) and loaded at startup â€
 High-volume quota tests are skipped by default to avoid cloud cost. To run them:
 
 ```bash
-E2E_ALLOW_QUOTA_BURN=true E2E_BASE_URL=http://localhost:30080 \
+# Port-forward the API first (Service is ClusterIP; NodePort retired 2026-05-11):
+kubectl port-forward -n instant svc/instant-api 8080:8080 &
+E2E_ALLOW_QUOTA_BURN=true E2E_BASE_URL=http://localhost:8080 \
   go test ./e2e/... -v -tags e2e -run TestE2E_Quota -timeout 120s
 ```
 

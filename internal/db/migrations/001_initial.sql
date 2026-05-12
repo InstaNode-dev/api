@@ -4,7 +4,10 @@
 CREATE TABLE IF NOT EXISTS teams (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name              TEXT,
-    plan_tier         TEXT NOT NULL DEFAULT 'hobby',
+    -- Default 'free' — claimed-but-unpaid. Pay-from-day-one means a freshly
+    -- claimed team has no Razorpay subscription and a 24h grace; only the
+    -- subscription.charged webhook lifts plan_tier (and clears resource TTLs).
+    plan_tier         TEXT NOT NULL DEFAULT 'free',
     stripe_customer_id TEXT UNIQUE,
     trial_ends_at     TIMESTAMPTZ,
     created_at        TIMESTAMPTZ DEFAULT now()

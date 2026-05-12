@@ -9,6 +9,37 @@
 plans:
   anonymous:
     display_name: "Anonymous"
+    audience: "pre-claim"
+    price_monthly_cents: 0
+    trial_days: 0
+    limits:
+      provisions_per_day: 5
+      postgres_storage_mb: 10
+      postgres_connections: 2
+      redis_memory_mb: 5
+      redis_commands_per_day: 1000
+      mongodb_storage_mb: 5
+      mongodb_connections: 2
+      mongodb_ops_per_minute: 100
+      queue_storage_mb: 1024
+      storage_storage_mb: 10
+      webhook_requests_stored: 100
+      team_members: 1
+      vault_max_entries: 0
+      vault_envs_allowed: []
+      deployments_apps: 0
+    features:
+      alerts: false
+      custom_domains: false
+      sla: false
+
+  # `free` shares anonymous's exact limits and 24h TTL — the only difference is
+  # audience. `anonymous` is for pre-claim agents (no team_id). `free` is for
+  # claimed-but-unpaid teams (team_id set, no Razorpay subscription). The
+  # pay-from-day-one policy still applies: the reaper deletes both at 24h.
+  free:
+    display_name: "Free"
+    audience: "registered"
     price_monthly_cents: 0
     trial_days: 0
     limits:

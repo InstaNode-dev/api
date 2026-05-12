@@ -327,18 +327,27 @@ func UpdateProviderResourceID(ctx context.Context, db *sql.DB, resourceID uuid.U
 	return nil
 }
 
-// ElevateResourceTiersByTeam sets the tier of all active, permanent resources for a
-// team to newTier. Called from the Razorpay upgrade webhook so that existing resources
-// benefit from higher limits immediately — not just resources provisioned after the upgrade.
-// Only affects permanent resources (expires_at IS NULL); anonymous TTL resources are excluded.
-// Applies across ALL environments — an upgrade lifts dev, staging, and prod alike.
+// ElevateResourceTiersByTeam sets the tier of every active team-owned resource
+// to newTier and clears its TTL (expires_at = NULL).
+//
+// Called from the Razorpay subscription.charged webhook. Picks up two cases:
+//   1) Resources that are already permanent (expires_at IS NULL) — a hobby
+//      user upgrading to pro: lift their existing resources to the new tier.
+//   2) Resources still on anonymous TTL (expires_at > now()) — a freshly
+//      claimed user paying for the first time: clear the TTL + set tier.
+// This is the second half of "pay from day one": claim transfers team
+// ownership but does NOT clear the TTL or change tier. Only payment does.
+//
+// expires_at > now() guards a race with the reaper — we don't resurrect a
+// resource whose TTL already elapsed.
+// Applies across all environments — one upgrade lifts dev, staging, and prod.
 func ElevateResourceTiersByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID, newTier string) error {
 	_, err := db.ExecContext(ctx, `
 		UPDATE resources
-		SET tier = $1
+		SET tier = $1, expires_at = NULL
 		WHERE team_id = $2
 		  AND status = 'active'
-		  AND expires_at IS NULL
+		  AND (expires_at IS NULL OR expires_at > now())
 	`, newTier, teamID)
 	if err != nil {
 		return fmt.Errorf("models.ElevateResourceTiersByTeam: %w", err)
@@ -360,16 +369,31 @@ func SumStorageBytesByTeamAndType(ctx context.Context, db *sql.DB, teamID uuid.U
 	return total, nil
 }
 
-// ExpireAnonymousResources marks anonymous resources past their expires_at as 'deleted'.
+// ExpireAnonymousResources marks resources past their expires_at as 'deleted'.
+//
+// Despite the name, this covers TWO equivalent TTL policies that share the
+// 24h "pay from day one" mechanic:
+//
+//  1. tier='anonymous': pre-claim (team_id IS NULL). Classic case — the
+//     agent never claimed the token, the 24h grace period ran out.
+//  2. tier='free': claimed-but-unpaid (team_id IS NOT NULL, no subscription).
+//     The user claimed the resource on the dashboard but never paid; same
+//     24h fate. The Razorpay subscription.charged webhook clears expires_at
+//     before the reaper sees it, so any free row whose expires_at is in the
+//     past genuinely failed to convert.
+//
 // Returns the count of affected rows.
 func ExpireAnonymousResources(ctx context.Context, db *sql.DB) (int64, error) {
 	res, err := db.ExecContext(ctx, `
 		UPDATE resources
 		SET status = 'deleted'
-		WHERE team_id IS NULL
-		  AND status = 'active'
+		WHERE status = 'active'
 		  AND expires_at IS NOT NULL
 		  AND expires_at < now()
+		  AND (
+		    (team_id IS NULL AND tier = 'anonymous')
+		    OR tier = 'free'
+		  )
 	`)
 	if err != nil {
 		return 0, fmt.Errorf("models.ExpireAnonymousResources: %w", err)
