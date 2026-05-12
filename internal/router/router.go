@@ -228,6 +228,13 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Post("/billing/checkout", middleware.RequireAuth(cfg), billing.CreateCheckoutAPI)
 	app.Post("/razorpay/webhook", billing.RazorpayWebhook)
 
+	// §10.20 cached-aggregation endpoints. Separate handlers from BillingHandler
+	// so the caching contract (Redis + singleflight + Cache-Control headers)
+	// is visible at the route + handler boundary, not buried inside the billing
+	// state aggregator. Wired below under the /api/v1 group.
+	billingUsageH := handlers.NewBillingUsageHandler(db, rdb, planRegistry)
+	teamSummaryH := handlers.NewTeamSummaryHandler(db, rdb, planRegistry)
+
 	// Public webhook request listing — token IS the credential (no session needed).
 	// Authenticated callers use the same handler; it additionally verifies team ownership.
 	app.Get("/api/v1/webhooks/:token/requests", middleware.OptionalAuth(cfg), webhookH.ListRequests)
@@ -270,6 +277,13 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Get("/billing/invoices", billing.ListInvoicesAPI)
 	api.Post("/billing/update-payment", billing.UpdatePaymentMethodAPI)
 	api.Post("/billing/change-plan", billing.ChangePlanAPI)
+
+	// §10.20 cached aggregates — see billing_usage.go / team_summary.go.
+	// Both cache per-team in Redis (30s / 5min) with singleflight + Cache-Control
+	// response headers. The dashboard's BillingPage + SidebarUpgradeCard
+	// consume these instead of computing aggregates client-side.
+	api.Get("/billing/usage", billingUsageH.GetUsage)
+	api.Get("/team/summary", teamSummaryH.GetSummary)
 
 	// Deploy management endpoints — Phase 6 (aliases under /api/v1)
 	api.Get("/deployments", deployH.List)
