@@ -25,6 +25,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1244,14 +1245,45 @@ func (h *StackHandler) Family(c *fiber.Ctx) error {
 
 // promoteBody is the JSON body for POST /api/v1/stacks/:slug/promote.
 //
-//	From: source env (e.g. "staging"). Defaults to the source stack's env.
-//	To:   target env (e.g. "production"). Required.
-//	Name: optional override for the target stack's display name.
+//	From:      source env (e.g. "staging"). Defaults to the source stack's env.
+//	To:        target env (e.g. "production"). Required.
+//	Name:      optional override for the target stack's display name.
+//	CopyVault: when true (the default), every vault key that exists in the
+//	           source env but NOT in the target env is copied across as part
+//	           of the promote so the promoted stack can resolve vault://
+//	           references against the target namespace on its first deploy.
+//	           Defaults to true for backward compat — pre-slice-5 callers
+//	           that don't send the field still get the auto-copy behaviour.
+//	           Pointer-typed so we can distinguish "field omitted" (= true)
+//	           from "explicitly false".
 type promoteBody struct {
-	From string `json:"from"`
-	To   string `json:"to"`
-	Name string `json:"name"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Name      string `json:"name"`
+	CopyVault *bool  `json:"copy_vault,omitempty"`
 }
+
+// promoteCopyVaultDefault is the value used when the request body omits the
+// copy_vault field — keeping it as a named constant so the backward-compat
+// contract is documented in one place (slice 5, ENV-AWARE-DEPLOYMENTS-DESIGN
+// §4 slice 5).
+const promoteCopyVaultDefault = true
+
+// auditKindVaultPromoted is the audit_log.kind value written for every vault
+// secret that gets auto-copied during a stack promote. Held as a const so the
+// dashboard's Recent Activity feed + the slice-5 tests can both reference it
+// without a magic string.
+const auditKindVaultPromoted = "vault.promoted"
+
+// auditActorSystem is the audit_log.actor value for events the platform writes
+// on the caller's behalf (rather than the agent or user). The promote auto-copy
+// is a system action — the operator asked for a promote, the platform copied
+// vault values as a side-effect.
+const auditActorSystem = "system"
+
+// auditResourceTypeVault is the audit_log.resource_type tag for vault-scoped
+// events. Matches what the dashboard's Activity feed filters on for vault rows.
+const auditResourceTypeVault = "vault"
 
 // multiEnvTierAllowed reports whether the given tier may use the env-promotion
 // endpoints. Pro / Team / Growth only. The spec (RETRO-2026-05-12 §10.17) calls
@@ -1291,6 +1323,107 @@ func respondMultiEnvUpgradeRequired(c *fiber.Ctx, currentTier string) error {
 // keeps a local wrapper so the error code matches the stack-handler family.
 func validatePromoteEnv(raw string) (string, bool) {
 	return validateEnv(raw)
+}
+
+// copyVaultRefsForPromote copies every vault key that exists in fromEnv but
+// NOT in toEnv across to toEnv for the given team. Returns the list of keys
+// that were actually written so the caller can attribute the per-key audit
+// rows; missing source / existing target keys are silently skipped (this is
+// the non-destructive contract spelled out in slice 5 of the design doc).
+//
+// Behaviour:
+//   - List the distinct keys in the source env.
+//   - For each key, look up the target env's latest version. If a row exists,
+//     skip (existing target values win — non-destructive).
+//   - Otherwise, copy the source ciphertext into the target env at version 1
+//     (CreateVaultSecret picks the next free version automatically).
+//   - Append one audit_log row per copied key, kind=vault.promoted, with
+//     metadata carrying from_env / to_env / key. Audit failures are logged
+//     but never block the copy — same fail-open posture the rest of the
+//     audit pipeline uses.
+//
+// Shared with vault.CopySecrets in spirit but intentionally smaller: the REST
+// /vault/copy handler has dry_run / overwrite / tier-gate / per-tier quota
+// machinery that would be wrong to invoke here (the promote already gated on
+// pro+ at the top of Promote, and quota enforcement during a promote would
+// silently leave the target stack with a half-copied env).
+//
+// userID is uuid.Nil for system-actor copies; the audit row records "system"
+// as the actor regardless so the dashboard can render the event consistently.
+func copyVaultRefsForPromote(
+	ctx context.Context,
+	db *sql.DB,
+	teamID uuid.UUID,
+	userID uuid.UUID,
+	fromEnv, toEnv string,
+) (copied []string, err error) {
+	keys, err := models.ListVaultKeys(ctx, db, teamID, fromEnv)
+	if err != nil {
+		return nil, fmt.Errorf("copyVaultRefsForPromote: list source keys: %w", err)
+	}
+	if len(keys) == 0 {
+		// No-op when the source env has no vault entries — covers the
+		// "stack with no vault refs" test case from the slice-5 spec.
+		return nil, nil
+	}
+
+	copied = make([]string, 0, len(keys))
+	var createdBy uuid.NullUUID
+	if userID != uuid.Nil {
+		createdBy = uuid.NullUUID{UUID: userID, Valid: true}
+	}
+
+	for _, k := range keys {
+		src, ferr := models.GetVaultSecretLatest(ctx, db, teamID, fromEnv, k)
+		if ferr != nil {
+			if errors.Is(ferr, models.ErrVaultSecretNotFound) {
+				// Race: key disappeared between list and fetch. Skip.
+				continue
+			}
+			return copied, fmt.Errorf("copyVaultRefsForPromote: fetch %s: %w", k, ferr)
+		}
+
+		// Non-destructive: existing target keys are never overwritten.
+		_, derr := models.GetVaultSecretLatest(ctx, db, teamID, toEnv, k)
+		if derr == nil {
+			continue
+		}
+		if !errors.Is(derr, models.ErrVaultSecretNotFound) {
+			return copied, fmt.Errorf("copyVaultRefsForPromote: check target %s: %w", k, derr)
+		}
+
+		if _, werr := models.CreateVaultSecret(ctx, db, teamID, toEnv, k, src.EncryptedValue, createdBy); werr != nil {
+			return copied, fmt.Errorf("copyVaultRefsForPromote: persist %s: %w", k, werr)
+		}
+		copied = append(copied, k)
+
+		// Per-key audit row. Best-effort — never block the copy.
+		meta, mErr := json.Marshal(map[string]string{
+			"from_env": fromEnv,
+			"to_env":   toEnv,
+			"key":      k,
+		})
+		if mErr != nil {
+			slog.Warn("stack.promote.vault.audit_meta_failed",
+				"error", mErr, "team_id", teamID, "key", k)
+			meta = nil
+		}
+		if aErr := models.InsertAuditEvent(ctx, db, models.AuditEvent{
+			TeamID:       teamID,
+			UserID:       createdBy,
+			Actor:        auditActorSystem,
+			Kind:         auditKindVaultPromoted,
+			ResourceType: auditResourceTypeVault,
+			Summary:      "auto-copied vault key <code>" + k + "</code> " + fromEnv + " → " + toEnv,
+			Metadata:     meta,
+		}); aErr != nil {
+			slog.Warn("stack.promote.vault.audit_failed",
+				"error", aErr, "team_id", teamID, "key", k,
+				"from_env", fromEnv, "to_env", toEnv)
+		}
+	}
+
+	return copied, nil
 }
 
 // Promote handles POST /api/v1/stacks/:slug/promote.
@@ -1533,6 +1666,45 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 		}
 	}
 
+	// Step B-bis: Auto-copy vault refs (slice 5).
+	//
+	// Every vault key that exists in the source env but NOT in the target env
+	// is copied across so the promoted stack's first redeploy can resolve
+	// vault:// references against the target namespace without the operator
+	// having to remember a separate POST /vault/copy call. The copy is non-
+	// destructive — existing target keys are never overwritten so prod values
+	// always win over staging.
+	//
+	// Disabled when copy_vault=false. Today that's the only way to opt out —
+	// the design (§4 slice 5) deliberately makes the default behaviour the
+	// "complete promote" so the agent doesn't have to know about the option.
+	copyVault := promoteCopyVaultDefault
+	if body.CopyVault != nil {
+		copyVault = *body.CopyVault
+	}
+	var copiedVaultKeys []string
+	if copyVault {
+		uid := uuid.Nil
+		if userIDStr := middleware.GetUserID(c); userIDStr != "" {
+			if parsed, perr := uuid.Parse(userIDStr); perr == nil {
+				uid = parsed
+			}
+		}
+		copied, vErr := copyVaultRefsForPromote(c.Context(), h.db, team.ID, uid, from, to)
+		if vErr != nil {
+			// A vault copy failure must NOT roll back the stack rows we just
+			// created — the promote contract is "image first, secrets second"
+			// so a failed secret-copy still leaves a deployable target. Log
+			// loudly and continue; the operator can re-run POST /vault/copy
+			// (or POST /stacks/:slug/promote again) to retry.
+			slog.Error("stack.promote.vault_autocopy_failed",
+				"error", vErr, "team_id", team.ID, "from", from, "to", to,
+				"copied_before_failure", len(copied),
+				"request_id", middleware.GetRequestID(c))
+		}
+		copiedVaultKeys = copied
+	}
+
 	// Step C: Resolve vault refs against the TARGET env (not source.Env) and
 	// build the StackServiceDefs the provider will deploy. The vault scoping
 	// is the whole point of multi-env promotion — production must read from
@@ -1599,15 +1771,24 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 		parentID = target.ParentStackID.String()
 	}
 
+	// vault_keys_copied is always present in the response (empty slice when
+	// nothing was copied) so MCP/agent callers can detect the contract
+	// regardless of whether keys actually moved. Pre-slice-5 callers ignore
+	// the field, so backward compat is preserved.
+	if copiedVaultKeys == nil {
+		copiedVaultKeys = []string{}
+	}
+
 	return c.Status(responseCode).JSON(fiber.Map{
-		"ok":        true,
-		"action":    action,
-		"stack_id":  target.Slug,
-		"env":       target.Env,
-		"parent_id": parentID,
-		"source":    slug,
-		"status":    "building",
-		"note":      "Promoted to " + to + ". Poll GET /stacks/" + target.Slug + " for status.",
+		"ok":                true,
+		"action":            action,
+		"stack_id":          target.Slug,
+		"env":               target.Env,
+		"parent_id":         parentID,
+		"source":            slug,
+		"status":            "building",
+		"vault_keys_copied": copiedVaultKeys,
+		"note":              "Promoted to " + to + ". Poll GET /stacks/" + target.Slug + " for status.",
 	})
 }
 
