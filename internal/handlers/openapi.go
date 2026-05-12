@@ -36,7 +36,9 @@ const openAPISpec = `{
         "description": "Returns a real postgres:// connection string with pgvector pre-installed. Anonymous tier: 10MB, 2 connections, 24h TTL.",
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
-          "201": { "description": "Database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DBProvisionResponse" } } } }
+          "201": { "description": "Database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DBProvisionResponse" } } } },
+          "402": { "description": "Quota exceeded or feature requires upgrade. Includes agent_action with copy the calling agent can show the user, plus upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
@@ -46,7 +48,9 @@ const openAPISpec = `{
         "description": "Returns a real redis:// connection string with ACL namespace isolation. Anonymous tier: 5MB memory, 24h TTL.",
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
-          "201": { "description": "Cache provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CacheProvisionResponse" } } } }
+          "201": { "description": "Cache provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CacheProvisionResponse" } } } },
+          "402": { "description": "Quota exceeded or feature requires upgrade. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
@@ -56,7 +60,9 @@ const openAPISpec = `{
         "description": "Returns a real mongodb:// connection string scoped to a per-token database. Anonymous tier: 5MB, 2 connections, 24h TTL.",
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
-          "201": { "description": "MongoDB database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NoSQLProvisionResponse" } } } }
+          "201": { "description": "MongoDB database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NoSQLProvisionResponse" } } } },
+          "402": { "description": "Quota exceeded or feature requires upgrade. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
@@ -66,7 +72,9 @@ const openAPISpec = `{
         "description": "Returns a real nats:// connection string with per-account subject isolation. Anonymous tier: 24h TTL.",
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
-          "201": { "description": "Queue provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueProvisionResponse" } } } }
+          "201": { "description": "Queue provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueProvisionResponse" } } } },
+          "402": { "description": "Quota exceeded or feature requires upgrade. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
@@ -76,7 +84,9 @@ const openAPISpec = `{
         "description": "Returns a public receive_url that accepts any HTTP method and stores the payload (headers + body) in Redis for 24h.",
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
-          "201": { "description": "Webhook receiver provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WebhookProvisionResponse" } } } }
+          "201": { "description": "Webhook receiver provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WebhookProvisionResponse" } } } },
+          "402": { "description": "Quota exceeded. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
@@ -151,6 +161,90 @@ const openAPISpec = `{
           "202": { "description": "Redeploy accepted" },
           "401": { "description": "Unauthorized — redeploy mutates the stack and requires a session" },
           "404": { "description": "Stack not found" }
+        }
+      }
+    },
+    "/api/v1/stacks/{slug}/promote": {
+      "post": {
+        "summary": "Promote a stack from one env to another (Pro+)",
+        "description": "Copies the stack's config (image binding, resource bindings, name) to a sibling stack in the target env. If the target env already has a sibling, its status is bumped back to 'building' (in-place re-promote); otherwise a new stack row is created with parent_stack_id pointing at the family root. Pro / Team / Growth tiers only — returns 402 with agent_action otherwise. Compute redeploy is plumbed-but-waiting on Phase-1 POST /deploy/new; the row + parent linkage is the durable contract that future deploy hooks read from.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "slug", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Source stack slug (the env you are promoting FROM)" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["to"],
+                "properties": {
+                  "from": { "type": "string", "description": "Source env — defaults to source stack's env. Must match if provided." },
+                  "to":   { "type": "string", "description": "Target env (production, staging, dev, ...) — required." },
+                  "name": { "type": "string", "description": "Optional display name override for the new stack." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Re-promoted into existing sibling stack — same slug, status reset to building" },
+          "202": { "description": "Created a new stack in the target env (parent_stack_id points at family root)" },
+          "400": { "description": "Invalid body, missing 'to', from==to, or invalid env name" },
+          "401": { "description": "Unauthorized — session required" },
+          "402": { "description": "Upgrade required — team is not on pro/team/growth. Response carries upgrade_url + agent_action." },
+          "404": { "description": "Source stack not found or not owned by this team" },
+          "409": { "description": "Source env did not match the asserted 'from'" }
+        }
+      }
+    },
+    "/api/v1/vault/copy": {
+      "post": {
+        "summary": "Bulk-copy vault secrets from one env to another (Pro+)",
+        "description": "Copies vault entries from a source env to a target env, optionally filtered by an explicit key allowlist. dry_run=true returns the full plan without persisting. Pro / Team / Growth tiers only — returns 402 with agent_action otherwise.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["from", "to"],
+                "properties": {
+                  "from":      { "type": "string", "description": "Source env name. Required." },
+                  "to":        { "type": "string", "description": "Target env name. Required. Must differ from 'from'." },
+                  "keys":      { "type": "array", "items": { "type": "string" }, "description": "Optional allowlist of key names. Empty/omitted → copy all keys at source." },
+                  "dry_run":   { "type": "boolean", "description": "When true, returns the per-key plan but persists nothing." },
+                  "overwrite": { "type": "boolean", "description": "When true, keys already in the target env are bumped to a new version. Default false." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Plan + counts. Per-key actions are one of: copy, overwrite, skip, missing, quota_exceeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok":      { "type": "boolean" },
+                    "dry_run": { "type": "boolean" },
+                    "from":    { "type": "string" },
+                    "to":      { "type": "string" },
+                    "plan":    { "type": "array", "items": { "type": "object", "properties": { "key": { "type": "string" }, "action": { "type": "string" } } } },
+                    "copied":  { "type": "integer" },
+                    "skipped": { "type": "integer" },
+                    "missing": { "type": "integer" },
+                    "blocked": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Invalid body, missing from/to, from==to, or invalid env/key name" },
+          "401": { "description": "Unauthorized — session required" },
+          "402": { "description": "Upgrade required — team is not on pro/team/growth. Response carries upgrade_url + agent_action." }
         }
       }
     },
@@ -546,8 +640,9 @@ const openAPISpec = `{
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Storage provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StorageProvisionResponse" } } } },
-          "429": { "description": "Anonymous fingerprint limit exceeded" },
-          "503": { "description": "Object storage is not configured on this environment" }
+          "402": { "description": "Storage limit reached. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "429": { "description": "Anonymous fingerprint limit exceeded. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "503": { "description": "Object storage is not configured on this environment", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
@@ -1193,7 +1288,7 @@ const openAPISpec = `{
           "user_id": { "type": "string", "format": "uuid" },
           "team_id": { "type": "string", "format": "uuid" },
           "team_name": { "type": "string", "description": "Present only when the team has a non-empty name" },
-          "plan_tier": { "type": "string", "enum": ["anonymous", "hobby", "pro", "team"], "description": "Best-effort enrichment from the teams table; absent on DB lookup failure" }
+          "plan_tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "pro", "team"], "description": "Best-effort enrichment from the teams table; absent on DB lookup failure" }
         },
         "required": ["ok", "user_id", "team_id"]
       },
@@ -1307,7 +1402,7 @@ const openAPISpec = `{
         "description": "Aggregated billing state served by GET /api/v1/billing.",
         "properties": {
           "ok": { "type": "boolean" },
-          "tier": { "type": "string", "enum": ["anonymous", "hobby", "pro", "team"], "description": "Current plan tier from the team record" },
+          "tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "pro", "team"], "description": "Current plan tier from the team record" },
           "subscription_status": { "type": "string", "enum": ["none", "active", "cancelled", "trial"], "description": "'none' when no Razorpay subscription exists; 'trial' when trial_ends_at is in the future; 'cancelled' when Razorpay reports cancelled / completed / expired or cancel_at_cycle_end=true; 'active' otherwise" },
           "next_renewal_at": { "type": ["string", "null"], "format": "date-time", "description": "ISO timestamp for next renewal (Razorpay current_end). null when no active subscription" },
           "amount_inr": { "type": ["integer", "null"], "description": "Monthly subscription amount in INR rupees (not paise). Sourced from the most recent paid invoice when available; falls back to the tier-derived price for brand-new subscriptions. null when no subscription on file" },
@@ -1317,6 +1412,18 @@ const openAPISpec = `{
           "razorpay_customer_id": { "type": ["string", "null"], "description": "Razorpay customer id. Reserved for future use — always null today (Razorpay subscriptions don't require a pre-created customer record)" }
         },
         "required": ["ok", "tier", "subscription_status", "billing_email"]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "description": "Canonical JSON shape returned by every 4xx/5xx response. agent_action and upgrade_url are populated for error codes where the calling agent benefits from user-facing copy or a remediation link (quota walls, invalid tokens, expired resources, permission denied, tier gates). Codes without remediation guidance (transient db_error, list_failed, stream_failed, etc.) omit these fields. Backward-compatible: omitempty fields are absent on the wire when empty so existing clients that ignored agent_action/upgrade_url see no change.",
+        "properties": {
+          "ok": { "type": "boolean", "enum": [false], "description": "Always false on error responses" },
+          "error": { "type": "string", "description": "Stable machine-readable error code (e.g. 'quota_exceeded', 'invalid_token', 'forbidden', 'storage_limit_reached'). Programmatic clients should branch on this." },
+          "message": { "type": "string", "description": "Human-readable explanation of the error. May contain tier names, resource IDs, or other context. Not stable — use the 'error' code for programmatic decisions." },
+          "agent_action": { "type": "string", "description": "Optional. A sentence the calling agent should surface verbatim to the human user — e.g. 'Tell the user they've hit the hobby tier storage limit (500MB). Have them upgrade at https://instanode.dev/pricing to provision more storage.' Present on quota walls, invalid-token errors, permission-denied errors, expired-resource errors, and tier-gate errors. Absent on transient infra failures where the right response is silent retry." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Optional. Where the user can resolve the error — typically the pricing/upgrade page for quota walls and the login page for token errors. Present whenever following the URL would clear the error." }
+        },
+        "required": ["ok", "error", "message"]
       }
     }
   }

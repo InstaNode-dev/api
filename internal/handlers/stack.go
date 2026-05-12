@@ -353,11 +353,8 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 			slog.Warn("stack.new.rate_limit_check_failed", "error", limitErr)
 			// fail open — Redis errors must not block legitimate deploys
 		} else if exceeded {
-			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
-				"ok":      false,
-				"error":   "rate_limit_exceeded",
-				"message": "Anonymous deploy limit reached. Upgrade at "+urls.StartURLPrefix,
-			})
+			return respondError(c, fiber.StatusTooManyRequests, "rate_limit_exceeded",
+				"Anonymous deploy limit reached. Upgrade at "+urls.StartURLPrefix)
 		}
 	}
 
@@ -1039,6 +1036,244 @@ func (h *StackHandler) List(c *fiber.Ctx) error {
 		"items": items,
 		"total": len(items),
 	})
+}
+
+// ── POST /api/v1/stacks/:slug/promote ────────────────────────────────────────
+
+// promoteBody is the JSON body for POST /api/v1/stacks/:slug/promote.
+//
+//	From: source env (e.g. "staging"). Defaults to the source stack's env.
+//	To:   target env (e.g. "production"). Required.
+//	Name: optional override for the target stack's display name.
+type promoteBody struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	Name string `json:"name"`
+}
+
+// multiEnvTierAllowed reports whether the given tier may use the env-promotion
+// endpoints. Pro / Team / Growth only. The spec (RETRO-2026-05-12 §10.17) calls
+// this out as a Pro-tier differentiator — the hobby tier explicitly does NOT
+// get multi-env workflows.
+//
+// Held inline rather than added to common/plans/Registry because the plan YAML
+// does not yet have a `features.multi_env` flag and we don't want to widen the
+// shared schema for a feature that's still bedding in. If the policy grows
+// teeth (e.g. variant per-tier env count caps), promote this into plans.yaml.
+func multiEnvTierAllowed(tier string) bool {
+	switch tier {
+	case "pro", "team", "growth":
+		return true
+	default:
+		return false
+	}
+}
+
+// respondMultiEnvUpgradeRequired writes the canonical 402 the spec requires.
+// Carries an `agent_action` string so an agent reading the response knows
+// exactly what to tell the user — same shape used elsewhere in the codebase
+// for upgrade-gated paths.
+func respondMultiEnvUpgradeRequired(c *fiber.Ctx, currentTier string) error {
+	_ = c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
+		"ok":           false,
+		"error":        "upgrade_required",
+		"message":      "Multi-env workflows require the Pro plan or higher. Your team is on the " + currentTier + " plan.",
+		"upgrade_url":  "https://instanode.dev/pricing",
+		"agent_action": "Tell user to upgrade to Pro at https://instanode.dev/pricing to unlock multi-env workflows.",
+	})
+	return ErrResponseWritten
+}
+
+// validatePromoteEnv enforces the same charset as vault env names (a-z, A-Z,
+// 0-9, _, -). Reuses the validateEnv helper from vault.go for consistency, but
+// keeps a local wrapper so the error code matches the stack-handler family.
+func validatePromoteEnv(raw string) (string, bool) {
+	return validateEnv(raw)
+}
+
+// Promote handles POST /api/v1/stacks/:slug/promote.
+//
+// Semantics:
+//  1. Source stack must be owned by the requesting team.
+//  2. Requesting team must be on pro / team / growth (402 otherwise).
+//  3. If a sibling stack already exists with target env: update its status to
+//     "building" (in-place re-promote). Otherwise create a new stack row with
+//     parent_stack_id pointing at the source's family root.
+//  4. The new (or updated) stack inherits the source's tier and is created in
+//     status="building" so callers can poll with GET /stacks/:slug.
+//
+// What this endpoint does NOT do today:
+//   - It does not push tarballs (those were uploaded with /stacks/new).
+//   - It does not trigger an actual k8s redeploy of the target — the row is
+//     created but the compute provider is not invoked. That hook lands when
+//     the Phase-1 deploy endpoint (POST /deploy/new) is wired, at which point
+//     the goroutine pattern from runStackDeploy will be reused here.
+//
+// The row + parent linkage is enough for the dashboard UI to surface the
+// "promoted" state and for tests to verify the schema + tier-gate.
+func (h *StackHandler) Promote(c *fiber.Ctx) error {
+	team, err := h.requireStackTeam(c)
+	if err != nil {
+		return err
+	}
+
+	// Tier gate first — fail before doing any DB work for off-tier callers.
+	if !multiEnvTierAllowed(team.PlanTier) {
+		return respondMultiEnvUpgradeRequired(c, team.PlanTier)
+	}
+
+	slug := c.Params("slug")
+	source, err := models.GetStackBySlug(c.Context(), h.db, slug)
+	if err != nil {
+		var notFound *models.ErrStackNotFound
+		if errors.As(err, &notFound) {
+			return respondError(c, fiber.StatusNotFound, "not_found", "Stack not found")
+		}
+		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch stack")
+	}
+
+	// Cross-team ownership check (404, not 403, to avoid leaking existence).
+	if source.TeamID == nil || *source.TeamID != team.ID {
+		return respondError(c, fiber.StatusNotFound, "not_found", "Stack not found")
+	}
+
+	var body promoteBody
+	if err := c.BodyParser(&body); err != nil {
+		return respondError(c, fiber.StatusBadRequest, "invalid_body",
+			`Body must be valid JSON: {"from":"staging","to":"production"}`)
+	}
+
+	from := body.From
+	if from == "" {
+		from = source.Env
+	}
+	if fromV, ok := validatePromoteEnv(from); ok {
+		from = fromV
+	} else {
+		return respondError(c, fiber.StatusBadRequest, "invalid_env",
+			"from must be 1-64 chars [A-Za-z0-9_-]")
+	}
+	to, ok := validatePromoteEnv(body.To)
+	if !ok || body.To == "" {
+		return respondError(c, fiber.StatusBadRequest, "invalid_env",
+			`to is required and must be 1-64 chars [A-Za-z0-9_-]`)
+	}
+	if from == to {
+		return respondError(c, fiber.StatusBadRequest, "invalid_target",
+			"from and to must differ")
+	}
+
+	// The source env must match what the caller asserted so promotes are
+	// idempotent under concurrent callers (no surprise: "I thought I was
+	// promoting staging but it was actually dev").
+	if source.Env != from {
+		return respondError(c, fiber.StatusConflict, "env_mismatch",
+			fmt.Sprintf("Source stack %s is in env %q, not %q", slug, source.Env, from))
+	}
+
+	// Look for an existing sibling at target env. If one exists, update its
+	// status to building and return it — callers can repeatedly promote
+	// without piling up rows. Otherwise create a new child of the family root.
+	existing, err := models.FindStackByEnvInFamily(c.Context(), h.db, team.ID, source.ID, to)
+	if err != nil {
+		slog.Error("stack.promote.family_lookup_failed",
+			"error", err, "team_id", team.ID, "slug", slug, "to", to,
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusServiceUnavailable, "lookup_failed",
+			"Failed to look up env family")
+	}
+
+	if existing != nil {
+		// In-place re-promote: bump status back to building so the next deploy
+		// hook (Phase-1 /deploy/new) picks it up. Existing rows preserve their
+		// slug — the agent can keep polling the same URL.
+		if updErr := models.UpdateStackStatus(c.Context(), h.db, existing.ID, "building", ""); updErr != nil {
+			slog.Warn("stack.promote.status_update_failed",
+				"slug", existing.Slug, "error", updErr)
+		}
+
+		slog.Info("stack.promote.updated_existing",
+			"source_slug", slug, "target_slug", existing.Slug,
+			"from", from, "to", to,
+			"team_id", team.ID, "request_id", middleware.GetRequestID(c))
+
+		return c.JSON(fiber.Map{
+			"ok":         true,
+			"action":     "updated_existing",
+			"stack_id":   existing.Slug,
+			"env":        existing.Env,
+			"parent_id":  toString(existing.ParentStackID),
+			"source":     slug,
+			"status":     "building",
+			"note":       "Promoted into existing " + to + " stack. Poll GET /stacks/" + existing.Slug + " for status.",
+		})
+	}
+
+	// Determine the family root. If the source itself has no parent, it IS
+	// the root and the new stack points back at it. If the source already has
+	// a parent (i.e. source is staging promoted earlier from dev), the new
+	// stack shares the same root so the family stays one level deep.
+	rootID := source.ID
+	if source.ParentStackID != nil {
+		rootID = *source.ParentStackID
+	}
+
+	// Generate a fresh slug for the new env's stack.
+	newSlug, err := models.GenerateStackSlug()
+	if err != nil {
+		slog.Error("stack.promote.slug_failed",
+			"error", err, "request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusInternalServerError, "internal_error",
+			"Failed to generate stack ID")
+	}
+
+	name := sanitizeName(body.Name)
+	if name == "" {
+		// Inherit the source's display name verbatim so the UI can group them
+		// by parent_stack_id without needing a second lookup.
+		name = source.Name
+	}
+
+	created, err := models.CreateStack(c.Context(), h.db, models.CreateStackParams{
+		TeamID:        &team.ID,
+		Name:          name,
+		Slug:          newSlug,
+		Tier:          source.Tier,
+		Env:           to,
+		ParentStackID: &rootID,
+	})
+	if err != nil {
+		slog.Error("stack.promote.create_failed",
+			"error", err, "team_id", team.ID, "source_slug", slug, "to", to,
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusServiceUnavailable, "create_failed",
+			"Failed to create promoted stack record")
+	}
+
+	slog.Info("stack.promote.created",
+		"source_slug", slug, "target_slug", newSlug,
+		"from", from, "to", to,
+		"team_id", team.ID, "request_id", middleware.GetRequestID(c))
+
+	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+		"ok":         true,
+		"action":     "created",
+		"stack_id":   created.Slug,
+		"env":        created.Env,
+		"parent_id":  rootID.String(),
+		"source":     slug,
+		"status":     "building",
+		"note":       "Stack promoted to " + to + ". Poll GET /stacks/" + newSlug + " for status.",
+	})
+}
+
+// toString stringifies an optional UUID pointer for JSON responses (returns ""
+// for nil so the field is never `null` in the serialized payload).
+func toString(p *uuid.UUID) string {
+	if p == nil {
+		return ""
+	}
+	return p.String()
 }
 
 // ── private helpers ───────────────────────────────────────────────────────────

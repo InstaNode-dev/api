@@ -71,13 +71,14 @@ kubectl apply -f migrations-configmap.yaml
 docker build -f api/Dockerfile -t instant-api:local .   # from cron/ root
 kubectl apply -f app.yaml
 
-# 6. Verify
+# 6. Verify (Service is ClusterIP — port-forward for local access):
 kubectl rollout status deployment/instant-api -n instant
-curl http://localhost:30080/healthz
+kubectl port-forward -n instant svc/instant-api 8080:8080 &
+curl http://localhost:8080/healthz
 # → {"ok":true}
 ```
 
-See [CLAUDE.md](../CLAUDE.md) for the complete setup including provisioner, worker, migrator, and Temporal.
+See [CLAUDE.md](../CLAUDE.md) for the complete setup including provisioner and worker.
 
 ---
 
@@ -102,21 +103,24 @@ cd api
 
 make run          # start server (reads .env)
 make test         # unit + integration tests (needs TEST_DATABASE_URL)
-make test-e2e     # E2E against k8s at http://localhost:30080
+make test-e2e     # E2E against k8s (port-forward svc/instant-api 8080:8080 first; NodePort retired)
 make docker-build # docker build from repo root
 ```
 
 ### E2E tests
 
 ```bash
+# Port-forward the API (Service is ClusterIP; NodePort retired 2026-05-11):
+kubectl port-forward -n instant svc/instant-api 8080:8080 &
+
 # Basic — no auth/Razorpay needed
-E2E_BASE_URL=http://localhost:30080 go test ./e2e/... -tags e2e -timeout 60s
+E2E_BASE_URL=http://localhost:8080 go test ./e2e/... -tags e2e -timeout 60s
 
 # Full — with tier mechanics, Razorpay, real DB writes
 JWT_SECRET=$(kubectl get secret instant-secrets -n instant -o jsonpath='{.data.JWT_SECRET}' | base64 -d)
 RAZORPAY_SECRET=$(kubectl get secret instant-secrets -n instant -o jsonpath='{.data.RAZORPAY_WEBHOOK_SECRET}' | base64 -d)
 
-E2E_BASE_URL=http://localhost:30080 \
+E2E_BASE_URL=http://localhost:8080 \
 E2E_JWT_SECRET="$JWT_SECRET" \
 E2E_RAZORPAY_WEBHOOK_SECRET="$RAZORPAY_SECRET" \
 go test ./e2e/... -v -tags e2e -timeout 90s
@@ -164,7 +168,7 @@ api/
 Claude Code / curl / MCP tools
         │
         ▼
-  api/ — port 8080 (NodePort 30080)
+  api/ — port 8080 (ClusterIP Service; port-forward locally)
         │
         ├─ Middleware chain:
         │   RequestID → Recover → CORS → GeoEnrich → Fingerprint → RateLimit

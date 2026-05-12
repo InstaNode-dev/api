@@ -397,9 +397,12 @@ func (h *WebhookHandler) Receive(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusInternalServerError, "internal_error", "Failed to store request")
 	}
 
-	// Determine TTL based on tier.
+	// Determine TTL based on tier. "anonymous" (pre-claim) and "free"
+	// (claimed-but-unpaid) share the short 24h TTL — pay-from-day-one
+	// means free-tier webhooks expire on the same clock as anonymous ones.
+	// Anything paid (hobby/pro/team/growth) gets the longer authed TTL.
 	ttl := webhookAnonTTL
-	if resource.Tier != "anonymous" {
+	if resource.Tier != "anonymous" && resource.Tier != "free" {
 		ttl = webhookAuthTTL
 	}
 

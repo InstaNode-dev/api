@@ -131,6 +131,7 @@ func vaultTestApp(t *testing.T, db *sql.DB) *fiber.App {
 	api.Get("/vault/:env", h.ListKeys)
 	api.Delete("/vault/:env/:key", h.DeleteSecret)
 	api.Post("/vault/:env/:key/rotate", h.RotateSecret)
+	api.Post("/vault/copy", h.CopySecrets)
 	return app
 }
 

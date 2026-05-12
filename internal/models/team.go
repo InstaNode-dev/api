@@ -49,10 +49,17 @@ func (e *ErrUserNotFound) Error() string {
 }
 
 // CreateTeam inserts a new team and returns it.
+//
+// New teams start at plan_tier='free' (claimed-but-unpaid). The schema also
+// defaults to 'free', but we set it explicitly here so this code path is
+// independent of the DB default — drifting either side is a clear bug rather
+// than a silent shift in onboarding semantics. Pay-from-day-one: the team
+// stays on 'free' until the Razorpay subscription.charged webhook runs
+// UpdatePlanTier with a paid tier.
 func CreateTeam(ctx context.Context, db *sql.DB, name string) (*Team, error) {
 	t := &Team{}
 	err := db.QueryRowContext(ctx, `
-		INSERT INTO teams (name) VALUES ($1)
+		INSERT INTO teams (name, plan_tier) VALUES ($1, 'free')
 		RETURNING id, name, plan_tier, stripe_customer_id, trial_ends_at, created_at
 	`, name).Scan(
 		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.TrialEndsAt, &t.CreatedAt,

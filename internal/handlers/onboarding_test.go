@@ -152,11 +152,21 @@ func TestOnboarding_PostClaim_ValidJWT_SetsConvertedAtAndTeamID(t *testing.T) {
 
 	require.Equal(t, http.StatusCreated, claimResp.StatusCode)
 
-	// Verify the resource was claimed: team_id set, expires_at cleared.
+	// Verify the resource was claimed: team_id set, tier flipped to 'free',
+	// expires_at preserved (pay-from-day-one keeps the 24h TTL ticking).
 	var teamIDNull bool
-	err := db.QueryRow(`SELECT team_id IS NULL FROM resources WHERE token = $1`, res.Token).Scan(&teamIDNull)
+	var tier string
+	var expiresAtNull bool
+	err := db.QueryRow(
+		`SELECT team_id IS NULL, tier, expires_at IS NULL FROM resources WHERE token = $1`,
+		res.Token,
+	).Scan(&teamIDNull, &tier, &expiresAtNull)
 	require.NoError(t, err)
 	assert.False(t, teamIDNull, "team_id must be set on resource after claim")
+	assert.Equal(t, "free", tier,
+		"claim must flip tier from 'anonymous' to 'free' (claimed-but-unpaid audience)")
+	assert.False(t, expiresAtNull,
+		"claim must NOT clear expires_at — only Razorpay subscription.charged does that")
 
 	// Verify onboarding event marked as converted.
 	// Query by resource token since fingerprint in DB is the middleware hash, not the raw test fp.

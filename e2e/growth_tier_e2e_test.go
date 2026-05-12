@@ -11,15 +11,10 @@
 //	E2E_BASE_URL              agent API (required)
 //	E2E_DEDICATED_INFRA       must be "true" to run G1–G6 (requires dedicated k8s backends)
 //	E2E_JWT_SECRET            management API + claim session (G1–G2, G4–G6)
-//	E2E_MIGRATOR_URL          migrator HTTP base (G3)
-//	E2E_MIGRATOR_SECRET       migrator auth header (G3)
 //	E2E_ALLOW_QUOTA_BURN      must be "true" for destructive G6
 package e2e
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"io"
 	"net/http"
 	"os"
@@ -27,9 +22,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	goredis "github.com/redis/go-redis/v9"
-	"github.com/google/uuid"
 )
 
 // sharedInfraSubstrings match connection URLs routed to shared instant-data services.
@@ -98,46 +90,6 @@ func truncateURL(s string) string {
 		return s[:120] + "…"
 	}
 	return s
-}
-
-// growthMigratorClient allows long-running migration status polls.
-var growthMigratorClient = &http.Client{
-	Timeout:   60 * time.Second,
-	Transport: &http.Transport{DisableKeepAlives: true},
-}
-
-func growthMigratorPost(t *testing.T, base, path, secret string, body any) *http.Response {
-	t.Helper()
-	b, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, base+path, bytes.NewReader(b))
-	if err != nil {
-		t.Fatalf("growthMigratorPost: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if secret != "" {
-		req.Header.Set("X-Migrator-Secret", secret)
-	}
-	resp, err := growthMigratorClient.Do(req)
-	if err != nil {
-		t.Fatalf("growthMigratorPost %s: %v", path, err)
-	}
-	return resp
-}
-
-func growthMigratorGet(t *testing.T, base, path, secret string) *http.Response {
-	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, base+path, nil)
-	if err != nil {
-		t.Fatalf("growthMigratorGet: %v", err)
-	}
-	if secret != "" {
-		req.Header.Set("X-Migrator-Secret", secret)
-	}
-	resp, err := growthMigratorClient.Do(req)
-	if err != nil {
-		t.Fatalf("growthMigratorGet %s: %v", path, err)
-	}
-	return resp
 }
 
 // ── G1: Growth provisions use dedicated backends ─────────────────────────────
@@ -275,121 +227,6 @@ func TestE2E_Growth_G2_LimitsMatchPlansYAML(t *testing.T) {
 		t.Errorf("G2: growth mongo limits: want storage_mb=-1 connections=-1, got %d/%d",
 			mongoBody.Limits.StorageMB, mongoBody.Limits.Connections)
 	}
-}
-
-// ── G3: Migration shared (hobby) → growth ─────────────────────────────────────
-
-func TestE2E_Growth_G3_MigrateHobbyRedisToGrowth(t *testing.T) {
-	dedicatedInfraOrSkip(t)
-	jwtSecretOrSkip(t)
-	base := migratorURL(t)
-	secret := migratorSecret(t)
-
-	_, sessionJWT, _ := claimAndGetSession(t)
-	ip := uniqueIP(t)
-	provResp := apiPost(t, "/cache/new", nil, "X-Forwarded-For", ip, "Authorization", "Bearer "+sessionJWT)
-	skipIfServiceDown(t, provResp, "redis")
-	if provResp.StatusCode != http.StatusCreated {
-		t.Fatalf("G3: POST /cache/new: want 201, got %d\n%s", provResp.StatusCode, readBody(t, provResp))
-	}
-	var prov provisionNewResponse
-	decodeJSON(t, provResp, &prov)
-	if prov.Tier != "hobby" {
-		t.Skipf("G3: expected hobby-tier cache before migration, got %q", prov.Tier)
-	}
-	if prov.ConnectionURL == "" {
-		t.Fatal("G3: empty connection_url from hobby provision")
-	}
-
-	payload := map[string]any{
-		"migration_id":  uuid.NewString(),
-		"resource_id":   prov.ID,
-		"resource_type": "redis",
-		"token":         prov.Token,
-		"source_url":    prov.ConnectionURL,
-		"source_tier":   "hobby",
-		"target_tier":   "growth",
-		"request_id":    "e2e-g3-" + uuid.NewString()[:8],
-	}
-
-	start := growthMigratorPost(t, base, "/migrations", secret, payload)
-	defer start.Body.Close()
-	if start.StatusCode != http.StatusAccepted { // 202
-		t.Fatalf("G3: POST /migrations: want 202, got %d\n%s", start.StatusCode, readBody(t, start))
-	}
-	var startBody map[string]any
-	if err := json.NewDecoder(start.Body).Decode(&startBody); err != nil {
-		t.Fatalf("G3: decode start response: %v", err)
-	}
-	wfID, _ := startBody["workflow_id"].(string)
-	if wfID == "" {
-		t.Fatal("G3: missing workflow_id")
-	}
-
-	var finalState string
-	deadline := time.Now().Add(6 * time.Minute)
-	for time.Now().Before(deadline) {
-		stResp := growthMigratorGet(t, base, "/migrations/"+wfID, secret)
-		var st map[string]any
-		json.NewDecoder(stResp.Body).Decode(&st)
-		stResp.Body.Close()
-		finalState, _ = st["state"].(string)
-		if finalState == "complete" || finalState == "failed" {
-			break
-		}
-		time.Sleep(3 * time.Second)
-	}
-	if finalState != "complete" {
-		t.Fatalf("G3: migration did not complete: state=%q (want complete)", finalState)
-	}
-
-	listResp := get(t, "/api/v1/resources", "Authorization", "Bearer "+sessionJWT)
-	if listResp.StatusCode != http.StatusOK {
-		t.Fatalf("G3: GET /api/v1/resources: want 200, got %d", listResp.StatusCode)
-	}
-	var listBody struct {
-		Items []struct {
-			Token string `json:"token"`
-			Tier  string `json:"tier"`
-		} `json:"items"`
-	}
-	decodeJSON(t, listResp, &listBody)
-	var sawGrowth bool
-	for _, it := range listBody.Items {
-		if it.Token == prov.Token && it.Tier == "growth" {
-			sawGrowth = true
-			break
-		}
-	}
-	if !sawGrowth {
-		t.Fatal("G3: migrated resource not listed as tier=growth")
-	}
-
-	rotResp := post(t, "/api/v1/resources/"+prov.Token+"/rotate-credentials", nil,
-		"Authorization", "Bearer "+sessionJWT)
-	if rotResp.StatusCode != http.StatusOK {
-		t.Fatalf("G3: rotate-credentials: want 200, got %d\n%s", rotResp.StatusCode, readBody(t, rotResp))
-	}
-	var rot map[string]any
-	decodeJSON(t, rotResp, &rot)
-	newURL, _ := rot["connection_url"].(string)
-	if newURL == "" {
-		t.Fatal("G3: rotate-credentials returned empty connection_url")
-	}
-	skipUnlessDedicatedConn(t, "G3 post-migration redis", newURL)
-
-	opts, err := goredis.ParseURL(localURL(newURL))
-	if err != nil {
-		t.Fatalf("G3: parse redis URL: %v", err)
-	}
-	rdb := goredis.NewClient(opts)
-	defer rdb.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		t.Fatalf("G3: redis PING after migration+rotate: %v", err)
-	}
-	t.Logf("G3: hobby→growth redis migration complete; PING ok")
 }
 
 // ── G4: Logs — cross-reference logs_e2e_test.go ───────────────────────────────

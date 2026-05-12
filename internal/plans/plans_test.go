@@ -18,7 +18,7 @@ func TestDefault_LoadsWithoutError(t *testing.T) {
 
 func TestDefault_AllStandardTiersPresent(t *testing.T) {
 	r := plans.Default()
-	for _, tier := range []string{"anonymous", "hobby", "pro", "team", "growth"} {
+	for _, tier := range []string{"anonymous", "free", "hobby", "pro", "team", "growth"} {
 		p := r.Get(tier)
 		assert.Equal(t, tier, p.Name, "tier %q must be in default registry", tier)
 	}
@@ -102,10 +102,35 @@ func TestLoad_InvalidYAML_ReturnsError(t *testing.T) {
 func TestAll_ReturnsAllPlans(t *testing.T) {
 	r := plans.Default()
 	all := r.All()
-	assert.Len(t, all, 5, "default registry must have 5 plans")
-	for _, name := range []string{"anonymous", "hobby", "pro", "team", "growth"} {
+	assert.Len(t, all, 6, "default registry must have 6 plans (anonymous, free, hobby, pro, team, growth)")
+	for _, name := range []string{"anonymous", "free", "hobby", "pro", "team", "growth"} {
 		assert.Contains(t, all, name)
 	}
+}
+
+// TestFreeTier_MirrorsAnonymous verifies the api-level plans wrapper exposes
+// the new `free` tier and that its limits are byte-for-byte identical to
+// `anonymous`. The two tiers must stay in lock-step so an `anonymous` ->
+// `free` flip at claim time can't accidentally widen or narrow quotas.
+func TestFreeTier_MirrorsAnonymous(t *testing.T) {
+	r := plans.Default()
+	anon := r.Get("anonymous")
+	free := r.Get("free")
+	require.NotNil(t, free)
+	assert.Equal(t, "free", free.Name)
+	assert.Equal(t, anon.Limits, free.Limits,
+		"free tier limits must mirror anonymous exactly")
+	assert.Equal(t, anon.Features, free.Features,
+		"free tier features must mirror anonymous exactly")
+	// The two registry lookups must also agree across every per-service helper.
+	for _, svc := range []string{"postgres", "redis", "mongodb", "queue", "storage", "webhook"} {
+		assert.Equal(t,
+			r.StorageLimitMB("anonymous", svc),
+			r.StorageLimitMB("free", svc),
+			"StorageLimitMB(free,%s) must equal anonymous", svc)
+	}
+	assert.Equal(t, r.ProvisionLimit("anonymous"), r.ProvisionLimit("free"),
+		"ProvisionLimit(free) must equal anonymous")
 }
 
 func TestValidatePromotion_ValidCode_ReturnsPromotion(t *testing.T) {

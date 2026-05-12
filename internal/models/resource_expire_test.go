@@ -298,5 +298,101 @@ func TestExpireAnonymousJob_OnlyAnonymousResources(t *testing.T) {
 	assert.Equal(t, "active", claimedStatus, "claimed resource must remain active")
 }
 
+// TestExpireAnonymousJob_FreeTeamOwnedExpired verifies the new pay-from-day-one
+// path: a claimed-but-unpaid resource (tier='free', team_id IS NOT NULL,
+// expires_at < now()) MUST be expired by the reaper. The user clicked claim
+// but never paid; the 24h TTL applies to them too.
+func TestExpireAnonymousJob_FreeTeamOwnedExpired(t *testing.T) {
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+
+	// Create a team — required because tier='free' implies team_id IS NOT NULL.
+	var teamID string
+	err := db.QueryRow(`INSERT INTO teams (name) VALUES ('free-test') RETURNING id`).Scan(&teamID)
+	require.NoError(t, err)
+	defer db.Exec(`DELETE FROM teams WHERE id = $1`, teamID)
+
+	// Claimed but unpaid: tier=free, team_id set, TTL elapsed.
+	var resourceID string
+	err = db.QueryRow(`
+		INSERT INTO resources (resource_type, tier, status, team_id, expires_at)
+		VALUES ('redis', 'free', 'active', $1, NOW() - INTERVAL '1 hour')
+		RETURNING id`, teamID).Scan(&resourceID)
+	require.NoError(t, err)
+	defer db.Exec(`DELETE FROM resources WHERE id = $1`, resourceID)
+
+	n, err := models.ExpireAnonymousResources(context.Background(), db)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, n, int64(1),
+		"reaper must expire at least the one free-tier resource we inserted")
+
+	var status string
+	err = db.QueryRow(`SELECT status FROM resources WHERE id = $1`, resourceID).Scan(&status)
+	require.NoError(t, err)
+	assert.Equal(t, "deleted", status,
+		"claimed-but-unpaid free-tier resource past expires_at must be deleted")
+}
+
+// TestExpireAnonymousJob_FreeFutureExpiresAt_NotExpired verifies that a
+// free-tier resource with expires_at in the future is left alone (the user
+// still has time inside their 24h window to upgrade).
+func TestExpireAnonymousJob_FreeFutureExpiresAt_NotExpired(t *testing.T) {
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+
+	var teamID string
+	err := db.QueryRow(`INSERT INTO teams (name) VALUES ('free-future-test') RETURNING id`).Scan(&teamID)
+	require.NoError(t, err)
+	defer db.Exec(`DELETE FROM teams WHERE id = $1`, teamID)
+
+	var resourceID string
+	err = db.QueryRow(`
+		INSERT INTO resources (resource_type, tier, status, team_id, expires_at)
+		VALUES ('redis', 'free', 'active', $1, NOW() + INTERVAL '12 hours')
+		RETURNING id`, teamID).Scan(&resourceID)
+	require.NoError(t, err)
+	defer db.Exec(`DELETE FROM resources WHERE id = $1`, resourceID)
+
+	_, err = models.ExpireAnonymousResources(context.Background(), db)
+	require.NoError(t, err)
+
+	var status string
+	err = db.QueryRow(`SELECT status FROM resources WHERE id = $1`, resourceID).Scan(&status)
+	require.NoError(t, err)
+	assert.Equal(t, "active", status,
+		"free-tier resource with future expires_at must remain active")
+}
+
+// TestExpireAnonymousJob_FreeWithNullExpiresAt_NotExpired guards against the
+// edge case where a paid upgrade cleared expires_at but the reaper-race
+// somehow leaves tier='free'. Without an expires_at, the reaper has no
+// signal to act on, so the row must stay active regardless of tier.
+func TestExpireAnonymousJob_FreeWithNullExpiresAt_NotExpired(t *testing.T) {
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+
+	var teamID string
+	err := db.QueryRow(`INSERT INTO teams (name) VALUES ('free-null-test') RETURNING id`).Scan(&teamID)
+	require.NoError(t, err)
+	defer db.Exec(`DELETE FROM teams WHERE id = $1`, teamID)
+
+	var resourceID string
+	err = db.QueryRow(`
+		INSERT INTO resources (resource_type, tier, status, team_id, expires_at)
+		VALUES ('redis', 'free', 'active', $1, NULL)
+		RETURNING id`, teamID).Scan(&resourceID)
+	require.NoError(t, err)
+	defer db.Exec(`DELETE FROM resources WHERE id = $1`, resourceID)
+
+	_, err = models.ExpireAnonymousResources(context.Background(), db)
+	require.NoError(t, err)
+
+	var status string
+	err = db.QueryRow(`SELECT status FROM resources WHERE id = $1`, resourceID).Scan(&status)
+	require.NoError(t, err)
+	assert.Equal(t, "active", status,
+		"free-tier resource with NULL expires_at must never be expired")
+}
+
 // Ensure time.Duration is imported (used indirectly by the test).
 var _ = time.Second

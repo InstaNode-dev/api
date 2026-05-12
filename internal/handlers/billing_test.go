@@ -44,7 +44,7 @@ func billingTestApp(t *testing.T) *fiber.App {
 	}
 
 	emailClient := email.New("") // noop
-	billing := handlers.NewBillingHandler(nil, cfg, emailClient, nil)
+	billing := handlers.NewBillingHandler(nil, cfg, emailClient)
 
 	app := fiber.New(fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
@@ -393,7 +393,7 @@ func billingStateApp(t *testing.T, db *sql.DB, teamID string, fetch func(string)
 	}
 	mail := email.New("") // noop
 
-	bh := handlers.NewBillingHandler(db, cfg, mail, nil)
+	bh := handlers.NewBillingHandler(db, cfg, mail)
 	if fetch != nil {
 		bh.FetchSubscriptionDetails = fetch
 	}
@@ -483,19 +483,23 @@ func TestGetBillingState_ProSubscription_ReturnsRenewalAndPayment(t *testing.T) 
 
 	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
 	teamUUID := uuid.MustParse(teamID)
-	require.NoError(t, models.UpdateRazorpaySubscriptionID(context.Background(), db, teamUUID, "sub_test_xyz"))
+	// Unique subscription id per test run so the teams.stripe_customer_id
+	// unique constraint doesn't trip when this package is re-run against a
+	// non-fresh test DB.
+	subID := "sub_test_" + uuid.New().String()
+	require.NoError(t, models.UpdateRazorpaySubscriptionID(context.Background(), db, teamUUID, subID))
 	ownerEmail := testhelpers.UniqueEmail(t)
 	_, err := models.CreateUser(context.Background(), db, teamUUID, ownerEmail, "", "", "owner")
 	require.NoError(t, err)
 
 	renewal := time.Date(2026, 6, 11, 12, 0, 0, 0, time.UTC)
 	captured := ""
-	fetch := func(subID string) (*razorpaybilling.SubscriptionDetails, error) {
-		captured = subID
+	fetch := func(passedSubID string) (*razorpaybilling.SubscriptionDetails, error) {
+		captured = passedSubID
 		return &razorpaybilling.SubscriptionDetails{
 			Status:             "active",
 			CurrentPeriodEnd:   renewal,
-			ShortURL:           "https://rzp.io/sub/sub_test_xyz",
+			ShortURL:           "https://rzp.io/sub/" + passedSubID,
 			PaymentLast4:       "4242",
 			PaymentNetwork:     "visa",
 			PaymentMethod:      "card",
@@ -514,11 +518,11 @@ func TestGetBillingState_ProSubscription_ReturnsRenewalAndPayment(t *testing.T) 
 	var body map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 
-	assert.Equal(t, "sub_test_xyz", captured, "handler should pass the stored subscription id to the fetcher")
+	assert.Equal(t, subID, captured, "handler should pass the stored subscription id to the fetcher")
 	assert.Equal(t, true, body["ok"])
 	assert.Equal(t, "pro", body["tier"])
 	assert.Equal(t, "active", body["subscription_status"])
-	assert.Equal(t, "sub_test_xyz", body["razorpay_subscription_id"])
+	assert.Equal(t, subID, body["razorpay_subscription_id"])
 	assert.Equal(t, ownerEmail, body["billing_email"])
 
 	// next_renewal_at is rendered as RFC3339Nano UTC.

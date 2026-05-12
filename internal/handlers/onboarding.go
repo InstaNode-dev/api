@@ -313,8 +313,15 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 			continue // already claimed
 		}
 		claimedIDs[resource.ID] = true
+		// Pay-from-day-one: claim transfers ownership AND flips the tier
+		// from `anonymous` -> `free`. Both share identical limits + 24h TTL,
+		// but `free` signals "claimed but unpaid" — useful for marketing,
+		// dashboard copy, and analytics. expires_at stays untouched: only
+		// the Razorpay subscription.charged webhook clears it (via
+		// ElevateResourceTiersByTeam). If the user never pays, the reaper
+		// deletes the resource at expires_at — same fate as an anonymous one.
 		_, _ = h.db.ExecContext(ctx, `
-			UPDATE resources SET team_id = $1, tier = 'hobby', expires_at = NULL
+			UPDATE resources SET team_id = $1, tier = 'free'
 			WHERE id = $2 AND team_id IS NULL
 		`, team.ID, resource.ID)
 	}
@@ -331,31 +338,18 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 				continue
 			}
 			_, _ = h.db.ExecContext(ctx, `
-				UPDATE resources SET team_id = $1, tier = 'hobby', expires_at = NULL
+				UPDATE resources SET team_id = $1, tier = 'free'
 				WHERE id = $2 AND team_id IS NULL
 			`, team.ID, r.ID)
 		}
 	}
 
-	// Start 14-day trial
-	if err := models.StartTrial(ctx, h.db, team.ID); err != nil {
-		slog.Error("onboarding.claim.start_trial_failed",
-			"error", err,
-			"team_id", team.ID,
-			"request_id", requestID,
-		)
-		// Non-fatal: proceed
-	}
-
-	trialEndsAt := time.Now().Add(14 * 24 * time.Hour)
-	if err := h.email.SendTrialStarted(ctx, body.Email, teamName, trialEndsAt); err != nil {
-		slog.Error("onboarding.claim.send_trial_started_failed",
-			"error", err,
-			"email", body.Email,
-			"request_id", requestID,
-		)
-		// Non-fatal: proceed
-	}
+	// "Pay from day one" — no trial, no auto-elevation. The team is created
+	// at the default plan_tier; resources keep their anonymous tier + 24h
+	// TTL until the Razorpay subscription.charged webhook fires
+	// ElevateResourceTiersByTeam (see billing.handleSubscriptionCharged).
+	// The dashboard's /claim page is expected to route the user to checkout
+	// immediately — if they don't pay within 24h, the resource expires.
 
 	metrics.ConversionFunnel.WithLabelValues("claimed").Inc()
 

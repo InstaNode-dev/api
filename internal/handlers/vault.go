@@ -285,9 +285,11 @@ func (h *VaultHandler) upsertSecret(c *fiber.Ctx, action string) error {
 						// Accept this for now; revisit with SELECT FOR UPDATE if abuse appears.
 						existing, _ := models.GetVaultSecretLatest(c.Context(), h.db, teamID, env, key)
 						if existing == nil && n >= maxEntries {
-							return respondError(c, fiber.StatusPaymentRequired, vaultErrQuotaExceeded,
+							return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired, vaultErrQuotaExceeded,
 								fmt.Sprintf("Plan %q allows %d vault entries; you have %d. Upgrade to add more.",
-									team.PlanTier, maxEntries, n))
+									team.PlanTier, maxEntries, n),
+								fmt.Sprintf("Tell the user they've hit the %s tier vault quota (%d entries). Have them upgrade at %s to add more secrets.", team.PlanTier, maxEntries, DefaultPricingURL),
+								DefaultPricingURL)
 						}
 					}
 				}
@@ -409,6 +411,233 @@ func (h *VaultHandler) ListKeys(c *fiber.Ctx) error {
 		"ok":   true,
 		"env":  env,
 		"keys": keys,
+	})
+}
+
+// ── POST /api/v1/vault/copy ──────────────────────────────────────────────────
+
+// vaultCopyBody is the JSON body for POST /api/v1/vault/copy.
+//
+//	From:    source env name. Required.
+//	To:      target env name. Required.
+//	Keys:    optional allowlist of key names. Empty means copy ALL keys from
+//	         the source env. Length-capped at 1000 to bound the worst-case row
+//	         count for one request.
+//	DryRun:  when true, return the same shape but do not persist anything.
+//	Overwrite: when true (default false), keys that already exist in the
+//	         target env are bumped to a new version. When false, existing keys
+//	         in the target are reported as "skipped" and not touched.
+type vaultCopyBody struct {
+	From      string   `json:"from"`
+	To        string   `json:"to"`
+	Keys      []string `json:"keys"`
+	DryRun    bool     `json:"dry_run"`
+	Overwrite bool     `json:"overwrite"`
+}
+
+// vaultCopyKeysCap bounds the size of an explicit key allowlist so a single
+// request can't be coerced into reading the entire vault for an env. The
+// no-allowlist path is implicitly capped by the per-tier VaultMaxEntries
+// quota that gates writes.
+const vaultCopyKeysCap = 1000
+
+// CopySecrets handles POST /api/v1/vault/copy. Pro+ only.
+//
+// Bulk-copies vault secrets from one env to another for a single team. The
+// caller picks dry_run=true to preview the change set without writing
+// anything. Useful as the "show me the diff" step before a promote.
+//
+// Auth + tier:
+//   - team JWT required (RequireAuth at the router level)
+//   - team.PlanTier must be in pro/team/growth — returns 402 with agent_action
+//     otherwise (RETRO-2026-05-12 §10.17 spec).
+//
+// Behaviour:
+//   - Source-env keys are read at their latest version.
+//   - Each copy creates a NEW version in the target env so audit history is
+//     preserved (matches CreateVaultSecret's semantics).
+//   - Keys already present in the target env are skipped by default; pass
+//     {"overwrite": true} to bump them to a new version.
+//   - Per-tier quotas (VaultMaxEntries) are enforced PER CALL: if a copy
+//     would exceed the team's cap, the partial copy stops and the response
+//     reports how many keys were copied vs. skipped vs. would-exceed-quota.
+func (h *VaultHandler) CopySecrets(c *fiber.Ctx) error {
+	teamID, userID, ip, err := h.authContext(c)
+	if err != nil {
+		return respondError(c, fiber.StatusUnauthorized, vaultErrUnauthorized, "Valid session token required")
+	}
+
+	var body vaultCopyBody
+	if err := c.BodyParser(&body); err != nil {
+		return respondError(c, fiber.StatusBadRequest, vaultErrInvalidBody,
+			`Body must be valid JSON: {"from":"staging","to":"production","dry_run":false}`)
+	}
+
+	from, ok := validateEnv(body.From)
+	if !ok || body.From == "" {
+		return respondError(c, fiber.StatusBadRequest, vaultErrInvalidEnv,
+			"from is required and must be 1-64 chars [A-Za-z0-9_-]")
+	}
+	to, ok := validateEnv(body.To)
+	if !ok || body.To == "" {
+		return respondError(c, fiber.StatusBadRequest, vaultErrInvalidEnv,
+			"to is required and must be 1-64 chars [A-Za-z0-9_-]")
+	}
+	if from == to {
+		return respondError(c, fiber.StatusBadRequest, "invalid_target",
+			"from and to must differ")
+	}
+	if len(body.Keys) > vaultCopyKeysCap {
+		return respondError(c, fiber.StatusBadRequest, vaultErrInvalidBody,
+			fmt.Sprintf("keys allowlist exceeds %d entries", vaultCopyKeysCap))
+	}
+	for _, k := range body.Keys {
+		if _, ok := validateKey(k); !ok {
+			return respondError(c, fiber.StatusBadRequest, vaultErrInvalidKey,
+				"each key in 'keys' must be 1-256 chars [A-Za-z0-9_.-]; got: "+k)
+		}
+	}
+
+	// Tier gate. Same spec-mandated 402 shape used by the stack promote
+	// endpoint, including agent_action.
+	team, terr := models.GetTeamByID(c.Context(), h.db, teamID)
+	if terr != nil {
+		slog.Error("vault.copy.team_lookup_failed",
+			"error", terr, "team_id", teamID,
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusServiceUnavailable, "team_lookup_failed",
+			"Failed to look up team")
+	}
+	if !multiEnvTierAllowed(team.PlanTier) {
+		return respondMultiEnvUpgradeRequired(c, team.PlanTier)
+	}
+
+	// Determine the set of keys to copy. Empty allowlist → all keys at source.
+	var keysToCopy []string
+	if len(body.Keys) > 0 {
+		keysToCopy = body.Keys
+	} else {
+		keysToCopy, err = models.ListVaultKeys(c.UserContext(), h.db, teamID, from)
+		if err != nil {
+			slog.Error("vault.copy.list_failed",
+				"error", err, "team_id", teamID, "from", from,
+				"request_id", middleware.GetRequestID(c))
+			return respondError(c, fiber.StatusInternalServerError, vaultErrInternal,
+				"Failed to list source secrets")
+		}
+	}
+
+	// Fetch the latest version of each source key. Build a per-key plan that
+	// the response always echoes back (whether dry_run or not).
+	type keyAction struct {
+		Key    string `json:"key"`
+		Action string `json:"action"` // "copy", "overwrite", "skip", "missing", "quota_exceeded"
+	}
+	plan := make([]keyAction, 0, len(keysToCopy))
+
+	// For quota enforcement: each new key in the target env costs 1 against
+	// the team's VaultMaxEntries cap (overwrites of existing keys do not). We
+	// already know the total — compute the remaining budget once.
+	var remaining int
+	if h.plans != nil {
+		maxEntries := h.plans.VaultMaxEntries(team.PlanTier)
+		if maxEntries < 0 {
+			remaining = -1 // unlimited
+		} else {
+			used, cerr := models.CountVaultKeysByTeam(c.Context(), h.db, teamID)
+			if cerr != nil {
+				slog.Warn("vault.copy.count_failed", "error", cerr, "team_id", teamID)
+				remaining = maxEntries // fail open at the cap
+			} else {
+				remaining = maxEntries - used
+				if remaining < 0 {
+					remaining = 0
+				}
+			}
+		}
+	} else {
+		remaining = -1
+	}
+
+	copied, skipped, missing, blocked := 0, 0, 0, 0
+	for _, k := range keysToCopy {
+		// Read latest from source env. Missing → record + continue.
+		src, ferr := models.GetVaultSecretLatest(c.UserContext(), h.db, teamID, from, k)
+		if errors.Is(ferr, models.ErrVaultSecretNotFound) {
+			plan = append(plan, keyAction{Key: k, Action: "missing"})
+			missing++
+			continue
+		}
+		if ferr != nil {
+			slog.Error("vault.copy.fetch_failed",
+				"error", ferr, "team_id", teamID, "from", from, "key", k,
+				"request_id", middleware.GetRequestID(c))
+			return respondError(c, fiber.StatusInternalServerError, vaultErrInternal,
+				"Failed to read source secret: "+k)
+		}
+
+		// Check target side: does this key already exist?
+		dst, derr := models.GetVaultSecretLatest(c.UserContext(), h.db, teamID, to, k)
+		dstExists := derr == nil && dst != nil
+		if derr != nil && !errors.Is(derr, models.ErrVaultSecretNotFound) {
+			slog.Error("vault.copy.dst_check_failed",
+				"error", derr, "team_id", teamID, "to", to, "key", k,
+				"request_id", middleware.GetRequestID(c))
+			return respondError(c, fiber.StatusInternalServerError, vaultErrInternal,
+				"Failed to inspect target secret: "+k)
+		}
+
+		// Skip path: target already has the key and caller didn't ask to overwrite.
+		if dstExists && !body.Overwrite {
+			plan = append(plan, keyAction{Key: k, Action: "skip"})
+			skipped++
+			continue
+		}
+
+		// Quota check: a new key in the target env costs 1 budget unit.
+		// Existing-key overwrites are free. Unlimited → no check.
+		if !dstExists && remaining == 0 {
+			plan = append(plan, keyAction{Key: k, Action: "quota_exceeded"})
+			blocked++
+			continue
+		}
+
+		action := "copy"
+		if dstExists {
+			action = "overwrite"
+		}
+		plan = append(plan, keyAction{Key: k, Action: action})
+
+		if !body.DryRun {
+			if _, werr := models.CreateVaultSecret(c.UserContext(), h.db, teamID, to, k, src.EncryptedValue, userID); werr != nil {
+				slog.Error("vault.copy.persist_failed",
+					"error", werr, "team_id", teamID, "to", to, "key", k,
+					"request_id", middleware.GetRequestID(c))
+				return respondError(c, fiber.StatusServiceUnavailable, vaultErrPersist,
+					"Failed to copy secret: "+k)
+			}
+			// Audit the copy as a "copy" action so it's distinguishable from
+			// a regular PUT in the audit log.
+			h.audit(c, teamID, userID, "copy", to, k, ip)
+		}
+
+		copied++
+		if action == "copy" && remaining > 0 {
+			remaining--
+		}
+	}
+
+	return c.JSON(fiber.Map{
+		"ok":         true,
+		"dry_run":    body.DryRun,
+		"from":       from,
+		"to":         to,
+		"plan":       plan,
+		"copied":     copied,
+		"skipped":    skipped,
+		"missing":    missing,
+		"blocked":    blocked,
+		"total_keys": len(keysToCopy),
 	})
 }
 
