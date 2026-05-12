@@ -258,6 +258,10 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Get("/whoami", whoamiH.Get)
 
 	api.Get("/resources", resourceH.List)
+	// /families and /:id/family must register BEFORE /:id so Fiber routes
+	// the literal segments instead of binding them to the :id wildcard.
+	api.Get("/resources/families", resourceH.ListFamilies)
+	api.Get("/resources/:id/family", resourceH.Family)
 	api.Get("/resources/:id", resourceH.Get)
 	api.Get("/resources/:id/credentials", resourceH.GetCredentials)
 	api.Delete("/resources/:id", resourceH.Delete)

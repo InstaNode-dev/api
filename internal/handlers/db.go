@@ -100,7 +100,14 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 
 	// ── Authenticated path ────────────────────────────────────────────────────
 	if teamIDStr := middleware.GetTeamID(c); teamIDStr != "" {
-		return h.newDBAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, body.Dedicated, env, start)
+		return h.newDBAuthenticated(c, teamIDStr, fp, country, vendor, requestID, body.Name, body.Dedicated, env, body.ParentResourceID, start)
+	}
+
+	// Anonymous callers cannot family-link — there's no team to scope the
+	// link to. Reject early so we don't silently drop the field.
+	if body.ParentResourceID != "" {
+		return respondError(c, fiber.StatusPaymentRequired, "auth_required",
+			"parent_resource_id requires an authenticated team. Sign up at "+urls.StartURLPrefix)
 	}
 
 	// ── Dedicated requires authentication ─────────────────────────────────────
@@ -271,7 +278,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 }
 
 func (h *DBHandler) newDBAuthenticated(
-	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, dedicated bool, env string, start time.Time,
+	c *fiber.Ctx, teamIDStr, fp, country, vendor, requestID, name string, dedicated bool, env, parentResourceID string, start time.Time,
 ) error {
 	ctx := c.UserContext()
 	teamUUID, err := parseTeamID(teamIDStr)
@@ -289,9 +296,17 @@ func (h *DBHandler) newDBAuthenticated(
 		tier = "growth"
 	}
 
+	// Family-link validation runs BEFORE provisioning so a cross-team /
+	// cross-type / duplicate-twin parent_resource_id never causes us to
+	// create-then-fail (which would leak a database we can't link).
+	parentRootID, perr := resolveFamilyParent(c, h.db, parentResourceID, teamUUID, models.ResourceTypePostgres, env)
+	if perr != nil {
+		return perr
+	}
+
 	resource, err := models.CreateResource(ctx, h.db, models.CreateResourceParams{
 		TeamID:           &teamUUID,
-		ResourceType:     "postgres",
+		ResourceType:     models.ResourceTypePostgres,
 		Name:             name,
 		Tier:             tier,
 		Env:              env,
@@ -300,6 +315,7 @@ func (h *DBHandler) newDBAuthenticated(
 		CountryCode:      country,
 		ExpiresAt:        nil, // permanent
 		CreatedRequestID: requestID,
+		ParentResourceID: parentRootID,
 	})
 	if err != nil {
 		slog.Error("db.new.create_resource_failed_auth", "error", err, "team_id", teamIDStr, "request_id", requestID)
