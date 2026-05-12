@@ -11,3 +11,8 @@ func Load(path string) (*Registry, error) { return commonplans.Load(path) }
 
 // Default returns a Registry built from embedded defaults.
 func Default() *Registry { return commonplans.Default() }
+
+// CanonicalTier strips the "_yearly" suffix from a plan name and returns the
+// base tier (e.g. "pro_yearly" -> "pro"). Re-exported from common/plans so
+// handlers in this module don't need to import the shared package directly.
+func CanonicalTier(tier string) string { return commonplans.CanonicalTier(tier) }

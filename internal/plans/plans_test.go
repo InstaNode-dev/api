@@ -102,10 +102,41 @@ func TestLoad_InvalidYAML_ReturnsError(t *testing.T) {
 func TestAll_ReturnsAllPlans(t *testing.T) {
 	r := plans.Default()
 	all := r.All()
-	assert.Len(t, all, 6, "default registry must have 6 plans (anonymous, free, hobby, pro, team, growth)")
-	for _, name := range []string{"anonymous", "free", "hobby", "pro", "team", "growth"} {
+	// 6 base tiers + 3 yearly variants (hobby_yearly, pro_yearly, team_yearly).
+	assert.Len(t, all, 9, "default registry must have 9 plans (6 base + 3 yearly variants)")
+	for _, name := range []string{
+		"anonymous", "free", "hobby", "pro", "team", "growth",
+		"hobby_yearly", "pro_yearly", "team_yearly",
+	} {
 		assert.Contains(t, all, name)
 	}
+}
+
+// TestYearlyVariants_MirrorMonthly ensures the api-level wrapper exposes
+// the new yearly tiers with limits + features identical to their monthly
+// counterparts. The only allowed divergence is price and billing_period.
+func TestYearlyVariants_MirrorMonthly(t *testing.T) {
+	r := plans.Default()
+	for _, base := range []string{"hobby", "pro", "team"} {
+		yearly := r.Get(base + "_yearly")
+		monthly := r.Get(base)
+		assert.Equal(t, monthly.Limits, yearly.Limits,
+			"%s_yearly limits must mirror %s", base, base)
+		assert.Equal(t, monthly.Features, yearly.Features,
+			"%s_yearly features must mirror %s", base, base)
+		assert.Equal(t, "yearly", yearly.BillingPeriod,
+			"%s_yearly must declare billing_period: yearly", base)
+	}
+}
+
+// TestCanonicalTier_StripsYearlySuffix verifies the re-exported helper.
+func TestCanonicalTier_StripsYearlySuffix(t *testing.T) {
+	assert.Equal(t, "pro", plans.CanonicalTier("pro_yearly"))
+	assert.Equal(t, "hobby", plans.CanonicalTier("hobby_yearly"))
+	assert.Equal(t, "team", plans.CanonicalTier("team_yearly"))
+	assert.Equal(t, "pro", plans.CanonicalTier("pro"))
+	assert.Equal(t, "anonymous", plans.CanonicalTier("anonymous"))
+	assert.Equal(t, "", plans.CanonicalTier(""))
 }
 
 // TestFreeTier_MirrorsAnonymous verifies the api-level plans wrapper exposes

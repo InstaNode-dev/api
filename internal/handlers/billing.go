@@ -53,11 +53,20 @@ func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient *email.Client
 }
 
 // checkoutRequest is the request body for POST /api/v1/billing/checkout.
+//
+// PlanFrequency selects between the monthly and yearly Razorpay plan_id for
+// the requested tier. Accepted values: "monthly" (default when empty),
+// "yearly". Any other value is rejected as 400 invalid_frequency. The team's
+// canonical tier (the value stored on teams.plan_tier) is unchanged by
+// frequency — only the underlying Razorpay subscription differs.
 type checkoutRequest struct {
-	Plan string `json:"plan"`
+	Plan          string `json:"plan"`
+	PlanFrequency string `json:"plan_frequency"`
 }
 
-// razorpayPlanIDs returns the configured Razorpay plan_id for each tier.
+// razorpayPlanIDs returns the configured monthly Razorpay plan_id for each
+// tier. Used by ChangePlanAPI which today supports monthly-only plan
+// changes; yearly changes go through a new checkout subscription.
 func (h *BillingHandler) razorpayPlanIDs() map[string]string {
 	m := make(map[string]string)
 	if h.cfg.RazorpayPlanIDHobby != "" {
@@ -72,15 +81,63 @@ func (h *BillingHandler) razorpayPlanIDs() map[string]string {
 	return m
 }
 
-// planIDToTier maps a Razorpay plan_id back to an instant.dev tier name.
-// Defaults to "pro" when the plan_id is unrecognised.
+// razorpayPlanIDFor returns the configured plan_id for (tier, frequency)
+// where frequency is "monthly" or "yearly". Returns "" when the tier or
+// frequency has no plan_id configured (operator hasn't created it in the
+// Razorpay dashboard yet) — callers must surface 503 billing_not_configured.
+func (h *BillingHandler) razorpayPlanIDFor(tier, frequency string) string {
+	switch tier {
+	case "hobby":
+		if frequency == "yearly" {
+			return h.cfg.RazorpayPlanIDHobbyYearly
+		}
+		return h.cfg.RazorpayPlanIDHobby
+	case "pro":
+		if frequency == "yearly" {
+			return h.cfg.RazorpayPlanIDProYearly
+		}
+		return h.cfg.RazorpayPlanIDPro
+	case "team":
+		if frequency == "yearly" {
+			return h.cfg.RazorpayPlanIDTeamYearly
+		}
+		return h.cfg.RazorpayPlanIDTeam
+	}
+	return ""
+}
+
+// planIDToTier maps a Razorpay plan_id back to a canonical instant.dev tier
+// name. Recognises both monthly and yearly plan IDs and returns the bare
+// tier (e.g. "pro") in either case — the webhook stores canonical tiers on
+// teams.plan_tier so limits resolution stays cycle-agnostic. Defaults to
+// "pro" when the plan_id is unrecognised.
+//
+// An empty planID never matches anything: in development some env vars may
+// be "" and we must not silently classify a missing/empty webhook plan_id
+// or coincidentally-empty cfg slot as the matching tier.
 func (h *BillingHandler) planIDToTier(planID string) string {
-	switch planID {
-	case h.cfg.RazorpayPlanIDTeam:
-		return "team"
-	case h.cfg.RazorpayPlanIDPro:
+	if planID == "" {
 		return "pro"
-	case h.cfg.RazorpayPlanIDHobby:
+	}
+	// Explicit per-tier comparison to skip empty cfg slots — an unconfigured
+	// yearly variant should not consume a "" webhook plan_id and steal its
+	// canonical-tier mapping from another configured cfg value.
+	if h.cfg.RazorpayPlanIDTeam != "" && planID == h.cfg.RazorpayPlanIDTeam {
+		return "team"
+	}
+	if h.cfg.RazorpayPlanIDTeamYearly != "" && planID == h.cfg.RazorpayPlanIDTeamYearly {
+		return "team"
+	}
+	if h.cfg.RazorpayPlanIDPro != "" && planID == h.cfg.RazorpayPlanIDPro {
+		return "pro"
+	}
+	if h.cfg.RazorpayPlanIDProYearly != "" && planID == h.cfg.RazorpayPlanIDProYearly {
+		return "pro"
+	}
+	if h.cfg.RazorpayPlanIDHobby != "" && planID == h.cfg.RazorpayPlanIDHobby {
+		return "hobby"
+	}
+	if h.cfg.RazorpayPlanIDHobbyYearly != "" && planID == h.cfg.RazorpayPlanIDHobbyYearly {
 		return "hobby"
 	}
 	return "pro"
@@ -115,12 +172,22 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	}
 
 	plan := strings.ToLower(strings.TrimSpace(body.Plan))
-	var planID string
+	// plan_frequency selects monthly vs yearly Razorpay plan_id. Empty maps
+	// to "monthly" so existing callers (which never set the field) keep
+	// today's behaviour. Anything other than monthly|yearly is rejected so
+	// a typo doesn't silently fall back to the wrong cycle.
+	frequency := strings.ToLower(strings.TrimSpace(body.PlanFrequency))
+	if frequency == "" {
+		frequency = "monthly"
+	}
+	if frequency != "monthly" && frequency != "yearly" {
+		return respondError(c, fiber.StatusBadRequest, "invalid_frequency",
+			"plan_frequency must be 'monthly' or 'yearly'")
+	}
+
 	switch plan {
-	case "hobby":
-		planID = h.cfg.RazorpayPlanIDHobby
-	case "pro":
-		planID = h.cfg.RazorpayPlanIDPro
+	case "hobby", "pro":
+		// fall through — plan_id is resolved by razorpayPlanIDFor below.
 	case "team":
 		// Team tier is under development — block customer-initiated
 		// subscribe via the public API. The internal /internal/set-tier
@@ -131,11 +198,13 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	default:
 		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "plan must be 'hobby' or 'pro'")
 	}
+	planID := h.razorpayPlanIDFor(plan, frequency)
 
 	if h.cfg.RazorpayKeyID == "" || h.cfg.RazorpayKeySecret == "" || planID == "" {
 		slog.Warn("billing.checkout.not_configured",
 			"team_id", teamID,
 			"plan", plan,
+			"plan_frequency", frequency,
 			"key_set", h.cfg.RazorpayKeyID != "",
 			"secret_set", h.cfg.RazorpayKeySecret != "",
 			"plan_id_set", planID != "",
@@ -146,14 +215,22 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 
 	client := razorpay.NewClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
 
+	// total_count is the number of billing cycles before the subscription
+	// auto-completes. Monthly: 12 cycles ≈ 12 months. Yearly: 1 cycle ≈ 1
+	// year. cancel-at-cycle-end exits earlier via the cancelled webhook.
+	totalCount := 12
+	if frequency == "yearly" {
+		totalCount = 1
+	}
 	subBody := map[string]interface{}{
 		"plan_id":         planID,
-		"total_count":     12, // 12 billing cycles; cancel-at-cycle-end exits early via webhook
+		"total_count":     totalCount,
 		"quantity":        1,
 		"customer_notify": 1,
 		"notes": map[string]interface{}{
-			"team_id": teamID.String(),
-			"plan":    plan,
+			"team_id":        teamID.String(),
+			"plan":           plan,
+			"plan_frequency": frequency,
 		},
 	}
 
@@ -197,6 +274,7 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	slog.Info("billing.checkout.created",
 		"team_id", teamID,
 		"plan", plan,
+		"plan_frequency", frequency,
 		"subscription_id", subID,
 		"request_id", requestID,
 	)
