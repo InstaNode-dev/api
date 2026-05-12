@@ -1,3 +1,8 @@
+// TODO(obs-merge): replace obsstubs imports with common/buildinfo and
+// common/logctx once Tracks 1 + 2 of the observability rollout land on
+// master. The stubs at internal/obsstubs/{buildinfo,logctx} match the
+// exported surface of those packages 1:1; the merge agent should rewrite
+// the import paths and delete the obsstubs directory.
 package main
 
 import (
@@ -5,7 +10,10 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/newrelic/go-agent/v3/newrelic"
 	"google.golang.org/grpc"
+	"instant.dev/internal/obsstubs/buildinfo"
+	"instant.dev/internal/obsstubs/logctx"
 	"instant.dev/internal/config"
 	"instant.dev/internal/db"
 	"instant.dev/internal/email"
@@ -16,11 +24,24 @@ import (
 	"instant.dev/internal/telemetry"
 )
 
+// serviceName is the value of the `service` field stamped on every log
+// line emitted by this binary. The slog handler, the OTel resource, and
+// the NR app name all share this string so trace_id / log line / NR
+// transaction all join cleanly in queries.
+const serviceName = "api"
+
 func main() {
-	// Structured JSON logging
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	})))
+	// Structured JSON logging — wrapped in logctx.Handler so every record
+	// is decorated with service, commit_id, trace_id, team_id, tid.
+	//
+	// AddSource gives file:line of the slog call site (caller field in
+	// the design doc). Done before any other slog call in main so even
+	// telemetry init failures land enriched.
+	base := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level:     slog.LevelInfo,
+		AddSource: true,
+	})
+	slog.SetDefault(slog.New(logctx.NewHandler(serviceName, base)))
 
 	shutdownTracer := telemetry.InitTracer("instant-api", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 	defer func() {
@@ -28,6 +49,15 @@ func main() {
 			slog.Error("telemetry.shutdown_failed", "error", err)
 		}
 	}()
+
+	// New Relic Go agent. Fail-open on empty / missing license so local
+	// dev and CI runs (which never get a real key) still boot. Matches
+	// the contract of telemetry.InitTracer above.
+	nrApp := initNewRelic(serviceName)
+	if nrApp != nil {
+		defer nrApp.Shutdown(10_000_000_000) // 10s, in nanoseconds (NR's API)
+		middleware.SetNRApp(nrApp)
+	}
 
 	cfg := config.Load() // panics on missing required env vars
 
@@ -76,11 +106,55 @@ func main() {
 		slog.Info("main.provisioner_local", "note", "PROVISIONER_ADDR not set, using local providers")
 	}
 
-	app := router.New(cfg, database, rdb, geoDbs, emailClient, planRegistry, provClient)
+	app := router.New(cfg, database, rdb, geoDbs, emailClient, planRegistry, provClient, nrApp)
 
-	slog.Info("server.starting", "port", cfg.Port, "environment", cfg.Environment)
+	slog.Info("server.starting",
+		"port", cfg.Port,
+		"environment", cfg.Environment,
+		"commit_id", buildinfo.GitSHA,
+		"build_time", buildinfo.BuildTime,
+		"version", buildinfo.Version,
+	)
 	if err := app.Listen(":" + cfg.Port); err != nil {
 		slog.Error("server.fatal", "error", err)
 		os.Exit(1)
 	}
+}
+
+// initNewRelic constructs the NR Go agent. Returns nil (and logs a
+// single warning) when the license key is empty so the rest of the
+// process boots normally — fail-open is the contract for every
+// observability dependency in this codebase.
+//
+// The app name is derived from NEW_RELIC_APP_NAME when set, otherwise
+// "instant-<service>" matching the convention in the design doc
+// (instant-api, instant-worker, instant-provisioner).
+func initNewRelic(service string) *newrelic.Application {
+	license := os.Getenv("NEW_RELIC_LICENSE_KEY")
+	if license == "" {
+		slog.Warn("newrelic.disabled", "reason", "NEW_RELIC_LICENSE_KEY not set")
+		return nil
+	}
+	appName := os.Getenv("NEW_RELIC_APP_NAME")
+	if appName == "" {
+		appName = "instant-" + service
+	}
+	app, err := newrelic.NewApplication(
+		newrelic.ConfigAppName(appName),
+		newrelic.ConfigLicense(license),
+		newrelic.ConfigDistributedTracerEnabled(true),
+		// AppLogForwardingEnabled is intentionally left at the default
+		// (false). Forwarding via the agent doubles ingest cost; logs
+		// already ship via stdout → kube → log shipper. The slog
+		// handler stamps commit_id / trace_id so NR's log-trace join
+		// works without agent forwarding.
+	)
+	if err != nil {
+		// init failed (network, malformed license, etc.) — log and
+		// continue with a nil app. The middleware no-ops on nil.
+		slog.Error("newrelic.init_failed", "error", err)
+		return nil
+	}
+	slog.Info("newrelic.initialized", "app_name", appName)
+	return app
 }
