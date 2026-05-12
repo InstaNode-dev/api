@@ -41,6 +41,21 @@ import (
 	"instant.dev/internal/providers/compute/noop"
 )
 
+// maxAllowedIPs caps the size of the allowed_ips list on a private deploy.
+// Anything bigger belongs in a real VPN / CF Access policy — the goal here is
+// "agent locks the staging app to the office IP", not corporate networking.
+const maxAllowedIPs = 32
+
+// privateDeployAllowedTiers is the set of tiers permitted to use private=true.
+// Hobby / anonymous / free fall through to the 402 wall.
+var privateDeployAllowedTiers = map[string]bool{
+	"pro":         true,
+	"pro_yearly":  true,
+	"team":        true,
+	"team_yearly": true,
+	"growth":      true,
+}
+
 // DeployHandler handles all /deploy endpoints.
 type DeployHandler struct {
 	db           *sql.DB
@@ -91,6 +106,13 @@ func generateAppID() (string, error) {
 // field for the new env scope (production / staging / dev / ...). Callers can
 // continue to read .env as a map of vars; .environment is the scope name.
 func deploymentToMap(d *models.Deployment) fiber.Map {
+	// allowed_ips is always emitted (as [] when empty) so a Pro-tier dashboard
+	// can branch on "is this deployment private?" without having to special-case
+	// the missing-key path. private mirrors the column verbatim.
+	allowedIPs := d.AllowedIPs
+	if allowedIPs == nil {
+		allowedIPs = []string{}
+	}
 	m := fiber.Map{
 		"id":          d.ID,
 		"token":       d.AppID, // public-facing alias
@@ -102,6 +124,8 @@ func deploymentToMap(d *models.Deployment) fiber.Map {
 		"status":      d.Status,
 		"env":         d.EnvVars,
 		"environment": d.Env,
+		"private":     d.Private,
+		"allowed_ips": allowedIPs,
 		"created_at":  d.CreatedAt,
 		"updated_at":  d.UpdatedAt,
 		"team_id":     d.TeamID,
@@ -161,12 +185,14 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 	}
 
 	opts := compute.DeployOptions{
-		AppID:   d.AppID,
-		Token:   d.ID.String(),
-		Tarball: tarball,
-		Port:    d.Port,
-		Tier:    d.Tier,
-		EnvVars: resolvedEnv,
+		AppID:      d.AppID,
+		Token:      d.ID.String(),
+		Tarball:    tarball,
+		Port:       d.Port,
+		Tier:       d.Tier,
+		EnvVars:    resolvedEnv,
+		Private:    d.Private,
+		AllowedIPs: d.AllowedIPs,
 	}
 	result, err := h.compute.Deploy(ctx, opts)
 	if err != nil {
@@ -334,6 +360,26 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		}
 	}
 
+	// ── Private deploy fields (Track A — migration 020) ─────────────────────
+	//
+	// Two new multipart fields gate ingress access for the deployed app:
+	//   private:     "true" / "1" / "yes" → set the nginx
+	//                whitelist-source-range annotation on the Ingress
+	//   allowed_ips: comma-separated list of IPs or CIDRs
+	//                (e.g. "1.2.3.4,10.0.0.0/8"); required when private=true.
+	//
+	// Validation order matters:
+	//   1. Tier gate FIRST so hobby/anonymous never sees a 400 for "missing
+	//      allowed_ips" when the real failure is "your plan can't do this".
+	//      Hides ladder-rung knowledge from low-tier callers.
+	//   2. Then non-empty allowed_ips.
+	//   3. Then per-entry parsing.
+	//   4. Then the 32-entry cap.
+	private, allowedIPs, privErr := parsePrivateDeployFields(c, form, team.PlanTier)
+	if privErr != nil {
+		return privErr // respondError already called inside parsePrivateDeployFields
+	}
+
 	// ── Tier-limit enforcement (plans.yaml: deployments_apps) ────────────────
 	//
 	// Count the team's currently-active deployments and reject when over the
@@ -360,12 +406,14 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 	}
 
 	saved, err := models.CreateDeployment(c.Context(), h.db, models.CreateDeploymentParams{
-		TeamID:  team.ID,
-		AppID:   appID,
-		Port:    port,
-		Tier:    team.PlanTier,
-		Env:     environment,
-		EnvVars: initEnv,
+		TeamID:     team.ID,
+		AppID:      appID,
+		Port:       port,
+		Tier:       team.PlanTier,
+		Env:        environment,
+		EnvVars:    initEnv,
+		Private:    private,
+		AllowedIPs: allowedIPs,
 	})
 	if err != nil {
 		slog.Error("deploy.new.db_create_failed",
