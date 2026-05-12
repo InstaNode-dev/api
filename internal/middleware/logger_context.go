@@ -3,7 +3,7 @@ package middleware
 import (
 	"github.com/gofiber/fiber/v2"
 
-	"instant.dev/internal/obsstubs/logctx"
+	"instant.dev/common/logctx"
 )
 
 // LoggerContext copies the request_id (from RequestID middleware) and the
