@@ -1,0 +1,37 @@
+{
+  "name": "instant-api — p95 latency > 500ms (5m)",
+  "type": "NRQL",
+  "description": "Page when instant-api p95 latency exceeds 500ms sustained for 5 minutes. Tracks user-visible slowness on provisioning + dashboard read paths.",
+  "enabled": true,
+  "nrql": {
+    "query": "SELECT percentile(duration, 95) * 1000 FROM Transaction WHERE appName LIKE 'instant-api%'"
+  },
+  "terms": [
+    {
+      "priority": "CRITICAL",
+      "operator": "ABOVE",
+      "threshold": 500,
+      "thresholdDuration": 300,
+      "thresholdOccurrences": "ALL"
+    },
+    {
+      "priority": "WARNING",
+      "operator": "ABOVE",
+      "threshold": 300,
+      "thresholdDuration": 300,
+      "thresholdOccurrences": "ALL"
+    }
+  ],
+  "signal": {
+    "aggregationWindow": 60,
+    "aggregationMethod": "EVENT_FLOW",
+    "aggregationDelay": 120,
+    "fillOption": "NONE"
+  },
+  "expiration": {
+    "expirationDuration": 600,
+    "openViolationOnExpiration": false,
+    "closeViolationsOnExpiration": true
+  },
+  "violationTimeLimitSeconds": 86400
+}
