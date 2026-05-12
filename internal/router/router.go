@@ -404,6 +404,14 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	auditH := handlers.NewAuditHandler(db)
 	api.Get("/audit", auditH.List)
 
+	// Quota-wall nudge endpoint — Track U1. Returns the most recent
+	// near_quota_wall row (written by the worker's QuotaWallNudgeWorker)
+	// scoped to the caller's team and bounded to the last 24h. The
+	// dashboard polls this on mount + every 5 minutes to decide whether
+	// to render the upgrade banner. See handlers/usage_wall.go.
+	usageWallH := handlers.NewUsageWallHandler(db)
+	api.Get("/usage/wall", usageWallH.GetWall)
+
 	// A/B-experiment conversion sink — the dashboard fires
 	// POST /api/v1/experiments/converted from the click handler
 	// on an experimental UI element (e.g. the Upgrade button)
