@@ -573,9 +573,12 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 	// Step 7: Build StackDeployOptions.
 	//
 	// Per-service env vars may include "vault://KEY" references. We resolve
-	// them here against the team's vault for the production env (stack
-	// deploys do not yet expose multi-env scoping; this matches the
-	// per-deployment behaviour). Anonymous stacks cannot use vault refs
+	// them here against the team's vault scoped to the STACK'S env (post-
+	// §10.17 — was hardcoded "production"). Today the /stacks/new path does
+	// not accept an `env` form field so freshly created stacks default to
+	// production, but promoted stacks inherit their target env and any
+	// future endpoint that creates a non-production stack will get the
+	// right vault scoping for free. Anonymous stacks cannot use vault refs
 	// because there is no team to look up.
 	services := make([]compute.StackServiceDef, 0, len(m.Services))
 	for svcName, svc := range m.Services {
@@ -589,8 +592,18 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		}
 
 		// Resolve vault:// refs (authenticated only).
+		// IMPORTANT: we resolve against the stack's own env, NOT a hardcoded
+		// "production" string. Promoted staging stacks read from the staging
+		// vault namespace, dev stacks from dev, and so on. This is what
+		// makes the env-aware deployment story actually work end-to-end —
+		// previously every redeploy resolved against production's vault
+		// regardless of where the stack lived (§10.17 J's flagged gap #3).
 		if !anon {
-			resolved, vaultErr := ResolveVaultRefs(c.Context(), h.db, h.cfg.AESKey, team.ID, "production", envVars)
+			vaultEnv := stack.Env
+			if vaultEnv == "" {
+				vaultEnv = "production"
+			}
+			resolved, vaultErr := ResolveVaultRefs(c.Context(), h.db, h.cfg.AESKey, team.ID, vaultEnv, envVars)
 			if vaultErr != nil {
 				slog.Error("stack.new.vault_resolve_failed",
 					"error", vaultErr, "slug", slug, "service", svcName,
@@ -951,10 +964,18 @@ func (h *StackHandler) Redeploy(c *fiber.Ctx) error {
 	// before passing to the compute provider — same semantics as the
 	// initial /stacks/new path. Redeploy is always authenticated, so
 	// no anonymous-rejection branch is needed here.
+	//
+	// Resolve against the stack's own env (NOT hardcoded "production"). A
+	// staging stack redeploying must read from the staging vault — that
+	// is the whole point of multi-env deployments.
+	vaultEnv := stack.Env
+	if vaultEnv == "" {
+		vaultEnv = "production"
+	}
 	services := make([]compute.StackServiceDef, 0, len(m.Services))
 	for svcName, svc := range m.Services {
 		envVars := svc.Env
-		resolved, vaultErr := ResolveVaultRefs(c.Context(), h.db, h.cfg.AESKey, team.ID, "production", envVars)
+		resolved, vaultErr := ResolveVaultRefs(c.Context(), h.db, h.cfg.AESKey, team.ID, vaultEnv, envVars)
 		if vaultErr != nil {
 			slog.Error("stack.redeploy.vault_resolve_failed",
 				"error", vaultErr, "slug", slug, "service", svcName,
@@ -1022,12 +1043,14 @@ func (h *StackHandler) List(c *fiber.Ctx) error {
 	items := make([]fiber.Map, 0, len(stacks))
 	for _, s := range stacks {
 		items = append(items, fiber.Map{
-			"stack_id":   s.Slug,
-			"name":       s.Name,
-			"status":     s.Status,
-			"tier":       s.Tier,
-			"namespace":  s.Namespace,
-			"created_at": s.CreatedAt,
+			"stack_id":        s.Slug,
+			"name":            s.Name,
+			"status":          s.Status,
+			"tier":            s.Tier,
+			"namespace":       s.Namespace,
+			"env":             s.Env,
+			"parent_stack_id": toString(s.ParentStackID),
+			"created_at":      s.CreatedAt,
 		})
 	}
 
@@ -1035,6 +1058,147 @@ func (h *StackHandler) List(c *fiber.Ctx) error {
 		"ok":    true,
 		"items": items,
 		"total": len(items),
+	})
+}
+
+// ── GET /api/v1/stacks/:slug/family ───────────────────────────────────────────
+
+// Family handles GET /api/v1/stacks/:slug/family — return the env siblings of
+// a stack so the dashboard's "Environments" grid can render production /
+// staging / dev variants of the same app side-by-side.
+//
+// Behaviour:
+//  1. Source stack must be owned by the requesting team (404 otherwise to
+//     avoid existence leak across teams).
+//  2. Same tier gate as Promote/CopySecrets — Pro / Team / Growth only. Free
+//     and hobby callers get a 402 with `agent_action` telling them to upgrade
+//     (the contract is identical to the promote endpoint by design).
+//  3. Returns the family the model layer already knows how to walk:
+//     `GetStackFamily(team_id, any_member_id)` resolves the root via
+//     WITH RECURSIVE and returns root + all direct children, ordered with
+//     the root first.
+//
+// Response shape:
+//
+//	{
+//	  "ok": true,
+//	  "slug": "<source slug>",
+//	  "family": [
+//	    { "slug": "...", "name": "...", "env": "production", "status": "healthy",
+//	      "tier": "pro", "url": "...", "is_root": true,
+//	      "parent_stack_id": "", "last_deploy_at": "2026-05-12T...", "created_at": "..." },
+//	    { "slug": "...", "env": "staging", ... "is_root": false, "parent_stack_id": "<root>" }
+//	  ],
+//	  "total": 2
+//	}
+//
+// `url` is derived from the primary service's app_url where present so the
+// dashboard can render a clickable link per env without doing N service
+// lookups client-side. When the family has no services or the primary is not
+// yet healthy, `url` is the empty string.
+//
+// The endpoint sets a short `Cache-Control: private, max-age=60` since family
+// metadata is read-only and per-team-scoped, but never longer than 60s — env
+// state changes during promotes/redeploys and stale UI is worse than a fresh
+// 60ms refetch.
+func (h *StackHandler) Family(c *fiber.Ctx) error {
+	team, err := h.requireStackTeam(c)
+	if err != nil {
+		return err
+	}
+
+	// Tier gate first — symmetric with Promote/CopySecrets. The §10.17 spec
+	// treats multi-env discoverability as part of the Pro-tier bundle, so
+	// the family read itself is gated. Free/hobby cannot see other envs
+	// because they cannot create other envs.
+	if !multiEnvTierAllowed(team.PlanTier) {
+		return respondMultiEnvUpgradeRequired(c, team.PlanTier)
+	}
+
+	slug := c.Params("slug")
+	source, err := models.GetStackBySlug(c.Context(), h.db, slug)
+	if err != nil {
+		var notFound *models.ErrStackNotFound
+		if errors.As(err, &notFound) {
+			return respondError(c, fiber.StatusNotFound, "not_found", "Stack not found")
+		}
+		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch stack")
+	}
+
+	// Cross-team ownership check (404 to avoid existence leak).
+	if source.TeamID == nil || *source.TeamID != team.ID {
+		return respondError(c, fiber.StatusNotFound, "not_found", "Stack not found")
+	}
+
+	family, err := models.GetStackFamily(c.Context(), h.db, team.ID, source.ID)
+	if err != nil {
+		slog.Error("stack.family.lookup_failed",
+			"error", err, "team_id", team.ID, "slug", slug,
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusServiceUnavailable, "lookup_failed",
+			"Failed to look up env family")
+	}
+
+	// If the recursive walk found nothing (e.g. orphaned row), fall back to
+	// the source alone so the UI still has a single tile to render — this
+	// keeps the legacy "production-only" path working for stacks that pre-
+	// date the env migration.
+	if len(family) == 0 {
+		family = []*models.Stack{source}
+	}
+
+	// Best-effort per-stack URL enrichment. We look up services per stack
+	// and pick the first exposed one. Stacks rarely have >5 services so the
+	// N+1 is bounded and cheap; the alternative (one JOIN'd query) would
+	// require ordering hacks to find "the primary service" per row.
+	items := make([]fiber.Map, 0, len(family))
+	for _, s := range family {
+		url := ""
+		svcs, svcErr := models.GetStackServicesByStack(c.Context(), h.db, s.ID)
+		if svcErr == nil {
+			for _, svc := range svcs {
+				if svc.Expose && svc.AppURL != "" {
+					url = svc.AppURL
+					break
+				}
+			}
+			// If nothing is exposed yet, fall back to the first service URL
+			// so callers see SOMETHING for in-progress builds.
+			if url == "" {
+				for _, svc := range svcs {
+					if svc.AppURL != "" {
+						url = svc.AppURL
+						break
+					}
+				}
+			}
+		}
+
+		items = append(items, fiber.Map{
+			"slug":            s.Slug,
+			"name":            s.Name,
+			"env":             s.Env,
+			"status":          s.Status,
+			"tier":            s.Tier,
+			"url":             url,
+			"is_root":         s.ParentStackID == nil,
+			"parent_stack_id": toString(s.ParentStackID),
+			"last_deploy_at":  s.UpdatedAt,
+			"created_at":      s.CreatedAt,
+		})
+	}
+
+	// Short cache: env-family metadata is read-only and per-team-scoped, so
+	// edge caches must NOT share across teams. `private` keeps it browser-
+	// local; max-age=60 covers the typical dashboard navigation between
+	// envs without serving stale state across a promote.
+	c.Set("Cache-Control", "private, max-age=60")
+
+	return c.JSON(fiber.Map{
+		"ok":     true,
+		"slug":   slug,
+		"family": items,
+		"total":  len(items),
 	})
 }
 
