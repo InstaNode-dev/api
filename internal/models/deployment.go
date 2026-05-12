@@ -5,12 +5,19 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
 
 // Deployment represents a user app hosted on instant.dev infrastructure (Phase 6).
+//
+// Private / AllowedIPs back the private-deploy feature (migration 020). When
+// Private is true, the underlying k8s Ingress carries an
+// nginx.ingress.kubernetes.io/whitelist-source-range annotation. AllowedIPs
+// is stored as a comma-joined TEXT column (not JSONB) — keeps the model's
+// scalar-friendly shape and matches the Ingress annotation format byte-for-byte.
 type Deployment struct {
 	ID           uuid.UUID
 	TeamID       uuid.UUID
@@ -23,6 +30,8 @@ type Deployment struct {
 	Port         int
 	Tier         string
 	Env          string // dev | staging | production | <custom>; defaults to "production"
+	Private      bool
+	AllowedIPs   []string // parsed from the comma-joined `allowed_ips` column
 	ErrorMessage string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
@@ -37,6 +46,8 @@ type CreateDeploymentParams struct {
 	Tier       string
 	Env        string // empty string is normalised to EnvProduction
 	EnvVars    map[string]string
+	Private    bool
+	AllowedIPs []string // each entry must already be a valid IP or CIDR
 }
 
 // ErrDeploymentNotFound is returned when a deployment lookup yields no rows.
@@ -50,10 +61,11 @@ func (e *ErrDeploymentNotFound) Error() string {
 
 // deploymentColumns is the canonical column list shared by all deployment SELECTs.
 const deploymentColumns = `id, team_id, resource_id, app_id, provider_id, status, app_url,
-       env_vars, port, tier, env, error_message, created_at, updated_at`
+       env_vars, port, tier, env, private, allowed_ips, error_message, created_at, updated_at`
 
 // scanDeployment reads a single deployments row into a Deployment struct.
 // env_vars is stored as JSONB; error_message, provider_id, and app_url are nullable.
+// allowed_ips is a comma-joined TEXT column — empty string parses to a nil slice.
 func scanDeployment(row interface {
 	Scan(dest ...any) error
 }) (*Deployment, error) {
@@ -61,11 +73,14 @@ func scanDeployment(row interface {
 	var envVarsRaw []byte
 	var providerID, appURL, errorMessage sql.NullString
 	var resourceID uuid.NullUUID
+	var allowedIPsRaw string
 
 	if err := row.Scan(
 		&d.ID, &d.TeamID, &resourceID, &d.AppID,
 		&providerID, &d.Status, &appURL,
-		&envVarsRaw, &d.Port, &d.Tier, &d.Env, &errorMessage,
+		&envVarsRaw, &d.Port, &d.Tier, &d.Env,
+		&d.Private, &allowedIPsRaw,
+		&errorMessage,
 		&d.CreatedAt, &d.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -75,6 +90,7 @@ func scanDeployment(row interface {
 	d.ProviderID = providerID.String
 	d.AppURL = appURL.String
 	d.ErrorMessage = errorMessage.String
+	d.AllowedIPs = splitAllowedIPs(allowedIPsRaw)
 
 	if len(envVarsRaw) > 0 {
 		if err := json.Unmarshal(envVarsRaw, &d.EnvVars); err != nil {
@@ -86,6 +102,34 @@ func scanDeployment(row interface {
 	}
 
 	return d, nil
+}
+
+// splitAllowedIPs parses the comma-joined `allowed_ips` column into a slice.
+// Empty string returns nil so JSON marshalling emits `null`/omits the field
+// for legacy rows instead of `[]`. Whitespace around entries is trimmed.
+func splitAllowedIPs(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// joinAllowedIPs is the inverse of splitAllowedIPs — produces the canonical
+// comma-joined form used by the DB column AND the nginx whitelist-source-range
+// annotation. Exported for the k8s compute provider so it doesn't have to
+// know the storage convention.
+func JoinAllowedIPs(ips []string) string {
+	return strings.Join(ips, ",")
 }
 
 // CreateDeployment inserts a new deployment row and returns it.
@@ -114,12 +158,17 @@ func CreateDeployment(ctx context.Context, db *sql.DB, p CreateDeploymentParams)
 		env = EnvProduction
 	}
 
+	// allowed_ips is stored as a comma-joined string — keeps it identical to
+	// the form the nginx whitelist-source-range annotation already requires.
+	allowedIPs := JoinAllowedIPs(p.AllowedIPs)
+
 	row := db.QueryRowContext(ctx, `
 		INSERT INTO deployments
-			(team_id, resource_id, app_id, port, tier, env, env_vars)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+			(team_id, resource_id, app_id, port, tier, env, env_vars, private, allowed_ips)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING `+deploymentColumns,
-		p.TeamID, resourceID, p.AppID, port, p.Tier, env, envVarsJSON)
+		p.TeamID, resourceID, p.AppID, port, p.Tier, env, envVarsJSON,
+		p.Private, allowedIPs)
 
 	d, err := scanDeployment(row)
 	if err != nil {

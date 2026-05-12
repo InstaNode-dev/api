@@ -507,8 +507,11 @@ func (p *K8sProvider) Deploy(ctx context.Context, opts compute.DeployOptions) (*
 
 	// Step 8: Create Ingress (+ cert-manager TLS) when DEPLOY_DOMAIN is set.
 	// Falls back to the NodePort URL on local clusters that don't have an
-	// ingress controller or public domain configured.
-	ingressURL, err := p.applyIngressForDeploy(ctx, ns, svcName, opts.AppID, opts.Port)
+	// ingress controller or public domain configured. When opts.Private is
+	// true, the Ingress carries an nginx whitelist-source-range annotation
+	// built from opts.AllowedIPs — see applyIngressForDeploy for the precise
+	// annotation key and how it's joined.
+	ingressURL, err := p.applyIngressForDeploy(ctx, ns, svcName, opts.AppID, opts.Port, opts.Private, opts.AllowedIPs)
 	if err != nil {
 		return nil, fmt.Errorf("k8s.Deploy: apply ingress: %w", err)
 	}
@@ -1113,12 +1116,26 @@ func (p *K8sProvider) applyServiceInNS(ctx context.Context, ns, name, deployName
 // (e.g. local Rancher Desktop), no ingress is created and the caller falls back
 // to the NodePort URL.
 //
+// When private is true, the Ingress also carries
+// `nginx.ingress.kubernetes.io/whitelist-source-range` with allowedIPs
+// comma-joined — only requests originating from one of those CIDRs reach the
+// backend. nginx serves a 403 to everything else. private=false produces an
+// Ingress identical to pre-private behaviour.
+//
 // Returns the public URL on success, or "" if no ingress was created (callers
 // should then fall back to the NodePort URL).
-func (p *K8sProvider) applyIngressForDeploy(ctx context.Context, ns, svcName, appID string, port int) (string, error) {
+func (p *K8sProvider) applyIngressForDeploy(ctx context.Context, ns, svcName, appID string, port int, private bool, allowedIPs []string) (string, error) {
 	domain := os.Getenv("DEPLOY_DOMAIN")
 	if domain == "" {
 		// No public domain configured — skip ingress creation (local dev path).
+		// On local dev the NodePort fallback bypasses nginx anyway, so the
+		// private flag has no enforcement surface. We log it so the dev
+		// understands the flag won't take effect until they wire DEPLOY_DOMAIN.
+		if private {
+			slog.Warn("k8s.applyIngressForDeploy: private=true but DEPLOY_DOMAIN is unset; no enforcement on local NodePort",
+				"app_id", appID,
+			)
+		}
 		return "", nil
 	}
 	host := appID + "." + domain
@@ -1134,6 +1151,13 @@ func (p *K8sProvider) applyIngressForDeploy(ctx context.Context, ns, svcName, ap
 			SecretName: "app-" + appID + "-tls",
 		}}
 		scheme = "https"
+	}
+	// Private deploy → nginx whitelist-source-range. Empty allowedIPs here
+	// would silently lock everyone out, so the handler enforces non-empty
+	// before this is reached. Belt-and-suspenders: skip the annotation when
+	// the slice is empty to avoid an accidental "allow nobody" Ingress.
+	if private && len(allowedIPs) > 0 {
+		annotations["nginx.ingress.kubernetes.io/whitelist-source-range"] = strings.Join(allowedIPs, ",")
 	}
 	publicURL := scheme + "://" + host
 
