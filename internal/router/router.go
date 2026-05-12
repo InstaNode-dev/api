@@ -9,9 +9,11 @@ import (
 	"github.com/gofiber/fiber/v2"
 	fiberCORS "github.com/gofiber/fiber/v2/middleware/cors"
 	fiberRecover "github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/newrelic/go-agent/v3/newrelic"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/valyala/fasthttp/fasthttpadaptor"
+	"instant.dev/internal/obsstubs/buildinfo"
 	"instant.dev/internal/config"
 	"instant.dev/internal/email"
 	"instant.dev/internal/handlers"
@@ -23,7 +25,11 @@ import (
 )
 
 // New creates and configures the Fiber application with all middleware and routes registered.
-func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.GeoDBs, emailClient *email.Client, planRegistry *plans.Registry, provClient *provisioner.Client) *fiber.App {
+//
+// nrApp may be nil — the New Relic Go agent fails open when no license
+// key is set (local dev, CI). The NewRelic Fiber middleware degrades to
+// a no-op in that case, so the rest of the chain is unaffected.
+func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.GeoDBs, emailClient *email.Client, planRegistry *plans.Registry, provClient *provisioner.Client, nrApp *newrelic.Application) *fiber.App {
 	app := fiber.New(fiber.Config{
 		// Disable default error handler — we write our own JSON errors
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
@@ -58,7 +64,20 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 
 	// ── Middleware chain (order matters) ─────────────────────────────────────
 	app.Use(middleware.RequestID())
+	// LoggerContext copies request_id (and team_id once auth has run)
+	// from Fiber locals onto the Go ctx so every slog call downstream
+	// is auto-stamped via the logctx.Handler wrapper. Must follow
+	// RequestID; team_id gets stamped on a second pass after auth
+	// middleware writes it to locals (LoggerContext also runs once
+	// inside the auth-gated groups via middleware.RequireAuth chain).
+	app.Use(middleware.LoggerContext())
 	app.Use(otelfiber.Middleware())
+	// New Relic transaction per request. No-op when nrApp is nil.
+	// Sits after otelfiber so the OTel span context is established
+	// before NR's StartTransaction (NR's distributed-tracer header
+	// extraction reads from the request, not from OTel context, but
+	// keeping both before user middleware is the safe order).
+	app.Use(middleware.NewRelic(nrApp))
 	// Telemetry must come before Recover so that panic-induced 500s are recorded.
 	app.Use(middleware.Telemetry())
 	app.Use(fiberRecover.New(fiberRecover.Config{
@@ -140,9 +159,18 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 
 	// ── Routes ───────────────────────────────────────────────────────────────
 
-	// Health check
+	// Health check — emits buildinfo so operators / canaries / dashboards
+	// can verify which commit is actually running. All three fields are
+	// always present; uninstrumented binaries return the "dev" sentinel
+	// rather than empty strings so the wire shape stays stable.
 	app.Get("/healthz", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"ok": true, "service": "instant.dev"})
+		return c.JSON(fiber.Map{
+			"ok":         true,
+			"service":    "instant.dev",
+			"commit_id":  buildinfo.GitSHA,
+			"build_time": buildinfo.BuildTime,
+			"version":    buildinfo.Version,
+		})
 	})
 
 	// OpenAPI spec — machine-readable description of the agent-facing API
