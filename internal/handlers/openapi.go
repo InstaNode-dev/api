@@ -684,6 +684,39 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/resources/{id}/provision-twin": {
+      "post": {
+        "summary": "Provision an env-twin of an existing resource (Pro+)",
+        "description": "Creates a fresh resource of the same type as the source, in a different env, linked into the same family (parent_resource_id = family root). Tier-gated to Pro/Team/Growth — hobby/free callers get a 402 with agent_action telling them to upgrade. Only supports postgres/redis/mongodb sources (the resource types where env-twin has real per-env infra). The response shape mirrors the corresponding /db/new, /cache/new, /nosql/new endpoint so dashboard + MCP code consuming those needs no branching for twins.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" }, "description": "Token of the source resource (root or any sibling — the handler resolves the family root)." }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["env"],
+                "properties": {
+                  "env":  { "type": "string", "description": "Target env for the twin (production / staging / dev / ...). Must match ^[a-z0-9-]{1,32}$." },
+                  "name": { "type": "string", "description": "Optional human-readable label (max 120 chars). Falls back to the source's name when omitted." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Twin provisioned — body carries connection_url + family_root_id (same shape as POST /db/new etc.)" },
+          "400": { "description": "invalid_id / missing_env / invalid_env / unsupported_for_twin (source isn't postgres/redis/mongodb)" },
+          "401": { "description": "Unauthorized" },
+          "402": { "description": "upgrade_required — team is on hobby/free; response carries agent_action + upgrade_url" },
+          "403": { "description": "forbidden — caller does not own the source resource" },
+          "404": { "description": "Source resource not found" },
+          "409": { "description": "twin_exists — family already has a row in the requested env" },
+          "503": { "description": "provision_failed — downstream provisioner errored; resource row was soft-deleted" }
+        }
+      }
+    },
     "/api/v1/webhooks/{token}/requests": {
       "get": {
         "summary": "List received webhook payloads",

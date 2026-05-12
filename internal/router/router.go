@@ -131,6 +131,10 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	dbH := handlers.NewDBHandler(db, rdb, cfg, provClient, planRegistry)
 	cacheH := handlers.NewCacheHandler(db, rdb, cfg, provClient, planRegistry)
 	nosqlH := handlers.NewNoSQLHandler(db, rdb, cfg, provClient, planRegistry)
+	// twinH composes the three above so POST /api/v1/resources/:id/provision-twin
+	// dispatches to the same low-level provision pipelines as /db/new etc.
+	// Wire AFTER the three constructors so the handler instances exist.
+	twinH := handlers.NewTwinHandler(dbH, cacheH, nosqlH)
 	queueH := handlers.NewQueueHandler(db, rdb, cfg, provClient, planRegistry)
 	storageH := handlers.NewStorageHandler(db, rdb, cfg, storageProv, planRegistry)
 	webhookH := handlers.NewWebhookHandler(db, rdb, cfg, planRegistry)
@@ -322,6 +326,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		resourceH.Delete,
 	)
 	api.Post("/resources/:id/rotate-credentials", resourceH.RotateCredentials)
+	// Slice 3 of env-aware deployments — spawn a same-type, same-family
+	// twin in a new env. Tier-gated to Pro+ inside the handler. The
+	// resource type the source row carries determines which low-level
+	// provisioner (db/cache/nosql) runs.
+	api.Post("/resources/:id/provision-twin", twinH.ProvisionTwin)
 
 	// Team env-policy (slice 6) — owner edits, any member reads.
 	// Owner-check is enforced inside Put (with a structured 403 body that

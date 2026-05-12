@@ -434,3 +434,117 @@ func dbAnonymousLimits() fiber.Map {
 		"expires_in":  "24h",
 	}
 }
+
+// ProvisionForTwin runs the same pipeline as newDBAuthenticated for a single
+// resource row, but skips the body-parsing / tier-derivation / family-link
+// validation that already happened upstream in TwinHandler.ProvisionTwin.
+//
+// The caller (TwinHandler) supplies a pre-validated input — TeamID is the
+// caller's team, ParentRootID is the family root id, Tier is mirrored from
+// the source resource, Fingerprint/CloudVendor/CountryCode are inherited
+// so quota+geo dashboards group siblings together.
+//
+// Response shape on 201 mirrors newDBAuthenticated so the dashboard +
+// MCP can consume twin responses with zero branching against /db/new.
+func (h *DBHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) error {
+	ctx := c.UserContext()
+
+	resource, err := models.CreateResource(ctx, h.db, models.CreateResourceParams{
+		TeamID:           &in.TeamID,
+		ResourceType:     models.ResourceTypePostgres,
+		Name:             in.Name,
+		Tier:             in.Tier,
+		Env:              in.Env,
+		Fingerprint:      in.Fingerprint,
+		CloudVendor:      in.CloudVendor,
+		CountryCode:      in.CountryCode,
+		ExpiresAt:        nil, // permanent — twin inherits source's no-TTL status
+		CreatedRequestID: in.RequestID,
+		ParentResourceID: in.ParentRootID,
+	})
+	if err != nil {
+		slog.Error("twin.db.create_resource_failed",
+			"error", err, "team_id", in.TeamID, "env", in.Env, "request_id", in.RequestID)
+		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to record twin resource")
+	}
+
+	// Best-effort audit event; failures never block the provision. Matches
+	// the `provision` kind used by /db/new so the Activity feed renders
+	// twin events alongside normal provisions.
+	go func() {
+		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+			TeamID:       in.TeamID,
+			Actor:        "agent",
+			Kind:         "provision",
+			ResourceType: models.ResourceTypePostgres,
+			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
+			Summary: "agent provisioned <strong>postgres</strong> twin <code>" +
+				resource.Token.String()[:8] + "</code> in env=<code>" + in.Env + "</code>",
+		})
+	}()
+
+	tokenStr := resource.Token.String()
+	provStart := time.Now()
+	provCtx, span := h.startProvisionSpan(ctx, models.ResourceTypePostgres, in.Tier, in.TeamID.String(), in.Fingerprint, tokenStr)
+	creds, err := h.provisionDB(provCtx, tokenStr, in.Tier)
+	finishProvisionSpan(span, err)
+	metrics.ProvisionDuration.WithLabelValues(models.ResourceTypePostgres, in.Tier).Observe(time.Since(provStart).Seconds())
+	if err != nil {
+		metrics.ProvisionFailures.WithLabelValues(models.ResourceTypePostgres, "grpc_error").Inc()
+		slog.Error("twin.db.provision_failed",
+			"error", err, "token", tokenStr, "team_id", in.TeamID, "request_id", in.RequestID)
+		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+			slog.Error("twin.db.soft_delete_failed",
+				"error", delErr, "resource_id", resource.ID, "request_id", in.RequestID)
+		}
+		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision Postgres twin")
+	}
+
+	if aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey); keyErr != nil {
+		slog.Error("twin.db.aes_key_parse_failed", "error", keyErr, "request_id", in.RequestID)
+	} else if encryptedURL, encErr := crypto.Encrypt(aesKey, creds.URL); encErr != nil {
+		slog.Error("twin.db.encrypt_url_failed", "error", encErr, "request_id", in.RequestID)
+	} else if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
+		slog.Error("twin.db.update_connection_url_failed", "error", upErr, "request_id", in.RequestID)
+	}
+
+	if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
+		slog.Error("twin.db.update_provider_resource_id_failed", "error", upErr, "request_id", in.RequestID)
+	}
+
+	slog.Info("twin.provision.success",
+		"service", models.ResourceTypePostgres,
+		"token", tokenStr,
+		"team_id", in.TeamID,
+		"tier", in.Tier,
+		"env", in.Env,
+		"family_root_id", in.ParentRootID,
+		"duration_ms", time.Since(in.Start).Milliseconds(),
+		"request_id", in.RequestID,
+	)
+	metrics.ProvisionsTotal.WithLabelValues(models.ResourceTypePostgres, in.Tier).Inc()
+
+	storageLimitMB := h.plans.StorageLimitMB(in.Tier, models.ResourceTypePostgres)
+	_, storageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
+
+	resp := fiber.Map{
+		"ok":             true,
+		"id":             resource.ID.String(),
+		"token":          tokenStr,
+		"name":           resource.Name.String,
+		"connection_url": creds.URL,
+		"internal_url":   proxiedInternalURL(creds.URL, models.ResourceTypePostgres),
+		"tier":           in.Tier,
+		"env":            resource.Env,
+		"family_root_id": derefUUID(in.ParentRootID),
+		"limits": fiber.Map{
+			"storage_mb":  storageLimitMB,
+			"connections": h.plans.ConnectionsLimit(in.Tier, models.ResourceTypePostgres),
+		},
+	}
+	if storageExceeded {
+		resp["warning"] = "Storage limit reached. Upgrade to continue."
+		c.Set("X-Instant-Notice", "storage_limit_reached")
+	}
+	return c.Status(fiber.StatusCreated).JSON(resp)
+}

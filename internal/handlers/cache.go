@@ -443,3 +443,115 @@ func cacheAnonymousLimits() fiber.Map {
 		"expires_in": "24h",
 	}
 }
+
+// ProvisionForTwin runs the same pipeline as newCacheAuthenticated for a
+// pre-validated twin input. Mirrors DBHandler.ProvisionForTwin — see the
+// doc comment there for the orchestration shape. The twin flow always
+// inherits source.Tier (never elevates to growth/dedicated).
+func (h *CacheHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) error {
+	ctx := c.UserContext()
+
+	resource, err := models.CreateResource(ctx, h.db, models.CreateResourceParams{
+		TeamID:           &in.TeamID,
+		ResourceType:     models.ResourceTypeRedis,
+		Name:             in.Name,
+		Tier:             in.Tier,
+		Env:              in.Env,
+		Fingerprint:      in.Fingerprint,
+		CloudVendor:      in.CloudVendor,
+		CountryCode:      in.CountryCode,
+		ExpiresAt:        nil,
+		CreatedRequestID: in.RequestID,
+		ParentResourceID: in.ParentRootID,
+	})
+	if err != nil {
+		slog.Error("twin.cache.create_resource_failed",
+			"error", err, "team_id", in.TeamID, "env", in.Env, "request_id", in.RequestID)
+		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to record twin resource")
+	}
+
+	go func() {
+		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+			TeamID:       in.TeamID,
+			Actor:        "agent",
+			Kind:         "provision",
+			ResourceType: models.ResourceTypeRedis,
+			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
+			Summary: "agent provisioned <strong>redis</strong> twin <code>" +
+				resource.Token.String()[:8] + "</code> in env=<code>" + in.Env + "</code>",
+		})
+	}()
+
+	tokenStr := resource.Token.String()
+	provStart := time.Now()
+	provCtx, span := h.startProvisionSpan(ctx, models.ResourceTypeRedis, in.Tier, in.TeamID.String(), in.Fingerprint, tokenStr)
+	creds, err := h.provisionCache(provCtx, tokenStr, in.Tier)
+	finishProvisionSpan(span, err)
+	metrics.ProvisionDuration.WithLabelValues(models.ResourceTypeRedis, in.Tier).Observe(time.Since(provStart).Seconds())
+	if err != nil {
+		metrics.ProvisionFailures.WithLabelValues(models.ResourceTypeRedis, "grpc_error").Inc()
+		slog.Error("twin.cache.provision_failed",
+			"error", err, "token", tokenStr, "team_id", in.TeamID, "request_id", in.RequestID)
+		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+			slog.Error("twin.cache.soft_delete_failed",
+				"error", delErr, "resource_id", resource.ID, "request_id", in.RequestID)
+		}
+		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision Redis twin")
+	}
+
+	if creds.KeyPrefix != "" {
+		if kpErr := models.UpdateKeyPrefix(ctx, h.db, resource.ID, creds.KeyPrefix); kpErr != nil {
+			slog.Error("twin.cache.update_key_prefix_failed", "error", kpErr, "request_id", in.RequestID)
+		}
+	}
+
+	if aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey); keyErr != nil {
+		slog.Error("twin.cache.aes_key_parse_failed", "error", keyErr, "request_id", in.RequestID)
+	} else if encryptedURL, encErr := crypto.Encrypt(aesKey, creds.URL); encErr != nil {
+		slog.Error("twin.cache.encrypt_url_failed", "error", encErr, "request_id", in.RequestID)
+	} else if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
+		slog.Error("twin.cache.update_connection_url_failed", "error", upErr, "request_id", in.RequestID)
+	}
+
+	if creds.ProviderResourceID != "" {
+		if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
+			slog.Error("twin.cache.update_provider_resource_id_failed", "error", upErr, "request_id", in.RequestID)
+		}
+	}
+
+	slog.Info("twin.provision.success",
+		"service", models.ResourceTypeRedis,
+		"token", tokenStr,
+		"team_id", in.TeamID,
+		"tier", in.Tier,
+		"env", in.Env,
+		"family_root_id", in.ParentRootID,
+		"duration_ms", time.Since(in.Start).Milliseconds(),
+		"request_id", in.RequestID,
+	)
+	metrics.ProvisionsTotal.WithLabelValues(models.ResourceTypeRedis, in.Tier).Inc()
+
+	storageLimitMB := h.plans.StorageLimitMB(in.Tier, models.ResourceTypeRedis)
+	_, storageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
+
+	resp := fiber.Map{
+		"ok":             true,
+		"id":             resource.ID.String(),
+		"token":          tokenStr,
+		"name":           resource.Name.String,
+		"connection_url": creds.URL,
+		"internal_url":   proxiedInternalURL(creds.URL, models.ResourceTypeRedis),
+		"tier":           in.Tier,
+		"env":            resource.Env,
+		"family_root_id": derefUUID(in.ParentRootID),
+		"key_prefix":     creds.KeyPrefix,
+		"limits": fiber.Map{
+			"memory_mb": storageLimitMB,
+		},
+	}
+	if storageExceeded {
+		resp["warning"] = "Storage limit reached. Upgrade to continue."
+		c.Set("X-Instant-Notice", "storage_limit_reached")
+	}
+	return c.Status(fiber.StatusCreated).JSON(resp)
+}
