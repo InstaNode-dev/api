@@ -7,7 +7,14 @@ COPY common/ /common/
 COPY api/go.mod api/go.sum ./
 RUN go mod download
 COPY api/ .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /instant .
+# Build-time metadata injected via -ldflags into instant.dev/common/buildinfo.
+# Defaults keep the build runnable without --build-arg; CI passes real values.
+ARG GIT_SHA=dev
+ARG BUILD_TIME=unknown
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags "-X instant.dev/common/buildinfo.GitSHA=${GIT_SHA} -X instant.dev/common/buildinfo.BuildTime=${BUILD_TIME} -X instant.dev/common/buildinfo.Version=${VERSION}" \
+    -o /instant .
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata docker-cli

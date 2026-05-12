@@ -1,9 +1,16 @@
 .PHONY: run build build-cli test test-unit test-db-up test-db-down test-db-reset \
         docker-up docker-down docker-logs \
         migrate migrate-platform migrate-customers \
-        docker-build \
+        docker-build smoke-buildinfo \
         k8s-deploy k8s-delete k8s-status k8s-regen-migrations \
         gen-secrets install-cli
+
+# Build-time metadata injected into instant.dev/common/buildinfo via -ldflags.
+# Override on the make line if needed. GIT_SHA falls back to "dev" when not
+# in a git checkout (e.g. CI tarball builds).
+GIT_SHA    ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
+BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+VERSION    ?= dev
 
 # Local test database — Postgres 16 in Docker on localhost:5432. Matches
 # testhelpers.defaultTestDBURL so tests run without setting any env vars
@@ -116,8 +123,33 @@ migrate-customers:
 
 # ── Local Kubernetes (Rancher Desktop / k3s) ─────────────────────────────────
 
+# NOTE: per CLAUDE.md the canonical build is from the repo root:
+#   docker build -f api/Dockerfile -t instant-api:local \
+#     --build-arg GIT_SHA=$(git rev-parse --short HEAD) \
+#     --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+#     --build-arg VERSION=$VERSION ..
+# This target mirrors that — `cd ..` first so the build context is the repo root.
 docker-build:
-	docker build -t instant-api:local .
+	cd .. && docker build -f api/Dockerfile -t instant-api:local \
+	  --build-arg GIT_SHA=$(GIT_SHA) \
+	  --build-arg BUILD_TIME=$(BUILD_TIME) \
+	  --build-arg VERSION=$(VERSION) \
+	  .
+
+# Verifies the -ldflags injection actually wires through to the buildinfo
+# package. Builds a tiny throwaway binary, then runs it; expects to see the
+# override value (`smoke-sha`) in stdout. CI can run this on every PR to
+# catch a regression where someone breaks the ldflag path.
+smoke-buildinfo:
+	@tmpdir=$$(mktemp -d) && \
+	  go build -ldflags "-X instant.dev/common/buildinfo.GitSHA=smoke-sha -X instant.dev/common/buildinfo.BuildTime=smoke-time -X instant.dev/common/buildinfo.Version=smoke-ver" \
+	    -o $$tmpdir/smoke ./cmd/smoke-buildinfo && \
+	  out=$$($$tmpdir/smoke) && \
+	  echo "$$out" | grep -q "GitSHA=smoke-sha" || (echo "FAIL: $$out" && exit 1) && \
+	  echo "$$out" | grep -q "BuildTime=smoke-time" || (echo "FAIL: $$out" && exit 1) && \
+	  echo "$$out" | grep -q "Version=smoke-ver" || (echo "FAIL: $$out" && exit 1) && \
+	  echo "smoke-buildinfo: OK ($$out)" && \
+	  rm -rf $$tmpdir
 
 # Regen the SQL ConfigMap from the actual migration file (run after schema changes)
 k8s-regen-migrations:
