@@ -9,7 +9,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/stretchr/testify/require"
 
-	"instant.dev/internal/obsstubs/buildinfo"
+	"instant.dev/common/buildinfo"
 )
 
 // TestHealthzShape pins the wire shape of GET /healthz. We don't spin
