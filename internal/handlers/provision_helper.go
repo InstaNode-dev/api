@@ -16,6 +16,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -231,6 +232,14 @@ type provisionRequestBody struct {
 	// Empty defaults to "production". Validated against ^[a-z0-9-]{1,32}$.
 	// Body field is overridden by the ?env= query string when both are set.
 	Env string `json:"env"`
+
+	// ParentResourceID links the new resource into an existing env-twin
+	// family. The new row becomes a sibling of the parent (same family
+	// root, different env). Validated against same-team + same-type +
+	// no-duplicate-twin before provisioning. Empty / zero UUID means
+	// "no family link — this row stands alone" (backwards compatible
+	// with every caller that pre-dates slice 2).
+	ParentResourceID string `json:"parent_resource_id"`
 }
 
 func sanitizeName(name string) string {
@@ -267,4 +276,72 @@ func resolveEnv(c *fiber.Ctx, bodyEnv string) (string, error) {
 			"env must match ^[a-z0-9-]{1,32}$ (lowercase letters, digits, dashes; max 32 chars)")
 	}
 	return env, nil
+}
+
+// resolveFamilyParent parses the body's optional parent_resource_id and
+// validates that linking a child of (resourceType, env) is legal for the
+// caller's team. Returns:
+//
+//   (nil, nil)       — no parent_resource_id requested (standalone resource)
+//   (*uuid, nil)     — parent valid; *uuid is the FAMILY ROOT id to store
+//   (nil, fiberErr)  — caller-facing error; response already written
+//
+// The handlers wire this between the env resolution and CreateResource:
+//
+//	parentID, perr := resolveFamilyParent(c, h.db, body.ParentResourceID,
+//	                                       teamID, resourceType, env)
+//	if perr != nil { return perr }
+//	// ...then pass parentID to CreateResourceParams.ParentResourceID
+//
+// HTTP status mapping by FamilyLinkError.Reason:
+//
+//	cross_team       → 403  (we know it exists, but caller can't see it)
+//	cross_type       → 400  (caller error — wrong shape)
+//	duplicate_twin   → 409  (resource already there in this env)
+//	deleted_parent   → 404  (parent doesn't exist / was deleted)
+func resolveFamilyParent(
+	c *fiber.Ctx, db *sql.DB, bodyParentID string,
+	teamID uuid.UUID, resourceType, env string,
+) (*uuid.UUID, error) {
+	if bodyParentID == "" {
+		return nil, nil
+	}
+	parentID, parseErr := uuid.Parse(bodyParentID)
+	if parseErr != nil || parentID == uuid.Nil {
+		return nil, respondError(c, fiber.StatusBadRequest, "invalid_parent_resource_id",
+			"parent_resource_id must be a valid UUID")
+	}
+
+	rootID, err := models.ValidateFamilyParent(c.Context(), db, parentID, teamID, resourceType, env)
+	if err != nil {
+		var linkErr *models.FamilyLinkError
+		if errors.As(err, &linkErr) {
+			switch linkErr.Reason {
+			case "cross_team":
+				return nil, respondError(c, fiber.StatusForbidden, "forbidden_parent_resource",
+					"parent_resource_id belongs to a different team")
+			case "cross_type":
+				return nil, respondError(c, fiber.StatusBadRequest, "type_mismatch",
+					linkErr.Detail)
+			case "duplicate_twin":
+				return nil, respondError(c, fiber.StatusConflict, "twin_exists",
+					linkErr.Detail)
+			case "deleted_parent":
+				return nil, respondError(c, fiber.StatusNotFound, "parent_not_found",
+					linkErr.Detail)
+			}
+		}
+		// Unrecognised failure — log + 503 so we don't accidentally green-
+		// light a provision with an unresolved family relationship.
+		slog.Error("resource.family.validate_failed",
+			"error", err,
+			"parent_resource_id", parentID,
+			"team_id", teamID,
+			"resource_type", resourceType,
+			"env", env,
+		)
+		return nil, respondError(c, fiber.StatusServiceUnavailable, "family_validate_failed",
+			"Failed to validate parent_resource_id")
+	}
+	return &rootID, nil
 }

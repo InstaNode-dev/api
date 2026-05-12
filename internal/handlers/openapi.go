@@ -587,6 +587,103 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/resources/families": {
+      "get": {
+        "summary": "List resource families for the authenticated team",
+        "description": "Returns one entry per family root the team owns, with members grouped by env. A family is a set of env-twin resources (prod-db / staging-db / dev-db) linked via parent_resource_id (migration 018). Resources without children or parent appear as single-member families. Sets Cache-Control: private, max-age=30 — narrow freshness window because provisioning + soft-delete both shift family membership. Quota / billing decisions must NOT rely on this aggregate; it's a UX-only optimisation.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Family list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok":       { "type": "boolean" },
+                    "families": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "family_root_id":  { "type": "string", "format": "uuid", "description": "Stable family identifier — the row's own id when it is its own root." },
+                          "resource_type":   { "type": "string", "description": "postgres | redis | mongodb | webhook | queue | storage" },
+                          "members_per_env": {
+                            "type": "object",
+                            "additionalProperties": {
+                              "type": "object",
+                              "properties": {
+                                "id":            { "type": "string", "format": "uuid" },
+                                "token":         { "type": "string", "format": "uuid" },
+                                "env":           { "type": "string" },
+                                "resource_type": { "type": "string" },
+                                "tier":          { "type": "string" },
+                                "status":        { "type": "string" },
+                                "is_root":       { "type": "boolean", "description": "true when this row is the family root (parent_resource_id IS NULL)." },
+                                "name":          { "type": "string" }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "total":    { "type": "integer" }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/resources/{id}/family": {
+      "get": {
+        "summary": "Get the env-twin family for a resource",
+        "description": "Returns the root + every sibling for the family containing the given resource. The id can be the family root or any child — the handler walks parent_resource_id up to the root and back down. Cross-team callers get 403 (not 404) so honest mistakes are debuggable. Sensitive fields like connection_url are never returned. Sets Cache-Control: private, max-age=30.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" }, "description": "Any member of the family — root or child. The handler resolves the root by walking parent_resource_id." }],
+        "responses": {
+          "200": {
+            "description": "Family payload",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok":             { "type": "boolean" },
+                    "family_root_id": { "type": "string", "format": "uuid" },
+                    "members": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id":                 { "type": "string", "format": "uuid" },
+                          "token":              { "type": "string", "format": "uuid" },
+                          "env":                { "type": "string" },
+                          "resource_type":      { "type": "string" },
+                          "tier":               { "type": "string" },
+                          "status":             { "type": "string" },
+                          "is_root":            { "type": "boolean" },
+                          "parent_resource_id": { "type": "string", "description": "Empty for the root; otherwise the root's id." },
+                          "name":               { "type": "string" },
+                          "created_at":         { "type": "string", "format": "date-time" }
+                        }
+                      }
+                    },
+                    "total":          { "type": "integer" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Resource ID is not a valid UUID" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Cross-team — caller does not own this resource" },
+          "404": { "description": "Resource not found" }
+        }
+      }
+    },
     "/api/v1/webhooks/{token}/requests": {
       "get": {
         "summary": "List received webhook payloads",
@@ -1286,7 +1383,8 @@ const openAPISpec = `{
         "type": "object",
         "properties": {
           "name": { "type": "string", "description": "Optional human-readable label (max 120 chars)" },
-          "env": { "type": "string", "description": "Optional environment scope (production / staging / dev / ...). Anonymous tier is always 'production'.", "default": "production" }
+          "env": { "type": "string", "description": "Optional environment scope (production / staging / dev / ...). Anonymous tier is always 'production'.", "default": "production" },
+          "parent_resource_id": { "type": "string", "format": "uuid", "description": "Optional. Link the new resource into an existing env-twin family — the new row becomes a sibling of the parent (same family root, different env). Validated against same-team + same-type + no-duplicate-twin before provisioning. Authenticated callers only. Errors: 400 type_mismatch (parent is a different resource_type), 403 forbidden_parent_resource (parent belongs to another team), 404 parent_not_found, 409 twin_exists (family already has a row in this env). See GET /api/v1/resources/{id}/family + /api/v1/resources/families." }
         }
       },
       "DBProvisionResponse": {
