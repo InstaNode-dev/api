@@ -157,6 +157,11 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 		}
 	}
 
+	// Free-tier recycle gate (see provision_helper.go for rationale).
+	if h.recycleGate(c, fp, "redis") {
+		return nil
+	}
+
 	expiresAt := time.Now().UTC().Add(24 * time.Hour)
 	resource, err := models.CreateResource(ctx, h.db, models.CreateResourceParams{
 		ResourceType:     "redis",
@@ -251,6 +256,12 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 	)
 	metrics.ProvisionsTotal.WithLabelValues("redis", "anonymous").Inc()
 	metrics.ConversionFunnel.WithLabelValues("provision").Inc()
+
+	if markErr := h.markRecycleSeen(ctx, fp); markErr != nil {
+		slog.Warn("cache.new.mark_recycle_seen_failed",
+			"error", markErr, "fingerprint", fp, "request_id", requestID)
+		metrics.RedisErrors.WithLabelValues("recycle_mark").Inc()
+	}
 
 	cacheStorageLimitMB := h.plans.StorageLimitMB("anonymous", "redis")
 	_, cacheStorageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, cacheStorageLimitMB)

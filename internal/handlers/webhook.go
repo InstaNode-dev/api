@@ -181,6 +181,11 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 		}
 	}
 
+	// Free-tier recycle gate (see provision_helper.go for rationale).
+	if h.recycleGate(c, fp, "webhook") {
+		return nil
+	}
+
 	expiresAt := time.Now().UTC().Add(24 * time.Hour)
 	tokenStr := ""
 
@@ -238,6 +243,12 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 	)
 	metrics.ProvisionsTotal.WithLabelValues("webhook", "anonymous").Inc()
 	metrics.ConversionFunnel.WithLabelValues("provision").Inc()
+
+	if markErr := h.markRecycleSeen(ctx, fp); markErr != nil {
+		slog.Warn("webhook.new.mark_recycle_seen_failed",
+			"error", markErr, "fingerprint", fp, "request_id", requestID)
+		metrics.RedisErrors.WithLabelValues("recycle_mark").Inc()
+	}
 
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"ok":          true,

@@ -37,7 +37,7 @@ const openAPISpec = `{
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DBProvisionResponse" } } } },
-          "402": { "description": "Quota exceeded or feature requires upgrade. Includes agent_action with copy the calling agent can show the user, plus upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim — anonymous fingerprint that previously provisioned must claim with email before re-provisioning). Includes agent_action with copy the calling agent can show the user, plus upgrade_url and (for the recycle gate) claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -49,7 +49,7 @@ const openAPISpec = `{
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Cache provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CacheProvisionResponse" } } } },
-          "402": { "description": "Quota exceeded or feature requires upgrade. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -61,7 +61,7 @@ const openAPISpec = `{
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "MongoDB database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NoSQLProvisionResponse" } } } },
-          "402": { "description": "Quota exceeded or feature requires upgrade. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -73,7 +73,7 @@ const openAPISpec = `{
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Queue provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueProvisionResponse" } } } },
-          "402": { "description": "Quota exceeded or feature requires upgrade. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -85,7 +85,7 @@ const openAPISpec = `{
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Webhook receiver provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WebhookProvisionResponse" } } } },
-          "402": { "description": "Quota exceeded. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "402": { "description": "Quota exceeded OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
