@@ -32,9 +32,9 @@ import (
 )
 
 const (
-	defaultTestDBURL              = "postgres://postgres:postgres@localhost:5432/instant_dev_test?sslmode=disable"
-	defaultTestRedisURL           = "redis://localhost:6379/15" // DB 15 = isolated test keyspace
-	defaultTestCustomersURL       = "postgres://instant_cust:instant_cust@localhost:5434/instant_customers?sslmode=disable"
+	defaultTestDBURL        = "postgres://postgres:postgres@localhost:5432/instant_dev_test?sslmode=disable"
+	defaultTestRedisURL     = "redis://localhost:6379/15" // DB 15 = isolated test keyspace
+	defaultTestCustomersURL = "postgres://instant_cust:instant_cust@localhost:5434/instant_customers?sslmode=disable"
 )
 
 // TestJWTSecret is the HMAC secret used by all test JWT helpers (≥32 bytes).
@@ -279,15 +279,15 @@ func testConfig() *config.Config {
 		customersURL = defaultTestCustomersURL
 	}
 	return &config.Config{
-		Port:                    "8080",
-		DatabaseURL:             defaultTestDBURL,
-		RedisURL:                defaultTestRedisURL,
-		JWTSecret:               TestJWTSecret,
-		AESKey:                  TestAESKeyHex,
-		EnabledServices:         "redis",
-		Environment:             "test",
+		Port:                     "8080",
+		DatabaseURL:              defaultTestDBURL,
+		RedisURL:                 defaultTestRedisURL,
+		JWTSecret:                TestJWTSecret,
+		AESKey:                   TestAESKeyHex,
+		EnabledServices:          "redis",
+		Environment:              "test",
 		PostgresProvisionBackend: "local",
-		PostgresCustomersURL:    customersURL,
+		PostgresCustomersURL:     customersURL,
 	}
 }
 
@@ -389,6 +389,11 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	api.Get("/resources/:id", resourceH.Get)
 	api.Delete("/resources/:id", resourceH.Delete)
 	api.Post("/resources/:id/rotate-credentials", resourceH.RotateCredentials)
+	// Slice 3 of env-aware deployments — spawn a same-type, same-family
+	// twin in a new env. Tier-gated to Pro+ inside the handler. Wired here
+	// so handler-layer tests (twin_test.go) exercise the full route stack.
+	twinH := handlers.NewTwinHandler(dbH, cacheH, nosqlH)
+	api.Post("/resources/:id/provision-twin", twinH.ProvisionTwin)
 	api.Get("/webhooks/:token/requests", webhookH.ListRequests)
 	api.Get("/deployments", deployH.List)
 	api.Get("/deployments/:id", deployH.Get)
