@@ -20,21 +20,18 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"instant.dev/internal/config"
-	"instant.dev/internal/crypto"
 	"instant.dev/internal/email"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
-	"instant.dev/internal/migratorclient"
 	"instant.dev/internal/models"
 	"instant.dev/internal/razorpaybilling"
 )
 
 // BillingHandler handles billing and Razorpay webhook endpoints.
 type BillingHandler struct {
-	db        *sql.DB
-	cfg       *config.Config
-	email     *email.Client
-	migClient *migratorclient.Client
+	db    *sql.DB
+	cfg   *config.Config
+	email *email.Client
 
 	// FetchSubscriptionDetails fetches a Razorpay subscription + its latest
 	// paid invoice for billing-state aggregation. Set in tests to substitute
@@ -45,8 +42,8 @@ type BillingHandler struct {
 }
 
 // NewBillingHandler constructs a BillingHandler.
-func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient *email.Client, migClient *migratorclient.Client) *BillingHandler {
-	h := &BillingHandler{db: db, cfg: cfg, email: emailClient, migClient: migClient}
+func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient *email.Client) *BillingHandler {
+	h := &BillingHandler{db: db, cfg: cfg, email: emailClient}
 	// Default to the real Razorpay portal; tests override this field directly.
 	h.FetchSubscriptionDetails = func(subID string) (*razorpaybilling.SubscriptionDetails, error) {
 		portal := &razorpaybilling.Portal{DB: h.db, Cfg: h.cfg}
@@ -334,8 +331,6 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 		}
 	}
 
-	h.triggerMigrationsForTeam(ctx, teamID, teamID.String(), tier, "subscription.charged/"+sub.ID)
-
 	slog.Info("billing.subscription.charged",
 		"team_id", teamID, "plan_tier", tier, "subscription_id", sub.ID)
 	metrics.ConversionFunnel.WithLabelValues("paid").Inc()
@@ -356,9 +351,14 @@ func (h *BillingHandler) handleSubscriptionCancelled(ctx context.Context, c *fib
 		return
 	}
 
+	// Downgrade behaviour: a cancellation with zero paid invoices means the
+	// user never actually paid, so they fall back to 'free' (claimed-but-
+	// unpaid). 'anonymous' would be wrong — they still have a team_id. A
+	// cancellation after at least one paid invoice keeps Hobby as a courtesy
+	// floor; resources keep their existing tier (UpdatePlanTier only).
 	tier := "hobby"
 	if sub.PaidCount != nil && *sub.PaidCount == 0 {
-		tier = "anonymous"
+		tier = "free"
 	}
 	if updateErr := models.UpdatePlanTier(ctx, h.db, teamID, tier); updateErr != nil {
 		slog.Error("billing.subscription.cancelled.downgrade_failed",
@@ -436,101 +436,6 @@ func resolveTeamFromNotes(ctx context.Context, h *BillingHandler, sub rzpSubscri
 		return team.ID, nil
 	}
 	return uuid.Nil, errors.New("cannot resolve team: missing notes.team_id and no subscription_id")
-}
-
-// triggerMigrationsForTeam iterates active postgres/redis/mongodb resources for the
-// team and calls the migrator for any that still live on shared infrastructure.
-// Errors are logged but never propagate — migration failure must not block the webhook response.
-func (h *BillingHandler) triggerMigrationsForTeam(ctx context.Context, teamID uuid.UUID, teamIDStr, targetTier, logTag string) {
-	if h.migClient == nil || h.cfg.MigratorAddr == "" {
-		slog.Info("billing.triggerMigrations.skipped_no_migrator", "team_id", teamIDStr)
-		return
-	}
-
-	aesKey, err := crypto.ParseAESKey(h.cfg.AESKey)
-	if err != nil {
-		slog.Error("billing.triggerMigrations.aes_key_failed", "error", err, "team_id", teamIDStr)
-		return
-	}
-
-	resources, err := models.ListResourcesByTeam(ctx, h.db, teamID)
-	if err != nil {
-		slog.Error("billing.triggerMigrations.list_failed", "error", err, "team_id", teamIDStr)
-		return
-	}
-
-	migratable := map[string]bool{"postgres": true, "redis": true, "mongodb": true}
-	triggered := 0
-
-	for _, r := range resources {
-		if !migratable[r.ResourceType] {
-			continue
-		}
-		if r.Status != "active" {
-			continue
-		}
-		if r.ExpiresAt.Valid {
-			continue // skip ephemeral anonymous resources
-		}
-		if r.MigrationStatus.Valid {
-			switch r.MigrationStatus.String {
-			case "complete", "running", "verifying":
-				continue
-			}
-		}
-		if !r.ConnectionURL.Valid || r.ConnectionURL.String == "" {
-			continue
-		}
-
-		plainURL, decErr := crypto.Decrypt(aesKey, r.ConnectionURL.String)
-		if decErr != nil {
-			plainURL = r.ConnectionURL.String
-		}
-
-		if !isSharedInfraURL(plainURL) {
-			slog.Info("billing.triggerMigrations.already_isolated",
-				"resource_id", r.ID, "resource_type", r.ResourceType, "team_id", teamIDStr)
-			continue
-		}
-
-		if err := h.migClient.Trigger(ctx, migratorclient.MigrationRequest{
-			ResourceID:   r.ID.String(),
-			ResourceType: r.ResourceType,
-			Token:        r.Token.String(),
-			SourceTier:   r.Tier,
-			TargetTier:   targetTier,
-			SourceURL:    plainURL,
-			RequestID:    logTag,
-		}); err != nil {
-			slog.Warn("billing.triggerMigrations.trigger_failed",
-				"error", err,
-				"resource_id", r.ID,
-				"resource_type", r.ResourceType,
-				"team_id", teamIDStr,
-			)
-			continue
-		}
-
-		slog.Info("billing.triggerMigrations.triggered",
-			"resource_id", r.ID,
-			"resource_type", r.ResourceType,
-			"source_tier", r.Tier,
-			"target_tier", targetTier,
-			"team_id", teamIDStr,
-		)
-		triggered++
-	}
-
-	slog.Info("billing.triggerMigrations.done",
-		"triggered", triggered,
-		"team_id", teamIDStr,
-		"target_tier", targetTier,
-	)
-}
-
-// isSharedInfraURL returns true when the connection URL points at shared cluster infrastructure.
-func isSharedInfraURL(url string) bool {
-	return strings.Contains(url, ".svc.cluster.local")
 }
 
 // CancelSubscriptionAPI handles POST /api/v1/billing/cancel (session JWT).

@@ -55,18 +55,24 @@ func ensureStackTables(t *testing.T, db *sql.DB) {
 	t.Helper()
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS stacks (
-			id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-			team_id     UUID REFERENCES teams(id) ON DELETE CASCADE,
-			name        TEXT,
-			slug        TEXT UNIQUE NOT NULL,
-			namespace   TEXT UNIQUE NOT NULL,
-			status      TEXT NOT NULL DEFAULT 'building',
-			tier        TEXT NOT NULL DEFAULT 'hobby',
-			expires_at  TIMESTAMPTZ,
-			fingerprint TEXT,
-			created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id         UUID REFERENCES teams(id) ON DELETE CASCADE,
+			name            TEXT,
+			slug            TEXT UNIQUE NOT NULL,
+			namespace       TEXT UNIQUE NOT NULL,
+			status          TEXT NOT NULL DEFAULT 'building',
+			tier            TEXT NOT NULL DEFAULT 'hobby',
+			env             TEXT NOT NULL DEFAULT 'production',
+			parent_stack_id UUID,
+			expires_at      TIMESTAMPTZ,
+			fingerprint     TEXT,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		// Idempotent ALTERs for environments where the table already existed
+		// before this migration (matches the production migration sequence).
+		`ALTER TABLE stacks ADD COLUMN IF NOT EXISTS env TEXT NOT NULL DEFAULT 'production'`,
+		`ALTER TABLE stacks ADD COLUMN IF NOT EXISTS parent_stack_id UUID`,
 		`CREATE TABLE IF NOT EXISTS stack_services (
 			id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			stack_id    UUID NOT NULL REFERENCES stacks(id) ON DELETE CASCADE,
@@ -133,6 +139,7 @@ func newStackTestApp(t *testing.T, db *sql.DB) *fiber.App {
 
 	api := app.Group("/api/v1", middleware.RequireAuth(cfg))
 	api.Get("/stacks", stackH.List)
+	api.Post("/stacks/:slug/promote", stackH.Promote)
 
 	return app
 }

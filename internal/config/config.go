@@ -41,8 +41,6 @@ type Config struct {
 	PostgresCustomersURL     string // POSTGRES_CUSTOMERS_URL (for local backend)
 	ProvisionerAddr          string // PROVISIONER_ADDR — if set, use gRPC provisioner; if empty, use local providers
 	ProvisionerSecret        string // PROVISIONER_SECRET — metadata token sent to provisioner
-	MigratorAddr             string // MIGRATOR_ADDR — HTTP address of the migrator service
-	MigratorSecret           string // MIGRATOR_SECRET — shared secret for migrator HTTP API
 	NATSHost                 string // NATS_HOST — host for building nats:// connection strings
 	R2Endpoint               string // R2_ENDPOINT — R2 endpoint hostname (default: r2.instant.dev)
 	R2BucketName             string // R2_BUCKET_NAME — shared R2 bucket name (default: instant-shared)
@@ -144,8 +142,6 @@ func Load() *Config {
 	}
 	cfg.ProvisionerAddr = os.Getenv("PROVISIONER_ADDR") // intentionally empty = use local providers
 	cfg.ProvisionerSecret = os.Getenv("PROVISIONER_SECRET")
-	cfg.MigratorAddr = os.Getenv("MIGRATOR_ADDR")
-	cfg.MigratorSecret = os.Getenv("MIGRATOR_SECRET")
 	cfg.NATSHost = getenv("NATS_HOST", "nats.instant-data.svc.cluster.local")
 	cfg.R2Endpoint = getenv("R2_ENDPOINT", "r2.instant.dev")
 	cfg.R2BucketName = getenv("R2_BUCKET_NAME", "instant-shared")

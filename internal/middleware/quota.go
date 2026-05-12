@@ -31,11 +31,20 @@ var QuotaUpgradeURL = "https://instanode.dev/pricing"
 //	WWW-Authenticate: Payment realm="instanode", upgrade_url="https://instanode.dev/pricing"
 //	Content-Type: application/json
 //
-//	{"ok":false,"error":"quota_exceeded","upgrade_url":"https://instanode.dev/pricing"}
+//	{
+//	  "ok":false,
+//	  "error":"quota_exceeded",
+//	  "upgrade_url":"https://instanode.dev/pricing",
+//	  "agent_action":"Tell the user they've hit their plan's usage limit..."
+//	}
 //
 // errKey lets callers customise the JSON `error` field for distinct quota
 // classes (e.g. "throughput_exceeded", "storage_exceeded"); it falls back
 // to the generic "quota_exceeded" when empty so call sites stay terse.
+//
+// agent_action is the sentence the calling agent should surface verbatim
+// to the human user — added per RETRO-2026-05-12 §10.15 so a Claude /
+// Cursor / MCP agent hitting this wall knows exactly what to say.
 //
 // The handler does not actually accept payment yet — the WWW-Authenticate
 // header is the forward-compatibility hook for Stripe's Machine Payments
@@ -49,8 +58,9 @@ func PaymentRequired(c *fiber.Ctx, errKey string) error {
 	c.Set("WWW-Authenticate",
 		`Payment realm="instanode", upgrade_url="`+QuotaUpgradeURL+`"`)
 	return c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
-		"ok":          false,
-		"error":       errKey,
-		"upgrade_url": QuotaUpgradeURL,
+		"ok":           false,
+		"error":        errKey,
+		"upgrade_url":  QuotaUpgradeURL,
+		"agent_action": "Tell the user they've hit their plan's usage limit. To unlock more, have them upgrade at " + QuotaUpgradeURL + ".",
 	})
 }

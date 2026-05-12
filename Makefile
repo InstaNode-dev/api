@@ -1,9 +1,47 @@
-.PHONY: run build build-cli test \
+.PHONY: run build build-cli test test-unit test-db-up test-db-down test-db-reset \
         docker-up docker-down docker-logs \
         migrate migrate-platform migrate-customers \
         docker-build \
         k8s-deploy k8s-delete k8s-status k8s-regen-migrations \
         gen-secrets install-cli
+
+# Local test database — Postgres 16 in Docker on localhost:5432. Matches
+# testhelpers.defaultTestDBURL so tests run without setting any env vars
+# beyond TEST_DATABASE_URL (which `make test-unit` sets for you).
+TEST_DB_URL := postgres://postgres:postgres@localhost:5432/instant_dev_test?sslmode=disable
+
+# Spin up the test-pg container + create + migrate the test DB. Idempotent.
+test-db-up:
+	@docker inspect test-pg >/dev/null 2>&1 || \
+	  docker run -d --name test-pg -p 5432:5432 \
+	    -e POSTGRES_PASSWORD=postgres postgres:16-alpine
+	@docker start test-pg >/dev/null 2>&1 || true
+	@for i in 1 2 3 4 5 6 7 8 9 10; do \
+	  docker exec test-pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; \
+	done
+	@docker exec test-pg psql -U postgres -tc \
+	  "SELECT 1 FROM pg_database WHERE datname='instant_dev_test'" | grep -q 1 || \
+	  docker exec test-pg psql -U postgres -c "CREATE DATABASE instant_dev_test"
+	@for f in internal/db/migrations/*.sql; do \
+	  docker exec -i test-pg psql -U postgres -d instant_dev_test < "$$f" >/dev/null 2>&1; \
+	done
+	@echo "test-pg ready · TEST_DATABASE_URL=$(TEST_DB_URL)"
+
+test-db-down:
+	@docker rm -f test-pg 2>/dev/null || true
+
+test-db-reset: test-db-down test-db-up
+
+# PR gate: run unit tests per-package against the test DB. Per-package
+# avoids cross-package test-pollution issues in the existing suite.
+test-unit: test-db-up
+	@TEST_DATABASE_URL="$(TEST_DB_URL)" go build ./...
+	@TEST_DATABASE_URL="$(TEST_DB_URL)" go vet ./...
+	@for pkg in $$(go list ./... | grep -v /e2e); do \
+	  echo "→ $$pkg"; \
+	  TEST_DATABASE_URL="$(TEST_DB_URL)" go test "$$pkg" -short -count=1 -timeout 90s || exit 1; \
+	done
+	@echo "test-unit: all packages green"
 
 # ── Local development ─────────────────────────────────────────────────────────
 
