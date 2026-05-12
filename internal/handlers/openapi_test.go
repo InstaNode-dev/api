@@ -213,6 +213,82 @@ func TestOpenAPI_ErrorResponseSchemaDocumented(t *testing.T) {
 	}
 }
 
+// TestOpenAPI_CachedAggregateEndpointsDocumented guards Wave 4-L: the two
+// cached aggregate endpoints (/api/v1/billing/usage and /api/v1/team/summary)
+// are live and tested in production but were undocumented in the OpenAPI
+// spec until this fix. Agents reading /openapi.json alone now have a
+// machine-readable signal that the cached aggregates exist + what their
+// payload shapes look like, so they can pull dashboard-style metrics
+// without falling back to scanning the full /resources list.
+func TestOpenAPI_CachedAggregateEndpointsDocumented(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	paths, _ := v["paths"].(map[string]any)
+	for _, p := range []string{
+		"/api/v1/billing/usage",
+		"/api/v1/team/summary",
+	} {
+		op, ok := paths[p].(map[string]any)
+		if !ok {
+			t.Errorf("OpenAPI is missing path %q — agents cannot discover the cached aggregate endpoints", p)
+			continue
+		}
+		get, ok := op["get"].(map[string]any)
+		if !ok {
+			t.Errorf("path %q missing GET operation", p)
+			continue
+		}
+		// Both endpoints are session-gated; if bearerAuth gets dropped from
+		// the security stanza, a dashboard refactor probably ripped the auth
+		// requirement out by accident.
+		sec, _ := get["security"].([]any)
+		if len(sec) == 0 {
+			t.Errorf("path %q GET must declare bearerAuth — these endpoints require a session JWT", p)
+		}
+		// 200 response must reference a schema and document the Cache-Control
+		// header — that's the whole point of these endpoints, and an agent
+		// reading the spec needs to know they're cache-friendly.
+		responses, _ := get["responses"].(map[string]any)
+		r200, ok := responses["200"].(map[string]any)
+		if !ok {
+			t.Errorf("path %q must document a 200 response with the cached payload schema", p)
+			continue
+		}
+		headers, _ := r200["headers"].(map[string]any)
+		if _, ok := headers["Cache-Control"].(map[string]any); !ok {
+			t.Errorf("path %q 200 response must document the Cache-Control header so agents know the response is cacheable", p)
+		}
+		body, _ := digMap(r200, "content", "application/json")
+		schemaRef, _ := body["schema"].(map[string]any)
+		ref, _ := schemaRef["$ref"].(string)
+		if ref == "" {
+			t.Errorf("path %q 200 must $ref a response schema", p)
+		}
+	}
+
+	// Schemas must be present + carry the canonical aggregate fields.
+	if props, ok := digMap(v, "components", "schemas", "BillingUsageResponse", "properties"); ok {
+		for _, k := range []string{"ok", "freshness_seconds", "as_of", "usage"} {
+			if _, ok := props[k]; !ok {
+				t.Errorf("BillingUsageResponse.properties.%s missing — agents lose the cache-window contract", k)
+			}
+		}
+	} else {
+		t.Error("components.schemas.BillingUsageResponse missing")
+	}
+	if props, ok := digMap(v, "components", "schemas", "TeamSummaryResponse", "properties"); ok {
+		for _, k := range []string{"ok", "freshness_seconds", "as_of", "tier", "counts"} {
+			if _, ok := props[k]; !ok {
+				t.Errorf("TeamSummaryResponse.properties.%s missing — agents lose the cache-window contract", k)
+			}
+		}
+	} else {
+		t.Error("components.schemas.TeamSummaryResponse missing")
+	}
+}
+
 func digMap(root map[string]any, keys ...string) (map[string]any, bool) {
 	cur := root
 	for _, k := range keys {
