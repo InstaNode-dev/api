@@ -569,5 +569,166 @@ func TestGetBillingState_TrialTeam_SurfacesTrialStatus(t *testing.T) {
 	assert.NotEmpty(t, body["next_renewal_at"], "trial status must surface trial_ends_at as next_renewal_at")
 }
 
+// ─── CreateCheckoutAPI plan_frequency (P2 annual pricing) ────────────────
+
+// checkoutAppNoDB builds a tiny Fiber app for testing checkout-handler
+// validation paths that never reach the DB or Razorpay (invalid input /
+// 503 not-configured branches). The team_id local is fixed.
+func checkoutAppNoDB(t *testing.T, cfg *config.Config) *fiber.App {
+	t.Helper()
+	bh := handlers.NewBillingHandler(nil, cfg, email.New(""))
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			if errors.Is(err, handlers.ErrResponseWritten) {
+				return nil
+			}
+			code := fiber.StatusInternalServerError
+			if e, ok := err.(*fiber.Error); ok {
+				code = e.Code
+			}
+			return c.Status(code).JSON(fiber.Map{"ok": false, "error": "internal_error", "message": err.Error()})
+		},
+	})
+	app.Use(func(c *fiber.Ctx) error {
+		c.Locals(middleware.LocalKeyTeamID, uuid.NewString())
+		return c.Next()
+	})
+	app.Post("/api/v1/billing/checkout", bh.CreateCheckoutAPI)
+	return app
+}
+
+func postCheckout(t *testing.T, app *fiber.App, body map[string]any) (int, map[string]any) {
+	t.Helper()
+	b, err := json.Marshal(body)
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/billing/checkout", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
+// TestCheckout_PlanFrequency_InvalidValue_Returns400 verifies that any
+// frequency other than monthly|yearly is rejected before Razorpay is
+// contacted — a typo can't silently fall back to monthly.
+func TestCheckout_PlanFrequency_InvalidValue_Returns400(t *testing.T) {
+	cfg := &config.Config{
+		JWTSecret:                 "test-secret-that-is-at-least-32-bytes-long!!",
+		RazorpayKeyID:             "rzp_test_key",
+		RazorpayKeySecret:         "rzp_test_secret",
+		RazorpayPlanIDPro:         "plan_monthly_pro",
+		RazorpayPlanIDProYearly:   "plan_yearly_pro",
+	}
+	app := checkoutAppNoDB(t, cfg)
+	status, body := postCheckout(t, app, map[string]any{
+		"plan":           "pro",
+		"plan_frequency": "lifetime",
+	})
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, "invalid_frequency", body["error"])
+}
+
+// TestCheckout_PlanFrequency_YearlyUnconfigured_Returns503 verifies that
+// when the operator hasn't created the yearly Razorpay plan yet and
+// RAZORPAY_PLAN_ID_*_YEARLY is empty, the request fails fast with 503
+// instead of trying to subscribe with an empty plan_id.
+func TestCheckout_PlanFrequency_YearlyUnconfigured_Returns503(t *testing.T) {
+	cfg := &config.Config{
+		JWTSecret:         "test-secret-that-is-at-least-32-bytes-long!!",
+		RazorpayKeyID:     "rzp_test_key",
+		RazorpayKeySecret: "rzp_test_secret",
+		RazorpayPlanIDPro: "plan_monthly_pro",
+		// RazorpayPlanIDProYearly intentionally left empty.
+	}
+	app := checkoutAppNoDB(t, cfg)
+	status, body := postCheckout(t, app, map[string]any{
+		"plan":           "pro",
+		"plan_frequency": "yearly",
+	})
+	assert.Equal(t, http.StatusServiceUnavailable, status)
+	assert.Equal(t, "billing_not_configured", body["error"])
+}
+
+// TestCheckout_PlanFrequency_MonthlyDefault_NoFrequency verifies that
+// requests with no plan_frequency field continue to behave as monthly
+// (back-compat with the pre-P2 dashboard).
+func TestCheckout_PlanFrequency_MonthlyDefault_NoFrequency(t *testing.T) {
+	cfg := &config.Config{
+		JWTSecret:         "test-secret-that-is-at-least-32-bytes-long!!",
+		RazorpayKeyID:     "rzp_test_key",
+		RazorpayKeySecret: "rzp_test_secret",
+		// No monthly Pro plan configured -> expect 503 not_configured.
+		// (Verifies it tries monthly when frequency is omitted.)
+		RazorpayPlanIDProYearly: "plan_yearly_pro_set",
+	}
+	app := checkoutAppNoDB(t, cfg)
+	status, body := postCheckout(t, app, map[string]any{
+		"plan": "pro",
+	})
+	// monthly plan_id is empty → 503
+	assert.Equal(t, http.StatusServiceUnavailable, status)
+	assert.Equal(t, "billing_not_configured", body["error"])
+}
+
+// TestCheckout_PlanFrequency_TeamGuard_StillFires verifies the team-tier
+// guard runs before frequency resolution — team is unavailable on either
+// cycle while the multi-seat surface is in development.
+func TestCheckout_PlanFrequency_TeamGuard_StillFires(t *testing.T) {
+	cfg := &config.Config{
+		JWTSecret:                "test-secret-that-is-at-least-32-bytes-long!!",
+		RazorpayKeyID:            "rzp_test_key",
+		RazorpayKeySecret:        "rzp_test_secret",
+		RazorpayPlanIDTeam:       "plan_monthly_team",
+		RazorpayPlanIDTeamYearly: "plan_yearly_team",
+	}
+	app := checkoutAppNoDB(t, cfg)
+	for _, freq := range []string{"monthly", "yearly", ""} {
+		body := map[string]any{"plan": "team"}
+		if freq != "" {
+			body["plan_frequency"] = freq
+		}
+		status, resp := postCheckout(t, app, body)
+		assert.Equal(t, http.StatusBadRequest, status,
+			"team is locked regardless of frequency=%q", freq)
+		assert.Equal(t, "tier_unavailable", resp["error"])
+	}
+}
+
+// TestPlanIDToTier_MapsYearlyPlanIDsToCanonicalTier verifies the webhook's
+// plan_id → tier resolver recognises yearly plan IDs and maps them back
+// to the canonical (bare) tier name. teams.plan_tier always stores the
+// canonical tier so limits resolution is cycle-agnostic.
+func TestPlanIDToTier_MapsYearlyPlanIDsToCanonicalTier(t *testing.T) {
+	cfg := &config.Config{
+		RazorpayPlanIDHobby:       "plan_monthly_hobby",
+		RazorpayPlanIDHobbyYearly: "plan_yearly_hobby",
+		RazorpayPlanIDPro:         "plan_monthly_pro",
+		RazorpayPlanIDProYearly:   "plan_yearly_pro",
+		RazorpayPlanIDTeam:        "plan_monthly_team",
+		RazorpayPlanIDTeamYearly:  "plan_yearly_team",
+	}
+	bh := handlers.NewBillingHandler(nil, cfg, email.New(""))
+	cases := []struct {
+		planID string
+		want   string
+	}{
+		{"plan_monthly_hobby", "hobby"},
+		{"plan_yearly_hobby", "hobby"},
+		{"plan_monthly_pro", "pro"},
+		{"plan_yearly_pro", "pro"},
+		{"plan_monthly_team", "team"},
+		{"plan_yearly_team", "team"},
+		{"", "pro"},               // empty defaults to pro (unchanged)
+		{"plan_unknown_xx", "pro"}, // unknown defaults to pro (unchanged)
+	}
+	for _, c := range cases {
+		got := handlers.ExportedPlanIDToTier(bh, c.planID)
+		assert.Equal(t, c.want, got, "planIDToTier(%q)", c.planID)
+	}
+}
+
 // Ensure the billing test file compiles and is non-empty.
 var _ = fmt.Sprintf
