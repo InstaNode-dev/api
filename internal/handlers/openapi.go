@@ -253,14 +253,17 @@ const openAPISpec = `{
     "/deploy/new": {
       "post": {
         "summary": "Deploy a container application",
-        "description": "Builds a Docker image from the supplied tarball (or pulls an existing image) and rolls it out behind a public HTTPS URL on *.deployment.instanode.dev. Env vars may use the value 'vault://KEY' to reference a secret stored via /api/v1/vault — the plaintext is resolved at deploy time and never persisted in plaintext.",
+        "description": "Builds a Docker image from the supplied tarball (or pulls an existing image) and rolls it out behind a public HTTPS URL on *.deployment.instanode.dev. Env vars may use the value 'vault://KEY' to reference a secret stored via /api/v1/vault — the plaintext is resolved at deploy time and never persisted in plaintext. The separate 'resource_bindings' field accepts 'family:<family_root_id>' values that resolve at submit time to the connection URL of the family member matching the deploy's env — so one manifest works across staging / production / dev. Raw resource-token UUIDs are also accepted for backward compatibility.",
         "security": [{ "bearerAuth": [] }],
         "requestBody": { "required": true, "content": { "multipart/form-data": { "schema": { "$ref": "#/components/schemas/DeployRequest" } } } },
         "responses": {
           "202": { "description": "Deployment accepted, building", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
+          "400": { "description": "Bad request — invalid env_vars JSON, or invalid_resource_binding (resource_bindings value is not a UUID or family:<uuid>)" },
           "401": { "description": "Unauthorized" },
-          "403": { "description": "Blocked by team env_policy. Body: { error: 'env_policy_denied', env, action, role, allowed_roles, agent_action }." },
-          "503": { "description": "Compute backend unavailable or service disabled" }
+          "403": { "description": "Blocked by team env_policy, OR resource_binding_forbidden (binding references a resource owned by a different team)" },
+          "404": { "description": "resource_binding_not_found — the resource or family root id supplied in resource_bindings does not exist" },
+          "409": { "description": "no_env_twin — resource_bindings used family:<id> but the family has no member in the deploy's env. agent_action tells the user to call POST /api/v1/resources/:id/provision-twin first." },
+          "503": { "description": "Compute backend unavailable or service disabled, OR resource_binding_lookup_failed (transient DB error during binding resolution)" }
         }
       }
     },
@@ -1667,7 +1670,8 @@ const openAPISpec = `{
           "name": { "type": "string", "description": "Optional human-readable label" },
           "port": { "type": "integer", "description": "Container port (default 8080)" },
           "env": { "type": "string", "description": "Environment scope (production / staging / dev / ...)" },
-          "env_vars": { "type": "string", "description": "Optional JSON object of env vars to inject into the deployed pod on the FIRST build — e.g. '{\"DATABASE_URL\":\"postgres://...\",\"REDIS_URL\":\"redis://...\"}'. Avoids the (POST /deploy/new) → (PATCH /env) → (POST /redeploy) round-trip pattern. Values may use 'vault://KEY' refs which resolve at deploy time. Keys starting with underscore are reserved and ignored." }
+          "env_vars": { "type": "string", "description": "Optional JSON object of env vars to inject into the deployed pod on the FIRST build — e.g. '{\"DATABASE_URL\":\"postgres://...\",\"REDIS_URL\":\"redis://...\"}'. Avoids the (POST /deploy/new) → (PATCH /env) → (POST /redeploy) round-trip pattern. Values may use 'vault://KEY' refs which resolve at deploy time. Keys starting with underscore are reserved and ignored." },
+          "resource_bindings": { "type": "string", "description": "Optional JSON object mapping env-var-name to a resource reference. Values can be either 'family:<family_root_id>' (resolved at submit time to the family member matching the deploy's env — one manifest works across all envs) or a raw resource-token UUID (legacy path; resolves to that specific resource regardless of env). Resolved values are merged into env_vars, with explicit env_vars taking precedence on key collision. Example: '{\"DATABASE_URL\":\"family:7a3f2c91-...\",\"REDIS_URL\":\"family:9bd5f3e0-...\"}'." }
         },
         "required": ["tarball"]
       },
