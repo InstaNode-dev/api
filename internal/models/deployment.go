@@ -281,3 +281,24 @@ func DeleteDeployment(ctx context.Context, db *sql.DB, id uuid.UUID) error {
 	}
 	return nil
 }
+
+// CountActiveDeploymentsByTeam counts deployments for a team that have not been
+// torn down. Used by POST /deploy/new to enforce the per-tier deployments_apps
+// cap from plans.yaml.
+//
+// "Active" here means anything that still consumes a slot — that is, every
+// row in the deployments table whose status is not "deleted". Hard-deleted
+// rows (via DeleteDeployment) drop out naturally because the row is gone.
+// A soft-deleted "deleted" status is treated as freeing the slot, mirroring
+// the behaviour callers expect when they DELETE then re-create.
+func CountActiveDeploymentsByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) (int, error) {
+	var n int
+	err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM deployments
+		WHERE team_id = $1 AND status != 'deleted'
+	`, teamID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("models.CountActiveDeploymentsByTeam: %w", err)
+	}
+	return n, nil
+}
