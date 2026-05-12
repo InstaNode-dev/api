@@ -115,7 +115,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	storageH := handlers.NewStorageHandler(db, rdb, cfg, storageProv, planRegistry)
 	webhookH := handlers.NewWebhookHandler(db, rdb, cfg, planRegistry)
 	logsH := handlers.NewLogsHandler(db)
-	deployH := handlers.NewDeployHandler(db, rdb, cfg)
+	deployH := handlers.NewDeployHandler(db, rdb, cfg, planRegistry)
 	stackH := handlers.NewStackHandler(db, rdb, cfg, planRegistry)
 
 	// Custom-domain handler shares the k8s stack provider so EnsureCustomDomainIngress
