@@ -1,0 +1,115 @@
+{
+  "name": "instant-api — overview",
+  "description": "Top-level health for instant-api: error rate, latency (p95/p99), request rate, and per-endpoint breakdown. Sourced from APM Transaction events emitted by the Fiber NR middleware in track 3.",
+  "permissions": "PUBLIC_READ_WRITE",
+  "pages": [
+    {
+      "name": "Overview",
+      "description": "Golden signals for instant-api",
+      "widgets": [
+        {
+          "title": "Request rate (rpm)",
+          "layout": { "column": 1, "row": 1, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT rate(count(*), 1 minute) FROM Transaction WHERE appName LIKE 'instant-api%' TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Error rate (%)",
+          "layout": { "column": 5, "row": 1, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT percentage(count(*), WHERE error IS true) AS 'error rate' FROM Transaction WHERE appName LIKE 'instant-api%' TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Latency p95 / p99 (ms)",
+          "layout": { "column": 9, "row": 1, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT percentile(duration, 95) * 1000 AS 'p95 ms', percentile(duration, 99) * 1000 AS 'p99 ms' FROM Transaction WHERE appName LIKE 'instant-api%' TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Top endpoints by request count",
+          "layout": { "column": 1, "row": 4, "width": 6, "height": 3 },
+          "visualization": { "id": "viz.table" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT count(*) AS 'requests', percentile(duration, 95) * 1000 AS 'p95 ms', percentage(count(*), WHERE error IS true) AS 'err %' FROM Transaction WHERE appName LIKE 'instant-api%' FACET name LIMIT 25"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "5xx responses by endpoint",
+          "layout": { "column": 7, "row": 4, "width": 6, "height": 3 },
+          "visualization": { "id": "viz.bar" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT count(*) FROM Transaction WHERE appName LIKE 'instant-api%' AND httpResponseCode >= '500' FACET name LIMIT 20"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Apdex (target 500ms)",
+          "layout": { "column": 1, "row": 7, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.billboard" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT apdex(duration, t: 0.5) FROM Transaction WHERE appName LIKE 'instant-api%'"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false },
+            "thresholds": [
+              { "alertSeverity": "WARNING", "value": 0.9 },
+              { "alertSeverity": "CRITICAL", "value": 0.8 }
+            ]
+          }
+        },
+        {
+          "title": "Error log volume (commit_id breakdown)",
+          "layout": { "column": 5, "row": 7, "width": 8, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT count(*) FROM Log WHERE service = 'api' AND level = 'ERROR' FACET commit_id TIMESERIES AUTO LIMIT 5"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        }
+      ]
+    }
+  ]
+}

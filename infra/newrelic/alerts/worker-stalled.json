@@ -1,0 +1,31 @@
+{
+  "name": "instant-worker — no jobs processed in 10m",
+  "type": "NRQL",
+  "description": "Page when the worker has processed zero jobs for 10 minutes. Catches stalled River pollers, deadlocks against the platform DB, and pod crash loops missed by k8s readiness probes. Source: Log records emitted by River job middleware in track 4.",
+  "enabled": true,
+  "nrql": {
+    "query": "SELECT count(*) FROM Log WHERE service = 'worker' AND message = 'job.completed'"
+  },
+  "terms": [
+    {
+      "priority": "CRITICAL",
+      "operator": "BELOW",
+      "threshold": 1,
+      "thresholdDuration": 600,
+      "thresholdOccurrences": "ALL"
+    }
+  ],
+  "signal": {
+    "aggregationWindow": 60,
+    "aggregationMethod": "EVENT_FLOW",
+    "aggregationDelay": 120,
+    "fillOption": "STATIC",
+    "fillValue": 0
+  },
+  "expiration": {
+    "expirationDuration": 1200,
+    "openViolationOnExpiration": true,
+    "closeViolationsOnExpiration": false
+  },
+  "violationTimeLimitSeconds": 86400
+}
