@@ -1,0 +1,101 @@
+{
+  "name": "instant-api — provisioning",
+  "description": "Success/fail counts for /db/new, /cache/new, /nosql/new, /queue/new, /storage/new, /webhook/new. Source: Custom/Provision/Success and Custom/Provision/Fail metrics emitted by track 3 from the Fiber middleware, plus anonymous-tier recycle counts from worker expire jobs (track 4).",
+  "permissions": "PUBLIC_READ_WRITE",
+  "pages": [
+    {
+      "name": "Provisioning",
+      "description": "Resource provisioning health by service and tier",
+      "widgets": [
+        {
+          "title": "Provision success rate (last hour)",
+          "layout": { "column": 1, "row": 1, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.billboard" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT (sum(newrelic.timeslice.value) / (sum(newrelic.timeslice.value) + filter(sum(newrelic.timeslice.value), WHERE metricTimesliceName = 'Custom/Provision/Fail'))) * 100 AS 'success %' FROM Metric WHERE metricTimesliceName = 'Custom/Provision/Success' SINCE 1 hour ago"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false },
+            "thresholds": [
+              { "alertSeverity": "WARNING", "value": 99 },
+              { "alertSeverity": "CRITICAL", "value": 95 }
+            ]
+          }
+        },
+        {
+          "title": "Provision success vs fail (timeseries)",
+          "layout": { "column": 5, "row": 1, "width": 8, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT sum(newrelic.timeslice.value) AS 'count' FROM Metric WHERE metricTimesliceName IN ('Custom/Provision/Success', 'Custom/Provision/Fail') FACET metricTimesliceName TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Median provision duration by endpoint (ms)",
+          "layout": { "column": 1, "row": 4, "width": 6, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT percentile(duration, 50) * 1000 AS 'median ms', percentile(duration, 95) * 1000 AS 'p95 ms' FROM Transaction WHERE appName LIKE 'instant-api%' AND name IN ('POST /db/new', 'POST /cache/new', 'POST /nosql/new', 'POST /queue/new', 'POST /storage/new', 'POST /webhook/new') FACET name TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Provision failures by service",
+          "layout": { "column": 7, "row": 4, "width": 6, "height": 3 },
+          "visualization": { "id": "viz.bar" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT count(*) FROM Log WHERE service = 'api' AND level = 'ERROR' AND message LIKE '%provision%' FACET resource_type LIMIT 10"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Anonymous-tier expirations (worker)",
+          "layout": { "column": 1, "row": 7, "width": 6, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT sum(newrelic.timeslice.value) FROM Metric WHERE metricTimesliceName = 'Custom/Resource/Expired' TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Provision attempts by tier",
+          "layout": { "column": 7, "row": 7, "width": 6, "height": 3 },
+          "visualization": { "id": "viz.pie" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT count(*) FROM Log WHERE service = 'api' AND message LIKE '%provisioned%' FACET tier"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        }
+      ]
+    }
+  ]
+}

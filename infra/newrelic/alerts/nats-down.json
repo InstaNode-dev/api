@@ -1,0 +1,38 @@
+{
+  "name": "instant-api — NATS connection failures",
+  "type": "NRQL",
+  "description": "Page when the api logs NATS connection failures. Triggers on any error log mentioning NATS — covers JetStream unreachable, auth failure, or stream not found. Threshold deliberately low (>=3 in 5min) to catch real outages without paging on transient blips.",
+  "enabled": true,
+  "nrql": {
+    "query": "SELECT count(*) FROM Log WHERE service IN ('api', 'worker') AND level = 'ERROR' AND (message LIKE '%nats%' OR message LIKE '%NATS%' OR message LIKE '%jetstream%')"
+  },
+  "terms": [
+    {
+      "priority": "CRITICAL",
+      "operator": "ABOVE_OR_EQUALS",
+      "threshold": 3,
+      "thresholdDuration": 300,
+      "thresholdOccurrences": "ALL"
+    },
+    {
+      "priority": "WARNING",
+      "operator": "ABOVE_OR_EQUALS",
+      "threshold": 1,
+      "thresholdDuration": 300,
+      "thresholdOccurrences": "ALL"
+    }
+  ],
+  "signal": {
+    "aggregationWindow": 60,
+    "aggregationMethod": "EVENT_FLOW",
+    "aggregationDelay": 120,
+    "fillOption": "STATIC",
+    "fillValue": 0
+  },
+  "expiration": {
+    "expirationDuration": 600,
+    "openViolationOnExpiration": false,
+    "closeViolationsOnExpiration": true
+  },
+  "violationTimeLimitSeconds": 86400
+}
