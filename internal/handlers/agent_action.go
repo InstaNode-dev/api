@@ -91,6 +91,21 @@ func newAgentActionDeploymentLimitReached(tier string, limit int) string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Private-deploy walls (Track A — migration 020)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// AgentActionPrivateDeployRequiresPro is returned when a hobby / anonymous /
+// free team tries to set private=true on POST /deploy/new. Names the gated
+// feature ("private deploys"), the required tier ("Pro"), and points at the
+// exact upgrade URL — satisfying all four contract requirements.
+const AgentActionPrivateDeployRequiresPro = "Tell the user private deploys require Pro tier. Upgrade at https://instanode.dev/pricing — takes 30 seconds."
+
+// AgentActionPrivateDeployRequiresAllowedIPs is returned when a caller sets
+// private=true but supplies no allowed_ips. We do NOT allow a "private deploy
+// with zero allowed IPs" — that would silently make the app unreachable.
+const AgentActionPrivateDeployRequiresAllowedIPs = "Tell the user a private deploy needs at least one allowed IP or CIDR. Have them pass allowed_ips like [\"1.2.3.4\",\"10.0.0.0/8\"] — see https://instanode.dev/docs/private-deploys."
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Storage / vault tier walls (called from respondErrorWithAgentAction)
 // ─────────────────────────────────────────────────────────────────────────────
 

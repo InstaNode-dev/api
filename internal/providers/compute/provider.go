@@ -7,13 +7,26 @@ import (
 )
 
 // DeployOptions describes an app deployment request.
+//
+// Private / AllowedIPs are the access-control fields wired by Track A of the
+// private-deploys feature (migration 020). The compute provider treats them
+// as a single unit: when Private is true, the resulting Ingress carries the
+// nginx whitelist annotation with AllowedIPs comma-joined; when false (the
+// zero value), the Ingress is created exactly as before — no annotation, no
+// behaviour change for existing public deploys.
+//
+// Validation of AllowedIPs (CIDR / IP parsing, max 32 entries, non-empty
+// when Private=true) lives in the handler — the compute layer trusts the
+// caller and is reused unchanged for both public and private deploys.
 type DeployOptions struct {
-	AppID   string            // short slug, used as k8s Deployment name and subdomain
-	Token   string            // instant.dev resource token (for env var injection)
-	Tarball []byte            // gzipped tar archive of the source directory (must contain Dockerfile)
-	EnvVars map[string]string // merged: infra resource URLs + user-defined vars
-	Port    int               // port the app listens on (default 8080)
-	Tier    string            // hobby|pro|team → resource requests/limits
+	AppID      string            // short slug, used as k8s Deployment name and subdomain
+	Token      string            // instant.dev resource token (for env var injection)
+	Tarball    []byte            // gzipped tar archive of the source directory (must contain Dockerfile)
+	EnvVars    map[string]string // merged: infra resource URLs + user-defined vars
+	Port       int               // port the app listens on (default 8080)
+	Tier       string            // hobby|pro|team → resource requests/limits
+	Private    bool              // true → Ingress carries whitelist-source-range annotation
+	AllowedIPs []string          // CIDRs / IPs allowed when Private=true; ignored otherwise
 }
 
 // AppDeployment represents the live state of a deployed app.

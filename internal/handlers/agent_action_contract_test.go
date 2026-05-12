@@ -27,11 +27,13 @@ import (
 func agentActionContractCases() map[string]string {
 	cases := map[string]string{
 		// Static constants.
-		"AgentActionMultiEnvUpgradeRequired":     AgentActionMultiEnvUpgradeRequired,
-		"AgentActionStackPromoteMissingImageRef": AgentActionStackPromoteMissingImageRef,
-		"AgentActionBindingFamilyDisabled":       AgentActionBindingFamilyDisabled,
-		"AgentActionBindingLookupFailed":         AgentActionBindingLookupFailed,
-		"RecycleGateAgentAction":                 RecycleGateAgentAction,
+		"AgentActionMultiEnvUpgradeRequired":           AgentActionMultiEnvUpgradeRequired,
+		"AgentActionStackPromoteMissingImageRef":       AgentActionStackPromoteMissingImageRef,
+		"AgentActionBindingFamilyDisabled":             AgentActionBindingFamilyDisabled,
+		"AgentActionBindingLookupFailed":               AgentActionBindingLookupFailed,
+		"RecycleGateAgentAction":                       RecycleGateAgentAction,
+		"AgentActionPrivateDeployRequiresPro":          AgentActionPrivateDeployRequiresPro,
+		"AgentActionPrivateDeployRequiresAllowedIPs":   AgentActionPrivateDeployRequiresAllowedIPs,
 
 		// Builders — representative inputs covering tier/env/role/limit
 		// interpolation.

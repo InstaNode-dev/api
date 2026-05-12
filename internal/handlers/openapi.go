@@ -258,8 +258,9 @@ const openAPISpec = `{
         "requestBody": { "required": true, "content": { "multipart/form-data": { "schema": { "$ref": "#/components/schemas/DeployRequest" } } } },
         "responses": {
           "202": { "description": "Deployment accepted, building", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
-          "400": { "description": "Bad request — invalid env_vars JSON, or invalid_resource_binding (resource_bindings value is not a UUID or family:<uuid>)" },
+          "400": { "description": "Bad request — invalid env_vars JSON, invalid_resource_binding (resource_bindings value is not a UUID or family:<uuid>), private_deploy_requires_allowed_ips (private=true with no IPs), invalid_allowed_ip (bad CIDR/IP literal), or too_many_allowed_ips (>32 entries)" },
           "401": { "description": "Unauthorized" },
+          "402": { "description": "deployment_limit_reached OR private_deploy_requires_pro — hobby/anonymous/free trying to set private=true. agent_action points to https://instanode.dev/pricing." },
           "403": { "description": "Blocked by team env_policy, OR resource_binding_forbidden (binding references a resource owned by a different team)" },
           "404": { "description": "resource_binding_not_found — the resource or family root id supplied in resource_bindings does not exist" },
           "409": { "description": "no_env_twin — resource_bindings used family:<id> but the family has no member in the deploy's env. agent_action tells the user to call POST /api/v1/resources/:id/provision-twin first." },
@@ -1671,7 +1672,9 @@ const openAPISpec = `{
           "port": { "type": "integer", "description": "Container port (default 8080)" },
           "env": { "type": "string", "description": "Environment scope (production / staging / dev / ...)" },
           "env_vars": { "type": "string", "description": "Optional JSON object of env vars to inject into the deployed pod on the FIRST build — e.g. '{\"DATABASE_URL\":\"postgres://...\",\"REDIS_URL\":\"redis://...\"}'. Avoids the (POST /deploy/new) → (PATCH /env) → (POST /redeploy) round-trip pattern. Values may use 'vault://KEY' refs which resolve at deploy time. Keys starting with underscore are reserved and ignored." },
-          "resource_bindings": { "type": "string", "description": "Optional JSON object mapping env-var-name to a resource reference. Values can be either 'family:<family_root_id>' (resolved at submit time to the family member matching the deploy's env — one manifest works across all envs) or a raw resource-token UUID (legacy path; resolves to that specific resource regardless of env). Resolved values are merged into env_vars, with explicit env_vars taking precedence on key collision. Example: '{\"DATABASE_URL\":\"family:7a3f2c91-...\",\"REDIS_URL\":\"family:9bd5f3e0-...\"}'." }
+          "resource_bindings": { "type": "string", "description": "Optional JSON object mapping env-var-name to a resource reference. Values can be either 'family:<family_root_id>' (resolved at submit time to the family member matching the deploy's env — one manifest works across all envs) or a raw resource-token UUID (legacy path; resolves to that specific resource regardless of env). Resolved values are merged into env_vars, with explicit env_vars taking precedence on key collision. Example: '{\"DATABASE_URL\":\"family:7a3f2c91-...\",\"REDIS_URL\":\"family:9bd5f3e0-...\"}'." },
+          "private": { "type": "string", "description": "Optional flag (\"true\" / \"1\" / \"yes\") that turns this into a private deploy. When set, the resulting Ingress carries an nginx whitelist-source-range annotation built from allowed_ips. Pro / Team / Growth only — hobby/anonymous/free return 402 with agent_action: \"Tell the user private deploys require Pro tier. Upgrade at https://instanode.dev/pricing — takes 30 seconds.\"" },
+          "allowed_ips": { "type": "string", "description": "Comma-separated list of CIDRs or IP literals (e.g. \"1.2.3.4,10.0.0.0/8,2001:db8::/32\"). Required when private=true; max 32 entries. Each entry is validated via Go's net.ParseCIDR / net.ParseIP — invalid entries surface in the 400 message so an agent can fix the literal that broke. Larger allowlists belong in CF Access or a real VPN, not an nginx annotation." }
         },
         "required": ["tarball"]
       },
@@ -1690,6 +1693,8 @@ const openAPISpec = `{
               "environment": { "type": "string", "description": "Env scope (production/staging/dev). Note: 'env' on this object is the env_vars map, not the scope." },
               "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Env vars map — vault://KEY references resolve at deploy time" },
               "port": { "type": "integer" },
+              "private": { "type": "boolean", "description": "True when the Ingress is locked down via nginx whitelist-source-range. Pro / Team / Growth feature." },
+              "allowed_ips": { "type": "array", "items": { "type": "string" }, "description": "CIDRs / IPs whitelisted on the Ingress when private=true. Empty array on a public deploy." },
               "team_id": { "type": "string", "format": "uuid" }
             }
           },
