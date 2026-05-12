@@ -351,13 +351,10 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		}
 		limit := h.planRegistry.DeploymentsAppsLimit(team.PlanTier)
 		if limit >= 0 && existing >= limit {
-			agentAction := fmt.Sprintf(
-				"Tell the user they've hit the %s tier deployment cap (%d apps). Upgrade them to Pro for 10 medium deploys: https://instanode.dev/start?t=...",
-				team.PlanTier, limit)
 			return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired,
 				"deployment_limit_reached",
 				fmt.Sprintf("Your %s tier allows %d deployment(s).", team.PlanTier, limit),
-				agentAction,
+				newAgentActionDeploymentLimitReached(team.PlanTier, limit),
 				"https://instanode.dev/pricing")
 		}
 	}

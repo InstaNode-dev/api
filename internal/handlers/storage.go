@@ -286,7 +286,7 @@ func (h *StorageHandler) newStorageAuthenticated(
 			if usedBytes >= limitBytes {
 				return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired, "storage_limit_reached",
 					fmt.Sprintf("Storage limit reached (%dMB). Upgrade your plan.", storageLimitMB),
-					fmt.Sprintf("Tell the user they've hit the %s tier storage limit (%dMB). Have them upgrade at %s to provision more storage.", team.PlanTier, storageLimitMB, DefaultPricingURL),
+					newAgentActionStorageLimitReached(team.PlanTier, storageLimitMB),
 					DefaultPricingURL)
 			}
 		}
