@@ -652,17 +652,30 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 
 // ── GET /api/v1/deployments ───────────────────────────────────────────────────
 
-// List handles GET /api/v1/deployments — list all deployments for the team.
+// List handles GET /api/v1/deployments — list deployments for the team.
+// Accepts an optional ?env=<name> query parameter to filter by environment.
+// When omitted, returns all envs.
 func (h *DeployHandler) List(c *fiber.Ctx) error {
 	team, err := h.requireTeam(c)
 	if err != nil {
 		return err
 	}
 
-	deploys, err := models.GetDeploymentsByTeam(c.Context(), h.db, team.ID)
+	envFilter := c.Query("env")
+	var deploys []*models.Deployment
+	if envFilter != "" {
+		normalized, ok := models.NormalizeEnv(envFilter)
+		if !ok {
+			return c.JSON(fiber.Map{"ok": true, "items": []fiber.Map{}, "total": 0})
+		}
+		deploys, err = models.GetDeploymentsByTeamAndEnv(c.Context(), h.db, team.ID, normalized)
+	} else {
+		deploys, err = models.GetDeploymentsByTeam(c.Context(), h.db, team.ID)
+	}
 	if err != nil {
 		slog.Error("deploy.list.failed",
 			"error", err, "team_id", team.ID,
+			"env_filter", envFilter,
 			"request_id", middleware.GetRequestID(c))
 		return respondError(c, fiber.StatusServiceUnavailable, "list_failed", "Failed to list deployments")
 	}
