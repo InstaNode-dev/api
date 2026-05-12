@@ -42,7 +42,9 @@ func NewResourceHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, reg *
 	return &ResourceHandler{db: db, rdb: rdb, cfg: cfg, plans: reg, provisioner: prov, storageProvider: storageProv}
 }
 
-// List handles GET /api/v1/resources — lists all resources for the authenticated team.
+// List handles GET /api/v1/resources — lists resources for the authenticated team.
+// Accepts an optional ?env=<name> query parameter to filter by environment.
+// Omitting it returns all envs (backward compat with pre-slice-1 callers).
 func (h *ResourceHandler) List(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
@@ -51,11 +53,24 @@ func (h *ResourceHandler) List(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Valid session token required")
 	}
 
-	resources, err := models.ListResourcesByTeam(c.Context(), h.db, teamID)
+	envFilter := c.Query("env")
+	var resources []*models.Resource
+	if envFilter != "" {
+		// Bogus envs (uppercase, spaces, unicode) fail NormalizeEnv and
+		// return 200 + empty so the dashboard stays stable on stale state.
+		normalized, ok := models.NormalizeEnv(envFilter)
+		if !ok {
+			return c.JSON(fiber.Map{"ok": true, "items": []fiber.Map{}, "total": 0})
+		}
+		resources, err = models.ListResourcesByTeamAndEnv(c.Context(), h.db, teamID, normalized)
+	} else {
+		resources, err = models.ListResourcesByTeam(c.Context(), h.db, teamID)
+	}
 	if err != nil {
 		slog.Error("resource.list.failed",
 			"error", err,
 			"team_id", teamID,
+			"env_filter", envFilter,
 			"request_id", requestID,
 		)
 		return respondError(c, fiber.StatusServiceUnavailable, "list_failed", "Failed to list resources")
