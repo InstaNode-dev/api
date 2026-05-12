@@ -288,6 +288,10 @@ func testConfig() *config.Config {
 		Environment:             "test",
 		PostgresProvisionBackend: "local",
 		PostgresCustomersURL:    customersURL,
+		// Slice 4 of env-aware deployments: production default is `true`, so
+		// tests should mirror that. Tests that need the flag off override it
+		// after the testConfig call.
+		FamilyBindingsEnabled: true,
 	}
 }
 
