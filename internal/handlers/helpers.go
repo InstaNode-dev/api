@@ -58,83 +58,86 @@ type errorCodeMeta struct {
 //     the agent should retry, not show prose to the user.
 var codeToAgentAction = map[string]errorCodeMeta{
 	// ── Quota walls ────────────────────────────────────────────────────────
+	// Each string adheres to the U3 contract (see agent_action.go): opens
+	// with "Tell the user", names the specific reason, names the exact next
+	// action, contains a full https://instanode.dev/ URL, under 280 chars.
 	"quota_exceeded": {
-		AgentAction: "Tell the user they've hit their plan's usage limit. To unlock more, have them upgrade at https://instanode.dev/pricing.",
+		AgentAction: "Tell the user they've hit their plan's usage limit. Upgrade to Pro at https://instanode.dev/pricing — takes 30 seconds and unlocks higher quotas.",
 		UpgradeURL:  "https://instanode.dev/pricing",
 	},
 	"storage_limit_reached": {
-		AgentAction: "Tell the user they've hit their storage limit for this plan. Have them upgrade at https://instanode.dev/pricing to provision larger or additional resources.",
+		AgentAction: "Tell the user they've hit their plan's storage limit. Upgrade to Pro for 5GB at https://instanode.dev/pricing to provision more storage.",
 		UpgradeURL:  "https://instanode.dev/pricing",
 	},
 	"vault_quota_exceeded": {
-		AgentAction: "Tell the user they've hit their vault entry quota. Have them upgrade at https://instanode.dev/pricing to add more secrets.",
+		AgentAction: "Tell the user they've hit their plan's vault entry quota. Upgrade to Pro at https://instanode.dev/pricing to add more secrets.",
 		UpgradeURL:  "https://instanode.dev/pricing",
 	},
 	"vault_not_available": {
-		AgentAction: "Tell the user the vault feature isn't available on their current plan. Have them upgrade at https://instanode.dev/pricing to use it.",
+		AgentAction: "Tell the user the vault feature isn't available on their current plan. Upgrade to Hobby or higher at https://instanode.dev/pricing to use it.",
 		UpgradeURL:  "https://instanode.dev/pricing",
 	},
 	"vault_env_not_allowed": {
-		AgentAction: "Tell the user their plan only allows the default vault environment; multi-env vault requires Pro or higher. Upgrade at https://instanode.dev/pricing.",
+		AgentAction: "Tell the user their plan only allows the default vault env; multi-env vault requires Pro. Upgrade at https://instanode.dev/pricing — takes 30 seconds.",
 		UpgradeURL:  "https://instanode.dev/pricing",
 	},
 	"member_limit": {
-		AgentAction: "Tell the user they've hit the team member limit for their plan. Have them upgrade at https://instanode.dev/pricing to add more teammates.",
+		AgentAction: "Tell the user they've hit the team member limit for their plan. Upgrade to Pro at https://instanode.dev/pricing to add more teammates.",
 		UpgradeURL:  "https://instanode.dev/pricing",
 	},
 	"upgrade_required": {
-		AgentAction: "Tell the user this feature requires a higher plan. Have them upgrade at https://instanode.dev/pricing.",
+		AgentAction: "Tell the user this feature requires the Pro plan or higher. Upgrade at https://instanode.dev/pricing — takes 30 seconds.",
 		UpgradeURL:  "https://instanode.dev/pricing",
 	},
 	"tier_unavailable": {
-		AgentAction: "Tell the user this resource type is not available on their current plan. Have them upgrade at https://instanode.dev/pricing.",
+		AgentAction: "Tell the user this resource type isn't available on their plan. Upgrade to Pro at https://instanode.dev/pricing to unlock it.",
 		UpgradeURL:  "https://instanode.dev/pricing",
 	},
 	"rate_limit_exceeded": {
-		AgentAction: "Tell the user they've sent too many requests in a short window. Have them wait a minute and retry, or upgrade at https://instanode.dev/pricing for higher limits.",
+		AgentAction: "Tell the user they've sent too many requests in a short window. Wait 60 seconds and retry — or upgrade to Pro at https://instanode.dev/pricing for higher limits.",
 		UpgradeURL:  "https://instanode.dev/pricing",
 	},
 
 	// ── Auth / token errors ────────────────────────────────────────────────
 	"unauthorized": {
-		AgentAction: "The user's INSTANODE_TOKEN is missing or invalid. Have them log in at https://instanode.dev/login to mint a new one.",
+		AgentAction: "Tell the user their INSTANODE_TOKEN is missing or invalid. Have them log in at https://instanode.dev/login to mint a new one — takes 30 seconds.",
 	},
 	"auth_required": {
-		AgentAction: "This action requires an authenticated user. Have them log in at https://instanode.dev/login (or sign up — both flows mint a token).",
+		AgentAction: "Tell the user this action requires an authenticated session. Have them log in or sign up at https://instanode.dev/login — both flows mint a token.",
 	},
 	"invalid_token": {
-		AgentAction: "The user's INSTANODE_TOKEN is invalid or expired. Have them log in at https://instanode.dev/login to mint a new one.",
+		AgentAction: "Tell the user their INSTANODE_TOKEN is invalid or expired. Have them log in at https://instanode.dev/login to mint a new one.",
 	},
 	"missing_token": {
-		AgentAction: "No INSTANODE_TOKEN was provided. Have the user log in at https://instanode.dev/login and pass the token in Authorization: Bearer <token>.",
+		AgentAction: "Tell the user no INSTANODE_TOKEN was provided. Have them log in at https://instanode.dev/login and pass it via Authorization: Bearer <token>.",
 	},
 	"vault_requires_auth": {
-		AgentAction: "Vault access requires an authenticated session. Have the user log in at https://instanode.dev/login.",
+		AgentAction: "Tell the user vault access requires an authenticated session. Have them log in at https://instanode.dev/login to mint a token.",
 	},
 	"invitation_invalid": {
-		AgentAction: "This invitation link is invalid or has already been used. Ask the team owner to send a fresh invitation.",
+		AgentAction: "Tell the user this invitation link is invalid or already used. Ask the team owner to send a fresh invitation from https://instanode.dev/app/team.",
 	},
 	"already_accepted": {
-		AgentAction: "This invitation has already been accepted. The user is already on the team — no action needed.",
+		AgentAction: "Tell the user this invitation has already been accepted — they're on the team. Have them open https://instanode.dev/app to see their resources.",
 	},
 	"already_claimed": {
-		AgentAction: "These resources have already been claimed by another account. If the user believes this is wrong, have them contact support@instanode.dev.",
+		AgentAction: "Tell the user these resources were already claimed by another account. If they believe this is wrong, have them email support@instanode.dev — see https://instanode.dev/support.",
 	},
 
 	// ── Expired / gone ─────────────────────────────────────────────────────
 	"webhook_inactive": {
-		AgentAction: "This webhook token has expired or been deactivated. Have the user provision a fresh one with POST /webhook/new.",
+		AgentAction: "Tell the user this webhook token has expired or been deactivated. Have them provision a fresh one with POST https://instanode.dev/webhook/new.",
 	},
 	"resource_not_found": {
-		AgentAction: "This resource no longer exists. It may have expired (anonymous resources auto-expire after 24h). Have the user provision a fresh one with POST /{type}/new.",
+		AgentAction: "Tell the user this resource no longer exists — anonymous resources auto-expire after 24h. Have them provision a fresh one at https://instanode.dev/docs/quickstart.",
 	},
 
 	// ── Permission denied ──────────────────────────────────────────────────
 	"forbidden": {
-		AgentAction: "The user does not have permission for this action. If they expected access, double-check they're logged in to the right team.",
+		AgentAction: "Tell the user they don't have permission for this action. Have them confirm they're logged in to the right team at https://instanode.dev/app/team.",
 	},
 	"last_owner": {
-		AgentAction: "The team needs at least one owner. Have the user promote another member to owner before changing or removing this one.",
+		AgentAction: "Tell the user the team needs at least one owner. Have them promote another member to owner at https://instanode.dev/app/team before changing or removing this one.",
 	},
 }
 
