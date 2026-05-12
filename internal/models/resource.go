@@ -14,6 +14,18 @@ import (
 // All migration-backfilled rows start at this value.
 const EnvProduction = "production"
 
+// Canonical resource_type strings used by the handlers and model layer.
+// Keep these in one place so callers performing same-type checks (e.g.
+// the family-linking guard) can't drift on string capitalisation.
+const (
+	ResourceTypePostgres = "postgres"
+	ResourceTypeRedis    = "redis"
+	ResourceTypeMongoDB  = "mongodb"
+	ResourceTypeQueue    = "queue"
+	ResourceTypeStorage  = "storage"
+	ResourceTypeWebhook  = "webhook"
+)
+
 // envPattern restricts the env name to lowercase alphanumerics + dashes,
 // 1–32 chars. Enforced at the model boundary so every caller (handlers,
 // background jobs, internal endpoints) gets the same guarantee.
@@ -51,7 +63,11 @@ type Resource struct {
 	StorageBytes       int64
 	ProviderResourceID sql.NullString
 	CreatedRequestID   sql.NullString
-	CreatedAt          time.Time
+	// ParentResourceID is the family root for env-twin resources. Nil for the
+	// root row itself (the root's family id is its own ID). Added by
+	// migration 018_resource_family.sql for slice 2 of env-aware deployments.
+	ParentResourceID *uuid.UUID
+	CreatedAt        time.Time
 }
 
 // ErrResourceNotFound is returned when a resource lookup yields no rows.
@@ -75,6 +91,11 @@ type CreateResourceParams struct {
 	CountryCode      string
 	ExpiresAt        *time.Time
 	CreatedRequestID string
+	// ParentResourceID links the new row into an existing env-twin family.
+	// Nil = standalone (own family root). When non-nil the caller is
+	// expected to have already enforced same-team + same-type (handlers
+	// do that via ValidateFamilyParent before calling CreateResource).
+	ParentResourceID *uuid.UUID
 }
 
 // resourceColumns is the canonical list of columns selected by every read query.
@@ -82,19 +103,25 @@ type CreateResourceParams struct {
 // makes it easy to add a new column without touching half a dozen functions.
 const resourceColumns = `id, team_id, token, resource_type, name, connection_url, key_prefix, tier,
        env, fingerprint, cloud_vendor, country_code, status, migration_status,
-       expires_at, storage_bytes, provider_resource_id, created_request_id, created_at`
+       expires_at, storage_bytes, provider_resource_id, created_request_id, parent_resource_id, created_at`
 
 // scanResource reads a single resources row in the order defined by resourceColumns.
 func scanResource(row interface {
 	Scan(dest ...any) error
 }) (*Resource, error) {
 	r := &Resource{}
+	var parentID uuid.NullUUID
 	if err := row.Scan(
 		&r.ID, &r.TeamID, &r.Token, &r.ResourceType, &r.Name, &r.ConnectionURL, &r.KeyPrefix,
 		&r.Tier, &r.Env, &r.Fingerprint, &r.CloudVendor, &r.CountryCode, &r.Status,
-		&r.MigrationStatus, &r.ExpiresAt, &r.StorageBytes, &r.ProviderResourceID, &r.CreatedRequestID, &r.CreatedAt,
+		&r.MigrationStatus, &r.ExpiresAt, &r.StorageBytes, &r.ProviderResourceID, &r.CreatedRequestID,
+		&parentID, &r.CreatedAt,
 	); err != nil {
 		return nil, err
+	}
+	if parentID.Valid {
+		id := parentID.UUID
+		r.ParentResourceID = &id
 	}
 	return r, nil
 }
@@ -109,6 +136,10 @@ func CreateResource(ctx context.Context, db *sql.DB, p CreateResourceParams) (*R
 	if p.ExpiresAt != nil {
 		expiresAt = *p.ExpiresAt
 	}
+	var parentID interface{}
+	if p.ParentResourceID != nil {
+		parentID = *p.ParentResourceID
+	}
 
 	env := p.Env
 	if env == "" {
@@ -117,11 +148,11 @@ func CreateResource(ctx context.Context, db *sql.DB, p CreateResourceParams) (*R
 
 	row := db.QueryRowContext(ctx, `
 		INSERT INTO resources
-			(team_id, resource_type, name, tier, env, fingerprint, cloud_vendor, country_code, expires_at, created_request_id)
-		VALUES ($1, $2, NULLIF($3,''), $4, $5, NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), $9, NULLIF($10,''))
+			(team_id, resource_type, name, tier, env, fingerprint, cloud_vendor, country_code, expires_at, created_request_id, parent_resource_id)
+		VALUES ($1, $2, NULLIF($3,''), $4, $5, NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), $9, NULLIF($10,''), $11)
 		RETURNING `+resourceColumns,
 		teamID, p.ResourceType, p.Name, p.Tier, env, p.Fingerprint, p.CloudVendor, p.CountryCode,
-		expiresAt, p.CreatedRequestID,
+		expiresAt, p.CreatedRequestID, parentID,
 	)
 
 	r, err := scanResource(row)
