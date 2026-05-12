@@ -302,35 +302,36 @@ func mapBindingError(e *BindingError) (status int, code, message, agentAction st
 	case BindingErrInvalidUUID:
 		return 400, "invalid_resource_binding",
 			fmt.Sprintf("resource_bindings[%s] is not a valid UUID or family:<uuid>", keyLabel),
-			fmt.Sprintf("Tell the user the deploy's resource_bindings.%s value must be a resource token UUID or the form family:<family_root_id>. They provided %q.",
-				keyLabel, e.RawValue)
+			newAgentActionBindingInvalidUUID(keyLabel, e.RawValue)
 	case BindingErrInvalidBinding:
 		return 400, "invalid_resource_binding",
 			fmt.Sprintf("resource_bindings[%s]: %s", keyLabel, e.Detail),
-			"Tell the user this server has FAMILY_BINDINGS_ENABLED=false. Remove the family: prefix and pass a raw resource-token UUID instead."
+			AgentActionBindingFamilyDisabled
 	case BindingErrNotFound:
 		return 404, "resource_binding_not_found",
 			fmt.Sprintf("resource_bindings[%s]: no resource found for %q", keyLabel, e.RawValue),
-			fmt.Sprintf("Tell the user the resource referenced in resource_bindings.%s doesn't exist. Check the UUID — if they meant a family root, list their families with GET /api/v1/resources/families.",
-				keyLabel)
+			newAgentActionBindingNotFound(keyLabel)
 	case BindingErrCrossTeam:
 		return 403, "resource_binding_forbidden",
 			fmt.Sprintf("resource_bindings[%s]: resource belongs to another team", keyLabel),
-			fmt.Sprintf("Tell the user the resource in resource_bindings.%s belongs to a different team. They can only reference resources owned by their own team.",
-				keyLabel)
+			newAgentActionBindingCrossTeam(keyLabel)
 	case BindingErrNoEnvTwin:
-		name := e.ResourceName
-		if name == "" {
-			name = e.RootID
-		}
 		return 409, "no_env_twin",
-			fmt.Sprintf("resource_bindings[%s]: family for %q has no member in env=%s", keyLabel, name, e.Env),
-			fmt.Sprintf("Tell the user to provision a %s twin of %q first (POST /api/v1/resources/%s/provision-twin with body {\"env\":\"%s\"}). The deploy is targeting env=%s but no family member exists there yet.",
-				e.Env, name, e.RootID, e.Env, e.Env)
+			fmt.Sprintf("resource_bindings[%s]: family for %q has no member in env=%s", keyLabel, nameOrEmpty(e.ResourceName, e.RootID), e.Env),
+			newAgentActionBindingNoEnvTwin(e.RootID, e.ResourceName, e.Env)
 	default: // BindingErrLookupFailed
 		return 503, "resource_binding_lookup_failed",
 			fmt.Sprintf("resource_bindings[%s] resolution failed: %s", keyLabel, e.Detail),
-			"Tell the user the platform couldn't resolve the resource binding right now. Retry the deploy in a few seconds."
+			AgentActionBindingLookupFailed
 	}
+}
+
+// nameOrEmpty returns name when non-empty, else fallback. Local helper so
+// mapBindingError doesn't re-implement the trivial fall-through inline.
+func nameOrEmpty(name, fallback string) string {
+	if name == "" {
+		return fallback
+	}
+	return name
 }
 
