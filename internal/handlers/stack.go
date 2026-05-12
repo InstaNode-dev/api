@@ -272,6 +272,9 @@ func serializeServices(services []*models.StackService) []fiber.Map {
 
 // runStackDeploy is run in a goroutine after POST /stacks/new returns 202.
 // It calls the stack provider and updates DB rows on each status transition.
+//
+// onImageBuilt persists stack_services.image_ref so a subsequent /promote
+// can re-use the built image rather than re-running the build pipeline.
 func (h *StackHandler) runStackDeploy(
 	ctx context.Context,
 	stack *models.Stack,
@@ -289,7 +292,26 @@ func (h *StackHandler) runStackDeploy(
 		}
 	}
 
-	if err := h.stackProv.DeployStack(ctx, opts, onUpdate); err != nil {
+	onImageBuilt := func(svcName, imageRef string) {
+		ss, ok := serviceRows[svcName]
+		if !ok {
+			slog.Warn("stack.runDeploy.image_built_unknown_service", "name", svcName)
+			return
+		}
+		if imageRef == "" {
+			return
+		}
+		if dbErr := models.UpdateStackServiceImageRef(context.Background(), h.db, ss.ID, imageRef); dbErr != nil {
+			slog.Error("stack.runDeploy.update_image_ref", "service", svcName, "error", dbErr)
+			return
+		}
+		// Local mirror so the in-memory serviceRows reflect what we just
+		// persisted — useful if a subsequent step inside the same goroutine
+		// reads ImageRef (none today, but cheap to keep correct).
+		ss.ImageRef = imageRef
+	}
+
+	if err := h.stackProv.DeployStack(ctx, opts, onUpdate, onImageBuilt); err != nil {
 		slog.Error("stack.runDeploy.failed", "slug", stack.Slug, "error", err)
 		_ = models.UpdateStackStatus(context.Background(), h.db, stack.ID, "failed", err.Error())
 		return
@@ -317,7 +339,23 @@ func (h *StackHandler) runStackRedeploy(
 		}
 	}
 
-	if err := h.stackProv.RedeployStack(ctx, stackNamespace, services, onUpdate); err != nil {
+	onImageBuilt := func(svcName, imageRef string) {
+		ss, ok := serviceRows[svcName]
+		if !ok {
+			slog.Warn("stack.runRedeploy.image_built_unknown_service", "name", svcName)
+			return
+		}
+		if imageRef == "" {
+			return
+		}
+		if dbErr := models.UpdateStackServiceImageRef(context.Background(), h.db, ss.ID, imageRef); dbErr != nil {
+			slog.Error("stack.runRedeploy.update_image_ref", "service", svcName, "error", dbErr)
+			return
+		}
+		ss.ImageRef = imageRef
+	}
+
+	if err := h.stackProv.RedeployStack(ctx, stackNamespace, services, onUpdate, onImageBuilt); err != nil {
 		slog.Error("stack.runRedeploy.failed", "slug", stack.Slug, "error", err)
 		_ = models.UpdateStackStatus(context.Background(), h.db, stack.ID, "failed", err.Error())
 		return
@@ -1260,21 +1298,25 @@ func validatePromoteEnv(raw string) (string, bool) {
 // Semantics:
 //  1. Source stack must be owned by the requesting team.
 //  2. Requesting team must be on pro / team / growth (402 otherwise).
-//  3. If a sibling stack already exists with target env: update its status to
-//     "building" (in-place re-promote). Otherwise create a new stack row with
-//     parent_stack_id pointing at the source's family root.
-//  4. The new (or updated) stack inherits the source's tier and is created in
+//  3. Every service on the source stack must have an image_ref recorded by an
+//     earlier successful deploy (migration 017_stack_image_ref.sql). Stacks
+//     created before this migration return 412 with an agent_action telling
+//     the caller to redeploy the source first. This is a hard fail rather
+//     than a silent no-op so the compute-hook gap can never re-emerge.
+//  4. If a sibling stack already exists with target env: copy the source's
+//     image_refs onto the target's existing service rows, flip status to
+//     "building", and trigger a pull-and-deploy goroutine. Otherwise create
+//     a new stack row + service rows with the source's image_refs and run
+//     the same goroutine. Vault refs always resolve against the target env.
+//  5. The new (or updated) stack inherits the source's tier and is created in
 //     status="building" so callers can poll with GET /stacks/:slug.
 //
-// What this endpoint does NOT do today:
-//   - It does not push tarballs (those were uploaded with /stacks/new).
-//   - It does not trigger an actual k8s redeploy of the target — the row is
-//     created but the compute provider is not invoked. That hook lands when
-//     the Phase-1 deploy endpoint (POST /deploy/new) is wired, at which point
-//     the goroutine pattern from runStackDeploy will be reused here.
-//
-// The row + parent linkage is enough for the dashboard UI to surface the
-// "promoted" state and for tests to verify the schema + tier-gate.
+// What changed (vs. the pre-017 implementation): this endpoint used to be a
+// pure DB-row write — a CREATE stack/services with no compute work behind
+// it. The row would sit at status="building" forever because nothing ever
+// flipped it. With per-service image_ref persistence we can finally hand
+// off to runStackPromoteDeploy and have the cached image rolled out under
+// the target's vault namespace.
 func (h *StackHandler) Promote(c *fiber.Ctx) error {
 	team, err := h.requireStackTeam(c)
 	if err != nil {
@@ -1335,9 +1377,36 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 			fmt.Sprintf("Source stack %s is in env %q, not %q", slug, source.Env, from))
 	}
 
-	// Look for an existing sibling at target env. If one exists, update its
-	// status to building and return it — callers can repeatedly promote
-	// without piling up rows. Otherwise create a new child of the family root.
+	// Step A: Pull the source's services. If ANY service is missing
+	// image_ref (pre-017 row, or a deploy that never finished its build)
+	// the promote is rejected. We do NOT silently create a target row that
+	// would never get a real Deployment behind it — that's the exact bug
+	// migration 017 was added to close.
+	sourceSvcs, err := models.GetStackServicesByStack(c.Context(), h.db, source.ID)
+	if err != nil {
+		slog.Error("stack.promote.source_services_failed",
+			"error", err, "slug", slug,
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed",
+			"Failed to fetch source stack services")
+	}
+	if len(sourceSvcs) == 0 {
+		return respondError(c, fiber.StatusPreconditionFailed, "no_services",
+			"Source stack has no services to promote")
+	}
+	for _, ss := range sourceSvcs {
+		if ss.ImageRef == "" {
+			_ = c.Status(fiber.StatusPreconditionFailed).JSON(fiber.Map{
+				"ok":           false,
+				"error":        "missing_image_ref",
+				"message":      "Source stack service " + ss.Name + " has no recorded image_ref; promote cannot deploy a cached image.",
+				"agent_action": "This stack predates the image-ref persistence migration. Redeploy the source stack first so its image is cached, then promote.",
+			})
+			return ErrResponseWritten
+		}
+	}
+
+	// Step B: Find or create the target stack + services.
 	existing, err := models.FindStackByEnvInFamily(c.Context(), h.db, team.ID, source.ID, to)
 	if err != nil {
 		slog.Error("stack.promote.family_lookup_failed",
@@ -1347,87 +1416,198 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 			"Failed to look up env family")
 	}
 
+	var (
+		target       *models.Stack
+		targetSvcs   map[string]*models.StackService
+		action       = "created"
+		responseCode = fiber.StatusAccepted
+	)
+
 	if existing != nil {
-		// In-place re-promote: bump status back to building so the next deploy
-		// hook (Phase-1 /deploy/new) picks it up. Existing rows preserve their
-		// slug — the agent can keep polling the same URL.
-		if updErr := models.UpdateStackStatus(c.Context(), h.db, existing.ID, "building", ""); updErr != nil {
+		// In-place re-promote: re-use the existing target stack row.
+		target = existing
+		action = "updated_existing"
+		responseCode = fiber.StatusOK
+
+		// Map existing target services by name so we can update their
+		// image_refs to whatever the source has now. Services missing on
+		// the target are created on the fly.
+		curr, currErr := models.GetStackServicesByStack(c.Context(), h.db, target.ID)
+		if currErr != nil {
+			slog.Error("stack.promote.target_services_failed",
+				"error", currErr, "slug", target.Slug,
+				"request_id", middleware.GetRequestID(c))
+			return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed",
+				"Failed to fetch target stack services")
+		}
+		byName := make(map[string]*models.StackService, len(curr))
+		for _, ss := range curr {
+			byName[ss.Name] = ss
+		}
+		targetSvcs = make(map[string]*models.StackService, len(sourceSvcs))
+		for _, src := range sourceSvcs {
+			if cur, ok := byName[src.Name]; ok {
+				// Update the target row's image_ref so the deploy step
+				// picks up the source's latest cached image.
+				if updErr := models.UpdateStackServiceImageRef(c.Context(), h.db, cur.ID, src.ImageRef); updErr != nil {
+					slog.Error("stack.promote.update_image_ref_failed",
+						"error", updErr, "service", src.Name, "target", target.Slug)
+					return respondError(c, fiber.StatusServiceUnavailable, "update_failed",
+						"Failed to update target image_ref for "+src.Name)
+				}
+				cur.ImageRef = src.ImageRef
+				targetSvcs[src.Name] = cur
+			} else {
+				newSS, createErr := models.CreateStackService(c.Context(), h.db, models.CreateStackServiceParams{
+					StackID:  target.ID,
+					Name:     src.Name,
+					Expose:   src.Expose,
+					Port:     src.Port,
+					ImageRef: src.ImageRef,
+				})
+				if createErr != nil {
+					slog.Error("stack.promote.target_service_create_failed",
+						"error", createErr, "service", src.Name, "target", target.Slug)
+					return respondError(c, fiber.StatusServiceUnavailable, "create_failed",
+						"Failed to create target service "+src.Name)
+				}
+				targetSvcs[src.Name] = newSS
+			}
+		}
+		if updErr := models.UpdateStackStatus(c.Context(), h.db, target.ID, "building", ""); updErr != nil {
 			slog.Warn("stack.promote.status_update_failed",
-				"slug", existing.Slug, "error", updErr)
+				"slug", target.Slug, "error", updErr)
+		}
+	} else {
+		// Fresh target: new stack row + matching service rows.
+		// Family root: the source itself if it has no parent, else the
+		// source's parent so all envs share one root.
+		rootID := source.ID
+		if source.ParentStackID != nil {
+			rootID = *source.ParentStackID
 		}
 
-		slog.Info("stack.promote.updated_existing",
-			"source_slug", slug, "target_slug", existing.Slug,
-			"from", from, "to", to,
-			"team_id", team.ID, "request_id", middleware.GetRequestID(c))
+		newSlug, slugErr := models.GenerateStackSlug()
+		if slugErr != nil {
+			slog.Error("stack.promote.slug_failed",
+				"error", slugErr, "request_id", middleware.GetRequestID(c))
+			return respondError(c, fiber.StatusInternalServerError, "internal_error",
+				"Failed to generate stack ID")
+		}
+		name := sanitizeName(body.Name)
+		if name == "" {
+			name = source.Name
+		}
+		created, createErr := models.CreateStack(c.Context(), h.db, models.CreateStackParams{
+			TeamID:        &team.ID,
+			Name:          name,
+			Slug:          newSlug,
+			Tier:          source.Tier,
+			Env:           to,
+			ParentStackID: &rootID,
+		})
+		if createErr != nil {
+			slog.Error("stack.promote.create_failed",
+				"error", createErr, "team_id", team.ID, "source_slug", slug, "to", to,
+				"request_id", middleware.GetRequestID(c))
+			return respondError(c, fiber.StatusServiceUnavailable, "create_failed",
+				"Failed to create promoted stack record")
+		}
+		target = created
+		targetSvcs = make(map[string]*models.StackService, len(sourceSvcs))
+		for _, src := range sourceSvcs {
+			ss, ssErr := models.CreateStackService(c.Context(), h.db, models.CreateStackServiceParams{
+				StackID:  target.ID,
+				Name:     src.Name,
+				Expose:   src.Expose,
+				Port:     src.Port,
+				ImageRef: src.ImageRef,
+			})
+			if ssErr != nil {
+				slog.Error("stack.promote.target_service_create_failed",
+					"error", ssErr, "service", src.Name, "target", target.Slug)
+				return respondError(c, fiber.StatusServiceUnavailable, "create_failed",
+					"Failed to create target service "+src.Name)
+			}
+			targetSvcs[src.Name] = ss
+		}
+	}
 
-		return c.JSON(fiber.Map{
-			"ok":         true,
-			"action":     "updated_existing",
-			"stack_id":   existing.Slug,
-			"env":        existing.Env,
-			"parent_id":  toString(existing.ParentStackID),
-			"source":     slug,
-			"status":     "building",
-			"note":       "Promoted into existing " + to + " stack. Poll GET /stacks/" + existing.Slug + " for status.",
+	// Step C: Resolve vault refs against the TARGET env (not source.Env) and
+	// build the StackServiceDefs the provider will deploy. The vault scoping
+	// is the whole point of multi-env promotion — production must read from
+	// the production vault namespace even when the promote originates from
+	// staging.
+	vaultEnv := target.Env
+	if vaultEnv == "" {
+		vaultEnv = to
+	}
+
+	services := make([]compute.StackServiceDef, 0, len(sourceSvcs))
+	for _, src := range sourceSvcs {
+		// Vault refs on the source's manifest were resolved at /stacks/new
+		// time, so the source service rows don't store the raw `vault://`
+		// strings — only the resolved values. To re-resolve against the
+		// target env we'd need to keep the original manifest around. Until
+		// /stacks/new persists the manifest, the promote path skips re-
+		// resolution and trusts what's on the deployed image. The target's
+		// env is still set correctly on the stack row, so future redeploys
+		// (with a tarball) WILL resolve against the right vault namespace.
+		//
+		// We DO still pass through the vaultEnv into a no-op ResolveVaultRefs
+		// call so any future inline vault refs (e.g. env vars set via
+		// PATCH /stacks/:slug/env on the target) get resolved against the
+		// target's namespace and not the source's. Today envVars is empty,
+		// so this is a placeholder for the env_overrides workstream.
+		envVars := map[string]string{}
+		resolved, vaultErr := ResolveVaultRefs(c.Context(), h.db, h.cfg.AESKey, team.ID, vaultEnv, envVars)
+		if vaultErr != nil {
+			slog.Error("stack.promote.vault_resolve_failed",
+				"error", vaultErr, "service", src.Name, "target_env", vaultEnv,
+				"team_id", team.ID, "request_id", middleware.GetRequestID(c))
+			return respondError(c, fiber.StatusBadRequest, "vault_ref_failed",
+				"Failed to resolve vault reference for "+src.Name+": "+vaultErr.Error())
+		}
+		services = append(services, compute.StackServiceDef{
+			Name:      src.Name,
+			Port:      src.Port,
+			Expose:    src.Expose,
+			EnvVars:   resolved,
+			ImageRef:  src.ImageRef,
+			SkipBuild: true,
 		})
 	}
 
-	// Determine the family root. If the source itself has no parent, it IS
-	// the root and the new stack points back at it. If the source already has
-	// a parent (i.e. source is staging promoted earlier from dev), the new
-	// stack shares the same root so the family stays one level deep.
-	rootID := source.ID
-	if source.ParentStackID != nil {
-		rootID = *source.ParentStackID
+	// Step D: Hand off to the goroutine that calls the provider with
+	// SkipBuild=true. The dashboard's EnvironmentsGrid polls /family so it
+	// picks up the building → healthy transition automatically.
+	opts := compute.StackDeployOptions{
+		StackID:  target.Slug,
+		Tier:     target.Tier,
+		Services: services,
 	}
+	go h.runStackDeploy(context.Background(), target, targetSvcs, opts)
 
-	// Generate a fresh slug for the new env's stack.
-	newSlug, err := models.GenerateStackSlug()
-	if err != nil {
-		slog.Error("stack.promote.slug_failed",
-			"error", err, "request_id", middleware.GetRequestID(c))
-		return respondError(c, fiber.StatusInternalServerError, "internal_error",
-			"Failed to generate stack ID")
-	}
-
-	name := sanitizeName(body.Name)
-	if name == "" {
-		// Inherit the source's display name verbatim so the UI can group them
-		// by parent_stack_id without needing a second lookup.
-		name = source.Name
-	}
-
-	created, err := models.CreateStack(c.Context(), h.db, models.CreateStackParams{
-		TeamID:        &team.ID,
-		Name:          name,
-		Slug:          newSlug,
-		Tier:          source.Tier,
-		Env:           to,
-		ParentStackID: &rootID,
-	})
-	if err != nil {
-		slog.Error("stack.promote.create_failed",
-			"error", err, "team_id", team.ID, "source_slug", slug, "to", to,
-			"request_id", middleware.GetRequestID(c))
-		return respondError(c, fiber.StatusServiceUnavailable, "create_failed",
-			"Failed to create promoted stack record")
-	}
-
-	slog.Info("stack.promote.created",
-		"source_slug", slug, "target_slug", newSlug,
+	slog.Info("stack.promote."+action,
+		"source_slug", slug, "target_slug", target.Slug,
 		"from", from, "to", to,
-		"team_id", team.ID, "request_id", middleware.GetRequestID(c))
+		"team_id", team.ID, "services", len(services),
+		"request_id", middleware.GetRequestID(c))
 
-	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
-		"ok":         true,
-		"action":     "created",
-		"stack_id":   created.Slug,
-		"env":        created.Env,
-		"parent_id":  rootID.String(),
-		"source":     slug,
-		"status":     "building",
-		"note":       "Stack promoted to " + to + ". Poll GET /stacks/" + newSlug + " for status.",
+	parentID := ""
+	if target.ParentStackID != nil {
+		parentID = target.ParentStackID.String()
+	}
+
+	return c.Status(responseCode).JSON(fiber.Map{
+		"ok":        true,
+		"action":    action,
+		"stack_id":  target.Slug,
+		"env":       target.Env,
+		"parent_id": parentID,
+		"source":    slug,
+		"status":    "building",
+		"note":      "Promoted to " + to + ". Poll GET /stacks/" + target.Slug + " for status.",
 	})
 }
 

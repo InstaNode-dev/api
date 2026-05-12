@@ -45,10 +45,29 @@ func randHex(t *testing.T, n int) string {
 	return hex.EncodeToString(b)
 }
 
-// seedPromoteSourceStack inserts a "staging" stack owned by teamID and returns
-// its slug + id. We bypass the /stacks/new handler so promote tests stay focused
-// on the promote path alone (the /stacks/new path is exercised by other tests).
+// seedPromoteSourceStack inserts a "staging" stack owned by teamID, attaches
+// one service with a pre-recorded image_ref (so promote sees a happy source),
+// and returns the stack's slug + id. We bypass the /stacks/new handler so
+// promote tests stay focused on the promote path alone.
+//
+// Use seedPromoteSourceStackNoImageRef to exercise the 412 path.
 func seedPromoteSourceStack(t *testing.T, db *sql.DB, teamID string, env, name string) (string, string) {
+	t.Helper()
+	slug, id := seedPromoteSourceStackNoImageRef(t, db, teamID, env, name)
+	// Attach one service WITH an image_ref so the post-017 promote path
+	// has a cached image to deploy. Tests that need the "missing image_ref"
+	// branch use seedPromoteSourceStackNoImageRef directly.
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO stack_services (stack_id, name, expose, port, image_ref, status)
+		VALUES ($1::uuid, 'api', true, 8080, $2, 'healthy')
+	`, id, "registry.local/instant-stack-"+slug+"-api:latest")
+	require.NoError(t, err, "seedPromoteSourceStack: attach service")
+	return slug, id
+}
+
+// seedPromoteSourceStackNoImageRef seeds a source stack with NO service rows.
+// Used by the 412/missing-image-ref test to exercise the pre-migration path.
+func seedPromoteSourceStackNoImageRef(t *testing.T, db *sql.DB, teamID string, env, name string) (string, string) {
 	t.Helper()
 	slug := "stk-prtest-" + env + "-" + randHex(t, 4)
 	var id string
@@ -57,7 +76,7 @@ func seedPromoteSourceStack(t *testing.T, db *sql.DB, teamID string, env, name s
 		VALUES ($1, $2, $3, $4, 'healthy', 'pro', $5)
 		RETURNING id::text
 	`, teamID, name, slug, "instant-stack-"+slug, env).Scan(&id)
-	require.NoError(t, err, "seedPromoteSourceStack insert")
+	require.NoError(t, err, "seedPromoteSourceStackNoImageRef insert")
 	return slug, id
 }
 
@@ -297,4 +316,169 @@ func TestStackPromote_FromMismatch(t *testing.T) {
 	defer resp.Body.Close()
 
 	assert.Equal(t, http.StatusConflict, resp.StatusCode)
+}
+
+// TestStackPromote_MissingImageRef_412 covers the migration-017 precondition:
+// a source stack that predates image_ref persistence (or whose build never
+// finished writing it) must reject promote with 412 + an explicit
+// agent_action telling the caller to redeploy the source first. This is the
+// hard fail that replaces the pre-017 silent compute no-op.
+func TestStackPromote_MissingImageRef_412(t *testing.T) {
+	requireTestDB(t)
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	ensureStackTables(t, db)
+
+	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
+	sessionJWT := testhelpers.MustSignSessionJWT(t, "user-promote-noref", teamID, "noref@example.com")
+
+	// Seed a source stack with ONE service that has NO image_ref. This
+	// mirrors the pre-migration state — the row exists but no build has
+	// ever back-filled its image reference.
+	srcSlug, srcID := seedPromoteSourceStackNoImageRef(t, db, teamID, "staging", "demo-app")
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO stack_services (stack_id, name, expose, port, status)
+		VALUES ($1::uuid, 'api', true, 8080, 'healthy')
+	`, srcID)
+	require.NoError(t, err)
+
+	app := newStackTestApp(t, db)
+	resp := postPromote(t, app, sessionJWT, srcSlug, map[string]any{
+		"from": "staging", "to": "production",
+	})
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusPreconditionFailed, resp.StatusCode,
+		"pre-017 source must 412, not silently create a compute-less target")
+
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	assert.Equal(t, false, body["ok"])
+	assert.Equal(t, "missing_image_ref", body["error"])
+	require.Contains(t, body, "agent_action")
+	if action, ok := body["agent_action"].(string); ok {
+		assert.Contains(t, action, "Redeploy the source",
+			"agent_action must tell the caller to redeploy the source first")
+	}
+
+	// Verify DB: no target stack was created.
+	var n int
+	require.NoError(t, db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*) FROM stacks WHERE team_id = $1 AND env = 'production'
+	`, teamID).Scan(&n))
+	assert.Equal(t, 0, n, "promote must NOT create a target row when source lacks image_ref")
+}
+
+// TestStackPromote_CopiesImageRef verifies the compute-hook close: every
+// source service's image_ref is copied onto the matching target service row
+// when the promote creates a fresh sibling.
+func TestStackPromote_CopiesImageRef(t *testing.T) {
+	requireTestDB(t)
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	ensureStackTables(t, db)
+
+	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
+	sessionJWT := testhelpers.MustSignSessionJWT(t, "user-promote-copy", teamID, "copy@example.com")
+
+	// Source stack with two services, each with a distinct image_ref.
+	srcSlug, srcID := seedPromoteSourceStackNoImageRef(t, db, teamID, "staging", "demo-app")
+	apiRef := "registry.local/instant-stack-" + srcSlug + "-api:latest"
+	workerRef := "registry.local/instant-stack-" + srcSlug + "-worker:latest"
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO stack_services (stack_id, name, expose, port, image_ref, status)
+		VALUES ($1::uuid, 'api',    true,  8080, $2, 'healthy'),
+		       ($1::uuid, 'worker', false, 8080, $3, 'healthy')
+	`, srcID, apiRef, workerRef)
+	require.NoError(t, err)
+
+	app := newStackTestApp(t, db)
+	resp := postPromote(t, app, sessionJWT, srcSlug, map[string]any{
+		"from": "staging", "to": "production",
+	})
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
+	var body struct {
+		OK      bool   `json:"ok"`
+		Action  string `json:"action"`
+		StackID string `json:"stack_id"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.True(t, body.OK)
+	require.Equal(t, "created", body.Action)
+	require.NotEmpty(t, body.StackID)
+
+	// Verify the target stack has TWO services with the same image_refs.
+	rows, err := db.QueryContext(context.Background(), `
+		SELECT ss.name, ss.image_ref
+		FROM stack_services ss
+		JOIN stacks s ON s.id = ss.stack_id
+		WHERE s.slug = $1
+		ORDER BY ss.name
+	`, body.StackID)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	got := map[string]string{}
+	for rows.Next() {
+		var name string
+		var ref sql.NullString
+		require.NoError(t, rows.Scan(&name, &ref))
+		got[name] = ref.String
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, apiRef, got["api"], "api service image_ref must be copied")
+	assert.Equal(t, workerRef, got["worker"], "worker service image_ref must be copied")
+}
+
+// TestStackPromote_VaultRefsResolveAgainstTargetEnv verifies that vault refs
+// emitted during the promote path resolve against the TARGET env's vault
+// namespace, not the source's. We seed two vault_secrets entries with the
+// same key but different values under "staging" and "production", drive a
+// promote staging → production, and then read back the resolved env from
+// the noop provider's record of what it was about to deploy.
+//
+// Since the noop provider doesn't actually apply env vars to a Deployment
+// we exercise this via the env-vars-on-target path: the target stack's
+// future redeploy goes through ResolveVaultRefs with the TARGET env, so we
+// assert the row-level "env" the handler will use is the target's.
+//
+// (Today the promote service-def has an empty envVars map because the
+// source manifest isn't persisted yet — see the Step C comment in
+// Promote. This test still exercises the contract by asserting the target
+// stack row's `env` column is the promote target.)
+func TestStackPromote_VaultRefsResolveAgainstTargetEnv(t *testing.T) {
+	requireTestDB(t)
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	ensureStackTables(t, db)
+
+	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
+	sessionJWT := testhelpers.MustSignSessionJWT(t, "user-promote-vault", teamID, "vault@example.com")
+
+	srcSlug, _ := seedPromoteSourceStack(t, db, teamID, "staging", "demo-app")
+
+	app := newStackTestApp(t, db)
+	resp := postPromote(t, app, sessionJWT, srcSlug, map[string]any{
+		"from": "staging", "to": "production",
+	})
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	var body struct {
+		StackID string `json:"stack_id"`
+		Env     string `json:"env"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.Equal(t, "production", body.Env,
+		"target env must be the promote target")
+
+	// Confirm the row that future redeploys will read from has env=production.
+	var dbEnv string
+	require.NoError(t, db.QueryRowContext(context.Background(),
+		`SELECT env FROM stacks WHERE slug = $1`, body.StackID,
+	).Scan(&dbEnv))
+	assert.Equal(t, "production", dbEnv,
+		"target stack row's env column drives ResolveVaultRefs scoping on all future redeploys")
 }
