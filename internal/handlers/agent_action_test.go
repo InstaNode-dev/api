@@ -99,7 +99,7 @@ func TestRespondError_KnownCode_PopulatesAgentAction(t *testing.T) {
 			code:             "upgrade_required",
 			status:           fiber.StatusPaymentRequired,
 			wantUpgradeURL:   true,
-			wantActionSubstr: "higher plan",
+			wantActionSubstr: "Pro plan",
 		},
 		{
 			name:             "rate_limit_exceeded gets upgrade_url",
@@ -127,14 +127,14 @@ func TestRespondError_KnownCode_PopulatesAgentAction(t *testing.T) {
 			code:             "auth_required",
 			status:           fiber.StatusPaymentRequired,
 			wantUpgradeURL:   false,
-			wantActionSubstr: "log in at https://instanode.dev/login",
+			wantActionSubstr: "https://instanode.dev/login",
 		},
 		{
 			name:             "webhook_inactive tells agent to re-provision",
 			code:             "webhook_inactive",
 			status:           fiber.StatusGone,
 			wantUpgradeURL:   false,
-			wantActionSubstr: "POST /webhook/new",
+			wantActionSubstr: "https://instanode.dev/webhook/new",
 		},
 		{
 			name:             "forbidden suggests checking team membership",

@@ -187,8 +187,14 @@ func RequireEnvAccess(action string, opts ...EnvPolicyOption) fiber.Handler {
 		if agentRole == "" {
 			agentRole = "unknown"
 		}
+		// agent_action conforms to the U3 contract — see
+		// internal/handlers/agent_action.go. The middleware lives in a
+		// different package, so the string is built inline here; the
+		// shape (open with "Tell the user", name the specific reason,
+		// name the exact next action, include full https://instanode.dev/ URL)
+		// must stay in sync.
 		agentAction := fmt.Sprintf(
-			"Tell the user this team's %s env requires the %s role to %s. Their role is %s. Have an owner run the prompt instead.",
+			"Tell the user the %s env requires the %s role to %s. Their role is %s — have a team owner run the prompt at https://instanode.dev/app/team or adjust the env-policy.",
 			env, formatAllowedRoles(allowed), action, agentRole,
 		)
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{

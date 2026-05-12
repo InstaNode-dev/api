@@ -86,10 +86,11 @@ const RecycleGateErrorCode = "free_tier_recycle_requires_claim"
 const RecycleGateClaimURL = "https://instanode.dev/claim"
 
 // RecycleGateAgentAction is the verbatim sentence the calling agent surfaces
-// to the human user when the gate fires.
-const RecycleGateAgentAction = "Tell the user their previous free resource expired. " +
-	"Free tier resources require a one-time email claim before provisioning a replacement. " +
-	"Have them claim at https://instanode.dev/claim — takes 30 seconds, no card."
+// to the human user when the gate fires. Adheres to the U3 contract
+// (agent_action.go): "Tell the user" opening, specific reason
+// (previous free resource expired), exact action (claim at the URL), full
+// https://instanode.dev/ URL, under 280 chars.
+const RecycleGateAgentAction = "Tell the user their previous free resource expired and the free tier requires a one-time email claim before re-provisioning. Have them claim at https://instanode.dev/claim — takes 30 seconds, no card."
 
 // RecycleGateMessage is the human-readable explanation accompanying the
 // machine error code.
