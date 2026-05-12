@@ -85,6 +85,9 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			trial_ends_at     TIMESTAMPTZ,
 			created_at        TIMESTAMPTZ DEFAULT now()
 		)`,
+		// Slice 6 (migration 019_env_policy.sql) — mirror the column here
+		// so tests pick it up on every DB bring-up.
+		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS env_policy JSONB NOT NULL DEFAULT '{}'::jsonb`,
 		`CREATE TABLE IF NOT EXISTS users (
 			id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			team_id     UUID REFERENCES teams(id) ON DELETE CASCADE,

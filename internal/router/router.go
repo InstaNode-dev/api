@@ -108,6 +108,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 
 	resourceH := handlers.NewResourceHandler(db, rdb, cfg, planRegistry, provClient, storageProv)
 	teamMembersH := handlers.NewTeamMembersHandler(db, cfg, planRegistry, emailClient)
+	envPolicyH := handlers.NewEnvPolicyHandler(db)
 	dbH := handlers.NewDBHandler(db, rdb, cfg, provClient, planRegistry)
 	cacheH := handlers.NewCacheHandler(db, rdb, cfg, provClient, planRegistry)
 	nosqlH := handlers.NewNoSQLHandler(db, rdb, cfg, provClient, planRegistry)
@@ -179,9 +180,23 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Post("/webhook/receive/:token", webhookH.Receive)
 	app.Get("/resources/:token/logs", logsH.ResourceLogs)
 
-	// Deploy — Phase 6 (auth required on all endpoints)
-	deployGroup := app.Group("/deploy", middleware.RequireAuth(cfg))
-	deployGroup.Post("/new", deployH.New)
+	// Deploy — Phase 6 (auth required on all endpoints).
+	// POST /deploy/new is gated by RequireEnvAccess(ActionDeploy) — the
+	// env scope arrives as a multipart form field (not JSON or query), so
+	// we provide a custom env-lookup that reads c.FormValue("env") and
+	// falls back to "production" for the policy check.
+	deployGroup := app.Group("/deploy", middleware.RequireAuth(cfg), middleware.PopulateTeamRole())
+	deployGroup.Post("/new",
+		middleware.RequireEnvAccess(middleware.EnvPolicyActionDeploy,
+			middleware.WithEnvLookup(func(c *fiber.Ctx) (string, error) {
+				if v := c.FormValue("env"); v != "" {
+					return v, nil
+				}
+				return "", nil
+			}),
+		),
+		deployH.New,
+	)
 	deployGroup.Get("/:id", deployH.Get)
 	deployGroup.Get("/:id/logs", deployH.Logs)
 	deployGroup.Patch("/:id/env", deployH.UpdateEnv)
@@ -246,8 +261,9 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Post("/api/v1/invitations/:token/accept", teamsHPublic.AcceptInvitation)
 
 	// Authenticated resource management
-	middleware.SetRoleLookupDB(db) // populate auth_team_role on every RequireAuth
-	middleware.SetAPIKeyDB(db)     // enable PAT auth path in RequireAuth
+	middleware.SetRoleLookupDB(db)  // populate auth_team_role on every RequireAuth
+	middleware.SetAPIKeyDB(db)      // enable PAT auth path in RequireAuth
+	middleware.SetEnvPolicyDB(db)   // RequireEnvAccess reads teams.env_policy
 	api := app.Group("/api/v1", middleware.RequireAuth(cfg), middleware.PopulateTeamRole())
 
 	// /whoami — identity probe for agents. Returning 401 here is the canonical
@@ -260,8 +276,28 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Get("/resources", resourceH.List)
 	api.Get("/resources/:id", resourceH.Get)
 	api.Get("/resources/:id/credentials", resourceH.GetCredentials)
-	api.Delete("/resources/:id", resourceH.Delete)
+	// DELETE is env-policy gated: the env scope is the env recorded on the
+	// resource row itself (NOT a request param). The custom lookup reads
+	// the resource by URL :id and returns its env. Lookup errors fall
+	// through to the handler so a 404 / 403 surfaces with the real reason
+	// instead of a confusing 403/env_policy_denied.
+	api.Delete("/resources/:id",
+		middleware.RequireEnvAccess(middleware.EnvPolicyActionDeleteResource,
+			middleware.WithEnvLookup(func(c *fiber.Ctx) (string, error) {
+				return handlers.ResourceEnvByTokenForMiddleware(c, db)
+			}),
+		),
+		resourceH.Delete,
+	)
 	api.Post("/resources/:id/rotate-credentials", resourceH.RotateCredentials)
+
+	// Team env-policy (slice 6) — owner edits, any member reads.
+	// Owner-check is enforced inside Put (with a structured 403 body that
+	// mirrors RequireEnvAccess's shape) rather than via RequireRole, so the
+	// dashboard and agents see one consistent error keyword for env-policy
+	// rejections.
+	api.Get("/team/env-policy", envPolicyH.Get)
+	api.Put("/team/env-policy", envPolicyH.Put)
 
 	api.Get("/team/members", teamMembersH.ListMembers)
 	api.Post("/team/members/invite", teamMembersH.InviteMember)
@@ -295,8 +331,12 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 
 	// Env promotion — Pro+ "promote staging → production" + sibling envs.
 	// Tier gate (pro/team/growth) is enforced inside the handler so the
-	// router doesn't have to know the policy.
-	api.Post("/stacks/:slug/promote", stackH.Promote)
+	// router doesn't have to know the policy. RequireEnvAccess gates the
+	// target env (read from the "to" field via the default JSON lookup).
+	api.Post("/stacks/:slug/promote",
+		middleware.RequireEnvAccess(middleware.EnvPolicyActionDeploy),
+		stackH.Promote,
+	)
 
 	// Env family — Pro+ "show me production + staging + dev variants of
 	// this app side-by-side." Same tier gate as promote (handler-enforced).
@@ -332,8 +372,12 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Post("/vault/:env/:key/rotate", vaultH.RotateSecret)
 	// Vault env-to-env bulk copy (Pro+ tier-gated inside the handler) —
 	// pairs with POST /api/v1/stacks/:slug/promote for the dashboard's
-	// "promote staging → production" flow.
-	api.Post("/vault/copy", vaultH.CopySecrets)
+	// "promote staging → production" flow. RequireEnvAccess gates the
+	// target env using the default "to" JSON-body lookup.
+	api.Post("/vault/copy",
+		middleware.RequireEnvAccess(middleware.EnvPolicyActionVaultWrite),
+		vaultH.CopySecrets,
+	)
 
 	// Teams + RBAC invitation flow (Phase 3). Public accept route is
 	// registered above the api group so the auth middleware doesn't catch it.

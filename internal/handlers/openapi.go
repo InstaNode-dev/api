@@ -192,6 +192,7 @@ const openAPISpec = `{
           "400": { "description": "Invalid body, missing 'to', from==to, or invalid env name" },
           "401": { "description": "Unauthorized — session required" },
           "402": { "description": "Upgrade required — team is not on pro/team/growth. Response carries upgrade_url + agent_action." },
+          "403": { "description": "Blocked by team env_policy. Body: { error: 'env_policy_denied', env, action, role, allowed_roles, agent_action }." },
           "404": { "description": "Source stack not found or not owned by this team" },
           "409": { "description": "Source env did not match the asserted 'from'" }
         }
@@ -244,7 +245,8 @@ const openAPISpec = `{
           },
           "400": { "description": "Invalid body, missing from/to, from==to, or invalid env/key name" },
           "401": { "description": "Unauthorized — session required" },
-          "402": { "description": "Upgrade required — team is not on pro/team/growth. Response carries upgrade_url + agent_action." }
+          "402": { "description": "Upgrade required — team is not on pro/team/growth. Response carries upgrade_url + agent_action." },
+          "403": { "description": "Blocked by team env_policy. Body: { error: 'env_policy_denied', env, action, role, allowed_roles, agent_action }." }
         }
       }
     },
@@ -257,6 +259,7 @@ const openAPISpec = `{
         "responses": {
           "202": { "description": "Deployment accepted, building", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
           "401": { "description": "Unauthorized" },
+          "403": { "description": "Blocked by team env_policy. Body: { error: 'env_policy_denied', env, action, role, allowed_roles, agent_action }." },
           "503": { "description": "Compute backend unavailable or service disabled" }
         }
       }
@@ -509,7 +512,67 @@ const openAPISpec = `{
         "summary": "Delete a resource",
         "security": [{ "bearerAuth": [] }],
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-        "responses": { "200": { "description": "Resource deleted" }, "403": { "description": "Forbidden" } }
+        "responses": {
+          "200": { "description": "Resource deleted" },
+          "403": { "description": "Forbidden — not your resource OR blocked by team env_policy. The env_policy variant carries body: { error: 'env_policy_denied', env, action, role, allowed_roles, agent_action }." }
+        }
+      }
+    },
+    "/api/v1/team/env-policy": {
+      "get": {
+        "summary": "Get the team's per-env access policy",
+        "description": "Returns the policy JSON. Any authenticated team member may read. An empty policy ({}) means no enforcement — every role can perform every action on every env (the default and backward-compat baseline).",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Policy fetched",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok":     { "type": "boolean" },
+                    "policy": {
+                      "type": "object",
+                      "description": "Shape: { <env>: { <action>: [<role>, ...] } }. Known actions: deploy, delete_resource, vault_write.",
+                      "additionalProperties": {
+                        "type": "object",
+                        "additionalProperties": { "type": "array", "items": { "type": "string" } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "description": "Unauthorized" }
+        }
+      },
+      "put": {
+        "summary": "Replace the team's per-env access policy (owner only)",
+        "description": "Writes the supplied policy verbatim, replacing any previous value. Empty {} disables enforcement. Validation: env names match ^[a-z0-9_-]{1,64}$, action names must be one of deploy/delete_resource/vault_write (unknown actions are rejected to catch typos), role names match ^[a-z0-9_]{1,32}$, total body capped at 8 KiB. Owner-only — non-owners receive 403 with agent_action telling them to have an owner run the prompt.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "The policy object itself (NOT wrapped). Example: {\"production\":{\"deploy\":[\"owner\"]}}",
+                "additionalProperties": {
+                  "type": "object",
+                  "additionalProperties": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Policy persisted; the response echoes the normalised policy." },
+          "400": { "description": "Invalid policy shape, unknown action, or malformed JSON. agent_action is populated when applicable." },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Caller is not the team owner. Body: { error: 'owner_required', role, allowed_roles, agent_action }." }
+        }
       }
     },
     "/api/v1/resources/{id}/rotate-credentials": {
