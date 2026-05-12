@@ -27,6 +27,46 @@ const (
 	audienceMismatchError = "invalid_token"
 )
 
+// AuthLoginURL is the URL agents should show users when their session
+// token is rejected. Exposed as a package-level variable so tests and
+// self-hosted operators can override it. Mirrors handlers.DefaultLoginURL —
+// duplicated rather than imported because the handlers package consumes
+// middleware (not the other way around), and a circular import would
+// otherwise be required to share the constant.
+var AuthLoginURL = "https://instanode.dev/login"
+
+// unauthorizedAgentAction is the canonical agent_action sentence served on
+// every 401 from RequireAuth. Mirrors the "unauthorized" entry in
+// handlers.codeToAgentAction so an agent inspecting either a handler-emitted
+// 401 (e.g. a stale session bouncing off /api/v1/billing/usage) or a
+// middleware-emitted 401 (e.g. no Authorization header at all) gets the same
+// remediation prose either way.
+const unauthorizedAgentAction = "The user's INSTANODE_TOKEN is invalid or expired. Have them log in at https://instanode.dev/login to mint a new one."
+
+// respondUnauthorized writes the canonical 401 body shape used by RequireAuth:
+//
+//	{
+//	  "ok": false,
+//	  "error": "unauthorized",
+//	  "agent_action": "The user's INSTANODE_TOKEN is invalid or expired...",
+//	  "upgrade_url": "https://instanode.dev/login"
+//	}
+//
+// agent_action is the verbatim sentence the calling agent should surface to
+// the human user, per the §10.15 agent-action contract. upgrade_url points
+// at the login page because re-auth is the remediation for every variant of
+// this error (no header, malformed JWT, expired JWT, wrong secret, missing
+// claims, invalid PAT). Kept as a single helper so adding RFC 6750
+// WWW-Authenticate headers in a future PR happens in one place.
+func respondUnauthorized(c *fiber.Ctx) error {
+	return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+		"ok":           false,
+		"error":        "unauthorized",
+		"agent_action": unauthorizedAgentAction,
+		"upgrade_url":  AuthLoginURL,
+	})
+}
+
 // defaultCanonicalResourceURL is the audience used when neither API_PUBLIC_URL
 // nor the live request host is available. Aliased to urls.PublicAPIBase to
 // keep the literal "https://api.instanode.dev" in exactly one place.
@@ -133,15 +173,28 @@ func rejectAudienceMismatch(c *fiber.Ctx) error {
 
 // RequireAuth validates the Authorization: Bearer {jwt} header.
 // On success it stores user_id and team_id in fiber.Locals and calls Next.
-// On failure it returns 401 { ok: false, error: "unauthorized" }.
+//
+// On failure it returns 401 with the canonical agent-action body shape:
+//
+//	{
+//	  "ok": false,
+//	  "error": "unauthorized",
+//	  "agent_action": "The user's INSTANODE_TOKEN is invalid or expired...",
+//	  "upgrade_url": "https://instanode.dev/login"
+//	}
+//
+// agent_action mirrors the "unauthorized" entry in handlers.codeToAgentAction
+// so a Claude / Cursor / MCP agent inspecting any 401 from this API gets the
+// same remediation prose whether the rejection happened in this middleware
+// or in a downstream handler (e.g. a session that decoded but had stale
+// claims). Audience-mismatch responses (RFC 8707) still go through
+// rejectAudienceMismatch and keep their distinct `invalid_token` error
+// keyword so agents can branch "wrong server" from "bad credentials".
 func RequireAuth(cfg *config.Config) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		header := c.Get("Authorization")
 		if len(header) < 8 || header[:7] != "Bearer " {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"ok":    false,
-				"error": "unauthorized",
-			})
+			return respondUnauthorized(c)
 		}
 		tokenStr := header[7:]
 
@@ -151,10 +204,7 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 		if IsAPIKey(tokenStr) {
 			ok, err := AuthenticateAPIKey(c, tokenStr)
 			if err != nil || !ok {
-				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-					"ok":    false,
-					"error": "unauthorized",
-				})
+				return respondUnauthorized(c)
 			}
 			return c.Next()
 		}
@@ -167,17 +217,11 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 			return []byte(cfg.JWTSecret), nil
 		})
 		if err != nil || !parsed.Valid {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"ok":    false,
-				"error": "unauthorized",
-			})
+			return respondUnauthorized(c)
 		}
 
 		if claims.UserID == "" || claims.TeamID == "" {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"ok":    false,
-				"error": "unauthorized",
-			})
+			return respondUnauthorized(c)
 		}
 
 		// RFC 8707 audience check — only enforced when the token actually
