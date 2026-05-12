@@ -80,6 +80,13 @@ type Config struct {
 
 	MetricsToken     string // METRICS_TOKEN — if set, required as Bearer token to access /metrics
 	DashboardBaseURL string // DASHBOARD_BASE_URL — where to redirect onboarding flows (default: http://localhost:5173)
+
+	// FamilyBindingsEnabled controls the "family:<root_id>" syntax in
+	// POST /deploy/new resource_bindings (slice 4 of env-aware deployments).
+	// Default true. Set FAMILY_BINDINGS_ENABLED=false to disable the resolver
+	// path — with the flag off, "family:..." values pass through as raw strings
+	// and fail token validation (deterministic disable for rollback).
+	FamilyBindingsEnabled bool
 }
 
 // ErrMissingConfig is returned when a required env var is absent.
@@ -195,6 +202,13 @@ func Load() *Config {
 	cfg.KubeNamespaceApps = getenv("KUBE_NAMESPACE_APPS", "instant-apps")
 	cfg.MetricsToken = os.Getenv("METRICS_TOKEN") // empty = open (local dev)
 	cfg.DashboardBaseURL = getenv("DASHBOARD_BASE_URL", "http://localhost:5173")
+	// FAMILY_BINDINGS_ENABLED: default true. Only "false" / "0" disables.
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("FAMILY_BINDINGS_ENABLED"))) {
+	case "false", "0", "no":
+		cfg.FamilyBindingsEnabled = false
+	default:
+		cfg.FamilyBindingsEnabled = true
+	}
 
 	if len(cfg.JWTSecret) < 32 {
 		panic("JWT_SECRET must be at least 32 bytes")

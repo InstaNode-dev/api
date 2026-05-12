@@ -291,6 +291,49 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		}
 	}
 
+	// Optional resource_bindings multipart field (slice 4 of env-aware
+	// deployments): JSON map of env-var-name → "family:<root_id>" or raw
+	// resource-token UUID. Resolved server-side BEFORE the deployments row
+	// is persisted so 4xx surfaces sit in front of the user (vs failing
+	// silently in the async runDeploy goroutine).
+	//
+	// Family bindings let one manifest work across all envs — the resolver
+	// walks the family for each root id, picks the member matching the
+	// deploy's env, and substitutes its decrypted connection URL into the
+	// deployment's env vars. Raw token UUIDs are also accepted (backward
+	// compat).
+	if vals := form.Value["resource_bindings"]; len(vals) > 0 {
+		var bindings map[string]string
+		if err := json.Unmarshal([]byte(vals[0]), &bindings); err != nil {
+			return respondError(c, fiber.StatusBadRequest, "invalid_resource_bindings",
+				"Field 'resource_bindings' must be a JSON object {KEY:\"family:<uuid>\" | \"<token-uuid>\", ...}")
+		}
+		resolved, bErr := resolveResourceBindings(
+			c.Context(), h.db, h.cfg.AESKey, team.ID, environment, bindings,
+			h.cfg.FamilyBindingsEnabled,
+		)
+		if bErr != nil {
+			status, code, msg, action := mapBindingError(bErr)
+			slog.Info("deploy.new.resource_binding_rejected",
+				"env_var", bErr.EnvVarKey,
+				"raw_value", bErr.RawValue,
+				"kind", string(bErr.Kind),
+				"team_id", team.ID,
+				"deploy_env", environment,
+				"request_id", middleware.GetRequestID(c))
+			return respondErrorWithAgentAction(c, status, code, msg, action, "")
+		}
+		// Merge resolved bindings — explicit env_vars from the caller win
+		// over family-resolved values, so an agent can still pin a literal
+		// override per env if needed.
+		for k, v := range resolved {
+			if _, present := initEnv[k]; present {
+				continue
+			}
+			initEnv[k] = v
+		}
+	}
+
 	// ── Tier-limit enforcement (plans.yaml: deployments_apps) ────────────────
 	//
 	// Count the team's currently-active deployments and reject when over the
