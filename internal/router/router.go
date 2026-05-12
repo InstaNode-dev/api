@@ -404,6 +404,16 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	auditH := handlers.NewAuditHandler(db)
 	api.Get("/audit", auditH.List)
 
+	// A/B-experiment conversion sink — the dashboard fires
+	// POST /api/v1/experiments/converted from the click handler
+	// on an experimental UI element (e.g. the Upgrade button)
+	// before navigating to checkout. Writes an audit_log row
+	// (kind = "experiment.conversion") tagged with the variant
+	// the user clicked. See internal/experiments for the
+	// registry + bucket selector.
+	experimentsH := handlers.NewExperimentsHandler(db)
+	api.Post("/experiments/converted", experimentsH.Converted)
+
 	// Vault — per-team encrypted secret storage (Phase 1: Heroku-shape platform).
 	vaultH := handlers.NewVaultHandler(db, cfg, planRegistry)
 	api.Put("/vault/:env/:key", vaultH.PutSecret)
