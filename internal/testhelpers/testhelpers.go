@@ -403,6 +403,12 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	api.Get("/deployments/:id", deployH.Get)
 	api.Delete("/deployments/:id", deployH.Delete)
 
+	// A/B-experiment conversion sink — wired into the test app so
+	// handler tests can exercise the full route stack (router +
+	// auth middleware + JSON handler) end-to-end.
+	experimentsH := handlers.NewExperimentsHandler(db)
+	api.Post("/experiments/converted", experimentsH.Converted)
+
 	return app, func() { app.Shutdown() }
 }
 

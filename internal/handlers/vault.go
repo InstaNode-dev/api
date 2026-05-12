@@ -288,7 +288,7 @@ func (h *VaultHandler) upsertSecret(c *fiber.Ctx, action string) error {
 							return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired, vaultErrQuotaExceeded,
 								fmt.Sprintf("Plan %q allows %d vault entries; you have %d. Upgrade to add more.",
 									team.PlanTier, maxEntries, n),
-								fmt.Sprintf("Tell the user they've hit the %s tier vault quota (%d entries). Have them upgrade at %s to add more secrets.", team.PlanTier, maxEntries, DefaultPricingURL),
+								newAgentActionVaultQuotaExceeded(team.PlanTier, maxEntries),
 								DefaultPricingURL)
 						}
 					}

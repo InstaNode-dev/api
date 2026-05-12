@@ -98,7 +98,7 @@ func (h *EnvPolicyHandler) Put(c *fiber.Ctx) error {
 			"error":         "owner_required",
 			"role":          role,
 			"allowed_roles": []string{middleware.RoleOwner},
-			"agent_action":  "Tell the user that updating the team's env-policy requires the owner role. Their role is " + role + ". Have the team owner run the prompt instead.",
+			"agent_action":  newAgentActionOwnerRequired(role),
 		})
 	}
 
