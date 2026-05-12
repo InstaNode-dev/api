@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"instant.dev/internal/config"
+	"instant.dev/internal/experiments"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
@@ -252,6 +253,17 @@ func (h *CLIAuthHandler) GetCurrentUser(c *fiber.Ctx) error {
 
 	plan := h.planRegistry.Get(team.PlanTier)
 
+	// Experiment bucketing — identifier is team_id for claimed
+	// users (always set here since RequireAuth has already run and
+	// populated GetTeamID). This keeps every authenticated session
+	// for the same team in the same variant, which is what the
+	// "Upgrade to Pro" copy test needs (a user must not see two
+	// labels in one session). Anonymous bucketing uses the
+	// fingerprint at the unauthenticated provision endpoints —
+	// /auth/me is auth-only so there's no fingerprint fallback
+	// path to consider here.
+	exps := experiments.PickAll(team.ID.String())
+
 	resp := fiber.Map{
 		"ok":                true,
 		"user_id":           user.ID,
@@ -259,6 +271,7 @@ func (h *CLIAuthHandler) GetCurrentUser(c *fiber.Ctx) error {
 		"email":             user.Email,
 		"tier":              team.PlanTier,
 		"plan_display_name": plan.DisplayName,
+		"experiments":       exps,
 	}
 	if team.TrialEndsAt.Valid {
 		resp["trial_ends_at"] = team.TrialEndsAt.Time
