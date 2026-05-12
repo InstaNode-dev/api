@@ -13,7 +13,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/valyala/fasthttp/fasthttpadaptor"
-	"instant.dev/internal/obsstubs/buildinfo"
+	"instant.dev/common/buildinfo"
 	"instant.dev/internal/config"
 	"instant.dev/internal/email"
 	"instant.dev/internal/handlers"

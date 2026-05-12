@@ -7,7 +7,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/stretchr/testify/require"
 
-	"instant.dev/internal/obsstubs/logctx"
+	"instant.dev/common/logctx"
 	"instant.dev/internal/middleware"
 )
 
@@ -21,7 +21,7 @@ func TestLoggerContext_CopiesRequestID(t *testing.T) {
 
 	var seen string
 	app.Get("/probe", func(c *fiber.Ctx) error {
-		seen = logctx.TraceID(c.UserContext())
+		seen = logctx.TraceIDFromContext(c.UserContext())
 		return c.SendStatus(fiber.StatusNoContent)
 	})
 
@@ -47,7 +47,7 @@ func TestLoggerContext_CopiesTeamID(t *testing.T) {
 
 	var seen string
 	app.Get("/probe", func(c *fiber.Ctx) error {
-		seen = logctx.TeamID(c.UserContext())
+		seen = logctx.TeamIDFromContext(c.UserContext())
 		return c.SendStatus(fiber.StatusNoContent)
 	})
 
@@ -66,7 +66,7 @@ func TestLoggerContext_NoAuthLeavesTeamIDEmpty(t *testing.T) {
 
 	var seen string
 	app.Get("/probe", func(c *fiber.Ctx) error {
-		seen = logctx.TeamID(c.UserContext())
+		seen = logctx.TeamIDFromContext(c.UserContext())
 		return c.SendStatus(fiber.StatusNoContent)
 	})
 
