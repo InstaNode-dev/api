@@ -1,0 +1,129 @@
+{
+  "name": "instant-worker — River jobs",
+  "description": "Background-job health for instant-worker (River queue, Postgres-native). Tracks throughput, retries, lag on expiry jobs, and per-job-kind duration. Source: Log records and custom metrics emitted by track 4 from River job middleware.",
+  "permissions": "PUBLIC_READ_WRITE",
+  "pages": [
+    {
+      "name": "Worker",
+      "description": "Background-job processing health",
+      "widgets": [
+        {
+          "title": "Jobs processed / min",
+          "layout": { "column": 1, "row": 1, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT rate(count(*), 1 minute) FROM Log WHERE service = 'worker' AND message = 'job.completed' TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Job success vs fail",
+          "layout": { "column": 5, "row": 1, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT count(*) FROM Log WHERE service = 'worker' AND message IN ('job.completed', 'job.failed') FACET message TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Job retries / min",
+          "layout": { "column": 9, "row": 1, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT rate(count(*), 1 minute) FROM Log WHERE service = 'worker' AND message = 'job.retried' TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Throughput by job kind",
+          "layout": { "column": 1, "row": 4, "width": 6, "height": 3 },
+          "visualization": { "id": "viz.area" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT count(*) FROM Log WHERE service = 'worker' AND message = 'job.completed' FACET job_kind TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Job duration p95 by kind (ms)",
+          "layout": { "column": 7, "row": 4, "width": 6, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT percentile(duration_ms, 95) FROM Log WHERE service = 'worker' AND message = 'job.completed' AND duration_ms IS NOT NULL FACET job_kind TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Expiry-job lag (seconds since last run)",
+          "layout": { "column": 1, "row": 7, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.billboard" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT (max(timestamp) - min(timestamp)) / 1000 AS 'seconds since expire run' FROM Log WHERE service = 'worker' AND job_kind = 'expire' AND message = 'job.completed' SINCE 1 hour ago"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false },
+            "thresholds": [
+              { "alertSeverity": "WARNING", "value": 300 },
+              { "alertSeverity": "CRITICAL", "value": 600 }
+            ]
+          }
+        },
+        {
+          "title": "Failed jobs by job kind (last 24h)",
+          "layout": { "column": 5, "row": 7, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.bar" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT count(*) FROM Log WHERE service = 'worker' AND message = 'job.failed' FACET job_kind SINCE 24 hours ago LIMIT 10"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Worker error log volume",
+          "layout": { "column": 9, "row": 7, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT count(*) FROM Log WHERE service = 'worker' AND level = 'ERROR' TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        }
+      ]
+    }
+  ]
+}

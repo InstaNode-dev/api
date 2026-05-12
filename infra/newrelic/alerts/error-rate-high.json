@@ -1,0 +1,37 @@
+{
+  "name": "instant-api — error rate > 1% (5m)",
+  "type": "NRQL",
+  "description": "Page when instant-api error rate exceeds 1% sustained for 5 minutes. Sourced from Transaction events emitted by track 3's Fiber NR middleware.",
+  "enabled": true,
+  "nrql": {
+    "query": "SELECT percentage(count(*), WHERE error IS true) FROM Transaction WHERE appName LIKE 'instant-api%'"
+  },
+  "terms": [
+    {
+      "priority": "CRITICAL",
+      "operator": "ABOVE",
+      "threshold": 1.0,
+      "thresholdDuration": 300,
+      "thresholdOccurrences": "ALL"
+    },
+    {
+      "priority": "WARNING",
+      "operator": "ABOVE",
+      "threshold": 0.5,
+      "thresholdDuration": 300,
+      "thresholdOccurrences": "ALL"
+    }
+  ],
+  "signal": {
+    "aggregationWindow": 60,
+    "aggregationMethod": "EVENT_FLOW",
+    "aggregationDelay": 120,
+    "fillOption": "NONE"
+  },
+  "expiration": {
+    "expirationDuration": 600,
+    "openViolationOnExpiration": false,
+    "closeViolationsOnExpiration": true
+  },
+  "violationTimeLimitSeconds": 86400
+}

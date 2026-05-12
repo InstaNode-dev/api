@@ -1,0 +1,111 @@
+{
+  "name": "instant-api — deploy",
+  "description": "Health for POST /deploy/new (Kaniko build → k8s pod → ingress + TLS). Tracks build duration, success/fail, active deployments, and per-tier usage. Source: Transaction events on /deploy/* routes plus Log records emitted by api/internal/handlers/deploy.go.",
+  "permissions": "PUBLIC_READ_WRITE",
+  "pages": [
+    {
+      "name": "Deploy",
+      "description": "Application deployment pipeline health",
+      "widgets": [
+        {
+          "title": "Deploy success vs fail (last 24h)",
+          "layout": { "column": 1, "row": 1, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.billboard" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT filter(count(*), WHERE deploy_status = 'success') AS 'success', filter(count(*), WHERE deploy_status = 'fail') AS 'fail' FROM Log WHERE service = 'api' AND deploy_status IS NOT NULL SINCE 24 hours ago"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Build duration p50 / p95 (seconds)",
+          "layout": { "column": 5, "row": 1, "width": 8, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT percentile(build_duration_seconds, 50) AS 'p50 s', percentile(build_duration_seconds, 95) AS 'p95 s' FROM Log WHERE service = 'api' AND build_duration_seconds IS NOT NULL TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Deploy endpoint latency (p95 ms)",
+          "layout": { "column": 1, "row": 4, "width": 6, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT percentile(duration, 95) * 1000 AS 'p95 ms' FROM Transaction WHERE appName LIKE 'instant-api%' AND name LIKE '%/deploy%' FACET name TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Deploy failures by reason",
+          "layout": { "column": 7, "row": 4, "width": 6, "height": 3 },
+          "visualization": { "id": "viz.bar" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT count(*) FROM Log WHERE service = 'api' AND deploy_status = 'fail' FACET fail_reason LIMIT 10"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Active deployments (running pods)",
+          "layout": { "column": 1, "row": 7, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.billboard" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT uniqueCount(deploy_id) FROM Log WHERE service = 'api' AND deploy_status = 'running' SINCE 5 minutes ago"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Deploys by tier (last 7d)",
+          "layout": { "column": 5, "row": 7, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.pie" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT count(*) FROM Log WHERE service = 'api' AND message LIKE '%deploy.created%' FACET tier SINCE 7 days ago"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Deploy redeploys / day",
+          "layout": { "column": 9, "row": 7, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": [0],
+                "query": "SELECT count(*) FROM Transaction WHERE appName LIKE 'instant-api%' AND name LIKE '%/redeploy' TIMESERIES 1 day"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        }
+      ]
+    }
+  ]
+}
