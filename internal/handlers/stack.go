@@ -702,9 +702,16 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		noteMsg = fmt.Sprintf("%d warning(s) from manifest parsing. %s", len(warnings), noteMsg)
 	}
 
+	// Echo the resolved env on every stack-create response so the agent /
+	// curl caller knows which bucket they landed in. Today POST /stacks/new
+	// doesn't accept an env form field — every freshly-created stack lands
+	// in EnvDefault ("development", post-migration-026). Surfacing env
+	// explicitly means a no-env caller sees "env":"development" and can
+	// react (e.g. promote later, or re-create with an explicit env).
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
 		"ok":         true,
 		"stack_id":   stack.Slug,
+		"env":        stack.Env,
 		"status":     "building",
 		"tier":       stackTier,
 		"expires_in": func() string {

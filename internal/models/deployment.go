@@ -44,7 +44,7 @@ type CreateDeploymentParams struct {
 	AppID      string
 	Port       int
 	Tier       string
-	Env        string // empty string is normalised to EnvProduction
+	Env        string // empty string is normalised to EnvDefault ("development")
 	EnvVars    map[string]string
 	Private    bool
 	AllowedIPs []string // each entry must already be a valid IP or CIDR
@@ -155,7 +155,7 @@ func CreateDeployment(ctx context.Context, db *sql.DB, p CreateDeploymentParams)
 
 	env := p.Env
 	if env == "" {
-		env = EnvProduction
+		env = EnvDefault
 	}
 
 	// allowed_ips is stored as a comma-joined string — keeps it identical to
@@ -236,10 +236,11 @@ func GetDeploymentsByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]
 }
 
 // GetDeploymentsByTeamAndEnv returns deployments for a team scoped to a single
-// environment. Empty env is normalised to "production".
+// environment. Empty env is normalised to EnvDefault ("development") to match
+// the post-migration-026 default for POST /deploy/new.
 func GetDeploymentsByTeamAndEnv(ctx context.Context, db *sql.DB, teamID uuid.UUID, env string) ([]*Deployment, error) {
 	if env == "" {
-		env = EnvProduction
+		env = EnvDefault
 	}
 	rows, err := db.QueryContext(ctx, `
 		SELECT `+deploymentColumns+`
