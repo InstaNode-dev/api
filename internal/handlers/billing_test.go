@@ -375,6 +375,310 @@ func TestBillingWebhook_MissingSignature_Returns400(t *testing.T) {
 	}
 }
 
+// ── Audit emit on Razorpay webhooks (Track E) ────────────────────────────────
+//
+// These tests exercise the new subscription.upgraded / subscription.downgraded
+// / subscription.canceled audit_log rows that feed the Loops worker. They run
+// against a real test Postgres so the JSONB metadata is round-tripped through
+// the actual driver, not a mock.
+//
+// Two contract guarantees per kind:
+//   1. The happy path writes exactly one audit row with the expected kind +
+//      metadata.
+//   2. The fail-open invariant: when audit emit cannot fire (e.g. unknown
+//      from_tier), the webhook still returns 200 and the team-level tier
+//      mutation lands in the DB.
+
+// billingWebhookDBApp builds a Fiber app like billingTestApp but backed by a
+// real test DB so the webhook's audit emits and tier updates actually land.
+// Returns the handler-bound config so tests can read plan IDs back out.
+func billingWebhookDBApp(t *testing.T, db *sql.DB) (*fiber.App, *config.Config) {
+	t.Helper()
+	cfg := &config.Config{
+		JWTSecret:             testhelpers.TestJWTSecret,
+		RazorpayWebhookSecret: testWebhookSecret,
+		// Configured plan_ids so the webhook can classify plan_id → tier
+		// without falling back to the default "pro" mapping. Match prod env
+		// var names but use fixed strings — tests don't care about format.
+		RazorpayPlanIDHobby: "plan_test_hobby",
+		RazorpayPlanIDPro:   "plan_test_pro",
+		RazorpayPlanIDTeam:  "plan_test_team",
+	}
+	bh := handlers.NewBillingHandler(db, cfg, email.New(""))
+
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			if errors.Is(err, handlers.ErrResponseWritten) {
+				return nil
+			}
+			code := fiber.StatusInternalServerError
+			if e, ok := err.(*fiber.Error); ok {
+				code = e.Code
+			}
+			return c.Status(code).JSON(fiber.Map{"ok": false, "error": "internal_error"})
+		},
+	})
+	app.Use(middleware.RequestID())
+	app.Post("/razorpay/webhook", bh.RazorpayWebhook)
+	return app, cfg
+}
+
+// decodeAuditMetadata parses an audit_log.metadata::text payload back into a
+// map. Postgres JSONB re-serialises keys in a canonical order and adds
+// whitespace, so callers compare structural values rather than raw text.
+func decodeAuditMetadata(t *testing.T, raw string) map[string]string {
+	t.Helper()
+	var m map[string]string
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatalf("decodeAuditMetadata: %v\n  raw=%s", err, raw)
+	}
+	return m
+}
+
+// makeSubscriptionChargedPayloadWithPlan extends makeSubscriptionChargedPayload
+// to set the plan_id field — required to test the upgrade/downgrade
+// classification, which reads sub.plan_id via planIDToTier.
+func makeSubscriptionChargedPayloadWithPlan(t *testing.T, teamID, subscriptionID, planID string) []byte {
+	t.Helper()
+	notes := map[string]any{}
+	if teamID != "" {
+		notes["team_id"] = teamID
+	}
+	subEntity, _ := json.Marshal(map[string]any{
+		"id":      subscriptionID,
+		"entity":  "subscription",
+		"plan_id": planID,
+		"status":  "active",
+		"notes":   notes,
+	})
+	event := map[string]any{
+		"entity": "event",
+		"event":  "subscription.charged",
+		"payload": map[string]any{
+			"subscription": map[string]any{
+				"entity": json.RawMessage(subEntity),
+			},
+		},
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("makeSubscriptionChargedPayloadWithPlan: %v", err)
+	}
+	return payload
+}
+
+// TestBillingWebhook_SubscriptionUpgraded_EmitsAuditRow exercises the happy
+// path for an upgrade: a team currently on `hobby` receives subscription.
+// charged with the pro plan_id, the handler elevates the team to `pro`, and
+// one audit_log row with kind = subscription.upgraded is written for the
+// Loops forwarder.
+func TestBillingWebhook_SubscriptionUpgraded_EmitsAuditRow(t *testing.T) {
+	db, cleanDB := billingStateNeedsDB(t)
+	defer cleanDB()
+
+	app, cfg := billingWebhookDBApp(t, db)
+
+	// Seed a hobby team — handleSubscriptionCharged reads its current tier
+	// before updating to derive the upgrade direction.
+	teamID := testhelpers.MustCreateTeamDB(t, db, "hobby")
+	defer db.Exec(`DELETE FROM teams WHERE id = $1::uuid`, teamID)
+
+	payload := makeSubscriptionChargedPayloadWithPlan(
+		t, teamID, "sub_test_"+uuid.NewString(), cfg.RazorpayPlanIDPro,
+	)
+	req := signedWebhookRequest(t, payload)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// Tier must have moved to pro.
+	var newTier string
+	require.NoError(t, db.QueryRow(`SELECT plan_tier FROM teams WHERE id = $1::uuid`, teamID).Scan(&newTier))
+	assert.Equal(t, "pro", newTier)
+
+	// And exactly one subscription.upgraded audit row must exist.
+	var kind, summary, metaText string
+	require.NoError(t, db.QueryRow(`
+		SELECT kind, summary, metadata::text
+		  FROM audit_log
+		 WHERE team_id = $1::uuid AND kind = 'subscription.upgraded'
+		 ORDER BY created_at DESC
+		 LIMIT 1`, teamID).Scan(&kind, &summary, &metaText))
+	assert.Equal(t, "subscription.upgraded", kind)
+	assert.Contains(t, summary, "hobby")
+	assert.Contains(t, summary, "pro")
+
+	meta := decodeAuditMetadata(t, metaText)
+	assert.Equal(t, "hobby", meta["from_tier"])
+	assert.Equal(t, "pro", meta["to_tier"])
+}
+
+// TestBillingWebhook_SubscriptionDowngraded_EmitsAuditRow covers the
+// downgrade direction: a pro team receives a charged-webhook for the hobby
+// plan (the eventual delivery after ChangePlan settles), and the handler
+// writes a subscription.downgraded audit row.
+func TestBillingWebhook_SubscriptionDowngraded_EmitsAuditRow(t *testing.T) {
+	db, cleanDB := billingStateNeedsDB(t)
+	defer cleanDB()
+
+	app, cfg := billingWebhookDBApp(t, db)
+
+	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
+	defer db.Exec(`DELETE FROM teams WHERE id = $1::uuid`, teamID)
+
+	payload := makeSubscriptionChargedPayloadWithPlan(
+		t, teamID, "sub_test_"+uuid.NewString(), cfg.RazorpayPlanIDHobby,
+	)
+	req := signedWebhookRequest(t, payload)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var newTier string
+	require.NoError(t, db.QueryRow(`SELECT plan_tier FROM teams WHERE id = $1::uuid`, teamID).Scan(&newTier))
+	assert.Equal(t, "hobby", newTier)
+
+	var kind, metaText string
+	require.NoError(t, db.QueryRow(`
+		SELECT kind, metadata::text
+		  FROM audit_log
+		 WHERE team_id = $1::uuid AND kind = 'subscription.downgraded'
+		 ORDER BY created_at DESC
+		 LIMIT 1`, teamID).Scan(&kind, &metaText))
+	assert.Equal(t, "subscription.downgraded", kind)
+
+	meta := decodeAuditMetadata(t, metaText)
+	assert.Equal(t, "pro", meta["from_tier"])
+	assert.Equal(t, "hobby", meta["to_tier"])
+}
+
+// TestBillingWebhook_SubscriptionCharged_SameTier_EmitsNoTransitionRow
+// guards against the monthly-renewal noise case: a pro team receives a
+// charged webhook for the pro plan_id (just a renewal, not a transition),
+// and the handler must NOT write an upgrade / downgrade audit row. The
+// Loops upgrade email firing on every renewal would be a regression.
+func TestBillingWebhook_SubscriptionCharged_SameTier_EmitsNoTransitionRow(t *testing.T) {
+	db, cleanDB := billingStateNeedsDB(t)
+	defer cleanDB()
+
+	app, cfg := billingWebhookDBApp(t, db)
+
+	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
+	defer db.Exec(`DELETE FROM teams WHERE id = $1::uuid`, teamID)
+
+	payload := makeSubscriptionChargedPayloadWithPlan(
+		t, teamID, "sub_test_"+uuid.NewString(), cfg.RazorpayPlanIDPro,
+	)
+	req := signedWebhookRequest(t, payload)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var count int
+	require.NoError(t, db.QueryRow(`
+		SELECT count(*) FROM audit_log
+		 WHERE team_id = $1::uuid
+		   AND kind IN ('subscription.upgraded', 'subscription.downgraded')`,
+		teamID).Scan(&count))
+	assert.Equal(t, 0, count,
+		"same-tier renewals must NOT emit upgrade or downgrade rows")
+}
+
+// TestBillingWebhook_SubscriptionCancelled_EmitsAuditRow covers the
+// cancellation path: subscription.cancelled webhook arrives, the team is
+// dropped to hobby (or free if never paid), and exactly one
+// subscription.canceled audit row is written.
+func TestBillingWebhook_SubscriptionCancelled_EmitsAuditRow(t *testing.T) {
+	db, cleanDB := billingStateNeedsDB(t)
+	defer cleanDB()
+
+	app, _ := billingWebhookDBApp(t, db)
+
+	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
+	defer db.Exec(`DELETE FROM teams WHERE id = $1::uuid`, teamID)
+
+	payload := makeSubscriptionCancelledPayload(t, teamID, "sub_test_"+uuid.NewString())
+	req := signedWebhookRequest(t, payload)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// Tier dropped to hobby (courtesy floor when at least one paid invoice
+	// happened — paid_count omitted from the payload defaults to nil, which
+	// the handler treats as "non-zero paid count" → hobby).
+	var newTier string
+	require.NoError(t, db.QueryRow(`SELECT plan_tier FROM teams WHERE id = $1::uuid`, teamID).Scan(&newTier))
+	assert.Equal(t, "hobby", newTier)
+
+	var kind, metaText string
+	require.NoError(t, db.QueryRow(`
+		SELECT kind, metadata::text
+		  FROM audit_log
+		 WHERE team_id = $1::uuid AND kind = 'subscription.canceled'
+		 ORDER BY created_at DESC
+		 LIMIT 1`, teamID).Scan(&kind, &metaText))
+	assert.Equal(t, "subscription.canceled", kind)
+
+	meta := decodeAuditMetadata(t, metaText)
+	assert.Equal(t, "pro", meta["from_tier"])
+}
+
+// TestBillingWebhook_SubscriptionCharged_FailOpen_AuditMissDoesNotRevertTier
+// verifies the fail-open contract: when the audit emit silently fails
+// (because the audit_log table is missing — simulating a partial migration
+// state), the team-tier update still lands and the webhook returns 200.
+//
+// We force the failure by dropping the audit_log table inside the test, then
+// recreating it after for other tests that share the DB.
+func TestBillingWebhook_SubscriptionCharged_FailOpen_AuditMissDoesNotRevertTier(t *testing.T) {
+	db, cleanDB := billingStateNeedsDB(t)
+	defer cleanDB()
+
+	app, cfg := billingWebhookDBApp(t, db)
+
+	teamID := testhelpers.MustCreateTeamDB(t, db, "hobby")
+	defer db.Exec(`DELETE FROM teams WHERE id = $1::uuid`, teamID)
+
+	// Snapshot the audit_log table definition before nuking it. The defer
+	// re-creates it so subsequent tests sharing this DB still work.
+	_, err := db.Exec(`DROP TABLE IF EXISTS audit_log CASCADE`)
+	require.NoError(t, err)
+	defer db.Exec(`CREATE TABLE IF NOT EXISTS audit_log (
+		id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		team_id       UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+		user_id       UUID REFERENCES users(id) ON DELETE SET NULL,
+		actor         TEXT NOT NULL DEFAULT 'agent',
+		kind          TEXT NOT NULL,
+		resource_type TEXT,
+		resource_id   UUID,
+		summary       TEXT NOT NULL,
+		metadata      JSONB,
+		created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`)
+
+	payload := makeSubscriptionChargedPayloadWithPlan(
+		t, teamID, "sub_test_"+uuid.NewString(), cfg.RazorpayPlanIDPro,
+	)
+	req := signedWebhookRequest(t, payload)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err, "audit emit failure must not propagate as a Go error")
+	defer resp.Body.Close()
+
+	// Webhook still returns 200 — Razorpay must not retry on audit misses.
+	assert.Equal(t, http.StatusOK, resp.StatusCode,
+		"audit emit failure must not turn the webhook into a 4xx/5xx")
+
+	// And the tier elevation still landed despite the audit miss.
+	var newTier string
+	require.NoError(t, db.QueryRow(`SELECT plan_tier FROM teams WHERE id = $1::uuid`, teamID).Scan(&newTier))
+	assert.Equal(t, "pro", newTier,
+		"tier update must commit even when audit emit fails (fail-open contract)")
+}
+
 // ── GetBillingState (GET /api/v1/billing) ───────────────────────────────────
 
 // billingStateApp builds a Fiber app wired with the real BillingHandler plus a
