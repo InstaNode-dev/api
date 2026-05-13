@@ -432,6 +432,7 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	api.Get("/deployments", deployH.List)
 	api.Get("/deployments/:id", deployH.Get)
 	api.Delete("/deployments/:id", deployH.Delete)
+	api.Patch("/deployments/:id", deployH.Patch)
 
 	// A/B-experiment conversion sink — wired into the test app so
 	// handler tests can exercise the full route stack (router +

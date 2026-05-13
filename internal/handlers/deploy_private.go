@@ -8,12 +8,14 @@ package handlers
 // deploy.go calls parsePrivateDeployFields once before persisting the row.
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"instant.dev/internal/middleware"
+	"instant.dev/internal/models"
 
 	"log/slog"
 
@@ -60,6 +62,33 @@ func parsePrivateDeployFields(c *fiber.Ctx, form *multipart.Form, planTier strin
 		return false, nil, nil
 	}
 
+	entries := splitAllowedIPsField(rawAllowedIPs)
+	return validatePrivateDeployFields(c, planTier, true, entries)
+}
+
+// validatePrivateDeployFields is the shared validation routine used by both
+// the POST /deploy/new multipart flow (parsePrivateDeployFields) and the
+// PATCH /api/v1/deployments/:id JSON flow (DeployHandler.Patch). Centralising
+// the rule-set guarantees the two surfaces can't drift on a contract that the
+// U3 reviewer audits as a single rule-set.
+//
+// Inputs:
+//   - planTier:   team.PlanTier (e.g. "hobby", "pro"). Used for the tier gate.
+//   - private:    the parsed private boolean.
+//   - allowedIPs: already-split, already-trimmed entries (nil/empty allowed
+//     only when private=false).
+//
+// On failure, writes the 400/402 response inline and returns a non-nil error
+// (same pattern as the multipart helper). On success returns
+// (private, allowedIPs, nil) — the slice is returned verbatim so the
+// caller doesn't have to keep its own copy.
+func validatePrivateDeployFields(c *fiber.Ctx, planTier string, private bool, allowedIPs []string) (bool, []string, error) {
+	if !private {
+		// Public — the caller is responsible for ignoring allowedIPs on this
+		// path. No tier gate (every tier can run a public deploy).
+		return false, nil, nil
+	}
+
 	// Tier gate FIRST — hides downstream validation rules from tiers that
 	// don't have access to the feature at all.
 	if !privateDeployAllowedTiers[planTier] {
@@ -72,8 +101,7 @@ func parsePrivateDeployFields(c *fiber.Ctx, form *multipart.Form, planTier strin
 	}
 
 	// Required-field gate.
-	entries := splitAllowedIPsField(rawAllowedIPs)
-	if len(entries) == 0 {
+	if len(allowedIPs) == 0 {
 		return false, nil, respondErrorWithAgentAction(c,
 			fiber.StatusBadRequest,
 			"private_deploy_requires_allowed_ips",
@@ -86,17 +114,17 @@ func parsePrivateDeployFields(c *fiber.Ctx, form *multipart.Form, planTier strin
 	// list would otherwise burn CPU through 200 net.ParseCIDR calls before
 	// being rejected anyway. 32 is the max we'll ever stuff into an nginx
 	// annotation responsibly; bigger lists belong in CF Access.
-	if len(entries) > maxAllowedIPs {
+	if len(allowedIPs) > maxAllowedIPs {
 		return false, nil, respondError(c,
 			fiber.StatusBadRequest,
 			"too_many_allowed_ips",
 			fmt.Sprintf("allowed_ips has %d entries; max is %d. For larger allowlists use a real VPN or Cloudflare Access — see https://instanode.dev/docs/private-deploys.",
-				len(entries), maxAllowedIPs))
+				len(allowedIPs), maxAllowedIPs))
 	}
 
 	// Per-entry validation. Surface the bad literal verbatim — the LLM agent
 	// gets to feed the typo back to the human.
-	for _, entry := range entries {
+	for _, entry := range allowedIPs {
 		if !isValidIPOrCIDR(entry) {
 			return false, nil, respondError(c,
 				fiber.StatusBadRequest,
@@ -105,7 +133,158 @@ func parsePrivateDeployFields(c *fiber.Ctx, form *multipart.Form, planTier strin
 		}
 	}
 
-	return true, entries, nil
+	return true, allowedIPs, nil
+}
+
+// patchAccessControlBody is the JSON body for PATCH /api/v1/deployments/:id.
+//
+// Both fields are optional pointers so the handler can distinguish "field
+// omitted" (keep current state) from "field set to zero" (private=false /
+// allowed_ips=[]). REST PATCH semantics: send only what you want to change.
+//
+// Semantics decision (REPLACE, not APPEND): when allowed_ips is supplied, the
+// new slice REPLACES the current list rather than merging into it. This
+// matches REST conventions for collection fields and is what the dashboard
+// PrivacyPanel expects — the editor renders the current list, the user
+// edits it, and submits the new authoritative list. Append semantics would
+// silently grow the allow-list over multiple PATCHes (a known footgun for
+// "I removed an IP but it's still there" bug reports).
+type patchAccessControlBody struct {
+	Private    *bool     `json:"private,omitempty"`
+	AllowedIPs *[]string `json:"allowed_ips,omitempty"`
+}
+
+// Patch handles PATCH /api/v1/deployments/:id for in-place access-control
+// edits — flipping a deploy public ↔ private or replacing the allowed_ips
+// list. Does NOT rebuild the image; the apply-annotation helper that backs
+// POST /deploy/new is reused so the two paths can't diverge.
+//
+// Behaviour matrix:
+//
+//   - {private:true, allowed_ips:[...]}   → set private, set list
+//   - {allowed_ips:[...]} only            → keep current private; update list
+//     (rejected if currently public — can't have allow-list on public deploy)
+//   - {private:false}                     → clear allow-list, set public
+//   - {private:true} only, no allow_ips   → 400 (need allowed_ips)
+//   - {} empty body                       → 400 (nothing to change)
+//
+// All validation routes through validatePrivateDeployFields so the rule-set
+// (tier gate → required IPs → cap → per-entry parse) is byte-identical to
+// POST /deploy/new. The compute.Provider.UpdateAccessControl call patches
+// the live Ingress; the models.UpdateDeploymentAccessControl call persists
+// the row. Compute runs first because if it fails we don't want the DB to
+// claim a state the Ingress can't enforce — but we also have to handle the
+// reverse: if the Ingress doesn't exist yet (deploy is still building), the
+// k8s provider returns nil so the DB is still updated and the next runDeploy
+// picks up the fields.
+func (h *DeployHandler) Patch(c *fiber.Ctx) error {
+	team, err := h.requireTeam(c)
+	if err != nil {
+		return err
+	}
+
+	appID := c.Params("id")
+	d, err := models.GetDeploymentByAppID(c.Context(), h.db, appID)
+	if err != nil {
+		var notFound *models.ErrDeploymentNotFound
+		if errors.As(err, &notFound) {
+			return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
+		}
+		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch deployment")
+	}
+
+	if d.TeamID != team.ID {
+		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this deployment")
+	}
+
+	var body patchAccessControlBody
+	if err := c.BodyParser(&body); err != nil {
+		return respondError(c, fiber.StatusBadRequest, "invalid_body",
+			"Request body must be valid JSON: {\"private\": bool, \"allowed_ips\": [\"ip\",\"cidr\"]}")
+	}
+
+	if body.Private == nil && body.AllowedIPs == nil {
+		return respondError(c, fiber.StatusBadRequest, "missing_fields",
+			"At least one of 'private' or 'allowed_ips' must be supplied")
+	}
+
+	// Resolve the post-PATCH (private, allowed_ips) pair from the current
+	// state + the supplied deltas. Sending only allowed_ips keeps the
+	// current private flag (so a Pro user can edit their list without
+	// having to also resend private=true). Sending private=false clears
+	// the allow-list to empty regardless of what allowed_ips contains —
+	// the public-deploy invariant is "no whitelist annotation".
+	newPrivate := d.Private
+	if body.Private != nil {
+		newPrivate = *body.Private
+	}
+
+	var newAllowedIPs []string
+	switch {
+	case body.Private != nil && !*body.Private:
+		// Explicit public — drop the list entirely regardless of allowed_ips
+		// in the same body. Prevents the surface "I set private=false but
+		// the allow-list is still there" bug.
+		newAllowedIPs = nil
+	case body.AllowedIPs != nil:
+		// Caller supplied a new authoritative list (REPLACE semantics).
+		newAllowedIPs = *body.AllowedIPs
+	default:
+		// allowed_ips omitted, private flipped (or unchanged) but stays
+		// private — preserve the existing list verbatim.
+		newAllowedIPs = d.AllowedIPs
+	}
+
+	// Run through the shared validation rule-set. Tier gate fires first so
+	// hobby callers can't drill past it via "PATCH the public deploy I
+	// already have to private". The team's CURRENT plan tier is what's
+	// checked (matches POST semantics) — not the snapshot on the deployment
+	// row.
+	validatedPrivate, validatedAllowedIPs, vErr := validatePrivateDeployFields(c, team.PlanTier, newPrivate, newAllowedIPs)
+	if vErr != nil {
+		return vErr
+	}
+
+	// Compute-side first. The Ingress lives in k8s and a successful k8s
+	// update is the truth that matters to inbound traffic. If this fails,
+	// we surface 503 and skip the DB write so the row keeps reflecting
+	// reality.
+	if err := h.compute.UpdateAccessControl(c.Context(), d.AppID, validatedPrivate, validatedAllowedIPs); err != nil {
+		slog.Error("deploy.patch.compute_update_failed",
+			"app_id", appID, "error", err,
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusServiceUnavailable, "compute_update_failed",
+			"Failed to update ingress access control")
+	}
+
+	if err := models.UpdateDeploymentAccessControl(c.Context(), h.db, d.ID, validatedPrivate, validatedAllowedIPs); err != nil {
+		slog.Error("deploy.patch.db_update_failed",
+			"app_id", appID, "error", err,
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusServiceUnavailable, "update_failed",
+			"Failed to update deployment access control")
+	}
+
+	// Re-fetch so the response reflects the persisted row (status, updated_at).
+	updated, err := models.GetDeploymentByAppID(c.Context(), h.db, appID)
+	if err != nil {
+		// Update succeeded but read-back failed — return the in-memory
+		// representation we just wrote so the dashboard isn't blocked.
+		d.Private = validatedPrivate
+		d.AllowedIPs = validatedAllowedIPs
+		updated = d
+	}
+
+	slog.Info("deploy.patch.access_control_updated",
+		"app_id", appID, "team_id", team.ID,
+		"private", validatedPrivate,
+		"allowed_ip_count", len(validatedAllowedIPs),
+		"request_id", middleware.GetRequestID(c))
+
+	return c.JSON(fiber.Map{
+		"ok":   true,
+		"item": deploymentToMap(updated),
+	})
 }
 
 // firstFormValue returns the first value for a multipart field, or "" when

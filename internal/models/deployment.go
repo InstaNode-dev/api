@@ -320,6 +320,31 @@ func UpdateDeploymentEnvVars(ctx context.Context, db *sql.DB, id uuid.UUID, envV
 	return nil
 }
 
+// UpdateDeploymentAccessControl replaces the private flag and allowed_ips list
+// on an existing deployment row. Single-row UPDATE — no aggregation,
+// no caching concerns. Backs PATCH /api/v1/deployments/:id.
+//
+// allowedIPs uses REPLACE semantics (matches the storage column shape — the
+// row holds the canonical comma-joined list). Empty allowedIPs slice persists
+// as an empty string in the column, which is what splitAllowedIPs reads back
+// as nil — symmetric round-trip with CreateDeployment's behaviour.
+//
+// Caller is responsible for having validated the slice (each entry a valid
+// IP or CIDR, len ≤ maxAllowedIPs, non-empty when private=true). This
+// function trusts its inputs.
+func UpdateDeploymentAccessControl(ctx context.Context, db *sql.DB, id uuid.UUID, private bool, allowedIPs []string) error {
+	allowed := JoinAllowedIPs(allowedIPs)
+	_, err := db.ExecContext(ctx, `
+		UPDATE deployments
+		SET private = $1, allowed_ips = $2, updated_at = now()
+		WHERE id = $3
+	`, private, allowed, id)
+	if err != nil {
+		return fmt.Errorf("models.UpdateDeploymentAccessControl: %w", err)
+	}
+	return nil
+}
+
 // DeleteDeployment hard-deletes a deployment row.
 // Compute resources are real money — no soft-delete; callers must deprovision
 // the k8s Deployment before calling this.
