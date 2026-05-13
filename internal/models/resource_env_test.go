@@ -20,10 +20,15 @@ import (
 	"instant.dev/internal/testhelpers"
 )
 
-func TestNormalizeEnv_DefaultsToProduction(t *testing.T) {
+func TestNormalizeEnv_DefaultsToDevelopment(t *testing.T) {
+	// Migration 026 (2026-05-13) flipped the empty-input default from
+	// "production" → "development" so accidental no-env provisions land in
+	// the lowest-stakes bucket. This regression guards that flip.
 	got, ok := models.NormalizeEnv("")
 	assert.True(t, ok)
-	assert.Equal(t, models.EnvProduction, got)
+	assert.Equal(t, models.EnvDevelopment, got, "empty env must normalise to EnvDevelopment, not EnvProduction")
+	assert.Equal(t, "development", got)
+	assert.Equal(t, models.EnvDefault, got, "EnvDefault must alias EnvDevelopment")
 }
 
 func TestNormalizeEnv_AcceptsValidValues(t *testing.T) {
@@ -78,7 +83,7 @@ func requireDB(t *testing.T) {
 	}
 }
 
-func TestResourceEnv_CreateDefaultsToProduction(t *testing.T) {
+func TestResourceEnv_CreateDefaultsToDevelopment(t *testing.T) {
 	requireDB(t)
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
@@ -90,13 +95,15 @@ func TestResourceEnv_CreateDefaultsToProduction(t *testing.T) {
 		TeamID:       &teamID,
 		ResourceType: "redis",
 		Tier:         "hobby",
-		// Env intentionally empty — must default to "production".
+		// Env intentionally empty — must default to "development"
+		// post-migration-026 (was "production" before).
 	})
 	require.NoError(t, err)
 	defer db.Exec(`DELETE FROM resources WHERE id = $1`, r.ID)
 
-	assert.Equal(t, models.EnvProduction, r.Env,
-		"empty Env on CreateResource must default to 'production'")
+	assert.Equal(t, models.EnvDevelopment, r.Env,
+		"empty Env on CreateResource must default to 'development' (migration 026)")
+	assert.Equal(t, "development", r.Env)
 }
 
 func TestResourceEnv_CreateRoundTrips(t *testing.T) {
@@ -149,7 +156,9 @@ func TestResourceEnv_ListByTeamAndEnv_Isolates(t *testing.T) {
 	dev := mk("dev")
 	staging := mk("staging")
 	prod := mk("production")
-	defer db.Exec(`DELETE FROM resources WHERE id IN ($1, $2, $3)`, dev.ID, staging.ID, prod.ID)
+	development := mk("development")
+	defer db.Exec(`DELETE FROM resources WHERE id IN ($1, $2, $3, $4)`,
+		dev.ID, staging.ID, prod.ID, development.ID)
 
 	// Listing by env="dev" must only see the dev row.
 	devList, err := models.ListResourcesByTeamAndEnv(context.Background(), db, teamID, "dev")
@@ -157,33 +166,46 @@ func TestResourceEnv_ListByTeamAndEnv_Isolates(t *testing.T) {
 	assert.Len(t, devList, 1)
 	assert.Equal(t, dev.ID, devList[0].ID)
 
-	// Empty env defaults to production.
-	prodList, err := models.ListResourcesByTeamAndEnv(context.Background(), db, teamID, "")
+	// Empty env defaults to "development" (post-migration 026 — was
+	// "production" before). The dashboard's "default env view" now lands
+	// callers in the lowest-stakes bucket.
+	defaultList, err := models.ListResourcesByTeamAndEnv(context.Background(), db, teamID, "")
+	require.NoError(t, err)
+	assert.Len(t, defaultList, 1)
+	assert.Equal(t, development.ID, defaultList[0].ID)
+	assert.Equal(t, "development", defaultList[0].Env)
+
+	// Explicit "production" still works (backward compat).
+	prodList, err := models.ListResourcesByTeamAndEnv(context.Background(), db, teamID, "production")
 	require.NoError(t, err)
 	assert.Len(t, prodList, 1)
 	assert.Equal(t, prod.ID, prodList[0].ID)
 
-	// ListResourcesByTeam (no env filter) must see all three.
+	// ListResourcesByTeam (no env filter) must see all four.
 	all, err := models.ListResourcesByTeam(context.Background(), db, teamID)
 	require.NoError(t, err)
-	assert.Len(t, all, 3)
+	assert.Len(t, all, 4)
 }
 
 // TestResourceEnv_MigrationIdempotent verifies that the columns + indexes are
 // already present on a SetupTestDB instance and that re-applying the column-add
-// statements is a no-op (no error, schema unchanged). We mimic the migration
-// SQL directly rather than re-running 009 to keep this test independent of the
-// embed.FS plumbing.
+// + default-flip statements is a no-op (no error, schema unchanged). We mimic
+// the migration SQL (009 + 026) directly rather than re-running the embed.FS
+// chain to keep this test independent of the migration runner.
 func TestResourceEnv_MigrationIdempotent(t *testing.T) {
 	requireDB(t)
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 
 	stmts := []string{
+		// 009 — column + indexes.
 		`ALTER TABLE resources   ADD COLUMN IF NOT EXISTS env TEXT NOT NULL DEFAULT 'production'`,
 		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS env TEXT NOT NULL DEFAULT 'production'`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_team_env   ON resources   (team_id, env)`,
 		`CREATE INDEX IF NOT EXISTS idx_deployments_team_env ON deployments (team_id, env)`,
+		// 026 — flip the column DEFAULT to 'development'.
+		`ALTER TABLE resources   ALTER COLUMN env SET DEFAULT 'development'`,
+		`ALTER TABLE deployments ALTER COLUMN env SET DEFAULT 'development'`,
 	}
 	// Run twice; second run must not error.
 	for i := 0; i < 2; i++ {
@@ -193,7 +215,8 @@ func TestResourceEnv_MigrationIdempotent(t *testing.T) {
 		}
 	}
 
-	// New rows inserted without env get 'production' from the column DEFAULT.
+	// New rows inserted without env get 'development' from the column DEFAULT
+	// (post-migration 026, was 'production' before).
 	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, "hobby"))
 	defer db.Exec(`DELETE FROM teams WHERE id = $1`, teamID)
 
@@ -208,5 +231,6 @@ func TestResourceEnv_MigrationIdempotent(t *testing.T) {
 
 	var env string
 	require.NoError(t, db.QueryRow(`SELECT env FROM resources WHERE id = $1`, rid).Scan(&env))
-	assert.Equal(t, "production", env, "DEFAULT must populate env when caller omits it")
+	assert.Equal(t, "development", env,
+		"DEFAULT must populate env='development' when caller omits it (migration 026)")
 }

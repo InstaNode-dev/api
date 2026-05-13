@@ -707,13 +707,17 @@ func TestStackList(t *testing.T) {
 	// the env-aware deployments workstream — the dashboard relies on
 	// the real value rather than hardcoding "production" client-side.
 	// parent_stack_id is exposed as a string ("" for root stacks).
+	//
+	// Default env for no-env stacks flipped from "production" → "development"
+	// in migration 026 (2026-05-13) so accidental no-env creates land in the
+	// lowest-stakes bucket.
 	for _, item := range listBody.Items {
 		assert.NotEmpty(t, item["stack_id"], "stack_id must be set")
 		assert.NotEmpty(t, item["status"], "status must be set")
 		assert.NotEmpty(t, item["tier"], "tier must be set")
 		envField, hasEnv := item["env"]
 		require.True(t, hasEnv, "env field must be present on every list row")
-		assert.Equal(t, "production", envField, "default env for newly-created stacks is production")
+		assert.Equal(t, "development", envField, "default env for newly-created stacks is 'development' (mig 026)")
 		// parent_stack_id field is present (empty string for the root).
 		_, hasParent := item["parent_stack_id"]
 		assert.True(t, hasParent, "parent_stack_id field must be present (even if empty string)")

@@ -15,7 +15,7 @@ import (
 	"instant.dev/internal/testhelpers"
 )
 
-func TestDeploymentEnv_CreateDefaultsToProduction(t *testing.T) {
+func TestDeploymentEnv_CreateDefaultsToDevelopment(t *testing.T) {
 	requireDB(t)
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
@@ -27,12 +27,14 @@ func TestDeploymentEnv_CreateDefaultsToProduction(t *testing.T) {
 		TeamID: teamID,
 		AppID:  "app-test-" + uuid.NewString()[:8],
 		Tier:   "hobby",
-		// Env intentionally empty → must default.
+		// Env intentionally empty → must default to "development"
+		// post-migration-026 (was "production" before).
 	})
 	require.NoError(t, err)
 	defer db.Exec(`DELETE FROM deployments WHERE id = $1`, d.ID)
 
-	assert.Equal(t, models.EnvProduction, d.Env)
+	assert.Equal(t, models.EnvDevelopment, d.Env, "migration 026: empty Env defaults to 'development'")
+	assert.Equal(t, "development", d.Env)
 }
 
 func TestDeploymentEnv_CreateRoundTrips(t *testing.T) {
@@ -103,7 +105,9 @@ func TestDeploymentEnv_AppNameIsolation(t *testing.T) {
 	assert.Len(t, devList, 1)
 	assert.Equal(t, dev.ID, devList[0].ID)
 
-	prodList, err := models.GetDeploymentsByTeamAndEnv(context.Background(), db, teamID, "")
+	// Explicit env="production" still returns prod rows (backward compat —
+	// migration 026 only changed the DEFAULT, not how explicit values work).
+	prodList, err := models.GetDeploymentsByTeamAndEnv(context.Background(), db, teamID, "production")
 	require.NoError(t, err)
 	// Filter out unrelated rows from concurrent tests.
 	var matched int
