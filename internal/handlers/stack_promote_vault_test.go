@@ -26,7 +26,11 @@ import (
 
 const (
 	promoteVaultEnvSource = "staging"
-	promoteVaultEnvTarget = "production"
+	// Target is the dev env so the migration-026 email-link approval gate
+	// is bypassed (dev-env promotes execute immediately). Auto-copy vault
+	// behaviour is the contract under test here — non-dev approval flow
+	// has its own coverage in promote_approval_test.go.
+	promoteVaultEnvTarget = "development"
 )
 
 func TestStackPromote_AutoCopiesVaultRefs_Default(t *testing.T) {

@@ -108,7 +108,7 @@ func TestStackPromote_HobbyTier_402(t *testing.T) {
 	app := newStackTestApp(t, db)
 	resp := postPromote(t, app, sessionJWT, srcSlug, map[string]any{
 		"from": "staging",
-		"to":   "production",
+		"to":   "development",
 	})
 	defer resp.Body.Close()
 
@@ -145,7 +145,7 @@ func TestStackPromote_ProTier_CreatesChildStack(t *testing.T) {
 	app := newStackTestApp(t, db)
 	resp := postPromote(t, app, sessionJWT, srcSlug, map[string]any{
 		"from": "staging",
-		"to":   "production",
+		"to":   "development",
 	})
 	defer resp.Body.Close()
 
@@ -165,7 +165,7 @@ func TestStackPromote_ProTier_CreatesChildStack(t *testing.T) {
 	assert.Equal(t, "created", body.Action)
 	assert.NotEmpty(t, body.StackID, "stack_id of new env must be returned")
 	assert.NotEqual(t, srcSlug, body.StackID, "new env must have its own slug")
-	assert.Equal(t, "production", body.Env)
+	assert.Equal(t, "development", body.Env)
 	assert.Equal(t, srcID, body.ParentID, "parent_id must point at the source stack id")
 	assert.Equal(t, srcSlug, body.Source)
 	assert.Equal(t, "building", body.Status)
@@ -176,7 +176,7 @@ func TestStackPromote_ProTier_CreatesChildStack(t *testing.T) {
 		SELECT env, parent_stack_id::text FROM stacks WHERE slug = $1
 	`, body.StackID).Scan(&dbEnv, &dbParent)
 	require.NoError(t, err)
-	assert.Equal(t, "production", dbEnv)
+	assert.Equal(t, "development", dbEnv)
 	assert.Equal(t, srcID, dbParent)
 }
 
@@ -197,7 +197,7 @@ func TestStackPromote_RepromoteIsIdempotent(t *testing.T) {
 
 	// First promote: creates the production row.
 	r1 := postPromote(t, app, sessionJWT, srcSlug, map[string]any{
-		"from": "staging", "to": "production",
+		"from": "staging", "to": "development",
 	})
 	defer r1.Body.Close()
 	assert.Equal(t, http.StatusAccepted, r1.StatusCode)
@@ -211,7 +211,7 @@ func TestStackPromote_RepromoteIsIdempotent(t *testing.T) {
 
 	// Second promote: re-uses the existing production row.
 	r2 := postPromote(t, app, sessionJWT, srcSlug, map[string]any{
-		"from": "staging", "to": "production",
+		"from": "staging", "to": "development",
 	})
 	defer r2.Body.Close()
 	assert.Equal(t, http.StatusOK, r2.StatusCode, "in-place re-promote returns 200, not 202")
@@ -223,13 +223,13 @@ func TestStackPromote_RepromoteIsIdempotent(t *testing.T) {
 	assert.Equal(t, "updated_existing", b2.Action)
 	assert.Equal(t, firstSlug, b2.StackID, "second promote must return the same slug")
 
-	// Verify DB: only one production stack exists in the family.
+	// Verify DB: only one development stack exists in the family.
 	var n int
 	require.NoError(t, db.QueryRowContext(context.Background(), `
 		SELECT COUNT(*) FROM stacks
-		WHERE team_id = $1 AND env = 'production'
+		WHERE team_id = $1 AND env = 'development'
 	`, teamID).Scan(&n))
-	assert.Equal(t, 1, n, "exactly one production stack must exist after two promotes")
+	assert.Equal(t, 1, n, "exactly one development stack must exist after two promotes")
 }
 
 // TestStackPromote_InvalidBody covers the 400 paths: missing 'to', same
@@ -287,7 +287,7 @@ func TestStackPromote_CrossTeamIsolation(t *testing.T) {
 
 	app := newStackTestApp(t, db)
 	resp := postPromote(t, app, teamBJWT, srcSlug, map[string]any{
-		"from": "staging", "to": "production",
+		"from": "staging", "to": "development",
 	})
 	defer resp.Body.Close()
 
@@ -344,7 +344,7 @@ func TestStackPromote_MissingImageRef_412(t *testing.T) {
 
 	app := newStackTestApp(t, db)
 	resp := postPromote(t, app, sessionJWT, srcSlug, map[string]any{
-		"from": "staging", "to": "production",
+		"from": "staging", "to": "development",
 	})
 	defer resp.Body.Close()
 
@@ -394,7 +394,7 @@ func TestStackPromote_CopiesImageRef(t *testing.T) {
 
 	app := newStackTestApp(t, db)
 	resp := postPromote(t, app, sessionJWT, srcSlug, map[string]any{
-		"from": "staging", "to": "production",
+		"from": "staging", "to": "development",
 	})
 	defer resp.Body.Close()
 
@@ -461,7 +461,7 @@ func TestStackPromote_VaultRefsResolveAgainstTargetEnv(t *testing.T) {
 
 	app := newStackTestApp(t, db)
 	resp := postPromote(t, app, sessionJWT, srcSlug, map[string]any{
-		"from": "staging", "to": "production",
+		"from": "staging", "to": "development",
 	})
 	defer resp.Body.Close()
 
@@ -471,14 +471,14 @@ func TestStackPromote_VaultRefsResolveAgainstTargetEnv(t *testing.T) {
 		Env     string `json:"env"`
 	}
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-	require.Equal(t, "production", body.Env,
+	require.Equal(t, "development", body.Env,
 		"target env must be the promote target")
 
-	// Confirm the row that future redeploys will read from has env=production.
+	// Confirm the row that future redeploys will read from has env=development.
 	var dbEnv string
 	require.NoError(t, db.QueryRowContext(context.Background(),
 		`SELECT env FROM stacks WHERE slug = $1`, body.StackID,
 	).Scan(&dbEnv))
-	assert.Equal(t, "production", dbEnv,
+	assert.Equal(t, "development", dbEnv,
 		"target stack row's env column drives ResolveVaultRefs scoping on all future redeploys")
 }
