@@ -18,36 +18,59 @@ import (
 // nginx.ingress.kubernetes.io/whitelist-source-range annotation. AllowedIPs
 // is stored as a comma-joined TEXT column (not JSONB) — keeps the model's
 // scalar-friendly shape and matches the Ingress annotation format byte-for-byte.
+//
+// NotifyWebhook / NotifyWebhookSecret / NotifyState / NotifyAttempts back the
+// deploy-webhook-notify feature (migration 026). When NotifyWebhook is set,
+// the worker POSTs to it once the deploy reaches a terminal state — healthy
+// or failed. NotifyWebhookSecret (when supplied) is the HMAC-SHA256 signing
+// key for the X-InstaNode-Signature header; it is AES-256-GCM encrypted at
+// rest using the platform AES_KEY (same shape as resources.connection_url).
+// The model surfaces the ENCRYPTED form — the worker decrypts at dispatch
+// time so plaintext never lands in the deployments row.
 type Deployment struct {
-	ID           uuid.UUID
-	TeamID       uuid.UUID
-	ResourceID   uuid.NullUUID
-	AppID        string
-	ProviderID   string // k8s Deployment name, e.g. "app-{app_id}"
-	Status       string // building | deploying | healthy | failed | stopped
-	AppURL       string
-	EnvVars      map[string]string
-	Port         int
-	Tier         string
-	Env          string // dev | staging | production | <custom>; defaults to "production"
-	Private      bool
-	AllowedIPs   []string // parsed from the comma-joined `allowed_ips` column
-	ErrorMessage string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID                   uuid.UUID
+	TeamID               uuid.UUID
+	ResourceID           uuid.NullUUID
+	AppID                string
+	ProviderID           string // k8s Deployment name, e.g. "app-{app_id}"
+	Status               string // building | deploying | healthy | failed | stopped
+	AppURL               string
+	EnvVars              map[string]string
+	Port                 int
+	Tier                 string
+	Env                  string // dev | staging | production | <custom>; defaults to "production"
+	Private              bool
+	AllowedIPs           []string // parsed from the comma-joined `allowed_ips` column
+	NotifyWebhook        string   // user-supplied https:// URL; empty when unset
+	NotifyWebhookSecret  string   // AES-256-GCM ciphertext of the HMAC key; empty when unset
+	NotifyState          string   // 'unset' | 'pending' | 'sent' | 'failed'
+	NotifyAttempts       int      // dispatch retry counter (worker bumps on 5xx/network)
+	ErrorMessage         string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 // CreateDeploymentParams holds fields for inserting a new deployment row.
+//
+// NotifyWebhook (when non-empty) must already be a validated https:// URL
+// pointing at a publicly routable hostname (SSRF-checked by the handler
+// before this struct is constructed). NotifyWebhookSecret (when non-empty)
+// must already be AES-256-GCM ciphertext — this layer does no crypto.
+// When NotifyWebhook is empty, NotifyState defaults to 'unset' at the DB
+// layer; when non-empty, the INSERT sets it to 'pending' so the worker
+// scan picks it up the moment the deploy reaches a terminal state.
 type CreateDeploymentParams struct {
-	TeamID     uuid.UUID
-	ResourceID *uuid.UUID
-	AppID      string
-	Port       int
-	Tier       string
-	Env        string // empty string is normalised to EnvDefault ("development")
-	EnvVars    map[string]string
-	Private    bool
-	AllowedIPs []string // each entry must already be a valid IP or CIDR
+	TeamID              uuid.UUID
+	ResourceID          *uuid.UUID
+	AppID               string
+	Port                int
+	Tier                string
+	Env                 string // empty string is normalised to EnvDefault ("development")
+	EnvVars             map[string]string
+	Private             bool
+	AllowedIPs          []string // each entry must already be a valid IP or CIDR
+	NotifyWebhook       string   // empty = no webhook; non-empty = validated https URL
+	NotifyWebhookSecret string   // empty = no HMAC; non-empty = AES ciphertext
 }
 
 // ErrDeploymentNotFound is returned when a deployment lookup yields no rows.
@@ -60,8 +83,12 @@ func (e *ErrDeploymentNotFound) Error() string {
 }
 
 // deploymentColumns is the canonical column list shared by all deployment SELECTs.
+// notify_webhook / notify_webhook_secret / notify_state / notify_attempts
+// (migration 026) are appended at the end so existing column-order assumptions
+// in this file's scanDeployment continue to compile-fail loudly on drift.
 const deploymentColumns = `id, team_id, resource_id, app_id, provider_id, status, app_url,
-       env_vars, port, tier, env, private, allowed_ips, error_message, created_at, updated_at`
+       env_vars, port, tier, env, private, allowed_ips, error_message, created_at, updated_at,
+       notify_webhook, notify_webhook_secret, notify_state, notify_attempts`
 
 // scanDeployment reads a single deployments row into a Deployment struct.
 // env_vars is stored as JSONB; error_message, provider_id, and app_url are nullable.
@@ -74,6 +101,10 @@ func scanDeployment(row interface {
 	var providerID, appURL, errorMessage sql.NullString
 	var resourceID uuid.NullUUID
 	var allowedIPsRaw string
+	// migration 026: notify_webhook / notify_webhook_secret are nullable
+	// (legacy rows have NULL); notify_state defaults to 'unset' (NOT NULL)
+	// and notify_attempts defaults to 0 (NOT NULL).
+	var notifyWebhook, notifyWebhookSecret sql.NullString
 
 	if err := row.Scan(
 		&d.ID, &d.TeamID, &resourceID, &d.AppID,
@@ -82,6 +113,7 @@ func scanDeployment(row interface {
 		&d.Private, &allowedIPsRaw,
 		&errorMessage,
 		&d.CreatedAt, &d.UpdatedAt,
+		&notifyWebhook, &notifyWebhookSecret, &d.NotifyState, &d.NotifyAttempts,
 	); err != nil {
 		return nil, err
 	}
@@ -91,6 +123,8 @@ func scanDeployment(row interface {
 	d.AppURL = appURL.String
 	d.ErrorMessage = errorMessage.String
 	d.AllowedIPs = splitAllowedIPs(allowedIPsRaw)
+	d.NotifyWebhook = notifyWebhook.String
+	d.NotifyWebhookSecret = notifyWebhookSecret.String
 
 	if len(envVarsRaw) > 0 {
 		if err := json.Unmarshal(envVarsRaw, &d.EnvVars); err != nil {
@@ -162,13 +196,30 @@ func CreateDeployment(ctx context.Context, db *sql.DB, p CreateDeploymentParams)
 	// the form the nginx whitelist-source-range annotation already requires.
 	allowedIPs := JoinAllowedIPs(p.AllowedIPs)
 
+	// notify_state lifecycle (migration 026):
+	//   no URL supplied  → 'unset'   (column default, but explicit here so
+	//                                  the contract is visible in the query)
+	//   URL supplied     → 'pending' (worker scan picks it up the moment
+	//                                  the deploy reaches a terminal state)
+	notifyState := "unset"
+	var notifyWebhook, notifyWebhookSecret interface{}
+	if p.NotifyWebhook != "" {
+		notifyState = "pending"
+		notifyWebhook = p.NotifyWebhook
+		if p.NotifyWebhookSecret != "" {
+			notifyWebhookSecret = p.NotifyWebhookSecret
+		}
+	}
+
 	row := db.QueryRowContext(ctx, `
 		INSERT INTO deployments
-			(team_id, resource_id, app_id, port, tier, env, env_vars, private, allowed_ips)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			(team_id, resource_id, app_id, port, tier, env, env_vars, private, allowed_ips,
+			 notify_webhook, notify_webhook_secret, notify_state)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING `+deploymentColumns,
 		p.TeamID, resourceID, p.AppID, port, p.Tier, env, envVarsJSON,
-		p.Private, allowedIPs)
+		p.Private, allowedIPs,
+		notifyWebhook, notifyWebhookSecret, notifyState)
 
 	d, err := scanDeployment(row)
 	if err != nil {
