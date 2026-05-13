@@ -511,6 +511,14 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		adminGroup.Post("/customers/:team_id/tier", adminCustH.ChangeTier)
 		adminGroup.Post("/customers/:team_id/promo", adminCustH.IssuePromo)
 
+		// Promo lifecycle audit feed. /audit is uncached (admin needs to see
+		// "issued at 3 sec ago"); /stats is Redis-cached 5 min (the totals tile
+		// the dashboard polls). See handlers/admin_promos_audit.go for the
+		// freshness contract.
+		adminPromosH := handlers.NewAdminPromosAuditHandler(db, rdb)
+		adminGroup.Get("/promos/audit", adminPromosH.Audit)
+		adminGroup.Get("/promos/stats", adminPromosH.Stats)
+
 		// GET /api/v1/<prefix>/deploys — append-only deploy-identity log.
 		// Answers "which binary was serving traffic at $TIME?" — see
 		// internal/handlers/deploys_audit.go and migration 022 for the
