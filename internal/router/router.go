@@ -305,6 +305,18 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	teamsHPublic := handlers.NewTeamsHandler(db, cfg, emailClient)
 	app.Post("/api/v1/invitations/:token/accept", teamsHPublic.AcceptInvitation)
 
+	// Email-provider feedback webhooks — bounces, unsubscribes, spam
+	// complaints. Each handler authenticates the inbound call via
+	// HMAC (Brevo) or SNS-TopicArn match (SES), so they MUST register
+	// before the /api/v1 auth group — the group's RequireAuth would
+	// otherwise demand a Bearer token from Brevo's servers.
+	//
+	// PII: the raw payload is persisted to email_events.raw for audit,
+	// but the handlers DO NOT log it. See email_webhooks.go.
+	emailWebhookH := handlers.NewEmailWebhookHandler(db, cfg)
+	app.Post("/api/v1/email/webhook/brevo", emailWebhookH.Brevo)
+	app.Post("/api/v1/email/webhook/ses", emailWebhookH.SES)
+
 	// Authenticated resource management
 	middleware.SetRoleLookupDB(db)  // populate auth_team_role on every RequireAuth
 	middleware.SetAPIKeyDB(db)      // enable PAT auth path in RequireAuth
