@@ -20,20 +20,18 @@ var migrationsFS embed.FS
 // RunMigrations executes all embedded SQL migration files in alphabetical order.
 // All SQL files use CREATE TABLE IF NOT EXISTS / ALTER TABLE ADD COLUMN IF NOT EXISTS /
 // CREATE INDEX IF NOT EXISTS — safe to re-run on every startup.
+//
+// After all files run, each filename is recorded in schema_migrations
+// (created by 022_schema_migrations.sql) with ON CONFLICT DO NOTHING so
+// GET /healthz can surface migration_version + migration_count. The
+// INSERT is best-effort: a failure to record (e.g. on a fresh DB before
+// 022 has run for the first time on this exact connection) is logged
+// but does not fail the startup gate.
 func RunMigrations(db *sql.DB) error {
-	entries, err := fs.ReadDir(migrationsFS, "migrations")
+	names, err := embeddedMigrationFilenames()
 	if err != nil {
-		return fmt.Errorf("db.RunMigrations: read dir: %w", err)
+		return fmt.Errorf("db.RunMigrations: %w", err)
 	}
-
-	// Collect only .sql files and sort alphabetically.
-	var names []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
 
 	for _, name := range names {
 		content, err := fs.ReadFile(migrationsFS, "migrations/"+name)
@@ -45,7 +43,50 @@ func RunMigrations(db *sql.DB) error {
 			return fmt.Errorf("db.RunMigrations: exec %s: %w", name, err)
 		}
 	}
+
+	// Record every successfully-applied filename. ON CONFLICT preserves
+	// the original applied_at for migrations seen on a previous boot.
+	// The schema_migrations table itself is created by one of the
+	// migrations above, so this loop runs after the table exists.
+	for _, name := range names {
+		if _, err := db.Exec(
+			`INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING`,
+			name,
+		); err != nil {
+			// Don't fail startup on a tracking-row insert. The migration
+			// itself applied successfully (we just exec'd it above); the
+			// /healthz tracking surface is best-effort.
+			slog.Warn("db.migrations.record_failed", "file", name, "error", err)
+		}
+	}
 	return nil
+}
+
+// embeddedMigrationFilenames returns the sorted list of embedded migration
+// filenames. Exported via MigrationFiles for read-only callers that want
+// to compare the in-binary set against the DB-tracked set.
+func embeddedMigrationFilenames() ([]string, error) {
+	entries, err := fs.ReadDir(migrationsFS, "migrations")
+	if err != nil {
+		return nil, fmt.Errorf("read dir: %w", err)
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// MigrationFiles returns the sorted list of .sql filenames compiled into
+// this binary's embedded migration set. Read-only. Used by tests and by
+// internal/migrations to sanity-check that the DB-reported filename
+// actually exists in the binary.
+func MigrationFiles() []string {
+	names, _ := embeddedMigrationFilenames()
+	return names
 }
 
 // ErrDBConnect is returned when the Postgres connection cannot be established.
