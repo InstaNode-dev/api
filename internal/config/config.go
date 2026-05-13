@@ -94,6 +94,16 @@ type Config struct {
 	// and fail token validation (deterministic disable for rollback).
 	FamilyBindingsEnabled bool
 
+	// Email-feedback webhook secrets. Each provider authenticates its
+	// callbacks differently — these env vars give the handler the shared
+	// secret (Brevo, SendGrid) or topic ARN (SES via SNS) it needs to
+	// reject unsigned traffic. All three may be empty in local dev; the
+	// handlers then 401 every request, which is the correct fail-closed
+	// behavior for an unauthenticated public endpoint.
+	BrevoWebhookSecret   string // BREVO_WEBHOOK_SECRET — shared secret for HMAC-SHA256 verification
+	SESSNSTopicARN       string // SES_SNS_SUBSCRIPTION_ARN — expected SNS TopicArn on inbound notifications
+	SendGridWebhookKey   string // SENDGRID_WEBHOOK_PUBLIC_KEY — ECDSA public key (reserved; SendGrid is stubbed today)
+
 	// AdminPathPrefix is the unguessable URL segment under which the
 	// founder-only customer-management endpoints register. When set,
 	// admin routes mount at /api/v1/<prefix>/customers/... instead of
@@ -228,6 +238,14 @@ func Load() *Config {
 			cfg.ObjectStoreBackend = "shared-key"
 		}
 	}
+	// Email-feedback webhook auth secrets. Empty values → handler rejects
+	// every inbound webhook (fail-closed). Operators MUST set these in
+	// production; absence is logged via the BrevoWebhookSecret_set etc.
+	// flags emitted by logStartupConfig.
+	cfg.BrevoWebhookSecret = os.Getenv("BREVO_WEBHOOK_SECRET")
+	cfg.SESSNSTopicARN = os.Getenv("SES_SNS_SUBSCRIPTION_ARN")
+	cfg.SendGridWebhookKey = os.Getenv("SENDGRID_WEBHOOK_PUBLIC_KEY")
+
 	cfg.DeployDomain = getenv("DEPLOY_DOMAIN", "instant.dev")
 	cfg.ComputeProvider = getenv("COMPUTE_PROVIDER", "noop")
 	cfg.KubeNamespaceApps = getenv("KUBE_NAMESPACE_APPS", "instant-apps")
