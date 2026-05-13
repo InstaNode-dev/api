@@ -1530,7 +1530,16 @@ const openAPISpec = `{
     "schemas": {
       "HealthResponse": {
         "type": "object",
-        "properties": { "ok": { "type": "boolean" }, "service": { "type": "string" } }
+        "properties": {
+          "ok": { "type": "boolean" },
+          "service": { "type": "string" },
+          "commit_id": { "type": "string", "description": "Short git SHA of the running binary (compiled via -ldflags). Falls back to 'dev' for un-instrumented builds." },
+          "build_time": { "type": "string", "description": "RFC3339 UTC timestamp when the running binary was built. Falls back to 'dev'." },
+          "version": { "type": "string", "description": "Build version tag from -ldflags. Falls back to 'dev'." },
+          "migration_version": { "type": "string", "description": "Filename of the highest-applied embedded migration recorded in the platform DB's schema_migrations table (e.g. '022_schema_migrations.sql'). Empty when migration_status='unknown'." },
+          "migration_count": { "type": "integer", "description": "Total number of migrations recorded as applied in schema_migrations. 0 when migration_status='unknown'." },
+          "migration_status": { "type": "string", "enum": ["ok", "unknown"], "description": "'ok' when the read against schema_migrations succeeded; 'unknown' when the DB was unreachable or the table is absent. The service still returns 200 OK in either case — this field surfaces tracking-read health independently of overall service health." }
+        }
       },
       "ProvisionRequest": {
         "type": "object",
