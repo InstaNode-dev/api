@@ -58,6 +58,28 @@ func (p *Portal) CancelAtCycleEnd(subscriptionID string) error {
 	return err
 }
 
+// CancelImmediately calls POST /subscriptions/{id}/cancel with
+// cancel_at_cycle_end=false, terminating the subscription right away
+// (no further charges, MRR drops in the same billing cycle).
+//
+// Used by the admin demote flow — when an operator pushes a paying
+// customer down a tier, the customer should not continue to be charged
+// for the higher tier they no longer have. Picking the "immediate"
+// variant (rather than the at-cycle-end variant the customer's own
+// self-serve cancel uses) keeps the MRR math clean: the cancellation
+// shows up in the same period the tier change happened, with no
+// ambiguous "still billing the old tier through end of cycle" tail.
+func (p *Portal) CancelImmediately(subscriptionID string) error {
+	c, err := p.client()
+	if err != nil {
+		return err
+	}
+	_, err = c.Subscription.Cancel(subscriptionID, map[string]interface{}{
+		"cancel_at_cycle_end": false,
+	}, nil)
+	return err
+}
+
 // Invoice is a normalized subscription invoice row for the dashboard.
 type Invoice struct {
 	ID       string

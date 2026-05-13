@@ -664,3 +664,306 @@ func TestAdminIssuePromo_UnknownTeam_404(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, status)
 	assert.Equal(t, "team_not_found", body["error"])
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Razorpay subscription cancellation on admin demote
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Track B follow-up to PR #48: when admin demotes a paying customer
+// (pro → hobby, team → pro, etc.) the customer's Razorpay subscription
+// must be canceled out-of-band — otherwise we keep charging them at the
+// old tier indefinitely. Promotions are unchanged (comp-tier flow).
+//
+// The handler indirects through AdminCustomersHandler.CancelSubscription;
+// these tests substitute a tracking fake to assert (a) when it's called,
+// (b) with what subscription_id, and (c) that failures don't surface a
+// 500 to the admin caller.
+
+// adminAppWithCancel mirrors adminApp but lets the test inject a fake
+// CancelSubscription. Returns both the Fiber app and the underlying
+// handler so the test can inspect call-counts on the handler-owned fake.
+func adminAppWithCancel(t *testing.T, db *sql.DB, callerEmail string, cancelFn func(string) error) (*fiber.App, *handlers.AdminCustomersHandler) {
+	t.Helper()
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			if errors.Is(err, handlers.ErrResponseWritten) {
+				return nil
+			}
+			code := fiber.StatusInternalServerError
+			if e, ok := err.(*fiber.Error); ok {
+				code = e.Code
+			}
+			return c.Status(code).JSON(fiber.Map{"ok": false, "error": "internal_error", "message": err.Error()})
+		},
+	})
+
+	fakeAuth := func(c *fiber.Ctx) error {
+		if callerEmail != "" {
+			c.Locals(middleware.LocalKeyEmail, callerEmail)
+		}
+		c.Locals(middleware.LocalKeyUserID, uuid.NewString())
+		c.Locals(middleware.LocalKeyTeamID, uuid.NewString())
+		return c.Next()
+	}
+
+	planReg := plans.Default()
+	adminH := handlers.NewAdminCustomersHandler(db, planReg)
+	if cancelFn != nil {
+		adminH.CancelSubscription = cancelFn
+	}
+
+	adminGroup := app.Group("/api/v1/admin", fakeAuth, middleware.RequireAdmin())
+	adminGroup.Post("/customers/:team_id/tier", adminH.ChangeTier)
+	return app, adminH
+}
+
+// adminSeedTeamWithSub seeds a team at the given tier + a unique
+// Razorpay subscription_id on file. Returns (teamID, subID).
+func adminSeedTeamWithSub(t *testing.T, db *sql.DB, tier string) (uuid.UUID, string) {
+	t.Helper()
+	teamID, _ := adminSeedTeam(t, db, tier)
+	subID := "sub_test_demote_" + uuid.NewString()
+	require.NoError(t, models.UpdateRazorpaySubscriptionID(context.Background(), db, teamID, subID))
+	return teamID, subID
+}
+
+// adminLatestAuditMeta returns the metadata blob of the most recent
+// audit_log row for (teamID, kind). Test helper to keep the assertion
+// blocks short.
+func adminLatestAuditMeta(t *testing.T, db *sql.DB, teamID uuid.UUID, kind string) map[string]any {
+	t.Helper()
+	var raw sql.NullString
+	err := db.QueryRowContext(context.Background(), `
+		SELECT metadata::text
+		FROM audit_log
+		WHERE team_id = $1 AND kind = $2
+		ORDER BY created_at DESC LIMIT 1
+	`, teamID, kind).Scan(&raw)
+	require.NoError(t, err, "audit row with kind=%s must exist for team_id=%s", kind, teamID)
+	require.True(t, raw.Valid, "audit row metadata must be non-NULL")
+	var out map[string]any
+	require.NoError(t, json.Unmarshal([]byte(raw.String), &out))
+	return out
+}
+
+// TestAdminTierChange_DemoteProToHobby_CancelsSubscription is the headline
+// case: a paying Pro team with an active Razorpay subscription gets
+// demoted by admin → the Razorpay cancel fires + the canceled_by_admin
+// audit row carries cancel_succeeded=true + the subscription_id.
+//
+// Both audit rows must be emitted: admin.tier_changed (the existing PR #48
+// behavior) AND subscription.canceled_by_admin (new). Brevo / Loops keys
+// on the new kind to fire the "your subscription was canceled by support"
+// template — the old kind keeps existing consumers untouched.
+func TestAdminTierChange_DemoteProToHobby_CancelsSubscription(t *testing.T) {
+	db, cleanup := adminAppNeedsDB(t)
+	defer cleanup()
+	t.Setenv("ADMIN_EMAILS", adminCallerEmail)
+
+	teamID, subID := adminSeedTeamWithSub(t, db, "pro")
+
+	var cancelCalls []string
+	cancelFn := func(s string) error {
+		cancelCalls = append(cancelCalls, s)
+		return nil
+	}
+	app, _ := adminAppWithCancel(t, db, adminCallerEmail, cancelFn)
+
+	status, body := adminDoJSON(t, app, "POST", "/api/v1/admin/customers/"+teamID.String()+"/tier",
+		map[string]any{"tier": "hobby", "reason": "customer requested downgrade — support ticket #1042"})
+	require.Equal(t, http.StatusOK, status, "demote must succeed: body=%v", body)
+	assert.Equal(t, "pro", body["from"])
+	assert.Equal(t, "hobby", body["to"])
+
+	// 1. Razorpay cancel was called exactly once with the right subscription_id.
+	require.Equal(t, 1, len(cancelCalls), "CancelSubscription must be called exactly once on demote")
+	assert.Equal(t, subID, cancelCalls[0], "cancel must be called with the team's stored subscription_id")
+
+	// 2. team.plan_tier was actually demoted in DB.
+	team, err := models.GetTeamByID(context.Background(), db, teamID)
+	require.NoError(t, err)
+	assert.Equal(t, "hobby", team.PlanTier)
+
+	// 3. The admin.tier_changed audit row exists (preserves Track A behavior).
+	tierMeta := adminLatestAuditMeta(t, db, teamID, handlers.AuditKindAdminTierChanged)
+	assert.Equal(t, "pro", tierMeta["from"])
+	assert.Equal(t, "hobby", tierMeta["to"])
+
+	// 4. The subscription.canceled_by_admin audit row exists with the
+	//    expected provider-agnostic shape — Brevo / Loops keys on the
+	//    kind string + reads cancel_succeeded to decide template copy.
+	cancelMeta := adminLatestAuditMeta(t, db, teamID, models.AuditKindSubscriptionCanceledByAdmin)
+	assert.Equal(t, "pro", cancelMeta["from_tier"])
+	assert.Equal(t, "hobby", cancelMeta["to_tier"])
+	assert.Equal(t, adminCallerEmail, cancelMeta["by_admin_email"])
+	assert.Equal(t, subID, cancelMeta["subscription_id"])
+	assert.Equal(t, true, cancelMeta["cancel_attempted"])
+	assert.Equal(t, true, cancelMeta["cancel_succeeded"])
+	// cancel_error is omitempty — must be absent on success.
+	_, hasErr := cancelMeta["cancel_error"]
+	assert.False(t, hasErr, "cancel_error must be omitted when cancel succeeded")
+}
+
+// TestAdminTierChange_DemoteTeamToHobby_CancelsSubscription covers the
+// "biggest customer downgrades all the way" case. Same shape as the
+// pro→hobby test but exercises the rank delta of 2+ to defend against a
+// regression where the demote check assumes adjacent tiers only.
+func TestAdminTierChange_DemoteTeamToHobby_CancelsSubscription(t *testing.T) {
+	db, cleanup := adminAppNeedsDB(t)
+	defer cleanup()
+	t.Setenv("ADMIN_EMAILS", adminCallerEmail)
+
+	teamID, subID := adminSeedTeamWithSub(t, db, "team")
+	var cancelCalls []string
+	cancelFn := func(s string) error {
+		cancelCalls = append(cancelCalls, s)
+		return nil
+	}
+	app, _ := adminAppWithCancel(t, db, adminCallerEmail, cancelFn)
+
+	status, body := adminDoJSON(t, app, "POST", "/api/v1/admin/customers/"+teamID.String()+"/tier",
+		map[string]any{"tier": "hobby", "reason": "team requested full downgrade"})
+	require.Equal(t, http.StatusOK, status, "body=%v", body)
+	require.Equal(t, 1, len(cancelCalls))
+	assert.Equal(t, subID, cancelCalls[0])
+	cancelMeta := adminLatestAuditMeta(t, db, teamID, models.AuditKindSubscriptionCanceledByAdmin)
+	assert.Equal(t, "team", cancelMeta["from_tier"])
+	assert.Equal(t, "hobby", cancelMeta["to_tier"])
+	assert.Equal(t, true, cancelMeta["cancel_succeeded"])
+}
+
+// TestAdminTierChange_DemoteWithoutSubscriptionID_NoRazorpayCall — paying
+// tier with no subscription_id (operator comp-promoted, then later demoted)
+// must NOT call Razorpay but must still emit the audit row, with
+// cancel_attempted=false so Brevo doesn't claim we canceled anything.
+//
+// Defensive: catches the "loud failure if subID empty" regression where a
+// future refactor decides empty subID is a bug and returns 5xx.
+func TestAdminTierChange_DemoteWithoutSubscriptionID_NoRazorpayCall(t *testing.T) {
+	db, cleanup := adminAppNeedsDB(t)
+	defer cleanup()
+	t.Setenv("ADMIN_EMAILS", adminCallerEmail)
+
+	// Seed on Pro but DO NOT set a subscription_id — simulating a
+	// comp-promoted team being later demoted.
+	teamID, _ := adminSeedTeam(t, db, "pro")
+
+	var cancelCalls []string
+	cancelFn := func(s string) error {
+		cancelCalls = append(cancelCalls, s)
+		return nil
+	}
+	app, _ := adminAppWithCancel(t, db, adminCallerEmail, cancelFn)
+
+	status, body := adminDoJSON(t, app, "POST", "/api/v1/admin/customers/"+teamID.String()+"/tier",
+		map[string]any{"tier": "hobby", "reason": "comp expired"})
+	require.Equal(t, http.StatusOK, status, "body=%v", body)
+	assert.Equal(t, 0, len(cancelCalls), "no subscription_id → Razorpay must NOT be called")
+
+	cancelMeta := adminLatestAuditMeta(t, db, teamID, models.AuditKindSubscriptionCanceledByAdmin)
+	assert.Equal(t, "pro", cancelMeta["from_tier"])
+	assert.Equal(t, "hobby", cancelMeta["to_tier"])
+	assert.Equal(t, "", cancelMeta["subscription_id"])
+	assert.Equal(t, false, cancelMeta["cancel_attempted"])
+	assert.Equal(t, false, cancelMeta["cancel_succeeded"])
+}
+
+// TestAdminTierChange_PromoteHobbyToPro_NoRazorpayCall guards the comp-flow
+// invariant: promotes must not touch Razorpay (they're free upgrades from
+// the operator). A regression that fires the cancel on promote would
+// silently break every "comp this beta tester to pro" workflow.
+//
+// Also asserts NO subscription.canceled_by_admin audit row gets written —
+// promotes are pure admin.tier_changed (existing PR #48 behavior).
+func TestAdminTierChange_PromoteHobbyToPro_NoRazorpayCall(t *testing.T) {
+	db, cleanup := adminAppNeedsDB(t)
+	defer cleanup()
+	t.Setenv("ADMIN_EMAILS", adminCallerEmail)
+
+	teamID, _ := adminSeedTeamWithSub(t, db, "hobby")
+	var cancelCalls []string
+	cancelFn := func(s string) error {
+		cancelCalls = append(cancelCalls, s)
+		return nil
+	}
+	app, _ := adminAppWithCancel(t, db, adminCallerEmail, cancelFn)
+
+	status, body := adminDoJSON(t, app, "POST", "/api/v1/admin/customers/"+teamID.String()+"/tier",
+		map[string]any{"tier": "pro", "reason": "comp"})
+	require.Equal(t, http.StatusOK, status, "body=%v", body)
+	assert.Equal(t, 0, len(cancelCalls), "promote must NOT call Razorpay cancel")
+
+	// No subscription.canceled_by_admin audit row must exist for this team.
+	var count int
+	err := db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*) FROM audit_log WHERE team_id = $1 AND kind = $2
+	`, teamID, models.AuditKindSubscriptionCanceledByAdmin).Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "promote must NOT emit subscription.canceled_by_admin")
+}
+
+// TestAdminTierChange_DemoteRazorpayCancelFails_StillReturns200 is the
+// fail-open assertion: Razorpay returning 5xx must NOT block the admin
+// demote. The team is already on the new tier in our DB, the audit row
+// records cancel_succeeded=false + the error, and the operator reconciles
+// manually in the Razorpay dashboard. Returning 5xx here would leave the
+// admin UI in an ambiguous state (did the demote take?) — worse UX than
+// the audit-flag-and-move-on path.
+func TestAdminTierChange_DemoteRazorpayCancelFails_StillReturns200(t *testing.T) {
+	db, cleanup := adminAppNeedsDB(t)
+	defer cleanup()
+	t.Setenv("ADMIN_EMAILS", adminCallerEmail)
+
+	teamID, subID := adminSeedTeamWithSub(t, db, "pro")
+	cancelFn := func(s string) error {
+		return errors.New("razorpay 500: BAD_REQUEST_ERROR — server unreachable")
+	}
+	app, _ := adminAppWithCancel(t, db, adminCallerEmail, cancelFn)
+
+	status, body := adminDoJSON(t, app, "POST", "/api/v1/admin/customers/"+teamID.String()+"/tier",
+		map[string]any{"tier": "hobby", "reason": "downgrade despite razorpay flake"})
+	require.Equal(t, http.StatusOK, status,
+		"Razorpay cancel failure must not block the admin demote (fail-open). body=%v", body)
+	assert.Equal(t, "hobby", body["to"])
+
+	// DB demote actually happened.
+	team, err := models.GetTeamByID(context.Background(), db, teamID)
+	require.NoError(t, err)
+	assert.Equal(t, "hobby", team.PlanTier)
+
+	// Audit row records the failure so the operator (and Brevo) knows
+	// nothing was actually canceled in Razorpay.
+	cancelMeta := adminLatestAuditMeta(t, db, teamID, models.AuditKindSubscriptionCanceledByAdmin)
+	assert.Equal(t, subID, cancelMeta["subscription_id"])
+	assert.Equal(t, true, cancelMeta["cancel_attempted"])
+	assert.Equal(t, false, cancelMeta["cancel_succeeded"])
+	errMsg, _ := cancelMeta["cancel_error"].(string)
+	assert.Contains(t, errMsg, "razorpay 500",
+		"cancel_error must surface the underlying Razorpay error so the operator can debug")
+}
+
+// TestAdminTierChange_SameTier_409_NoRazorpayCall is the idempotency
+// assertion: re-running the same demote yields the existing same-tier 409
+// (preserves PR #48 behavior) and MUST NOT make a duplicate Razorpay
+// cancel call. The first demote already canceled the subscription;
+// re-canceling would either 404 or no-op upstream, and either way we
+// don't want to log a spurious "we canceled" audit row.
+func TestAdminTierChange_SameTier_409_NoRazorpayCall(t *testing.T) {
+	db, cleanup := adminAppNeedsDB(t)
+	defer cleanup()
+	t.Setenv("ADMIN_EMAILS", adminCallerEmail)
+
+	teamID, _ := adminSeedTeamWithSub(t, db, "hobby")
+	var cancelCalls []string
+	cancelFn := func(s string) error {
+		cancelCalls = append(cancelCalls, s)
+		return nil
+	}
+	app, _ := adminAppWithCancel(t, db, adminCallerEmail, cancelFn)
+
+	status, body := adminDoJSON(t, app, "POST", "/api/v1/admin/customers/"+teamID.String()+"/tier",
+		map[string]any{"tier": "hobby", "reason": "re-run"})
+	assert.Equal(t, http.StatusConflict, status)
+	assert.Equal(t, "tier_unchanged", body["error"])
+	assert.Equal(t, 0, len(cancelCalls), "same-tier 409 must NOT call Razorpay cancel")
+}
