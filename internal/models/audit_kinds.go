@@ -32,4 +32,16 @@ const (
 	// event name uses the double-l UK spelling, which is handled inside the
 	// billing handler.
 	AuditKindSubscriptionCanceled = "subscription.canceled"
+
+	// AuditKindSubscriptionCanceledByAdmin fires when an operator demotes a
+	// paying customer via POST /api/v1/admin/customers/:id/tier and the
+	// demotion triggers an out-of-band Razorpay subscription cancellation.
+	// Distinct from AuditKindSubscriptionCanceled (which is the customer's
+	// own self-serve cancel via Razorpay webhook) so the Loops forwarder /
+	// Brevo template can send a "your subscription was canceled by support"
+	// email rather than the standard customer-initiated copy. Metadata
+	// carries cancel_attempted + cancel_succeeded booleans so a downstream
+	// consumer can distinguish "we canceled in Razorpay" from "we tried but
+	// the call failed — operator must reconcile in the Razorpay dashboard."
+	AuditKindSubscriptionCanceledByAdmin = "subscription.canceled_by_admin"
 )

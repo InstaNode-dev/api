@@ -65,9 +65,15 @@ var adminAllowedTiers = map[string]bool{
 // Audit-log kinds emitted by this handler. Single source of truth for the
 // audit-trail consumer (dashboard Recent Activity, BI exports) so a new
 // admin action just adds one constant here + writes the row.
+//
+// AuditKindSubscriptionCanceledByAdmin lives on the models package (so the
+// Loops forwarder + webhook handlers can reference the same constant) — see
+// models.AuditKindSubscriptionCanceledByAdmin. Aliased here as a local name
+// for symmetry with the other admin-handler-emitted kinds.
 const (
-	AuditKindAdminTierChanged = "admin.tier_changed"
-	AuditKindAdminPromoIssued = "admin.promo_issued"
+	AuditKindAdminTierChanged           = "admin.tier_changed"
+	AuditKindAdminPromoIssued           = "admin.promo_issued"
+	AuditKindSubscriptionCanceledByAdmin = models.AuditKindSubscriptionCanceledByAdmin
 )
 
 // Sort keys accepted by GET /admin/customers. Validated against this set
@@ -98,15 +104,40 @@ const (
 // Holds the plans Registry so it can compute monthly-equivalent MRR for
 // yearly subscriptions in one place. The DB is the platform DB (teams,
 // resources, deployments, audit_log).
+//
+// CancelSubscription is the indirection used by ChangeTier when a demote
+// must also cancel the customer's active Razorpay subscription. Defaulted
+// in NewAdminCustomersHandler to a no-op-returning-error so test rigs that
+// don't wire a Razorpay portal don't accidentally hit the live API; the
+// router replaces it with a portal-backed call. Tests substitute their own
+// fake here to assert call-shape + drive the failure path.
 type AdminCustomersHandler struct {
-	db    *sql.DB
-	plans *plans.Registry
+	db                  *sql.DB
+	plans               *plans.Registry
+	CancelSubscription  func(subscriptionID string) error
 }
+
+// errBillingNotConfigured is the sentinel returned by the default
+// CancelSubscription when no Razorpay portal is wired up. Exposed (lowercase)
+// only inside this package — handlers swallow it after logging, never
+// returning it to the caller. Named (rather than fmt.Errorf at the call
+// site) so a future test can errors.Is against it.
+var errBillingNotConfigured = errors.New("admin_customers: CancelSubscription not wired — Razorpay portal unavailable")
 
 // NewAdminCustomersHandler constructs the handler. The plans Registry is
 // required because MRR computation needs PriceMonthly per tier.
+//
+// CancelSubscription defaults to a no-op error stub. Callers that need real
+// Razorpay cancellation on demote must override CancelSubscription on the
+// returned value (see internal/router/router.go for the wiring).
 func NewAdminCustomersHandler(db *sql.DB, planRegistry *plans.Registry) *AdminCustomersHandler {
-	return &AdminCustomersHandler{db: db, plans: planRegistry}
+	return &AdminCustomersHandler{
+		db:    db,
+		plans: planRegistry,
+		CancelSubscription: func(string) error {
+			return errBillingNotConfigured
+		},
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -489,12 +520,56 @@ type adminTierChangeMetadata struct {
 	Reason       string `json:"reason"`
 }
 
+// adminSubscriptionCanceledByAdminMetadata is the audit_log.metadata payload
+// emitted alongside an admin demote when an active Razorpay subscription
+// gets canceled out-of-band. The shape is provider-agnostic on purpose: the
+// Brevo / Loops template ID is operator-defined and keyed on the audit
+// `kind`, not on this metadata. Fields:
+//
+//   FromTier / ToTier      — the demote transition (e.g. pro → hobby).
+//   ByAdminEmail           — who pushed the button (same as the tier-change row).
+//   Reason                 — the admin-supplied reason string.
+//   SubscriptionID         — the Razorpay sub id that was canceled (or
+//                            empty when the team had no active sub).
+//   CancelAttempted        — true iff we made the Razorpay API call. False
+//                            when SubscriptionID was empty (nothing to cancel).
+//   CancelSucceeded        — true iff the Razorpay call returned no error.
+//                            When false + CancelAttempted true, the operator
+//                            must manually reconcile in the Razorpay dashboard;
+//                            Brevo must NOT send a "we canceled" email.
+//   CancelError            — short error string for the operator (only set
+//                            when CancelSucceeded is false). Not surfaced to
+//                            the customer — internal-only.
+type adminSubscriptionCanceledByAdminMetadata struct {
+	FromTier        string `json:"from_tier"`
+	ToTier          string `json:"to_tier"`
+	ByAdminEmail    string `json:"by_admin_email"`
+	Reason          string `json:"reason"`
+	SubscriptionID  string `json:"subscription_id"`
+	CancelAttempted bool   `json:"cancel_attempted"`
+	CancelSucceeded bool   `json:"cancel_succeeded"`
+	CancelError     string `json:"cancel_error,omitempty"`
+}
+
 // ChangeTier handles POST /api/v1/admin/customers/:team_id/tier.
 //
-// Does NOT touch Razorpay — the use case is comp / customer-success
-// promotion ("on-the-house upgrade for this beta tester"). For an actual
-// paid upgrade the customer hits checkout and the Razorpay webhook drives
-// the tier change. Documented at the route + in the OpenAPI description.
+// Promote path (toTier > fromTier): does NOT touch Razorpay — the use case
+// is comp / customer-success promotion ("on-the-house upgrade for this beta
+// tester"). For an actual paid upgrade the customer hits checkout and the
+// Razorpay webhook drives the tier change.
+//
+// Demote path (toTier < fromTier): ALSO cancels the team's active Razorpay
+// subscription via h.CancelSubscription (immediate cancel — see
+// razorpaybilling.Portal.CancelImmediately for the rationale around
+// MRR-cycle hygiene). If the team has no subscription_id, we skip the
+// Razorpay call but still emit a subscription.canceled_by_admin audit row
+// (with cancel_attempted=false) so the audit log is consistent across the
+// "they were paying" vs "they were on a comp tier" cases. If the Razorpay
+// call fails the handler STILL returns 200 — the DB-side demote already
+// succeeded, the audit row records cancel_succeeded=false, and the operator
+// reconciles manually in the Razorpay dashboard. This fail-open posture is
+// the same we use for resource elevation: never block an admin action on a
+// downstream provider hiccup.
 func (h *AdminCustomersHandler) ChangeTier(c *fiber.Ctx) error {
 	teamID, err := uuid.Parse(c.Params("team_id"))
 	if err != nil {
@@ -536,10 +611,14 @@ func (h *AdminCustomersHandler) ChangeTier(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "db_failed", "Failed to update tier")
 	}
 
+	fromR := adminTierRank(fromTier)
+	toR := adminTierRank(req.Tier)
+	isDemote := toR < fromR && fromR > 0 && toR >= 0
+
 	// Promote existing permanent resources only when this is a real
 	// promotion (rank goes up). Downgrades leave existing rows on their
 	// current tier — same user-benefit policy as the Razorpay path.
-	if adminTierRank(req.Tier) > adminTierRank(fromTier) {
+	if toR > fromR {
 		if err := models.ElevateResourceTiersByTeam(c.Context(), h.db, teamID, req.Tier); err != nil {
 			slog.Warn("admin.customers.tier.elevate_failed", "error", err, "team_id", teamID)
 		}
@@ -560,12 +639,100 @@ func (h *AdminCustomersHandler) ChangeTier(c *fiber.Ctx) error {
 		Metadata: meta,
 	})
 
+	// Demote → cancel Razorpay subscription (best-effort) + emit the
+	// canceled_by_admin audit row. Promotes skip this block entirely so the
+	// comp-promotion path is unchanged.
+	if isDemote {
+		h.cancelOnDemote(c, teamID, team, fromTier, req.Tier, req.Reason, adminEmail)
+	}
+
 	return c.JSON(fiber.Map{
 		"ok":           true,
 		"team_id":      teamID.String(),
 		"from":         fromTier,
 		"to":           req.Tier,
 		"agent_action": newAgentActionAdminTierChanged(teamID.String(), req.Tier),
+	})
+}
+
+// cancelOnDemote is the demote-side leg of ChangeTier. Extracted so the
+// happy path remains readable and so the cancel + audit semantics live in
+// one place. Never returns an error — failures are logged + recorded in
+// the audit row's cancel_succeeded=false field. The caller continues with
+// a 200 response regardless.
+//
+// Three branches:
+//
+//  1. team has no Razorpay subscription_id on file (comp-tier customer,
+//     never paid) → no Razorpay call, audit row written with
+//     cancel_attempted=false. Logged at WARN so the operator notices a
+//     paying-tier team without a subscription_id (data inconsistency).
+//
+//  2. CancelSubscription returns nil → audit row records
+//     cancel_attempted=true + cancel_succeeded=true. Brevo can fire its
+//     "we canceled your subscription" template.
+//
+//  3. CancelSubscription returns an error → audit row records
+//     cancel_attempted=true + cancel_succeeded=false + a short error
+//     string. Logged at ERROR so on-call sees it. Brevo template must
+//     check cancel_succeeded before claiming we canceled anything.
+func (h *AdminCustomersHandler) cancelOnDemote(c *fiber.Ctx, teamID uuid.UUID, team *models.Team, fromTier, toTier, reason, adminEmail string) {
+	subID := ""
+	if team.RazorpaySubscriptionID.Valid {
+		subID = strings.TrimSpace(team.RazorpaySubscriptionID.String)
+	}
+
+	auditMeta := adminSubscriptionCanceledByAdminMetadata{
+		FromTier:       fromTier,
+		ToTier:         toTier,
+		ByAdminEmail:   adminEmail,
+		Reason:         reason,
+		SubscriptionID: subID,
+	}
+
+	switch {
+	case subID == "":
+		// No subscription on file. Still emit an audit row so the BI/Loops
+		// consumer sees the demote transition uniformly — but with
+		// cancel_attempted=false so the email template knows nothing was
+		// charged-to-canceled.
+		slog.Warn("admin.customers.tier.demote_no_subscription_id",
+			"team_id", teamID, "from", fromTier, "to", toTier,
+			"reason", "team has paying tier but no razorpay_subscription_id — operator should verify")
+		auditMeta.CancelAttempted = false
+		auditMeta.CancelSucceeded = false
+
+	default:
+		auditMeta.CancelAttempted = true
+		if err := h.CancelSubscription(subID); err != nil {
+			// Log loudly. The team is already demoted in our DB, so the
+			// operator must reconcile manually in Razorpay (or retry the
+			// demote, which is now a same-tier 409 — so they'd cancel
+			// directly in the Razorpay dashboard).
+			slog.Error("admin.customers.tier.razorpay_cancel_failed",
+				"team_id", teamID, "subscription_id", subID,
+				"from", fromTier, "to", toTier, "error", err)
+			auditMeta.CancelSucceeded = false
+			auditMeta.CancelError = err.Error()
+		} else {
+			auditMeta.CancelSucceeded = true
+		}
+	}
+
+	metaBlob, _ := json.Marshal(auditMeta)
+	summary := fmt.Sprintf("admin %s canceled subscription on demote %s → %s", adminEmail, fromTier, toTier)
+	if auditMeta.CancelAttempted && !auditMeta.CancelSucceeded {
+		summary = fmt.Sprintf("admin %s attempted to cancel subscription on demote %s → %s — RAZORPAY CALL FAILED", adminEmail, fromTier, toTier)
+	}
+	if !auditMeta.CancelAttempted {
+		summary = fmt.Sprintf("admin %s demoted %s → %s — no Razorpay subscription on file", adminEmail, fromTier, toTier)
+	}
+	_ = models.InsertAuditEvent(c.Context(), h.db, models.AuditEvent{
+		TeamID:   teamID,
+		Actor:    "admin",
+		Kind:     AuditKindSubscriptionCanceledByAdmin,
+		Summary:  summary,
+		Metadata: metaBlob,
 	})
 }
 
