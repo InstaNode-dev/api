@@ -6,7 +6,8 @@ package middleware
 // RequireEnvAccess(action) returns a Fiber handler that:
 //   - looks up the authenticated team's env_policy JSONB row
 //   - reads the env scope from the request (query "?env=" first, then JSON
-//     body field "env" or "to", then "production" as a safe default)
+//     body field "env" or "to", then "development" as a safe default
+//     — flipped from "production" by migration 026)
 //   - reads the authenticated user's team role (populated by
 //     PopulateTeamRole upstream)
 //   - rejects with 403 + agent_action when role is not in the allowlist
@@ -69,9 +70,10 @@ const (
 )
 
 // envPolicyDefaultEnv is the env name used when neither the query string nor
-// the request body declares one. Matches resolveEnv's "empty → production"
-// default in handlers/provision_helper.go.
-const envPolicyDefaultEnv = "production"
+// the request body declares one. Matches resolveEnv's "empty → development"
+// default in handlers/provision_helper.go (flipped from "production" by
+// migration 026 — see models.EnvDefault).
+const envPolicyDefaultEnv = "development"
 
 // envPolicyLookupTimeout caps the DB call to read teams.env_policy. Kept
 // short because this middleware runs on every gated request — slow lookups
@@ -181,22 +183,15 @@ func RequireEnvAccess(action string, opts ...EnvPolicyOption) fiber.Handler {
 			}
 		}
 
-		// Build the agent_action prose. We list allowed roles in the
-		// human-readable form (comma-separated, last joined with "or").
-		agentRole := role
-		if agentRole == "" {
-			agentRole = "unknown"
-		}
-		// agent_action conforms to the U3 contract — see
-		// internal/handlers/agent_action.go. The middleware lives in a
-		// different package, so the string is built inline here; the
-		// shape (open with "Tell the user", name the specific reason,
-		// name the exact next action, include full https://instanode.dev/ URL)
-		// must stay in sync.
-		agentAction := fmt.Sprintf(
-			"Tell the user the %s env requires the %s role to %s. Their role is %s — have a team owner run the prompt at https://instanode.dev/app/team or adjust the env-policy.",
-			env, formatAllowedRoles(allowed), action, agentRole,
-		)
+		// Build the agent_action prose via the named builder. Extracted
+		// from an inline fmt.Sprintf so the contract-review grep
+		// (`grep "agent_action" internal/middleware`) surfaces every
+		// middleware-level agent_action string in one place, alongside
+		// unauthorizedAgentAction (auth.go) and adminForbiddenAgentAction
+		// (admin.go). The middleware can't import handlers/agent_action.go
+		// (cycle), so the builder lives in this package — same pattern as
+		// the other two middleware-level constants.
+		agentAction := envPolicyDeniedAgentAction(env, formatAllowedRoles(allowed), action, role)
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"ok":            false,
 			"error":         "env_policy_denied",
@@ -273,6 +268,37 @@ func defaultEnvLookup(c *fiber.Ctx) (string, error) {
 		return probe.To, nil
 	}
 	return "", nil
+}
+
+// envPolicyDeniedAgentAction is the canonical agent_action sentence served
+// on every 403 from RequireEnvAccess. Mirrors the U3 contract shape used by
+// handlers/agent_action.go::newAgentActionEnvPolicyDenied:
+//
+//   - opens with "Tell the user"
+//   - names the specific reason (env + required role + action)
+//   - exact next action ("have a team owner run the prompt")
+//   - full https://instanode.dev/... URL
+//
+// Duplicated here (rather than imported from handlers) because middleware is
+// depended on by handlers, not the other way around — a cross-import would
+// close a cycle. Same justification as unauthorizedAgentAction (auth.go) and
+// adminForbiddenAgentAction (admin.go). The handlers builder is the source
+// of truth; if the prose changes, update both.
+//
+// The contract test (handlers.TestAgentActionContract) can't reach into
+// middleware without an import cycle. The shape (Tell the user / specific
+// reason / next action / https URL) MUST stay in sync with the handlers
+// builder by hand — covered by env_policy_test.go assertions on the 403
+// response body.
+func envPolicyDeniedAgentAction(env, allowedRoles, action, callerRole string) string {
+	agentRole := callerRole
+	if agentRole == "" {
+		agentRole = "unknown"
+	}
+	return fmt.Sprintf(
+		"Tell the user the %s env requires the %s role to %s. Their role is %s — have a team owner run the prompt at https://instanode.dev/app/team or adjust the env-policy.",
+		env, allowedRoles, action, agentRole,
+	)
 }
 
 // formatAllowedRoles renders ["owner"] as "owner", ["owner","developer"] as

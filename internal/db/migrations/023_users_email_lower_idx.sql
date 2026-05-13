@@ -1,0 +1,29 @@
+-- Migration: 023_users_email_lower_idx
+-- Adds a functional index on lower(email) to make the admin customers list's
+-- case-insensitive substring search cheap.
+--
+-- Why this exists: GET /api/v1/admin/customers?q=<substr> matches with
+-- `WHERE lower(email) LIKE lower('%' || $q || '%')`. Without an index on
+-- lower(email) the planner has to scan every users row and apply the lower()
+-- function per row — fine at 100 users, painful at 100k. A functional
+-- B-tree index on lower(email) lets the planner use the index for prefix
+-- patterns and at minimum supports the function-result lookup directly.
+--
+-- LIKE '%...%' (substring-anywhere) is technically a sequential scan even
+-- with this index — the index is most useful for the equality / prefix case
+-- (?q=alice@x.com or ?q=alice). For true substring search at scale we'd
+-- need pg_trgm + a GIN index; we defer that until the founder actually
+-- has enough customers to feel the seq-scan cost. For now this index pays
+-- its rent on the equality path that dominates real usage.
+--
+-- Note on CREATE INDEX CONCURRENTLY: the project's migration runner
+-- (internal/db/postgres.go:RunMigrations) executes each .sql file via a
+-- single db.Exec call. CREATE INDEX CONCURRENTLY cannot run inside a
+-- transaction block AND lib/pq batches multi-statement Exec calls, which
+-- has been flaky with CONCURRENTLY historically. At instanode's current
+-- users-table size (single-digit-thousand rows at most), a blocking
+-- CREATE INDEX completes in well under a second — the lock window is
+-- imperceptible. When the table grows past ~100k rows we should revisit
+-- and either split this migration into its own connection or wrap it in
+-- a runner that knows about CONCURRENTLY.
+CREATE INDEX IF NOT EXISTS idx_users_email_lower ON users (lower(email));

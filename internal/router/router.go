@@ -18,6 +18,7 @@ import (
 	"instant.dev/internal/email"
 	"instant.dev/internal/handlers"
 	"instant.dev/internal/middleware"
+	"instant.dev/internal/migrations"
 	"instant.dev/internal/plans"
 	"instant.dev/internal/providers/compute/k8s"
 	storageprovider "instant.dev/internal/providers/storage"
@@ -164,17 +165,28 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 
 	// ── Routes ───────────────────────────────────────────────────────────────
 
-	// Health check — emits buildinfo so operators / canaries / dashboards
-	// can verify which commit is actually running. All three fields are
-	// always present; uninstrumented binaries return the "dev" sentinel
-	// rather than empty strings so the wire shape stays stable.
+	// Health check — emits buildinfo (so operators / canaries / dashboards
+	// can verify which commit is actually running) plus migration state
+	// (so the same probe answers "did my migrations apply" alongside "is
+	// my image stale"). The migration read is cached for 60s per pod
+	// so /healthz stays <10ms p99 under readiness-probe traffic.
+	//
+	// Uninstrumented binaries return the "dev" sentinel rather than empty
+	// strings so the wire shape stays stable. When the DB is unreachable
+	// migration_status becomes "unknown" but the response stays 200 — the
+	// service is up, only the tracking read failed.
+	migrationReader := migrations.NewReader(db, 0, nil)
 	app.Get("/healthz", func(c *fiber.Ctx) error {
+		mstate := migrationReader.Get(c.UserContext())
 		return c.JSON(fiber.Map{
-			"ok":         true,
-			"service":    "instant.dev",
-			"commit_id":  buildinfo.GitSHA,
-			"build_time": buildinfo.BuildTime,
-			"version":    buildinfo.Version,
+			"ok":                true,
+			"service":           "instant.dev",
+			"commit_id":         buildinfo.GitSHA,
+			"build_time":        buildinfo.BuildTime,
+			"version":           buildinfo.Version,
+			"migration_version": mstate.Filename,
+			"migration_count":   mstate.Count,
+			"migration_status":  mstate.Status,
 		})
 	})
 
@@ -314,6 +326,18 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	teamsHPublic := handlers.NewTeamsHandler(db, cfg, emailClient)
 	app.Post("/api/v1/invitations/:token/accept", teamsHPublic.AcceptInvitation)
 
+	// Email-provider feedback webhooks — bounces, unsubscribes, spam
+	// complaints. Each handler authenticates the inbound call via
+	// HMAC (Brevo) or SNS-TopicArn match (SES), so they MUST register
+	// before the /api/v1 auth group — the group's RequireAuth would
+	// otherwise demand a Bearer token from Brevo's servers.
+	//
+	// PII: the raw payload is persisted to email_events.raw for audit,
+	// but the handlers DO NOT log it. See email_webhooks.go.
+	emailWebhookH := handlers.NewEmailWebhookHandler(db, cfg)
+	app.Post("/api/v1/email/webhook/brevo", emailWebhookH.Brevo)
+	app.Post("/api/v1/email/webhook/ses", emailWebhookH.SES)
+
 	// Authenticated resource management
 	middleware.SetRoleLookupDB(db)  // populate auth_team_role on every RequireAuth
 	middleware.SetAPIKeyDB(db)      // enable PAT auth path in RequireAuth
@@ -359,6 +383,14 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		resourceH.Delete,
 	)
 	api.Post("/resources/:id/rotate-credentials", resourceH.RotateCredentials)
+	// Pause / Resume — Pro+ "suspend without deletion." Tier gate is
+	// enforced inside the handler so the 402 response shape matches the
+	// other multi-env walls. POST not PATCH because the side-effects (REVOKE
+	// CONNECT, ACL off, revokeRolesFromUser) are not idempotent at the
+	// provider level even though the DB flip is — POST signals "command,
+	// not state replacement."
+	api.Post("/resources/:id/pause", resourceH.Pause)
+	api.Post("/resources/:id/resume", resourceH.Resume)
 	// Slice 3 of env-aware deployments — spawn a same-type, same-family
 	// twin in a new env. Tier-gated to Pro+ inside the handler. The
 	// resource type the source row carries determines which low-level
@@ -486,33 +518,37 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		adminNotesH := handlers.NewAdminCustomerNotesHandler(db)
 		adminImpersonateH := handlers.NewAdminImpersonateHandler(db, cfg)
 
-		adminGroup := api.Group("/"+cfg.AdminPathPrefix, middleware.RequireAdmin())
+		// Defense-in-depth gates 3-5: AdminRateLimit → AdminAuditEmit → RequireAdmin.
+		// Audit MUST sit BEFORE RequireAdmin so brute-force probes still get logged
+		// on rejection (RequireAdmin returns 403 without c.Next). RateLimit first so
+		// invalid-JWT spam can't bypass the limiter. See PR #58 for full rationale.
+		adminGroup := api.Group("/"+cfg.AdminPathPrefix,
+			middleware.AdminRateLimit(rdb),
+			middleware.AdminAuditEmit(db, cfg.AdminPathPrefix),
+			middleware.RequireAdmin(),
+		)
 		adminGroup.Get("/customers", adminCustH.List)
 		adminGroup.Get("/customers/:team_id", adminCustH.Detail)
 		adminGroup.Post("/customers/:team_id/tier", adminCustH.ChangeTier)
 		adminGroup.Post("/customers/:team_id/promo", adminCustH.IssuePromo)
 
-		// Notes — free-text per-team admin annotations. List/Create are
-		// nested under /admin/customers/:team_id so the URL space mirrors
-		// the dashboard's Customer Detail drawer; Delete addresses by note
-		// id directly so the dashboard doesn't have to round-trip the
-		// team_id on every row's delete-button.
+		// Notes — free-text per-team admin annotations.
 		adminGroup.Get("/customers/:team_id/notes", adminNotesH.ListNotes)
 		adminGroup.Post("/customers/:team_id/notes", adminNotesH.CreateNote)
 		adminGroup.Delete("/notes/:note_id", adminNotesH.DeleteNote)
 
-		// Impersonation — mint a 10-minute read-only JWT for the target
-		// team so the admin can view-as-customer. Every mutating endpoint
-		// is gated by RequireWritable (installed on the /api/v1 group
-		// above) against the minted token's read_only=true claim — the
-		// impersonating session can browse but cannot write.
-		//
-		// This route is the one deliberate exemption from RequireWritable —
-		// but it's only theoretical: the admin minting the read-only token
-		// holds a normal (writable) session, so the gate would never fire
-		// here. Documenting the exemption keeps reviewers from "fixing"
-		// a non-bug.
+		// Impersonation — mint a 10-minute read-only JWT for the target team.
+		// RequireWritable on the /api/v1 group gates mutations on the read_only claim.
 		adminGroup.Post("/customers/:team_id/impersonate", adminImpersonateH.Impersonate)
+
+		// Promo lifecycle audit feed (PR #59). /audit uncached; /stats Redis-cached 5 min.
+		adminPromosH := handlers.NewAdminPromosAuditHandler(db, rdb)
+		adminGroup.Get("/promos/audit", adminPromosH.Audit)
+		adminGroup.Get("/promos/stats", adminPromosH.Stats)
+
+		// Deploy-identity append-only log (PR #57). Answers "which binary at $TIME?"
+		deploysAuditH := handlers.NewDeploysAuditHandler(db)
+		adminGroup.Get("/deploys", deploysAuditH.List)
 	}
 
 	// Quota-wall nudge endpoint — Track U1. Returns the most recent
