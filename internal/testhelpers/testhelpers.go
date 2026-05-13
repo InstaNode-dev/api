@@ -231,6 +231,36 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`CREATE INDEX IF NOT EXISTS idx_deployments_token ON deployments(token) WHERE token IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_deployments_resource_id ON deployments(resource_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_deployments_team_env ON deployments(team_id, env)`,
+		// 012_audit_log — per-team event stream consumed by the dashboard's
+		// Recent Activity feed AND by the admin customer-detail endpoint.
+		`CREATE TABLE IF NOT EXISTS audit_log (
+			id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id       UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			user_id       UUID REFERENCES users(id) ON DELETE SET NULL,
+			actor         TEXT NOT NULL DEFAULT 'agent',
+			kind          TEXT NOT NULL,
+			resource_type TEXT,
+			resource_id   UUID,
+			summary       TEXT NOT NULL,
+			metadata      JSONB,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_team_at ON audit_log (team_id, created_at DESC)`,
+		// 021_admin_promo_codes — single-use admin-issued promo codes.
+		`CREATE TABLE IF NOT EXISTS admin_promo_codes (
+			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			code            TEXT UNIQUE NOT NULL,
+			team_id         UUID REFERENCES teams(id) ON DELETE CASCADE,
+			issued_by_email TEXT NOT NULL,
+			kind            TEXT NOT NULL CHECK (kind IN ('percent_off', 'first_month_free', 'amount_off')),
+			value           INTEGER NOT NULL,
+			applies_to      INTEGER,
+			used_at         TIMESTAMPTZ,
+			expires_at      TIMESTAMPTZ NOT NULL,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_admin_promo_codes_code ON admin_promo_codes(code) WHERE used_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_admin_promo_codes_team ON admin_promo_codes(team_id)`,
 	}
 
 	for _, s := range stmts {

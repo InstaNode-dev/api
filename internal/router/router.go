@@ -404,6 +404,17 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	auditH := handlers.NewAuditHandler(db)
 	api.Get("/audit", auditH.List)
 
+	// Admin / customer-management surface (Track A). Gated by RequireAdmin
+	// which reads the JWT email against ADMIN_EMAILS (closed by default —
+	// an empty/unset env var rejects every caller). See
+	// internal/middleware/admin.go for the allowlist contract.
+	adminCustH := handlers.NewAdminCustomersHandler(db, planRegistry)
+	adminGroup := api.Group("/admin", middleware.RequireAdmin())
+	adminGroup.Get("/customers", adminCustH.List)
+	adminGroup.Get("/customers/:team_id", adminCustH.Detail)
+	adminGroup.Post("/customers/:team_id/tier", adminCustH.ChangeTier)
+	adminGroup.Post("/customers/:team_id/promo", adminCustH.IssuePromo)
+
 	// Quota-wall nudge endpoint — Track U1. Returns the most recent
 	// near_quota_wall row (written by the worker's QuotaWallNudgeWorker)
 	// scoped to the caller's team and bounded to the last 24h. The
