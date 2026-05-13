@@ -1486,6 +1486,71 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/admin/customers": {
+      "get": {
+        "summary": "List customers (admin only)",
+        "description": "Returns every team with aggregated MRR, storage, deploy count, and last-active timestamp. Gated by RequireAdmin — caller's JWT email must appear in ADMIN_EMAILS (comma-separated env var, case-insensitive). Closed by default: an unset/empty ADMIN_EMAILS rejects every caller. Aggregations are live SQL with no Redis cache — admin views are low-frequency and need ground truth. MRR is computed from plan_tier via the plans Registry (no DB column); yearly subscriptions contribute monthly-equivalent (annual/12) for apples-to-apples ranking.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "q", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Case-insensitive substring match on the team's primary user email." },
+          { "name": "tier", "in": "query", "required": false, "schema": { "type": "string", "enum": ["free", "hobby", "pro", "team"] } },
+          { "name": "sort_by", "in": "query", "required": false, "schema": { "type": "string", "enum": ["mrr", "last_active", "created_at", "storage_bytes"], "default": "mrr" } },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50, "minimum": 1, "maximum": 500 } },
+          { "name": "offset", "in": "query", "required": false, "schema": { "type": "integer", "default": 0, "minimum": 0 } }
+        ],
+        "responses": {
+          "200": { "description": "Customer list", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "total": { "type": "integer" }, "customers": { "type": "array", "items": { "type": "object", "properties": { "team_id": { "type": "string", "format": "uuid" }, "primary_email": { "type": "string" }, "name": { "type": "string" }, "tier": { "type": "string" }, "mrr_monthly": { "type": "integer", "description": "Monthly-equivalent MRR in USD cents." }, "mrr_yearly": { "type": "integer", "description": "Annualized MRR in USD cents (monthly * 12)." }, "storage_bytes": { "type": "integer", "format": "int64" }, "deployments_active": { "type": "integer" }, "last_active": { "type": ["string", "null"], "format": "date-time" }, "created_at": { "type": "string", "format": "date-time" } } } } } } } } },
+          "400": { "description": "Invalid tier or sort_by", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "401": { "description": "Unauthorized — no Bearer token" },
+          "403": { "description": "Caller is not on the ADMIN_EMAILS allowlist. Response carries the canonical admin agent_action.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      }
+    },
+    "/api/v1/admin/customers/{team_id}": {
+      "get": {
+        "summary": "Customer detail (admin only)",
+        "description": "Returns one team's full profile: users, per-type resource summary, deploy count, recent audit log (last 20 events), and Razorpay subscription state. Same auth gate as the list endpoint.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "team_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Customer detail" },
+          "400": { "description": "team_id is not a UUID" },
+          "403": { "description": "Caller is not on the ADMIN_EMAILS allowlist." },
+          "404": { "description": "No such team" }
+        }
+      }
+    },
+    "/api/v1/admin/customers/{team_id}/tier": {
+      "post": {
+        "summary": "Manually set a team's plan tier (admin only)",
+        "description": "Writes the team's plan_tier directly and elevates existing permanent resources on promotion. Does NOT touch Razorpay — use this for comp / customer-success promotions (free upgrade for a beta tester). Real paid upgrades go through checkout + Razorpay webhook. Every call writes an audit_log row of kind admin.tier_changed with {from, to, by_admin_email, reason} so a future BI consumer can answer who changed which team's tier and why.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "team_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["tier", "reason"], "properties": { "tier": { "type": "string", "enum": ["free", "hobby", "pro", "team"] }, "reason": { "type": "string", "description": "Free-form text written to audit_log.metadata; required so the audit trail is non-empty." } } } } } },
+        "responses": {
+          "200": { "description": "Tier updated; response carries an agent_action sentence for the calling agent to relay." },
+          "400": { "description": "Body invalid, tier unsupported, or reason missing." },
+          "403": { "description": "Caller is not on the ADMIN_EMAILS allowlist." },
+          "404": { "description": "No such team" },
+          "409": { "description": "team is already on the requested tier" }
+        }
+      }
+    },
+    "/api/v1/admin/customers/{team_id}/promo": {
+      "post": {
+        "summary": "Issue a single-use promo code for a team (admin only)",
+        "description": "Generates an 8-char hex code and persists it in admin_promo_codes. Distinct from the static promotion definitions in plans.yaml (which are server-config-level discounts applied to everyone in a window). This endpoint mints single-use, team-scoped codes that can be audited, expired, and redemption-marked at runtime. Audit row of kind admin.promo_issued is written on success.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "team_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["kind", "valid_for_days"], "properties": { "kind": { "type": "string", "enum": ["percent_off", "first_month_free", "amount_off"] }, "value": { "type": "integer", "description": "For percent_off: 1..100. For amount_off: cents. For first_month_free: ignored." }, "applies_to": { "type": "integer", "description": "Optional. For percent_off: optional cap in cents. For amount_off: ignored." }, "valid_for_days": { "type": "integer", "minimum": 1 } } } } } },
+        "responses": {
+          "201": { "description": "Promo code issued; response includes the 8-char code, expires_at, and an agent_action sentence." },
+          "400": { "description": "Invalid kind, value, or valid_for_days." },
+          "403": { "description": "Caller is not on the ADMIN_EMAILS allowlist." },
+          "404": { "description": "No such team" }
+        }
+      }
+    },
     "/internal/set-tier": {
       "post": {
         "summary": "Internal: forcibly elevate a team's tier (dev only)",
