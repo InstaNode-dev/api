@@ -1,0 +1,13 @@
+# .gitattributes — repo-level git behavior overrides.
+#
+# export-ignore: paths matched here are excluded from `git archive` (the
+# command that builds release tarballs / GitHub source-zip downloads).
+# We want the repo's contents available to anyone cloning the private
+# remote, but NOT bundled into archives that might end up on a CDN, in a
+# Docker layer cache, or attached to a public release page.
+
+# INTERNAL-OPS.md is the operator runbook for the admin surface — secrets,
+# rotation procedures, incident response. Public-ish exposure of this file
+# would defeat the unguessable-path-prefix gate by documenting the surface.
+# Keep it version-controlled here, keep it out of every archive.
+INTERNAL-OPS.md export-ignore

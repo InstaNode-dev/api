@@ -93,6 +93,28 @@ type Config struct {
 	// path — with the flag off, "family:..." values pass through as raw strings
 	// and fail token validation (deterministic disable for rollback).
 	FamilyBindingsEnabled bool
+
+	// AdminPathPrefix is the unguessable URL segment under which the
+	// founder-only customer-management endpoints register. When set,
+	// admin routes mount at /api/v1/<prefix>/customers/... instead of
+	// the guessable /api/v1/admin/customers/...
+	//
+	// Defense-in-depth on top of ADMIN_EMAILS:
+	//   - Empty / unset → admin endpoints are NOT registered (closed by
+	//     default). The whole surface returns 404. Operators who want
+	//     admin access must opt in by setting this var.
+	//   - len < 32     → fatal startup error. A weak prefix is worse
+	//     than none — it gives a false sense of security.
+	//   - non-alphanumeric → fatal startup error. The prefix is a URL
+	//     segment; non-alphanumeric characters can collide with Fiber's
+	//     route parser, percent-encoding, or path-traversal attempts.
+	//
+	// The prefix is treated as a secret with the same blast radius as
+	// a session token — never logged, never echoed to non-admin callers,
+	// only surfaced to admins via GET /auth/me's admin_path_prefix field.
+	//
+	// Generate with: openssl rand -hex 32 (yields 64 hex chars).
+	AdminPathPrefix string
 }
 
 // ErrMissingConfig is returned when a required env var is absent.
@@ -226,8 +248,70 @@ func Load() *Config {
 		panic("AES_KEY must be exactly 32 bytes hex-encoded (64 hex chars)")
 	}
 
+	// Admin-path-prefix validation. See AdminPathPrefix field doc above.
+	cfg.AdminPathPrefix = strings.TrimSpace(os.Getenv("ADMIN_PATH_PREFIX"))
+	if err := validateAdminPathPrefix(cfg.AdminPathPrefix); err != nil {
+		panic(err.Error())
+	}
+	if cfg.AdminPathPrefix == "" {
+		// Closed by default. Log loudly so operators know the admin
+		// surface is unreachable from the network until they set the
+		// env var. Use Warn (not Info) to surface in dashboards that
+		// filter at Warn+ level.
+		slog.Warn("admin.endpoints.disabled",
+			"reason", "ADMIN_PATH_PREFIX is empty or unset",
+			"impact", "admin routes are NOT registered; the entire /api/v1/<prefix>/customers surface returns 404",
+		)
+	} else {
+		// Never log the prefix value itself — it's a credential. Just
+		// log that it's configured so operators can confirm wiring.
+		slog.Info("admin.endpoints.enabled",
+			"prefix_len", len(cfg.AdminPathPrefix),
+		)
+	}
+
 	logStartupConfig(cfg)
 	return cfg
+}
+
+// validateAdminPathPrefix enforces the safety properties documented on
+// Config.AdminPathPrefix:
+//
+//   - Empty → OK (closed-by-default; caller must skip route registration).
+//   - len < 32 → error (a short prefix offers no obscurity benefit and
+//     gives a false sense of security).
+//   - Non-alphanumeric → error (prefix is a URL segment; bytes outside
+//     [A-Za-z0-9] can collide with Fiber's router, trigger percent-encoding
+//     edge cases, or be confused with path-traversal attempts).
+//
+// Exported as a free function (not a method) so tests can drive it directly
+// without constructing a Config.
+func validateAdminPathPrefix(p string) error {
+	if p == "" {
+		return nil // closed by default; caller skips registration
+	}
+	if len(p) < 32 {
+		return fmt.Errorf("ADMIN_PATH_PREFIX must be at least 32 characters (got %d) — generate via `openssl rand -hex 32`", len(p))
+	}
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'A' && c <= 'Z':
+		case c >= 'a' && c <= 'z':
+		default:
+			return fmt.Errorf("ADMIN_PATH_PREFIX must be alphanumeric only (offending byte 0x%02x at index %d) — generate via `openssl rand -hex 32`", c, i)
+		}
+	}
+	return nil
+}
+
+// ValidateAdminPathPrefix is the exported wrapper around validateAdminPathPrefix
+// for tests that don't want to build a full Config and exercise Load's panic
+// behavior. Returns nil for empty (closed-by-default) and a structured error
+// for any rejected value.
+func ValidateAdminPathPrefix(p string) error {
+	return validateAdminPathPrefix(p)
 }
 
 // IsServiceEnabled reports whether serviceName appears in the comma-separated EnabledServices list.
