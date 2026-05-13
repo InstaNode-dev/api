@@ -366,6 +366,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Get("/deployments", deployH.List)
 	api.Get("/deployments/:id", deployH.Get)
 	api.Delete("/deployments/:id", deployH.Delete)
+	// PATCH edits access-control fields (private + allowed_ips) without a
+	// rebuild. Pro+ tier gate enforced inside the handler; shares
+	// validatePrivateDeployFields with POST /deploy/new so the rule-set is
+	// audited in one place.
+	api.Patch("/deployments/:id", deployH.Patch)
 
 	// Stack management endpoints — Phase 6 (under /api/v1)
 	api.Get("/stacks", stackH.List)

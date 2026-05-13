@@ -55,6 +55,16 @@ type Provider interface {
 
 	// Redeploy rebuilds the image from a new tarball and rolls out.
 	Redeploy(ctx context.Context, providerID string, tarball []byte, envVars map[string]string) (*AppDeployment, error)
+
+	// UpdateAccessControl patches the access-control annotations on an
+	// existing deploy's Ingress in place — no image rebuild, no pod restart.
+	// Backs PATCH /api/v1/deployments/:id for the private + allowed_ips
+	// edit flow. private=false strips the whitelist annotation; private=true
+	// with non-empty allowedIPs sets it (REPLACE semantics — the supplied
+	// list is the new truth). Implementations on backends without a real
+	// Ingress concept (noop, local-dev without DEPLOY_DOMAIN) should return
+	// nil after a slog.Warn — the DB-only update is the user-visible change.
+	UpdateAccessControl(ctx context.Context, appID string, private bool, allowedIPs []string) error
 }
 
 // TierResources returns k8s resource requests/limits for a tier.
