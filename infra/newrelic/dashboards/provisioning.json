@@ -14,7 +14,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT (sum(newrelic.timeslice.value) / (sum(newrelic.timeslice.value) + filter(sum(newrelic.timeslice.value), WHERE metricTimesliceName = 'Custom/Provision/Fail'))) * 100 AS 'success %' FROM Metric WHERE metricTimesliceName = 'Custom/Provision/Success' SINCE 1 hour ago"
               }
             ],
@@ -32,7 +32,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT sum(newrelic.timeslice.value) AS 'count' FROM Metric WHERE metricTimesliceName IN ('Custom/Provision/Success', 'Custom/Provision/Fail') FACET metricTimesliceName TIMESERIES AUTO"
               }
             ],
@@ -46,7 +46,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT percentile(duration, 50) * 1000 AS 'median ms', percentile(duration, 95) * 1000 AS 'p95 ms' FROM Transaction WHERE appName LIKE 'instant-api%' AND name IN ('POST /db/new', 'POST /cache/new', 'POST /nosql/new', 'POST /queue/new', 'POST /storage/new', 'POST /webhook/new') FACET name TIMESERIES AUTO"
               }
             ],
@@ -60,7 +60,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT count(*) FROM Log WHERE service = 'api' AND level = 'ERROR' AND message LIKE '%provision%' FACET resource_type LIMIT 10"
               }
             ],
@@ -74,7 +74,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT sum(newrelic.timeslice.value) FROM Metric WHERE metricTimesliceName = 'Custom/Resource/Expired' TIMESERIES AUTO"
               }
             ],
@@ -88,7 +88,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT count(*) FROM Log WHERE service = 'api' AND message LIKE '%provisioned%' FACET tier"
               }
             ],
