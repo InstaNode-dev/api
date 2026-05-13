@@ -14,7 +14,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT rate(count(*), 1 minute) FROM Log WHERE service = 'worker' AND message = 'job.completed' TIMESERIES AUTO"
               }
             ],
@@ -28,7 +28,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT count(*) FROM Log WHERE service = 'worker' AND message IN ('job.completed', 'job.failed') FACET message TIMESERIES AUTO"
               }
             ],
@@ -42,7 +42,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT rate(count(*), 1 minute) FROM Log WHERE service = 'worker' AND message = 'job.retried' TIMESERIES AUTO"
               }
             ],
@@ -56,7 +56,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT count(*) FROM Log WHERE service = 'worker' AND message = 'job.completed' FACET job_kind TIMESERIES AUTO"
               }
             ],
@@ -70,7 +70,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT percentile(duration_ms, 95) FROM Log WHERE service = 'worker' AND message = 'job.completed' AND duration_ms IS NOT NULL FACET job_kind TIMESERIES AUTO"
               }
             ],
@@ -84,7 +84,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT (max(timestamp) - min(timestamp)) / 1000 AS 'seconds since expire run' FROM Log WHERE service = 'worker' AND job_kind = 'expire' AND message = 'job.completed' SINCE 1 hour ago"
               }
             ],
@@ -102,7 +102,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT count(*) FROM Log WHERE service = 'worker' AND message = 'job.failed' FACET job_kind SINCE 24 hours ago LIMIT 10"
               }
             ],
@@ -116,7 +116,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT count(*) FROM Log WHERE service = 'worker' AND level = 'ERROR' TIMESERIES AUTO"
               }
             ],

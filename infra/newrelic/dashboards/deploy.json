@@ -14,7 +14,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT filter(count(*), WHERE deploy_status = 'success') AS 'success', filter(count(*), WHERE deploy_status = 'fail') AS 'fail' FROM Log WHERE service = 'api' AND deploy_status IS NOT NULL SINCE 24 hours ago"
               }
             ],
@@ -28,7 +28,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT percentile(build_duration_seconds, 50) AS 'p50 s', percentile(build_duration_seconds, 95) AS 'p95 s' FROM Log WHERE service = 'api' AND build_duration_seconds IS NOT NULL TIMESERIES AUTO"
               }
             ],
@@ -42,7 +42,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT percentile(duration, 95) * 1000 AS 'p95 ms' FROM Transaction WHERE appName LIKE 'instant-api%' AND name LIKE '%/deploy%' FACET name TIMESERIES AUTO"
               }
             ],
@@ -56,7 +56,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT count(*) FROM Log WHERE service = 'api' AND deploy_status = 'fail' FACET fail_reason LIMIT 10"
               }
             ],
@@ -70,7 +70,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT uniqueCount(deploy_id) FROM Log WHERE service = 'api' AND deploy_status = 'running' SINCE 5 minutes ago"
               }
             ],
@@ -84,7 +84,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT count(*) FROM Log WHERE service = 'api' AND message LIKE '%deploy.created%' FACET tier SINCE 7 days ago"
               }
             ],
@@ -98,7 +98,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT count(*) FROM Transaction WHERE appName LIKE 'instant-api%' AND name LIKE '%/redeploy' TIMESERIES 1 day"
               }
             ],

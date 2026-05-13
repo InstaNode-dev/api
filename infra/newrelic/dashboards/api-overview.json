@@ -14,7 +14,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT rate(count(*), 1 minute) FROM Transaction WHERE appName LIKE 'instant-api%' TIMESERIES AUTO"
               }
             ],
@@ -28,7 +28,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT percentage(count(*), WHERE error IS true) AS 'error rate' FROM Transaction WHERE appName LIKE 'instant-api%' TIMESERIES AUTO"
               }
             ],
@@ -42,7 +42,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT percentile(duration, 95) * 1000 AS 'p95 ms', percentile(duration, 99) * 1000 AS 'p99 ms' FROM Transaction WHERE appName LIKE 'instant-api%' TIMESERIES AUTO"
               }
             ],
@@ -56,7 +56,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT count(*) AS 'requests', percentile(duration, 95) * 1000 AS 'p95 ms', percentage(count(*), WHERE error IS true) AS 'err %' FROM Transaction WHERE appName LIKE 'instant-api%' FACET name LIMIT 25"
               }
             ],
@@ -70,7 +70,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT count(*) FROM Transaction WHERE appName LIKE 'instant-api%' AND httpResponseCode >= '500' FACET name LIMIT 20"
               }
             ],
@@ -84,7 +84,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT apdex(duration, t: 0.5) FROM Transaction WHERE appName LIKE 'instant-api%'"
               }
             ],
@@ -102,7 +102,7 @@
           "rawConfiguration": {
             "nrqlQueries": [
               {
-                "accountIds": [0],
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
                 "query": "SELECT count(*) FROM Log WHERE service = 'api' AND level = 'ERROR' FACET commit_id TIMESERIES AUTO LIMIT 5"
               }
             ],
