@@ -22,6 +22,7 @@ import (
 	"instant.dev/internal/providers/compute/k8s"
 	storageprovider "instant.dev/internal/providers/storage"
 	"instant.dev/internal/provisioner"
+	"instant.dev/internal/razorpaybilling"
 )
 
 // New creates and configures the Fiber application with all middleware and routes registered.
@@ -421,6 +422,17 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// an empty/unset env var rejects every caller). See
 	// internal/middleware/admin.go for the allowlist contract.
 	adminCustH := handlers.NewAdminCustomersHandler(db, planRegistry)
+	// Wire the real Razorpay portal so admin demotes cancel the customer's
+	// active subscription out-of-band (CancelImmediately — see
+	// internal/razorpaybilling/portal.go for the cycle-end-vs-immediate
+	// rationale). If RAZORPAY_KEY_ID isn't set in this environment the
+	// portal returns "billing not configured" which the handler logs and
+	// records on the audit row's cancel_succeeded=false flag — the demote
+	// still succeeds.
+	adminCustH.CancelSubscription = func(subID string) error {
+		portal := &razorpaybilling.Portal{DB: db, Cfg: cfg}
+		return portal.CancelImmediately(subID)
+	}
 	adminGroup := api.Group("/admin", middleware.RequireAdmin())
 	adminGroup.Get("/customers", adminCustH.List)
 	adminGroup.Get("/customers/:team_id", adminCustH.Detail)
