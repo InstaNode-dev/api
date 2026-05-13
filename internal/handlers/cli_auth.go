@@ -277,6 +277,26 @@ func (h *CLIAuthHandler) GetCurrentUser(c *fiber.Ctx) error {
 		resp["trial_ends_at"] = team.TrialEndsAt.Time
 	}
 
+	// Admin-only surface: when the caller's email is on the ADMIN_EMAILS
+	// allowlist AND the operator has configured ADMIN_PATH_PREFIX, hand
+	// the caller the unguessable URL segment they need to reach the
+	// founder-only customer-management endpoints. Silence is golden for
+	// every non-admin caller — we never even send an empty-string field,
+	// because the field's mere presence would leak that the endpoint
+	// exists. The dashboard's admin page reads this value and builds
+	// /api/v1/<prefix>/customers/... URLs from it; non-admin sessions
+	// have no way to learn the prefix from the wire.
+	//
+	// Two gates collaborating here:
+	//   1. middleware.IsAdminEmail — second factor (ADMIN_EMAILS)
+	//   2. cfg.AdminPathPrefix     — secret URL segment
+	//
+	// If either is missing the field is omitted; the admin UI then
+	// hides the route because the URL builder has nothing to build with.
+	if h.cfg != nil && h.cfg.AdminPathPrefix != "" && middleware.IsAdminEmail(user.Email) {
+		resp["admin_path_prefix"] = h.cfg.AdminPathPrefix
+	}
+
 	return c.JSON(resp)
 }
 
