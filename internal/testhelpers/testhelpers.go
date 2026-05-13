@@ -124,6 +124,8 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS provider_resource_id TEXT`,
 		// 018_resource_family — env-twin linkage (slice 2 of env-aware deployments)
 		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS parent_resource_id UUID REFERENCES resources(id) ON DELETE SET NULL`,
+		// 024_resources_paused_status — pause/resume API (suspend without deletion)
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_token       ON resources(token)`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_fingerprint ON resources(fingerprint) WHERE team_id IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_expires     ON resources(expires_at) WHERE status = 'active'`,
@@ -278,6 +280,24 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_admin_promo_codes_code ON admin_promo_codes(code) WHERE used_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_admin_promo_codes_team ON admin_promo_codes(team_id)`,
+		// 022_deploys_audit — append-only deploy-identity log. Mirrored here
+		// so handler tests bringing up a fresh test DB get the table without
+		// running the SQL migration separately. The unique index backs the
+		// self-report INSERT's ON CONFLICT clause; the service+time index
+		// supports the admin endpoint's default sort.
+		`CREATE TABLE IF NOT EXISTS deploys_audit (
+			id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			service           TEXT NOT NULL,
+			commit_id         TEXT NOT NULL,
+			image_digest      TEXT NOT NULL,
+			version           TEXT,
+			build_time        TIMESTAMPTZ,
+			applied_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+			migration_version TEXT,
+			noticed_by        TEXT NOT NULL DEFAULT 'self-report'
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_deploys_audit_identity ON deploys_audit(service, commit_id, image_digest)`,
+		`CREATE INDEX IF NOT EXISTS idx_deploys_audit_service_time ON deploys_audit(service, applied_at DESC)`,
 	}
 
 	for _, s := range stmts {
@@ -440,6 +460,8 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	api.Get("/resources/:id", resourceH.Get)
 	api.Delete("/resources/:id", resourceH.Delete)
 	api.Post("/resources/:id/rotate-credentials", resourceH.RotateCredentials)
+	api.Post("/resources/:id/pause", resourceH.Pause)
+	api.Post("/resources/:id/resume", resourceH.Resume)
 	// Slice 3 of env-aware deployments — spawn a same-type, same-family
 	// twin in a new env. Tier-gated to Pro+ inside the handler. Wired here
 	// so handler-layer tests (twin_test.go) exercise the full route stack.

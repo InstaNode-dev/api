@@ -24,6 +24,34 @@ import (
 // can override it (e.g. point at a custom billing portal).
 var QuotaUpgradeURL = "https://instanode.dev/pricing"
 
+// quotaExceededAgentAction builds the canonical agent_action sentence served
+// on every 402 from PaymentRequired. Mirrors the "quota_exceeded" entry in
+// handlers.codeToAgentAction — the U3 contract shape is identical:
+//
+//   - opens with "Tell the user"
+//   - names the specific reason ("plan's usage limit")
+//   - exact next action ("upgrade")
+//   - full https://instanode.dev/... URL via QuotaUpgradeURL
+//
+// Built as a function (not a const) because QuotaUpgradeURL is a `var` so
+// tests + self-hosted operators can override it — a const would freeze the
+// URL at package-init time and silently ignore the override.
+//
+// Kept as a package-private builder rather than inlined at the call site so
+// the contract review (grep "agent_action" internal/middleware) surfaces
+// every middleware-level agent_action string in this file alongside
+// unauthorizedAgentAction (auth.go) and adminForbiddenAgentAction (admin.go).
+// Duplicated rather than imported because middleware is depended on by
+// handlers, not the other way around (cross-import would close a cycle —
+// same justification as the other two middleware-level constants).
+//
+// The contract test (handlers.TestAgentActionContract) can't reach into
+// middleware without an import cycle, so this builder is exercised by the
+// existing PaymentRequired tests which assert the response-body shape.
+func quotaExceededAgentAction() string {
+	return "Tell the user they've hit their plan's usage limit. To unlock more, have them upgrade at " + QuotaUpgradeURL + "."
+}
+
 // PaymentRequired writes a 402 response with the canonical instanode.dev
 // shape used across all quota-exceeded paths:
 //
@@ -61,6 +89,6 @@ func PaymentRequired(c *fiber.Ctx, errKey string) error {
 		"ok":           false,
 		"error":        errKey,
 		"upgrade_url":  QuotaUpgradeURL,
-		"agent_action": "Tell the user they've hit their plan's usage limit. To unlock more, have them upgrade at " + QuotaUpgradeURL + ".",
+		"agent_action": quotaExceededAgentAction(),
 	})
 }
