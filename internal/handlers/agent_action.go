@@ -224,3 +224,45 @@ func newAgentActionBindingNoEnvTwin(rootID, resourceName, env string) string {
 // error, the user-visible advice is "retry in a few seconds" which is a
 // concrete action the LLM can pass on.
 const AgentActionBindingLookupFailed = "Tell the user the platform couldn't resolve the resource binding right now. Retry the deploy in ~10 seconds — if it persists, check https://instanode.dev/status."
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Admin / customer-management surface (Track A)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// AgentActionAdminRequired is returned on every 403 from RequireAdmin —
+// the /api/v1/admin/* customer-management endpoints (list, detail, tier
+// change, promo issuance) gate on the JWT email matching ADMIN_EMAILS.
+// Closed by default: an unset/empty ADMIN_EMAILS rejects every caller, so
+// this sentence covers both "not on the allowlist" and "operator forgot
+// to configure ADMIN_EMAILS" in one piece of advice.
+//
+// Kept in sync with the verbatim string used by middleware.RequireAdmin —
+// the middleware can't import handlers (cycle), so both sides keep their
+// own copy. The contract test asserts only one of the two copies; touching
+// either without the other is the regression we want CI to catch.
+const AgentActionAdminRequired = "Tell the user this endpoint requires platform-admin access. Ask support@instanode.dev via https://instanode.dev/support if you think this is wrong."
+
+// newAgentActionAdminTierChanged is returned in the success response of
+// POST /api/v1/admin/customers/:team_id/tier so the calling agent has
+// verbatim copy to show the admin user — naming the team, the new tier,
+// and the next action ("verify the bump on the team page"). The dashboard
+// is the source of truth for "did the promote take?" so the agent_action
+// points there.
+func newAgentActionAdminTierChanged(teamID, newTier string) string {
+	return fmt.Sprintf(
+		"Tell the user team %s is now on the %s tier. Have them verify the bump at https://instanode.dev/app/team — existing resources were elevated immediately.",
+		teamID, newTier,
+	)
+}
+
+// newAgentActionAdminPromoIssued is returned in the success response of
+// POST /api/v1/admin/customers/:team_id/promo so the agent has a verbatim
+// sentence to relay to the admin user. Names the team, the code, and the
+// next action ("share with the customer"). Code is short (8 chars) so the
+// 280-char budget is never tight.
+func newAgentActionAdminPromoIssued(teamID, code string) string {
+	return fmt.Sprintf(
+		"Tell the user a promo code %s was issued for team %s. Have them share it with the customer — redemption tracked at https://instanode.dev/app/admin.",
+		code, teamID,
+	)
+}

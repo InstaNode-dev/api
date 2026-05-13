@@ -20,6 +20,11 @@ const (
 	// LocalKeyDPoPKeyThumbprint is set when the bearer token carries a DPoP
 	// proof-of-possession constraint (cnf.jkt). Consumed by RequireDPoP.
 	LocalKeyDPoPKeyThumbprint = "auth_dpop_jkt"
+	// LocalKeyEmail is the fiber.Locals key for the authenticated user's email
+	// address (read from the JWT `email` claim). Populated by RequireAuth so
+	// downstream middleware/handlers can branch on identity without a DB hit —
+	// in particular RequireAdmin reads it to check the ADMIN_EMAILS allowlist.
+	LocalKeyEmail = "auth_email"
 
 	// audienceMismatchError is the error keyword used when an RFC 8707
 	// audience check fails. Distinct from the generic "unauthorized" so that
@@ -236,11 +241,25 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 
 		c.Locals(LocalKeyUserID, claims.UserID)
 		c.Locals(LocalKeyTeamID, claims.TeamID)
+		if claims.Email != "" {
+			c.Locals(LocalKeyEmail, claims.Email)
+		}
 		if claims.Confirmation != nil && claims.Confirmation.JKT != "" {
 			c.Locals(LocalKeyDPoPKeyThumbprint, claims.Confirmation.JKT)
 		}
 		return c.Next()
 	}
+}
+
+// GetEmail retrieves the authenticated user's email from Fiber locals.
+// Returns an empty string if not set. The value originates from the JWT
+// `email` claim populated by RequireAuth and is the canonical input to
+// RequireAdmin's ADMIN_EMAILS allowlist check.
+func GetEmail(c *fiber.Ctx) string {
+	if v, ok := c.Locals(LocalKeyEmail).(string); ok {
+		return v
+	}
+	return ""
 }
 
 // GetUserID retrieves the authenticated user ID from Fiber locals.
@@ -309,6 +328,9 @@ func OptionalAuth(cfg *config.Config) fiber.Handler {
 
 		c.Locals(LocalKeyUserID, claims.UserID)
 		c.Locals(LocalKeyTeamID, claims.TeamID)
+		if claims.Email != "" {
+			c.Locals(LocalKeyEmail, claims.Email)
+		}
 		if claims.Confirmation != nil && claims.Confirmation.JKT != "" {
 			c.Locals(LocalKeyDPoPKeyThumbprint, claims.Confirmation.JKT)
 		}

@@ -34,6 +34,7 @@ func agentActionContractCases() map[string]string {
 		"RecycleGateAgentAction":                       RecycleGateAgentAction,
 		"AgentActionPrivateDeployRequiresPro":          AgentActionPrivateDeployRequiresPro,
 		"AgentActionPrivateDeployRequiresAllowedIPs":   AgentActionPrivateDeployRequiresAllowedIPs,
+		"AgentActionAdminRequired":                     AgentActionAdminRequired,
 		"AgentActionPromotionInvalid":                  AgentActionPromotionInvalid,
 
 		// Builders — representative inputs covering tier/env/role/limit
@@ -47,6 +48,8 @@ func agentActionContractCases() map[string]string {
 		"newAgentActionBindingNotFound(KEY)":             newAgentActionBindingNotFound("DATABASE_URL"),
 		"newAgentActionBindingCrossTeam(KEY)":            newAgentActionBindingCrossTeam("DATABASE_URL"),
 		"newAgentActionBindingNoEnvTwin(uuid,name,env)":  newAgentActionBindingNoEnvTwin("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "owner-db", "staging"),
+		"newAgentActionAdminTierChanged(team,pro)":       newAgentActionAdminTierChanged("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "pro"),
+		"newAgentActionAdminPromoIssued(team,code)":      newAgentActionAdminPromoIssued("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "01H8XGZJ"),
 	}
 
 	// codeToAgentAction registry — every entry must also pass the contract.
