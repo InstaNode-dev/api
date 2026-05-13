@@ -305,21 +305,10 @@ func newAgentActionAdminPromoIssued(teamID, code string) string {
 	)
 }
 
-<<<<<<< HEAD
 // ─────────────────────────────────────────────────────────────────────────────
-// Promote-approval walls (POST /api/v1/stacks/:slug/promote +
-// POST /api/v1/resources/:id/provision-twin, non-dev target envs)
+// Promote-approval walls (non-dev target envs)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// newAgentActionPromoteApprovalSent is returned in the 202 response body when
-// the API has accepted a promote / twin-provision request that targets a
-// non-development env. Names the env, the email recipient, and the next
-// action — the LLM agent re-articulates "go check your inbox" to the human
-// in front of it. Dev-env promotes bypass this code path entirely (immediate
-// execute), so this string never fires for development targets.
-//
-// The 24h validity window is reproduced verbatim so the agent doesn't have
-// to fish it out of the JSON body's expires_at field.
 func newAgentActionPromoteApprovalSent(toEnv, recipientEmail string) string {
 	if recipientEmail == "" {
 		recipientEmail = "the team owner's email"
@@ -330,23 +319,8 @@ func newAgentActionPromoteApprovalSent(toEnv, recipientEmail string) string {
 	)
 }
 
-// AgentActionPromoteTokenExpired is returned by the GET /approve/:token
-// HTML response copy (rendered in-page) and as the agent_action on any
-// retry attempt that hits an expired link. The user must re-request the
-// promote from the dashboard — re-using the same email link will never
-// work because the row's status is now 'expired'.
+// AgentActionPromoteTokenExpired — GET /approve/:token returns this when the row's status is 'expired'.
 const AgentActionPromoteTokenExpired = "Tell the user the approval link expired. Re-request the promote at https://instanode.dev/app — links are valid for 24h."
-=======
-// AgentActionReadOnlySession is returned on every 403 emitted by the
-// RequireWritable middleware when a JWT carries `read_only:true` — i.e. the
-// admin minted an impersonation token to view-as-customer and the agent
-// (or the dashboard the admin is steering) attempted a mutation. Names the
-// specific rejection reason ("read-only impersonated session"), the exact
-// next action ("switch back to your real account"), and a full
-// https://instanode.dev/app URL. The U3 contract test exercises it.
-//
-// Read-only is irrevocable for the lifetime of the impersonation token —
-// there is no "downgrade to writable" path. The remedy is to use the
-// admin's own session token, which never carries this flag.
+
+// AgentActionReadOnlySession — RequireWritable middleware returns this on 403 when JWT has read_only:true.
 const AgentActionReadOnlySession = "Tell the user this is a read-only impersonated session. Mutations are disabled. Switch back to your real account at https://instanode.dev/app to make changes."
->>>>>>> origin/master
