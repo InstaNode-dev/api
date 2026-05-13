@@ -213,15 +213,32 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Get("/claim/preview", onboardH.ClaimPreview)
 	app.Post("/claim", onboardH.Claim)
 
+	// Email-link approval workflow for non-dev env promotions (migration 026).
+	// Public, token-IS-the-credential route — never sits inside the /api/v1
+	// RequireAuth group. Rate-limited per-IP inside the handler (defends the
+	// token space against brute-force).
+	promoteApprovalH := handlers.NewPromoteApprovalHandler(db, rdb)
+	app.Get("/approve/:token", promoteApprovalH.Approve)
+
 	// Provisioning — Phase 2+ (gated by IsServiceEnabled in each handler)
 	// OptionalAuth is registered per-route rather than via app.Group("/", ...) to avoid
 	// accidentally applying it globally to all routes (Fiber's "/" group prefix matches everything).
-	app.Post("/db/new", middleware.OptionalAuth(cfg), dbH.NewDB)
-	app.Post("/cache/new", middleware.OptionalAuth(cfg), cacheH.NewCache)
-	app.Post("/nosql/new", middleware.OptionalAuth(cfg), nosqlH.NewNoSQL)
-	app.Post("/queue/new", middleware.OptionalAuth(cfg), queueH.NewQueue)
-	app.Post("/storage/new", middleware.OptionalAuth(cfg), storageH.NewStorage)
-	app.Post("/webhook/new", middleware.OptionalAuth(cfg), webhookH.NewWebhook)
+	//
+	// RequireWritable runs AFTER OptionalAuth on every mutating provisioning
+	// endpoint so an impersonated (read-only) session presenting an
+	// Authorization header is 403'd before the handler runs. Anonymous (no
+	// header) callers fall through — OptionalAuth never sets the read_only
+	// local, and RequireWritable is a no-op for unset locals. The same
+	// invariant covers /webhook/receive/:token: that route never reads
+	// Authorization headers in practice, but installing the gate keeps
+	// the policy uniform — see test #5 in PR #024 for the explicit
+	// "POST /db/new under an impersonated session must 403" assertion.
+	app.Post("/db/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), dbH.NewDB)
+	app.Post("/cache/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), cacheH.NewCache)
+	app.Post("/nosql/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), nosqlH.NewNoSQL)
+	app.Post("/queue/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), queueH.NewQueue)
+	app.Post("/storage/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), storageH.NewStorage)
+	app.Post("/webhook/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), webhookH.NewWebhook)
 	app.Post("/webhook/receive/:token", webhookH.Receive)
 	app.Get("/resources/:token/logs", logsH.ResourceLogs)
 
@@ -230,7 +247,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// env scope arrives as a multipart form field (not JSON or query), so
 	// we provide a custom env-lookup that reads c.FormValue("env") and
 	// falls back to "production" for the policy check.
-	deployGroup := app.Group("/deploy", middleware.RequireAuth(cfg), middleware.PopulateTeamRole())
+	// RequireWritable on the deploy group rejects impersonated sessions
+	// before any mutating deploy handler runs. GETs (deployGroup.Get) are
+	// no-ops under the middleware so the impersonated admin can still
+	// inspect deploy state — which is the entire point of view-as-customer.
+	deployGroup := app.Group("/deploy", middleware.RequireAuth(cfg), middleware.PopulateTeamRole(), middleware.RequireWritable())
 	deployGroup.Post("/new",
 		middleware.RequireEnvAccess(middleware.EnvPolicyActionDeploy,
 			middleware.WithEnvLookup(func(c *fiber.Ctx) (string, error) {
@@ -251,12 +272,15 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// Stacks — Phase 6 multi-service.
 	// New/Get/Logs/Delete use OptionalAuth (anonymous stacks supported, same as /db/new etc.).
 	// UpdateEnv/Redeploy require auth (mutations on owned stacks).
-	app.Post("/stacks/new", middleware.OptionalAuth(cfg), stackH.New)
+	// RequireWritable rejects impersonated sessions on all mutating
+	// stack endpoints (POST/PATCH/DELETE) so an admin viewing the
+	// customer's stack page can't accidentally redeploy / nuke it.
+	app.Post("/stacks/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), stackH.New)
 	app.Get("/stacks/:slug", middleware.OptionalAuth(cfg), stackH.Get)
 	app.Get("/stacks/:slug/logs/:svc", middleware.OptionalAuth(cfg), stackH.Logs)
-	app.Delete("/stacks/:slug", middleware.OptionalAuth(cfg), stackH.Delete)
-	app.Patch("/stacks/:slug/env", middleware.RequireAuth(cfg), stackH.UpdateEnv)
-	app.Post("/stacks/:slug/redeploy", middleware.RequireAuth(cfg), stackH.Redeploy)
+	app.Delete("/stacks/:slug", middleware.OptionalAuth(cfg), middleware.RequireWritable(), stackH.Delete)
+	app.Patch("/stacks/:slug/env", middleware.RequireAuth(cfg), middleware.RequireWritable(), stackH.UpdateEnv)
+	app.Post("/stacks/:slug/redeploy", middleware.RequireAuth(cfg), middleware.RequireWritable(), stackH.Redeploy)
 
 	// OAuth — POST handler serves the existing programmatic / SPA flow.
 	// Google login is intentionally NOT supported; if you need it, register
@@ -285,7 +309,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	billing := handlers.NewBillingHandler(db, cfg, emailClient)
 	// Legacy alias kept for backward compatibility; canonical path is
 	// /api/v1/billing/checkout (registered under the /api/v1 group below).
-	app.Post("/billing/checkout", middleware.RequireAuth(cfg), billing.CreateCheckoutAPI)
+	// RequireWritable rejects impersonated sessions — an admin viewing-as-
+	// customer must not be able to start a checkout on the customer's
+	// behalf. The canonical /api/v1 alias is already gated by the api
+	// group's RequireWritable.
+	app.Post("/billing/checkout", middleware.RequireAuth(cfg), middleware.RequireWritable(), billing.CreateCheckoutAPI)
 	app.Post("/razorpay/webhook", billing.RazorpayWebhook)
 
 	// §10.20 cached-aggregation endpoints. Separate handlers from BillingHandler
@@ -321,7 +349,18 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	middleware.SetRoleLookupDB(db)  // populate auth_team_role on every RequireAuth
 	middleware.SetAPIKeyDB(db)      // enable PAT auth path in RequireAuth
 	middleware.SetEnvPolicyDB(db)   // RequireEnvAccess reads teams.env_policy
-	api := app.Group("/api/v1", middleware.RequireAuth(cfg), middleware.PopulateTeamRole())
+	// RequireWritable gates every mutating route under /api/v1/* against
+	// the read_only JWT flag minted by the admin-impersonation endpoint
+	// (POST /api/v1/admin/customers/:team_id/impersonate). GET/HEAD/OPTIONS
+	// fall through unconditionally — the impersonated admin's whole reason
+	// for holding the token is to *read* the customer's dashboard state.
+	//
+	// One deliberate exemption: the impersonation-mint endpoint itself
+	// (registered below inside the admin group). It is called by an admin
+	// holding a *normal* (writable) session, so the gate would never fire
+	// there — but the brief calls out the exemption explicitly, and the
+	// audit-comment in router.go is where reviewers expect to find it.
+	api := app.Group("/api/v1", middleware.RequireAuth(cfg), middleware.PopulateTeamRole(), middleware.RequireWritable())
 
 	// /whoami — identity probe for agents. Returning 401 here is the canonical
 	// "your token is bad"; returning anything else from this endpoint means
@@ -351,6 +390,14 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		resourceH.Delete,
 	)
 	api.Post("/resources/:id/rotate-credentials", resourceH.RotateCredentials)
+	// Pause / Resume — Pro+ "suspend without deletion." Tier gate is
+	// enforced inside the handler so the 402 response shape matches the
+	// other multi-env walls. POST not PATCH because the side-effects (REVOKE
+	// CONNECT, ACL off, revokeRolesFromUser) are not idempotent at the
+	// provider level even though the DB flip is — POST signals "command,
+	// not state replacement."
+	api.Post("/resources/:id/pause", resourceH.Pause)
+	api.Post("/resources/:id/resume", resourceH.Resume)
 	// Slice 3 of env-aware deployments — spawn a same-type, same-family
 	// twin in a new env. Tier-gated to Pro+ inside the handler. The
 	// resource type the source row carries determines which low-level
@@ -475,32 +522,13 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 			portal := &razorpaybilling.Portal{DB: db, Cfg: cfg}
 			return portal.CancelImmediately(subID)
 		}
-		// Defense-in-depth gates 3-5, chained in strict order:
-		//
-		//   AdminRateLimit  — 30 req/min/fingerprint cap. Returns 403 with
-		//                     a body byte-for-byte identical to the
-		//                     allowlist-miss 403. Runs BEFORE RequireAdmin
-		//                     so an attacker who knows the prefix cannot
-		//                     bypass the limiter by sending invalid JWTs.
-		//   AdminAuditEmit  — after-response middleware. Internally calls
-		//                     c.Next() and observes the FINAL status; logs
-		//                     EVERY hit on the prefix (success AND 403).
-		//                     PathSuffix is the URL with the prefix
-		//                     stripped — the secret prefix MUST NOT land
-		//                     in audit_log.
-		//   RequireAdmin    — ADMIN_EMAILS allowlist check (gate 2).
-		//
-		// Audit MUST sit BEFORE RequireAdmin in the chain. RequireAdmin
-		// returns a 403 directly (no c.Next call) on rejection — any
-		// middleware sitting AFTER it would never run on the rejection
-		// path, so the brute-force-visibility property would silently
-		// break. By sitting BEFORE, the audit middleware's internal
-		// c.Next() dispatches RequireAdmin → handler and observes the
-		// final status either way.
-		//
-		// AdminRateLimit stays first: it short-circuits on excess with
-		// its own 403 (which AdminAuditEmit's c.Next observes as 403 +
-		// IsAdminRateLimited(c)=true → denied_by=rate_limit on the row).
+		adminNotesH := handlers.NewAdminCustomerNotesHandler(db)
+		adminImpersonateH := handlers.NewAdminImpersonateHandler(db, cfg)
+
+		// Defense-in-depth gates 3-5: AdminRateLimit → AdminAuditEmit → RequireAdmin.
+		// Audit MUST sit BEFORE RequireAdmin so brute-force probes still get logged
+		// on rejection (RequireAdmin returns 403 without c.Next). RateLimit first so
+		// invalid-JWT spam can't bypass the limiter. See PR #58 for full rationale.
 		adminGroup := api.Group("/"+cfg.AdminPathPrefix,
 			middleware.AdminRateLimit(rdb),
 			middleware.AdminAuditEmit(db, cfg.AdminPathPrefix),
@@ -511,20 +539,31 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		adminGroup.Post("/customers/:team_id/tier", adminCustH.ChangeTier)
 		adminGroup.Post("/customers/:team_id/promo", adminCustH.IssuePromo)
 
-		// Promo lifecycle audit feed. /audit is uncached (admin needs to see
-		// "issued at 3 sec ago"); /stats is Redis-cached 5 min (the totals tile
-		// the dashboard polls). See handlers/admin_promos_audit.go for the
-		// freshness contract.
+		// Notes — free-text per-team admin annotations.
+		adminGroup.Get("/customers/:team_id/notes", adminNotesH.ListNotes)
+		adminGroup.Post("/customers/:team_id/notes", adminNotesH.CreateNote)
+		adminGroup.Delete("/notes/:note_id", adminNotesH.DeleteNote)
+
+		// Impersonation — mint a 10-minute read-only JWT for the target team.
+		// RequireWritable on the /api/v1 group gates mutations on the read_only claim.
+		adminGroup.Post("/customers/:team_id/impersonate", adminImpersonateH.Impersonate)
+
+		// Promo lifecycle audit feed (PR #59). /audit uncached; /stats Redis-cached 5 min.
 		adminPromosH := handlers.NewAdminPromosAuditHandler(db, rdb)
 		adminGroup.Get("/promos/audit", adminPromosH.Audit)
 		adminGroup.Get("/promos/stats", adminPromosH.Stats)
 
-		// GET /api/v1/<prefix>/deploys — append-only deploy-identity log.
-		// Answers "which binary was serving traffic at $TIME?" — see
-		// internal/handlers/deploys_audit.go and migration 022 for the
-		// table shape and self-report contract.
+		// Deploy-identity append-only log (PR #57). Answers "which binary at $TIME?"
 		deploysAuditH := handlers.NewDeploysAuditHandler(db)
 		adminGroup.Get("/deploys", deploysAuditH.List)
+
+		// Promote-approval admin surface (migration 026). Read-only list
+		// + a reject endpoint that flips a pending row to rejected. The
+		// public GET /approve/:token route is wired ABOVE outside the
+		// admin gate — clicking the email link does NOT require an
+		// admin session (the token IS the credential there).
+		adminGroup.Get("/promotions", promoteApprovalH.List)
+		adminGroup.Post("/promotions/:id/reject", promoteApprovalH.Reject)
 	}
 
 	// Quota-wall nudge endpoint — Track U1. Returns the most recent

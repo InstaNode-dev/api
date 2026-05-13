@@ -25,6 +25,19 @@ const (
 	// downstream middleware/handlers can branch on identity without a DB hit —
 	// in particular RequireAdmin reads it to check the ADMIN_EMAILS allowlist.
 	LocalKeyEmail = "auth_email"
+	// LocalKeyReadOnly is the fiber.Locals key set to true when the JWT
+	// carries `read_only:true` — i.e. the session was minted via
+	// POST /api/v1/admin/customers/:team_id/impersonate. Consumed by
+	// RequireWritable, which 403s any POST/PATCH/PUT/DELETE while the flag
+	// is set. The flag is irrevocable for the session's lifetime.
+	LocalKeyReadOnly = "auth_read_only"
+	// LocalKeyImpersonatedBy is the fiber.Locals key holding the admin email
+	// that minted an impersonation token (`impersonated_by` JWT claim).
+	// Empty when the session is a normal (non-impersonated) one. Surfaced
+	// in logs / audit trails so a future investigation can answer "who
+	// caused this read?" — and emitted on /auth/me so the dashboard can
+	// render the "you are viewing as <customer>" banner.
+	LocalKeyImpersonatedBy = "auth_impersonated_by"
 
 	// audienceMismatchError is the error keyword used when an RFC 8707
 	// audience check fails. Distinct from the generic "unauthorized" so that
@@ -101,6 +114,17 @@ type sessionClaims struct {
 	TeamID       string        `json:"tid"`
 	Email        string        `json:"email"`
 	Confirmation *confirmation `json:"cnf,omitempty"`
+	// ReadOnly + ImpersonatedBy back the read-only "view-as-customer"
+	// impersonation surface: a platform admin mints a 10-minute JWT scoped
+	// to a target customer's team via POST /api/v1/admin/customers/:id/impersonate.
+	// RequireWritable consumes ReadOnly to 403 every POST/PATCH/PUT/DELETE
+	// the impersonated session attempts; ImpersonatedBy is surfaced on
+	// /auth/me and emitted in audit/log lines so the admin's identity is
+	// preserved across the session boundary. Both default to zero values
+	// for normal (non-impersonated) sessions — JSON omitempty keeps the
+	// wire shape unchanged for the common path.
+	ReadOnly       bool   `json:"read_only,omitempty"`
+	ImpersonatedBy string `json:"impersonated_by,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -247,6 +271,16 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 		if claims.Confirmation != nil && claims.Confirmation.JKT != "" {
 			c.Locals(LocalKeyDPoPKeyThumbprint, claims.Confirmation.JKT)
 		}
+		// Impersonation locals — set unconditionally when the claims carry
+		// them (omitempty on the wire means the receiver only sees them when
+		// the issuer set them). RequireWritable reads LocalKeyReadOnly to
+		// gate mutating routes.
+		if claims.ReadOnly {
+			c.Locals(LocalKeyReadOnly, true)
+		}
+		if claims.ImpersonatedBy != "" {
+			c.Locals(LocalKeyImpersonatedBy, claims.ImpersonatedBy)
+		}
 		return c.Next()
 	}
 }
@@ -285,6 +319,25 @@ func GetTeamID(c *fiber.Ctx) string {
 // RequireDPoP to decide whether to enforce DPoP for this request.
 func GetDPoPKeyThumbprint(c *fiber.Ctx) string {
 	if v, ok := c.Locals(LocalKeyDPoPKeyThumbprint).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// IsReadOnly reports whether the current request's JWT carried
+// `read_only:true` — i.e. it was minted by the admin impersonation flow.
+// Centralised so RequireWritable, audit-log emitters, and the /auth/me
+// surfacing all agree on the single source of truth (LocalKeyReadOnly).
+func IsReadOnly(c *fiber.Ctx) bool {
+	v, ok := c.Locals(LocalKeyReadOnly).(bool)
+	return ok && v
+}
+
+// GetImpersonatedBy returns the admin email that minted the current
+// impersonation token, or "" when the session is a normal one. Surfaced
+// on /auth/me so the dashboard can render the impersonation banner.
+func GetImpersonatedBy(c *fiber.Ctx) string {
+	if v, ok := c.Locals(LocalKeyImpersonatedBy).(string); ok {
 		return v
 	}
 	return ""
@@ -333,6 +386,18 @@ func OptionalAuth(cfg *config.Config) fiber.Handler {
 		}
 		if claims.Confirmation != nil && claims.Confirmation.JKT != "" {
 			c.Locals(LocalKeyDPoPKeyThumbprint, claims.Confirmation.JKT)
+		}
+		// Mirror the impersonation-locals population done in RequireAuth so
+		// downstream RequireWritable (when attached to an OptionalAuth route)
+		// sees the read_only flag and gates mutations. An impersonated session
+		// presenting an Authorization header on an OptionalAuth route must
+		// still be blocked from writing — that's exactly the /db/new etc.
+		// case test #5 in the brief exercises.
+		if claims.ReadOnly {
+			c.Locals(LocalKeyReadOnly, true)
+		}
+		if claims.ImpersonatedBy != "" {
+			c.Locals(LocalKeyImpersonatedBy, claims.ImpersonatedBy)
 		}
 		return c.Next()
 	}

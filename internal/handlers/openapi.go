@@ -185,7 +185,7 @@ const openAPISpec = `{
     "/api/v1/stacks/{slug}/promote": {
       "post": {
         "summary": "Promote a stack from one env to another (Pro+)",
-        "description": "Copies the stack's config (image binding, resource bindings, name) to a sibling stack in the target env. If the target env already has a sibling, its status is bumped back to 'building' (in-place re-promote); otherwise a new stack row is created with parent_stack_id pointing at the family root. Pro / Team / Growth tiers only — returns 402 with agent_action otherwise. Compute redeploy is plumbed-but-waiting on Phase-1 POST /deploy/new; the row + parent linkage is the durable contract that future deploy hooks read from.",
+        "description": "Copies the stack's config (image binding, resource bindings, name) to a sibling stack in the target env. If the target env already has a sibling, its status is bumped back to 'building' (in-place re-promote); otherwise a new stack row is created with parent_stack_id pointing at the family root. Pro / Team / Growth tiers only — returns 402 with agent_action otherwise.\n\nEmail-link approval gate (migration 026): when 'to' is anything other than 'development', the API does NOT execute the promote immediately. It persists a pending row in promote_approvals, returns 202 with status='pending_approval' + an approval_id + expires_at, and emails the requester a single-use https://api.instanode.dev/approve/<token> link valid for 24h. Dev-env promotes bypass this gate entirely. To run a previously-approved promote manually, pass approval_id in the body — the API verifies status='approved', from/to match, and flips the row to 'executed' before proceeding.",
         "security": [{ "bearerAuth": [] }],
         "parameters": [{ "name": "slug", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Source stack slug (the env you are promoting FROM)" }],
         "requestBody": {
@@ -196,9 +196,10 @@ const openAPISpec = `{
                 "type": "object",
                 "required": ["to"],
                 "properties": {
-                  "from": { "type": "string", "description": "Source env — defaults to source stack's env. Must match if provided." },
-                  "to":   { "type": "string", "description": "Target env (production, staging, dev, ...) — required." },
-                  "name": { "type": "string", "description": "Optional display name override for the new stack." }
+                  "from":        { "type": "string", "description": "Source env — defaults to source stack's env. Must match if provided." },
+                  "to":          { "type": "string", "description": "Target env (production, staging, dev, ...) — required. Anything other than 'development' triggers the email-link approval flow." },
+                  "name":        { "type": "string", "description": "Optional display name override for the new stack." },
+                  "approval_id": { "type": "string", "description": "Optional. Pass the id of an already-approved promote_approvals row to run the promote immediately (skips the email-link wait). The row's (kind,from,to) must match this request." }
                 }
               }
             }
@@ -206,13 +207,28 @@ const openAPISpec = `{
         },
         "responses": {
           "200": { "description": "Re-promoted into existing sibling stack — same slug, status reset to building" },
-          "202": { "description": "Created a new stack in the target env (parent_stack_id points at family root)" },
-          "400": { "description": "Invalid body, missing 'to', from==to, or invalid env name" },
+          "202": { "description": "Either a new stack was created in the target env (parent_stack_id points at family root), OR — for non-dev target envs without an approval_id — a pending approval was created. The body status field disambiguates: 'building' (executed) vs 'pending_approval' (waiting for email click). The pending shape includes approval_id, expires_at, and an agent_action telling the user to check their inbox." },
+          "400": { "description": "Invalid body, missing 'to', from==to, invalid env name, or approval_id mismatched (kind/from/to)." },
           "401": { "description": "Unauthorized — session required" },
           "402": { "description": "Upgrade required — team is not on pro/team/growth. Response carries upgrade_url + agent_action." },
           "403": { "description": "Blocked by team env_policy. Body: { error: 'env_policy_denied', env, action, role, allowed_roles, agent_action }." },
-          "404": { "description": "Source stack not found or not owned by this team" },
-          "409": { "description": "Source env did not match the asserted 'from'" }
+          "404": { "description": "Source stack not found, not owned by this team, OR approval_id does not match any row for this team" },
+          "409": { "description": "Source env did not match the asserted 'from', OR approval_id is not in status='approved'" },
+          "410": { "description": "approval_id is past its 24h expiry window" }
+        }
+      }
+    },
+    "/approve/{token}": {
+      "get": {
+        "summary": "Click-through endpoint for email-link promote approvals",
+        "description": "Public, no-auth endpoint. The operator's email link points here. On a valid pending unexpired token, the row is atomically flipped to status='approved' (single-use) and the response 302-redirects to https://instanode.dev/app/promotions/<id>?approved=1. Otherwise renders an HTML page describing the failure (invalid / expired / already-used). Rate-limited to 10 req/sec per IP — defends the 32-byte token space against brute-force.",
+        "parameters": [{ "name": "token", "in": "path", "required": true, "schema": { "type": "string" }, "description": "URL-safe base64 token from the approval email." }],
+        "responses": {
+          "302": { "description": "Approved — redirect to dashboard" },
+          "400": { "description": "Missing token (HTML)" },
+          "404": { "description": "Token does not match any row (HTML)" },
+          "410": { "description": "Token expired or already used (HTML)" },
+          "429": { "description": "Per-IP rate limit hit (HTML)" }
         }
       }
     },
@@ -276,7 +292,7 @@ const openAPISpec = `{
         "requestBody": { "required": true, "content": { "multipart/form-data": { "schema": { "$ref": "#/components/schemas/DeployRequest" } } } },
         "responses": {
           "202": { "description": "Deployment accepted, building", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
-          "400": { "description": "Bad request — invalid env_vars JSON, invalid_resource_binding (resource_bindings value is not a UUID or family:<uuid>), private_deploy_requires_allowed_ips (private=true with no IPs), invalid_allowed_ip (bad CIDR/IP literal), or too_many_allowed_ips (>32 entries)" },
+          "400": { "description": "Bad request — invalid env_vars JSON, invalid_resource_binding (resource_bindings value is not a UUID or family:<uuid>), private_deploy_requires_allowed_ips (private=true with no IPs), invalid_allowed_ip (bad CIDR/IP literal), too_many_allowed_ips (>32 entries), or invalid_notify_webhook (URL is not https, unresolvable, or resolves to a private/loopback/link-local IP)" },
           "401": { "description": "Unauthorized" },
           "402": { "description": "deployment_limit_reached OR private_deploy_requires_pro — hobby/anonymous/free trying to set private=true. agent_action points to https://instanode.dev/pricing." },
           "403": { "description": "Blocked by team env_policy, OR resource_binding_forbidden (binding references a resource owned by a different team)" },
@@ -609,6 +625,42 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/resources/{id}/pause": {
+      "post": {
+        "summary": "Pause a resource (suspend without deletion)",
+        "description": "Sets status to 'paused' and runs the provider-side revoke (REVOKE CONNECT for postgres, ACL SETUSER off for redis, revokeRolesFromUser for mongodb; queue/storage/webhook are pure status flips). The connection URL is preserved on resume — no re-issuance. Paused resources STOP counting against the per-type resource quota, but storage_bytes STILL counts toward the storage cap so pause-and-bloat is not a valid escape. Tier-gated to Pro+. Idempotent error: a second pause on an already-paused resource returns 409 already_paused.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Resource paused", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string", "format": "uuid" }, "token": { "type": "string", "format": "uuid" }, "status": { "type": "string", "enum": ["paused"] }, "message": { "type": "string" } } } } } },
+          "400": { "description": "invalid_id — :id is not a valid UUID" },
+          "401": { "description": "Unauthorized — session token required" },
+          "402": { "description": "upgrade_required — pause/resume requires Pro+. Body: { error: 'upgrade_required', upgrade_url, agent_action }." },
+          "403": { "description": "Forbidden — caller doesn't own the resource" },
+          "404": { "description": "not_found — resource doesn't exist" },
+          "409": { "description": "already_paused — the resource is already paused (idempotent error)" },
+          "503": { "description": "provider_failed — the provider-side revoke failed; the DB row is unchanged" }
+        }
+      }
+    },
+    "/api/v1/resources/{id}/resume": {
+      "post": {
+        "summary": "Resume a paused resource (restore from same data)",
+        "description": "Flips status from 'paused' back to 'active' and re-grants the provider-side connection (GRANT CONNECT / ACL on / grantRolesToUser). The connection URL is preserved unchanged — no re-issuance, no new password — so any existing client config still works. Tier-gated to Pro+ in symmetry with pause.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Resource resumed", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string", "format": "uuid" }, "token": { "type": "string", "format": "uuid" }, "status": { "type": "string", "enum": ["active"] }, "message": { "type": "string" } } } } } },
+          "400": { "description": "invalid_id" },
+          "401": { "description": "Unauthorized" },
+          "402": { "description": "upgrade_required — pause/resume requires Pro+" },
+          "403": { "description": "Forbidden" },
+          "404": { "description": "not_found" },
+          "409": { "description": "not_paused — the resource isn't currently paused" },
+          "503": { "description": "provider_failed — the provider-side grant failed; the DB row is unchanged" }
+        }
+      }
+    },
     "/api/v1/resources/families": {
       "get": {
         "summary": "List resource families for the authenticated team",
@@ -709,7 +761,7 @@ const openAPISpec = `{
     "/api/v1/resources/{id}/provision-twin": {
       "post": {
         "summary": "Provision an env-twin of an existing resource (Pro+)",
-        "description": "Creates a fresh resource of the same type as the source, in a different env, linked into the same family (parent_resource_id = family root). Tier-gated to Pro/Team/Growth — hobby/free callers get a 402 with agent_action telling them to upgrade. Only supports postgres/redis/mongodb sources (the resource types where env-twin has real per-env infra). The response shape mirrors the corresponding /db/new, /cache/new, /nosql/new endpoint so dashboard + MCP code consuming those needs no branching for twins.",
+        "description": "Creates a fresh resource of the same type as the source, in a different env, linked into the same family (parent_resource_id = family root). Tier-gated to Pro/Team/Growth — hobby/free callers get a 402 with agent_action telling them to upgrade. Only supports postgres/redis/mongodb sources (the resource types where env-twin has real per-env infra).\n\nEmail-link approval gate (migration 026): when 'env' is anything other than 'development', the API does NOT execute immediately. It persists a pending row in promote_approvals, returns 202 with status='pending_approval' + an approval_id + expires_at, and emails the requester a single-use https://api.instanode.dev/approve/<token> link valid for 24h. Dev-env twins bypass this gate. Pass approval_id in the body to consume a previously-approved row immediately.",
         "security": [{ "bearerAuth": [] }],
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" }, "description": "Token of the source resource (root or any sibling — the handler resolves the family root)." }],
         "requestBody": {
@@ -720,8 +772,9 @@ const openAPISpec = `{
                 "type": "object",
                 "required": ["env"],
                 "properties": {
-                  "env":  { "type": "string", "description": "Target env for the twin (production / staging / dev / ...). Must match ^[a-z0-9-]{1,32}$." },
-                  "name": { "type": "string", "description": "Optional human-readable label (max 120 chars). Falls back to the source's name when omitted." }
+                  "env":         { "type": "string", "description": "Target env for the twin (production / staging / dev / ...). Must match ^[a-z0-9-]{1,32}$. Anything other than 'development' triggers the email-link approval flow." },
+                  "name":        { "type": "string", "description": "Optional human-readable label (max 120 chars). Falls back to the source's name when omitted." },
+                  "approval_id": { "type": "string", "description": "Optional. Pass an already-approved approval row id to run the twin immediately (skips the email-link wait)." }
                 }
               }
             }
@@ -729,12 +782,14 @@ const openAPISpec = `{
         },
         "responses": {
           "201": { "description": "Twin provisioned — body carries connection_url + family_root_id (same shape as POST /db/new etc.)" },
-          "400": { "description": "invalid_id / missing_env / invalid_env / unsupported_for_twin (source isn't postgres/redis/mongodb)" },
+          "202": { "description": "Pending approval — non-dev target env, no approval_id supplied. Body: { status: 'pending_approval', approval_id, expires_at, agent_action, ... }." },
+          "400": { "description": "invalid_id / missing_env / invalid_env / unsupported_for_twin (source isn't postgres/redis/mongodb), or approval_id mismatched" },
           "401": { "description": "Unauthorized" },
           "402": { "description": "upgrade_required — team is on hobby/free; response carries agent_action + upgrade_url" },
           "403": { "description": "forbidden — caller does not own the source resource" },
-          "404": { "description": "Source resource not found" },
-          "409": { "description": "twin_exists — family already has a row in the requested env" },
+          "404": { "description": "Source resource not found, or approval_id does not match any row for this team" },
+          "409": { "description": "twin_exists — family already has a row in the requested env, OR approval_id is not in status='approved'" },
+          "410": { "description": "approval_id is past its 24h expiry window" },
           "503": { "description": "provision_failed — downstream provisioner errored; resource row was soft-deleted" }
         }
       }
@@ -1545,7 +1600,7 @@ const openAPISpec = `{
         "type": "object",
         "properties": {
           "name": { "type": "string", "description": "Optional human-readable label (max 120 chars)" },
-          "env": { "type": "string", "description": "Optional environment scope (production / staging / dev / ...). Anonymous tier is always 'production'.", "default": "production" },
+          "env": { "type": "string", "description": "Optional environment scope (production / staging / dev / ...). Defaults to 'development' (migration 026) so accidental no-env provisions land in the lowest-stakes bucket. Anonymous tier is always 'development'. Every provisioning response echoes the resolved env so callers know which bucket they landed in.", "default": "development" },
           "parent_resource_id": { "type": "string", "format": "uuid", "description": "Optional. Link the new resource into an existing env-twin family — the new row becomes a sibling of the parent (same family root, different env). Validated against same-team + same-type + no-duplicate-twin before provisioning. Authenticated callers only. Errors: 400 type_mismatch (parent is a different resource_type), 403 forbidden_parent_resource (parent belongs to another team), 404 parent_not_found, 409 twin_exists (family already has a row in this env). See GET /api/v1/resources/{id}/family + /api/v1/resources/families." }
         }
       },
@@ -1795,11 +1850,13 @@ const openAPISpec = `{
           "tarball": { "type": "string", "format": "binary", "description": "gzipped tar archive containing the Dockerfile + source (max 50 MB). When MINIO_ENDPOINT is configured the build context is uploaded to MinIO and kaniko pulls it via the S3 path; otherwise it falls back to a k8s Secret which caps at ~1 MiB." },
           "name": { "type": "string", "description": "Optional human-readable label" },
           "port": { "type": "integer", "description": "Container port (default 8080)" },
-          "env": { "type": "string", "description": "Environment scope (production / staging / dev / ...)" },
+          "env": { "type": "string", "description": "Environment scope (production / staging / dev / ...). Defaults to 'development' when omitted (migration 026 — the resolved env is echoed back as 'environment' on the response so callers know which bucket they landed in)." },
           "env_vars": { "type": "string", "description": "Optional JSON object of env vars to inject into the deployed pod on the FIRST build — e.g. '{\"DATABASE_URL\":\"postgres://...\",\"REDIS_URL\":\"redis://...\"}'. Avoids the (POST /deploy/new) → (PATCH /env) → (POST /redeploy) round-trip pattern. Values may use 'vault://KEY' refs which resolve at deploy time. Keys starting with underscore are reserved and ignored." },
           "resource_bindings": { "type": "string", "description": "Optional JSON object mapping env-var-name to a resource reference. Values can be either 'family:<family_root_id>' (resolved at submit time to the family member matching the deploy's env — one manifest works across all envs) or a raw resource-token UUID (legacy path; resolves to that specific resource regardless of env). Resolved values are merged into env_vars, with explicit env_vars taking precedence on key collision. Example: '{\"DATABASE_URL\":\"family:7a3f2c91-...\",\"REDIS_URL\":\"family:9bd5f3e0-...\"}'." },
           "private": { "type": "string", "description": "Optional flag (\"true\" / \"1\" / \"yes\") that turns this into a private deploy. When set, the resulting Ingress carries an nginx whitelist-source-range annotation built from allowed_ips. Pro / Team / Growth only — hobby/anonymous/free return 402 with agent_action: \"Tell the user private deploys require Pro tier. Upgrade at https://instanode.dev/pricing — takes 30 seconds.\"" },
-          "allowed_ips": { "type": "string", "description": "Comma-separated list of CIDRs or IP literals (e.g. \"1.2.3.4,10.0.0.0/8,2001:db8::/32\"). Required when private=true; max 32 entries. Each entry is validated via Go's net.ParseCIDR / net.ParseIP — invalid entries surface in the 400 message so an agent can fix the literal that broke. Larger allowlists belong in CF Access or a real VPN, not an nginx annotation." }
+          "allowed_ips": { "type": "string", "description": "Comma-separated list of CIDRs or IP literals (e.g. \"1.2.3.4,10.0.0.0/8,2001:db8::/32\"). Required when private=true; max 32 entries. Each entry is validated via Go's net.ParseCIDR / net.ParseIP — invalid entries surface in the 400 message so an agent can fix the literal that broke. Larger allowlists belong in CF Access or a real VPN, not an nginx annotation." },
+          "notify_webhook": { "type": "string", "description": "Optional https:// URL fired by POST when the deploy reaches a terminal state (status='healthy' or 'failed'). Lets callers subscribe instead of polling GET /deploy/:id. Rejected with 400 + agent_action if the URL is not https, the hostname is unresolvable, or resolves to a private/loopback/link-local/CGNAT IP (SSRF protection). Payload shape: { event: 'deploy.healthy' | 'deploy.failed', deploy_id, app_id, url, commit_id, build_time, duration_s, error_message? }. 2xx → notify_state='sent'; 4xx → 'failed' (no retry — user URL is broken); 5xx/network → up to 3 retries, then 'failed'." },
+          "notify_webhook_secret": { "type": "string", "description": "Optional HMAC-SHA256 signing key. When set, every dispatch includes an X-InstaNode-Signature: sha256=<hex(hmac(secret, body))> header. Stored AES-256-GCM encrypted; plaintext never leaves the request. Omit to dispatch without a signature header." }
         },
         "required": ["tarball"]
       },
@@ -1820,6 +1877,10 @@ const openAPISpec = `{
               "port": { "type": "integer" },
               "private": { "type": "boolean", "description": "True when the Ingress is locked down via nginx whitelist-source-range. Pro / Team / Growth feature." },
               "allowed_ips": { "type": "array", "items": { "type": "string" }, "description": "CIDRs / IPs whitelisted on the Ingress when private=true. Empty array on a public deploy." },
+              "notify_webhook": { "type": "string", "description": "Echoed-back webhook URL when set on POST /deploy/new. Empty string when no webhook was configured for this deployment." },
+              "notify_state": { "type": "string", "enum": ["unset", "pending", "sent", "failed"], "description": "Lifecycle of the deploy-notify webhook. 'unset' = no URL configured. 'pending' = URL configured, awaiting terminal state (or worker dispatch). 'sent' = 2xx received. 'failed' = 4xx received OR 5xx/network exhausted retries." },
+              "notify_attempts": { "type": "integer", "description": "Count of dispatch attempts made by the worker. Present only when notify_webhook is set. 5xx/network errors retry up to 3 times; 4xx is permanent." },
+              "notify_secret_set": { "type": "boolean", "description": "True when an HMAC signing secret was supplied at create time. Present only when notify_webhook is set. The plaintext secret is never returned." },
               "team_id": { "type": "string", "format": "uuid" }
             }
           },
