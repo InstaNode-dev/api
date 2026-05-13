@@ -297,6 +297,20 @@ func (h *CLIAuthHandler) GetCurrentUser(c *fiber.Ctx) error {
 		resp["admin_path_prefix"] = h.cfg.AdminPathPrefix
 	}
 
+	// Impersonation surfacing — when the caller's JWT carries read_only=true
+	// (i.e. the session was minted via POST /api/v1/admin/customers/:id/impersonate)
+	// expose two read-only fields so the dashboard can render the "viewing
+	// as <customer>" banner + grey out mutating UI. We only emit the keys
+	// when the flag is set; non-impersonated sessions see a clean response
+	// shape. The wire surface (read_only:bool, impersonated_by:string)
+	// matches what the RequireWritable middleware reads from the same JWT.
+	if middleware.IsReadOnly(c) {
+		resp["read_only"] = true
+		if by := middleware.GetImpersonatedBy(c); by != "" {
+			resp["impersonated_by"] = by
+		}
+	}
+
 	return c.JSON(resp)
 }
 
