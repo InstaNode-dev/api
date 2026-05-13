@@ -480,6 +480,13 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		adminGroup.Get("/customers/:team_id", adminCustH.Detail)
 		adminGroup.Post("/customers/:team_id/tier", adminCustH.ChangeTier)
 		adminGroup.Post("/customers/:team_id/promo", adminCustH.IssuePromo)
+
+		// GET /api/v1/<prefix>/deploys — append-only deploy-identity log.
+		// Answers "which binary was serving traffic at $TIME?" — see
+		// internal/handlers/deploys_audit.go and migration 022 for the
+		// table shape and self-report contract.
+		deploysAuditH := handlers.NewDeploysAuditHandler(db)
+		adminGroup.Get("/deploys", deploysAuditH.List)
 	}
 
 	// Quota-wall nudge endpoint — Track U1. Returns the most recent

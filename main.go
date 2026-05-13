@@ -7,8 +7,11 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log/slog"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/newrelic/go-agent/v3/newrelic"
 	"google.golang.org/grpc"
@@ -18,6 +21,7 @@ import (
 	"instant.dev/internal/db"
 	"instant.dev/internal/email"
 	"instant.dev/internal/middleware"
+	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
 	"instant.dev/internal/provisioner"
 	"instant.dev/internal/router"
@@ -68,6 +72,14 @@ func main() {
 		slog.Error("main.migrations_failed", "error", err)
 		os.Exit(1)
 	}
+
+	// Deploy-audit self-report. Idempotent on (service, commit_id,
+	// image_digest) — every pod startup of the same image is a no-op
+	// at the DB level, so a 10-replica autoscale or a routine restart
+	// writes at most one row. Failures here are non-fatal: this is
+	// observability, not a correctness gate, and a DB hiccup on boot
+	// must not stop the server from listening.
+	emitDeployAuditSelfReport(database)
 
 	rdb := db.ConnectRedis(cfg.RedisURL)
 	defer rdb.Close()
@@ -158,3 +170,65 @@ func initNewRelic(service string) *newrelic.Application {
 	slog.Info("newrelic.initialized", "app_name", appName)
 	return app
 }
+
+// imageDigestEnvVar names the env var Kubernetes populates via
+// `valueFrom.fieldRef: fieldPath: status.containerStatuses[0].imageID`.
+// The Deployment spec for the api service wires this in so the pod
+// learns its own image digest at boot. Unset → local-build fallback so
+// `make run` doesn't have to fake a sha256 string.
+const imageDigestEnvVar = "IMAGE_DIGEST"
+
+// imageDigestFallback is what we record when IMAGE_DIGEST is not in the
+// environment. Treated as a normal value at the DB layer — the unique
+// index works fine on the literal string. The point is that local
+// dev / CI / smoke-test boots all collapse onto one row instead of
+// being randomly attributed.
+const imageDigestFallback = "local-build"
+
+// resolveImageDigest returns the value of the IMAGE_DIGEST env var with
+// surrounding whitespace trimmed, or imageDigestFallback if the var is
+// unset or empty. Extracted as a pure function so unit tests can pin the
+// "unset → local-build" contract without spinning up a real DB.
+func resolveImageDigest() string {
+	if v := strings.TrimSpace(os.Getenv(imageDigestEnvVar)); v != "" {
+		return v
+	}
+	return imageDigestFallback
+}
+
+// emitDeployAuditSelfReport writes one row to deploys_audit reporting
+// the running binary's identity (service name + commit + image digest +
+// version + build time). Idempotent via the table's ON CONFLICT clause:
+// the first pod of a given image writes the row, every subsequent pod
+// of the same image is a no-op.
+//
+// Best-effort: a DB error here is logged at WARN and swallowed. The
+// audit row is observability — it must never block startup.
+//
+// The "migration_version" column is left empty here; the value would
+// have to come from peeking at the embedded migration FS at boot. We
+// can populate it in a follow-up if we ever need it operationally.
+// Right now the (service, commit, digest) tuple is enough to answer
+// "what was running."
+func emitDeployAuditSelfReport(database *sql.DB) {
+	digest := resolveImageDigest()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := models.InsertSelfReport(ctx, database, models.SelfReportParams{
+		Service:     "api",
+		CommitID:    buildinfo.GitSHA,
+		ImageDigest: digest,
+		Version:     buildinfo.Version,
+		BuildTime:   buildinfo.BuildTime,
+	}); err != nil {
+		slog.Warn("deploys_audit.self_report_failed", "error", err,
+			"service", "api", "commit_id", buildinfo.GitSHA, "image_digest", digest)
+		return
+	}
+	slog.Info("deploys_audit.self_report",
+		"service", "api", "commit_id", buildinfo.GitSHA, "image_digest", digest,
+		"version", buildinfo.Version, "build_time", buildinfo.BuildTime)
+}
+
