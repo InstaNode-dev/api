@@ -468,6 +468,14 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		adminGroup.Get("/customers/:team_id", adminCustH.Detail)
 		adminGroup.Post("/customers/:team_id/tier", adminCustH.ChangeTier)
 		adminGroup.Post("/customers/:team_id/promo", adminCustH.IssuePromo)
+
+		// Promo lifecycle audit feed. /audit is uncached (admin needs to see
+		// "issued at 3 sec ago"); /stats is Redis-cached 5 min (the totals tile
+		// the dashboard polls). See handlers/admin_promos_audit.go for the
+		// freshness contract.
+		adminPromosH := handlers.NewAdminPromosAuditHandler(db, rdb)
+		adminGroup.Get("/promos/audit", adminPromosH.Audit)
+		adminGroup.Get("/promos/stats", adminPromosH.Stats)
 	}
 
 	// Quota-wall nudge endpoint — Track U1. Returns the most recent
