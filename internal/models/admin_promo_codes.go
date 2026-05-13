@@ -240,3 +240,299 @@ func MarkAdminPromoCodeUsed(ctx context.Context, db *sql.DB, id uuid.UUID) error
 	}
 	return nil
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit feed — see internal/handlers/admin_promos_audit.go
+//
+// The agent-API admin surface needs a consolidated view of who issued which
+// codes to whom and how many got redeemed. Today the data is scattered:
+//
+//   - issued_by_email + created_at live in admin_promo_codes
+//   - team_id → email requires a join through users
+//   - redemption timestamp lives in admin_promo_codes.used_at
+//   - expiration is admin_promo_codes.expires_at < now() AND used_at IS NULL
+//
+// We surface each promo's full lifecycle (issued / redeemed / expired) as a
+// flat event stream via ListPromoAuditEvents below. Filtering by issuer
+// email + since + event_type happens in-query so we don't pull the full
+// table into Go just to drop rows.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Event-type constants for the promo audit feed. The query emits one of
+// these in the event_type column of each row. Strings (not iota) so the
+// JSON response is self-describing and a downstream consumer can filter by
+// literal value without an enum mapping.
+const (
+	PromoAuditEventIssued   = "issued"
+	PromoAuditEventRedeemed = "redeemed"
+	PromoAuditEventExpired  = "expired"
+)
+
+// IsValidPromoAuditEvent reports whether v is a known event_type filter
+// value. Used by the handler to validate ?event_type=... before it reaches
+// the SQL — the query whitelists the type internally too, so this is the
+// "clean 400 vs surprising empty list" surface.
+func IsValidPromoAuditEvent(v string) bool {
+	switch v {
+	case PromoAuditEventIssued, PromoAuditEventRedeemed, PromoAuditEventExpired:
+		return true
+	}
+	return false
+}
+
+// PromoAuditEvent is one row in the consolidated lifecycle feed.
+//
+// Field semantics:
+//   - EventType: one of PromoAuditEventIssued / Redeemed / Expired.
+//   - EventAt:   the timestamp this row's event happened (created_at for
+//                issued, used_at for redeemed, expires_at for expired).
+//                Single column so the handler can ORDER BY uniformly and
+//                the JSON consumer doesn't have to pick which of three
+//                nullable timestamps "this" event referred to.
+//   - TeamEmail: the primary owner's email. Empty string when the team
+//                has no owner row (data-consistency edge case — the
+//                LEFT JOIN keeps the promo visible rather than dropping it).
+//
+// All other fields are passed through from admin_promo_codes; AppliesTo is
+// 0 when the DB stored NULL.
+type PromoAuditEvent struct {
+	EventType     string
+	Code          string
+	TeamID        uuid.NullUUID
+	TeamEmail     string
+	IssuedByEmail string
+	Kind          string
+	Value         int
+	AppliesTo     int
+	IssuedAt      time.Time
+	RedeemedAt    sql.NullTime
+	ExpiredAt     sql.NullTime
+	EventAt       time.Time
+}
+
+// ListPromoAuditEventsParams collects the filter knobs for the audit feed.
+//
+//   - Since:           drop events whose event_at < Since. Zero value → no filter.
+//   - Limit / Offset:  paging; Limit is capped by the handler.
+//   - IssuedByEmail:   case-insensitive exact match on the issuer column.
+//                      Empty string → no filter.
+//   - EventType:       restrict to a single lifecycle phase. Empty → all three.
+type ListPromoAuditEventsParams struct {
+	Since          time.Time
+	Limit          int
+	Offset         int
+	IssuedByEmail  string
+	EventType      string
+}
+
+// ListPromoAuditEvents returns the consolidated lifecycle feed. The query
+// is a single CTE: one branch per event_type, unioned and ordered by the
+// canonical event_at DESC.
+//
+// We always-LEFT-JOIN users (not INNER) so a promo whose team has been
+// pruned still shows up in the audit log — admins want to see the issuance
+// happened even if the recipient team is gone. Team email is "" in that case.
+//
+// The Expired branch evaluates `expires_at < now()` server-side so the
+// query is self-consistent within a single statement (no clock-skew window
+// between two Go-side now() calls).
+func ListPromoAuditEvents(ctx context.Context, db *sql.DB, p ListPromoAuditEventsParams) ([]*PromoAuditEvent, error) {
+	args := []interface{}{}
+	// $1, $2... are positional in the generated SQL. We append in a strict
+	// order: since, issued_by_email, event_type, limit, offset. The CTE
+	// branches reference all of these; the outer WHERE clause filters the
+	// unioned result.
+
+	args = append(args, p.Since)            // $1
+	args = append(args, p.IssuedByEmail)    // $2 (lowercased)
+	args = append(args, p.EventType)        // $3
+	args = append(args, p.Limit)            // $4
+	args = append(args, p.Offset)           // $5
+
+	// Note on $1 ('epoch' sentinel): when Since is zero, p.Since is the Go
+	// zero time which marshals as 0001-01-01. Postgres accepts that and the
+	// `>= $1` filter degenerates to "everything" — exactly what we want.
+	query := `
+		WITH promo_events AS (
+			SELECT 'issued'::text AS event_type,
+			       p.code, p.team_id,
+			       COALESCE(u.email, '') AS team_email,
+			       p.issued_by_email, p.kind, p.value,
+			       COALESCE(p.applies_to, 0) AS applies_to,
+			       p.created_at AS issued_at,
+			       p.used_at    AS redeemed_at,
+			       CASE WHEN p.expires_at < now() AND p.used_at IS NULL
+			            THEN p.expires_at ELSE NULL END AS expired_at,
+			       p.created_at AS event_at
+			FROM admin_promo_codes p
+			LEFT JOIN users u ON u.team_id = p.team_id AND u.role = 'owner'
+			UNION ALL
+			SELECT 'redeemed'::text,
+			       p.code, p.team_id,
+			       COALESCE(u.email, ''),
+			       p.issued_by_email, p.kind, p.value,
+			       COALESCE(p.applies_to, 0),
+			       p.created_at, p.used_at,
+			       CASE WHEN p.expires_at < now() AND p.used_at IS NULL
+			            THEN p.expires_at ELSE NULL END,
+			       p.used_at
+			FROM admin_promo_codes p
+			LEFT JOIN users u ON u.team_id = p.team_id AND u.role = 'owner'
+			WHERE p.used_at IS NOT NULL
+			UNION ALL
+			SELECT 'expired'::text,
+			       p.code, p.team_id,
+			       COALESCE(u.email, ''),
+			       p.issued_by_email, p.kind, p.value,
+			       COALESCE(p.applies_to, 0),
+			       p.created_at, p.used_at, p.expires_at,
+			       p.expires_at
+			FROM admin_promo_codes p
+			LEFT JOIN users u ON u.team_id = p.team_id AND u.role = 'owner'
+			WHERE p.expires_at < now() AND p.used_at IS NULL
+		)
+		SELECT event_type, code, team_id, team_email,
+		       issued_by_email, kind, value, applies_to,
+		       issued_at, redeemed_at, expired_at, event_at
+		FROM promo_events
+		WHERE event_at >= $1
+		  AND ($2 = '' OR lower(issued_by_email) = $2)
+		  AND ($3 = '' OR event_type = $3)
+		ORDER BY event_at DESC
+		LIMIT $4 OFFSET $5
+	`
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("models.ListPromoAuditEvents: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*PromoAuditEvent, 0)
+	for rows.Next() {
+		ev := &PromoAuditEvent{}
+		if scanErr := rows.Scan(
+			&ev.EventType, &ev.Code, &ev.TeamID, &ev.TeamEmail,
+			&ev.IssuedByEmail, &ev.Kind, &ev.Value, &ev.AppliesTo,
+			&ev.IssuedAt, &ev.RedeemedAt, &ev.ExpiredAt, &ev.EventAt,
+		); scanErr != nil {
+			return nil, fmt.Errorf("models.ListPromoAuditEvents scan: %w", scanErr)
+		}
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("models.ListPromoAuditEvents rows: %w", err)
+	}
+	return out, nil
+}
+
+// PromoStatsTopIssuer is one row of the "who issued the most codes" leaderboard.
+type PromoStatsTopIssuer struct {
+	Email string `json:"email"`
+	Count int    `json:"count"`
+}
+
+// PromoStatsTopCode is one row of the "most-redeemed codes" leaderboard.
+// (Single-use codes max at count=1 today, but the column lives in the
+// response shape so a future multi-use code variant doesn't break the JSON
+// contract.)
+type PromoStatsTopCode struct {
+	Code  string `json:"code"`
+	Count int    `json:"count"`
+}
+
+// PromoStats is the response shape of GET /admin/promos/stats. Cached
+// 5 min in Redis at the handler layer — DO NOT call ComputePromoStats on
+// every request, it walks every row of admin_promo_codes twice.
+type PromoStats struct {
+	IssuedTotal          int                   `json:"issued_total"`
+	RedeemedTotal        int                   `json:"redeemed_total"`
+	ExpiredTotal         int                   `json:"expired_total"`
+	RedemptionRate       float64               `json:"redemption_rate"`
+	TopIssuers           []PromoStatsTopIssuer `json:"top_issuers"`
+	TopCodesByRedemption []PromoStatsTopCode   `json:"top_codes_by_redemption"`
+}
+
+// promoStatsTopLeaderboardSize caps the top_issuers / top_codes_by_redemption
+// arrays. Five is the same cardinality the dashboard renders today; bumping
+// it later is a one-line change.
+const promoStatsTopLeaderboardSize = 5
+
+// ComputePromoStats walks admin_promo_codes once via aggregate SQL +
+// fetches two leaderboards. Three round-trips total — kept simple rather
+// than a single mega-CTE because the resulting payload is cached for 5 min
+// upstream so the per-call cost matters less than the readability.
+//
+// Redemption rate = redeemed_total / issued_total, rounded to four decimal
+// places (so the dashboard can render "12.34 %"). Zero issued → 0.0 (not
+// NaN) so the JSON doesn't break.
+func ComputePromoStats(ctx context.Context, db *sql.DB) (PromoStats, error) {
+	var s PromoStats
+
+	// Single roundtrip for the three totals — uses FILTER so the planner
+	// scans admin_promo_codes once.
+	err := db.QueryRowContext(ctx, `
+		SELECT
+		  COUNT(*) AS issued_total,
+		  COUNT(*) FILTER (WHERE used_at IS NOT NULL) AS redeemed_total,
+		  COUNT(*) FILTER (WHERE expires_at < now() AND used_at IS NULL) AS expired_total
+		FROM admin_promo_codes
+	`).Scan(&s.IssuedTotal, &s.RedeemedTotal, &s.ExpiredTotal)
+	if err != nil {
+		return s, fmt.Errorf("models.ComputePromoStats totals: %w", err)
+	}
+
+	if s.IssuedTotal > 0 {
+		// Round to 4 dp by integer-rounding the *10000 product.
+		rate := float64(s.RedeemedTotal) / float64(s.IssuedTotal)
+		s.RedemptionRate = float64(int(rate*10000+0.5)) / 10000.0
+	}
+
+	// Top issuers — case-folded so "A@x.com" and "a@x.com" merge.
+	issuerRows, err := db.QueryContext(ctx, `
+		SELECT lower(issued_by_email) AS email, COUNT(*) AS n
+		FROM admin_promo_codes
+		GROUP BY lower(issued_by_email)
+		ORDER BY n DESC, email ASC
+		LIMIT $1
+	`, promoStatsTopLeaderboardSize)
+	if err != nil {
+		return s, fmt.Errorf("models.ComputePromoStats issuers: %w", err)
+	}
+	s.TopIssuers = make([]PromoStatsTopIssuer, 0, promoStatsTopLeaderboardSize)
+	for issuerRows.Next() {
+		var row PromoStatsTopIssuer
+		if scanErr := issuerRows.Scan(&row.Email, &row.Count); scanErr != nil {
+			issuerRows.Close()
+			return s, fmt.Errorf("models.ComputePromoStats issuers scan: %w", scanErr)
+		}
+		s.TopIssuers = append(s.TopIssuers, row)
+	}
+	issuerRows.Close()
+
+	// Top redeemed codes. Single-use today, but the GROUP BY + COUNT shape
+	// stays correct if redeemability becomes multi-use later.
+	codeRows, err := db.QueryContext(ctx, `
+		SELECT code, COUNT(*) AS n
+		FROM admin_promo_codes
+		WHERE used_at IS NOT NULL
+		GROUP BY code
+		ORDER BY n DESC, code ASC
+		LIMIT $1
+	`, promoStatsTopLeaderboardSize)
+	if err != nil {
+		return s, fmt.Errorf("models.ComputePromoStats codes: %w", err)
+	}
+	s.TopCodesByRedemption = make([]PromoStatsTopCode, 0, promoStatsTopLeaderboardSize)
+	for codeRows.Next() {
+		var row PromoStatsTopCode
+		if scanErr := codeRows.Scan(&row.Code, &row.Count); scanErr != nil {
+			codeRows.Close()
+			return s, fmt.Errorf("models.ComputePromoStats codes scan: %w", scanErr)
+		}
+		s.TopCodesByRedemption = append(s.TopCodesByRedemption, row)
+	}
+	codeRows.Close()
+
+	return s, nil
+}
