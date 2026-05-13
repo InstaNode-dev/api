@@ -811,6 +811,75 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/billing/promotion/validate": {
+      "post": {
+        "summary": "Validate a promotion code against a target plan",
+        "description": "HTTP wrapper around the plans-registry ValidatePromotion check. Accepts {code, plan} and returns either a structured discount payload (200 + ok:true) or a typed rejection (200 + ok:false with error/message/agent_action). Rejections deliberately return 200 — the dashboard's PromoCodePanel can render the red state through its normal success-path parser without a catch on the fetch promise. MCP/CLI agents read agent_action for the LLM-ready copy. Rate-limited at 30 validations/team/hour to make brute-forcing the seed-code namespace impractical; the limiter scopes per team so multiple developers on one team share the bucket. Codes are case-insensitive — the response echoes the canonical uppercase code.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["code", "plan"],
+                "properties": {
+                  "code": { "type": "string", "description": "Promotion code (case-insensitive)", "example": "LAUNCH50" },
+                  "plan": { "type": "string", "enum": ["hobby", "pro", "team"], "description": "Plan tier the discount must apply to" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Either a valid discount (ok:true) or a typed rejection (ok:false). The dashboard branches on the ok field, not the status code.",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "valid": {
+                    "summary": "Valid code for the requested plan",
+                    "value": {
+                      "ok": true,
+                      "code": "LAUNCH50",
+                      "discount": {
+                        "kind": "percent_off",
+                        "value": 50,
+                        "applies_to": ["pro", "team"],
+                        "max_uses": 1000,
+                        "description": "50% off Pro or Team for the first 1000 signups"
+                      },
+                      "valid_until": "2026-12-31T23:59:59Z"
+                    }
+                  },
+                  "invalid": {
+                    "summary": "Unknown code or wrong plan",
+                    "value": {
+                      "ok": false,
+                      "error": "promotion_invalid",
+                      "message": "Promotion code \"SAVE20\" is not valid for the pro plan.",
+                      "agent_action": "Tell the user this promo code isn't valid for the requested plan. Have them try a different code at https://instanode.dev/billing — promotion codes are case-insensitive."
+                    }
+                  },
+                  "expired": {
+                    "summary": "Code matched the registry but its expires_at is in the past",
+                    "value": {
+                      "ok": false,
+                      "error": "promotion_expired",
+                      "message": "Promotion code \"LAUNCH50\" has expired.",
+                      "agent_action": "Tell the user this promo code isn't valid for the requested plan. Have them try a different code at https://instanode.dev/billing — promotion codes are case-insensitive."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Empty code, missing plan, or malformed JSON body" },
+          "401": { "description": "Missing or invalid session token" },
+          "429": { "description": "Team exceeded 30 validations per hour. Wait for the next hourly bucket.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      }
+    },
     "/api/v1/billing/usage": {
       "get": {
         "summary": "Aggregated usage metrics for the authenticated team (cached)",
