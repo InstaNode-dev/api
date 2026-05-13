@@ -305,6 +305,18 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	teamsHPublic := handlers.NewTeamsHandler(db, cfg, emailClient)
 	app.Post("/api/v1/invitations/:token/accept", teamsHPublic.AcceptInvitation)
 
+	// Email-provider feedback webhooks — bounces, unsubscribes, spam
+	// complaints. Each handler authenticates the inbound call via
+	// HMAC (Brevo) or SNS-TopicArn match (SES), so they MUST register
+	// before the /api/v1 auth group — the group's RequireAuth would
+	// otherwise demand a Bearer token from Brevo's servers.
+	//
+	// PII: the raw payload is persisted to email_events.raw for audit,
+	// but the handlers DO NOT log it. See email_webhooks.go.
+	emailWebhookH := handlers.NewEmailWebhookHandler(db, cfg)
+	app.Post("/api/v1/email/webhook/brevo", emailWebhookH.Brevo)
+	app.Post("/api/v1/email/webhook/ses", emailWebhookH.SES)
+
 	// Authenticated resource management
 	middleware.SetRoleLookupDB(db)  // populate auth_team_role on every RequireAuth
 	middleware.SetAPIKeyDB(db)      // enable PAT auth path in RequireAuth
@@ -463,7 +475,37 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 			portal := &razorpaybilling.Portal{DB: db, Cfg: cfg}
 			return portal.CancelImmediately(subID)
 		}
-		adminGroup := api.Group("/"+cfg.AdminPathPrefix, middleware.RequireAdmin())
+		// Defense-in-depth gates 3-5, chained in strict order:
+		//
+		//   AdminRateLimit  — 30 req/min/fingerprint cap. Returns 403 with
+		//                     a body byte-for-byte identical to the
+		//                     allowlist-miss 403. Runs BEFORE RequireAdmin
+		//                     so an attacker who knows the prefix cannot
+		//                     bypass the limiter by sending invalid JWTs.
+		//   AdminAuditEmit  — after-response middleware. Internally calls
+		//                     c.Next() and observes the FINAL status; logs
+		//                     EVERY hit on the prefix (success AND 403).
+		//                     PathSuffix is the URL with the prefix
+		//                     stripped — the secret prefix MUST NOT land
+		//                     in audit_log.
+		//   RequireAdmin    — ADMIN_EMAILS allowlist check (gate 2).
+		//
+		// Audit MUST sit BEFORE RequireAdmin in the chain. RequireAdmin
+		// returns a 403 directly (no c.Next call) on rejection — any
+		// middleware sitting AFTER it would never run on the rejection
+		// path, so the brute-force-visibility property would silently
+		// break. By sitting BEFORE, the audit middleware's internal
+		// c.Next() dispatches RequireAdmin → handler and observes the
+		// final status either way.
+		//
+		// AdminRateLimit stays first: it short-circuits on excess with
+		// its own 403 (which AdminAuditEmit's c.Next observes as 403 +
+		// IsAdminRateLimited(c)=true → denied_by=rate_limit on the row).
+		adminGroup := api.Group("/"+cfg.AdminPathPrefix,
+			middleware.AdminRateLimit(rdb),
+			middleware.AdminAuditEmit(db, cfg.AdminPathPrefix),
+			middleware.RequireAdmin(),
+		)
 		adminGroup.Get("/customers", adminCustH.List)
 		adminGroup.Get("/customers/:team_id", adminCustH.Detail)
 		adminGroup.Post("/customers/:team_id/tier", adminCustH.ChangeTier)
@@ -476,6 +518,13 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		adminPromosH := handlers.NewAdminPromosAuditHandler(db, rdb)
 		adminGroup.Get("/promos/audit", adminPromosH.Audit)
 		adminGroup.Get("/promos/stats", adminPromosH.Stats)
+
+		// GET /api/v1/<prefix>/deploys — append-only deploy-identity log.
+		// Answers "which binary was serving traffic at $TIME?" — see
+		// internal/handlers/deploys_audit.go and migration 022 for the
+		// table shape and self-report contract.
+		deploysAuditH := handlers.NewDeploysAuditHandler(db)
+		adminGroup.Get("/deploys", deploysAuditH.List)
 	}
 
 	// Quota-wall nudge endpoint — Track U1. Returns the most recent
