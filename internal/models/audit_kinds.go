@@ -45,18 +45,19 @@ const (
 	// the call failed — operator must reconcile in the Razorpay dashboard."
 	AuditKindSubscriptionCanceledByAdmin = "subscription.canceled_by_admin"
 
-	// AuditKindPromoteApprovalRequested fires when the agent API creates a
-	// pending promote_approvals row (target env != development).
+	// Payment dunning lifecycle kinds (PR #66) — fire from Razorpay webhook
+	// + the worker's payment_grace_reminder + payment_grace_terminator jobs.
+	AuditKindPaymentGraceStarted    = "payment.grace_started"
+	AuditKindPaymentGraceReminder   = "payment.grace_reminder"
+	AuditKindPaymentGraceRecovered  = "payment.grace_recovered"
+	AuditKindPaymentGraceTerminated = "payment.grace_terminated"
+
+	// Promote approval lifecycle (PR #65) — non-dev promotes require an
+	// email-link approval before the worker executes them.
 	AuditKindPromoteApprovalRequested = "promote.approval_requested"
-
-	// AuditKindPromoteApproved fires when the user clicks the email link.
-	AuditKindPromoteApproved = "promote.approved"
-
-	// AuditKindPromoteRejected fires when an admin marks a row 'rejected'.
-	AuditKindPromoteRejected = "promote.rejected"
-
-	// AuditKindPromoteExecuted fires when the worker executes the cached promote.
-	AuditKindPromoteExecuted = "promote.executed"
+	AuditKindPromoteApproved          = "promote.approved"
+	AuditKindPromoteRejected          = "promote.rejected"
+	AuditKindPromoteExecuted          = "promote.executed"
 
 	// AuditKindAdminAccess fires on every hit to the admin route prefix.
 	// path_suffix MUST be the suffix only — the unguessable

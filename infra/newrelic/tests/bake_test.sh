@@ -33,8 +33,8 @@ fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1" >&2; }
 
 command -v jq >/dev/null 2>&1 || { echo "missing dep: jq" >&2; exit 2; }
 
-DASHBOARDS=(api-overview deploy provisioning worker)
-ALERTS=(error-rate-high nats-down p95-latency-high worker-stalled)
+DASHBOARDS=(api-overview billing-dunning deploy provisioning worker)
+ALERTS=(dunning-recovery-rate-low error-rate-high nats-down p95-latency-high payment-failure-spike worker-stalled)
 
 echo "==> Dashboards parse + no accountIds:[0] residue"
 for name in "${DASHBOARDS[@]}"; do

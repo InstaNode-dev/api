@@ -1,0 +1,38 @@
+{
+  "name": "instant-api — payment failure spike (>10 grace_started in 1h)",
+  "policyName": "instant-api alerts",
+  "description": "Page when more than 10 distinct teams enter the payment-grace state inside a single hour. Normal background rate sits near zero — a spike this size is almost always (a) Razorpay outage rejecting otherwise-valid cards, (b) a renewal-day cohort hitting the same expired-card path, or (c) our own webhook code is double-firing the grace_started audit. Investigate before reminders go out — each grace_started triggers a customer-visible email that we can't easily retract.",
+  "enabled": true,
+  "nrql": {
+    "query": "SELECT count(*) FROM Log WHERE service = 'api' AND message LIKE '%billing.subscription.charged_failed.grace_started%'"
+  },
+  "terms": [
+    {
+      "priority": "CRITICAL",
+      "operator": "ABOVE",
+      "threshold": 10,
+      "thresholdDuration": 3600,
+      "thresholdOccurrences": "ALL"
+    },
+    {
+      "priority": "WARNING",
+      "operator": "ABOVE",
+      "threshold": 5,
+      "thresholdDuration": 3600,
+      "thresholdOccurrences": "ALL"
+    }
+  ],
+  "signal": {
+    "aggregationWindow": 60,
+    "aggregationMethod": "EVENT_FLOW",
+    "aggregationDelay": 120,
+    "fillOption": "STATIC",
+    "fillValue": 0
+  },
+  "expiration": {
+    "expirationDuration": 3600,
+    "openViolationOnExpiration": false,
+    "closeViolationsOnExpiration": true
+  },
+  "violationTimeLimitSeconds": 86400
+}
