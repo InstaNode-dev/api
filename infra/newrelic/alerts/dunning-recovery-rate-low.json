@@ -1,0 +1,37 @@
+{
+  "name": "instant-api — dunning recovery rate < 30% (rolling 7d)",
+  "policyName": "instant-api alerts",
+  "description": "Page when the recovery rate of resolved grace periods drops below 30% on a 7-day rolling window. Healthy SaaS dunning recovers 40-60% of failed charges (Stripe's published benchmark is ~38% baseline, lifted to ~52% with smart-retry). Below 30% means the reminder copy is wrong, the recovery UX is broken, the cards in our base are genuinely dead (chargebacks ahead), OR our reminder cadence is too aggressive and customers are giving up. Surface before another week of grace cohorts terminates with the wrong outcome.",
+  "enabled": true,
+  "nrql": {
+    "query": "SELECT (filter(count(*), WHERE message LIKE '%billing.subscription.charged.grace_recovered%') / (filter(count(*), WHERE message LIKE '%billing.subscription.charged.grace_recovered%') + filter(count(*), WHERE message LIKE '%payment.grace_terminated%'))) * 100 FROM Log WHERE service IN ('api', 'worker')"
+  },
+  "terms": [
+    {
+      "priority": "CRITICAL",
+      "operator": "BELOW",
+      "threshold": 30,
+      "thresholdDuration": 604800,
+      "thresholdOccurrences": "ALL"
+    },
+    {
+      "priority": "WARNING",
+      "operator": "BELOW",
+      "threshold": 40,
+      "thresholdDuration": 604800,
+      "thresholdOccurrences": "ALL"
+    }
+  ],
+  "signal": {
+    "aggregationWindow": 3600,
+    "aggregationMethod": "EVENT_FLOW",
+    "aggregationDelay": 300,
+    "fillOption": "NONE"
+  },
+  "expiration": {
+    "expirationDuration": 7200,
+    "openViolationOnExpiration": false,
+    "closeViolationsOnExpiration": true
+  },
+  "violationTimeLimitSeconds": 604800
+}

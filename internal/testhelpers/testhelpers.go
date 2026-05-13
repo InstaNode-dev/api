@@ -296,6 +296,27 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS uq_deploys_audit_identity ON deploys_audit(service, commit_id, image_digest)`,
 		`CREATE INDEX IF NOT EXISTS idx_deploys_audit_service_time ON deploys_audit(service, applied_at DESC)`,
+		// 027_payment_dunning — failed-charge dunning state machine.
+		// Mirrored here so handler tests that exercise the Razorpay
+		// charge_failed / charged-during-grace paths get the table
+		// without depending on a separate SQL-migration step.
+		// One-active-row invariant enforced by the partial-unique index;
+		// see internal/db/migrations/027_payment_dunning.sql for the
+		// full design rationale.
+		`CREATE TABLE IF NOT EXISTS payment_grace_periods (
+			id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id          UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			subscription_id  TEXT NOT NULL,
+			status           TEXT NOT NULL DEFAULT 'active',
+			started_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+			expires_at       TIMESTAMPTZ NOT NULL,
+			reminders_sent   INTEGER NOT NULL DEFAULT 0,
+			last_reminder_at TIMESTAMPTZ,
+			recovered_at     TIMESTAMPTZ,
+			terminated_at    TIMESTAMPTZ
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_payment_grace_active ON payment_grace_periods(status, expires_at)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_grace_team_active ON payment_grace_periods(team_id) WHERE status = 'active'`,
 	}
 
 	for _, s := range stmts {

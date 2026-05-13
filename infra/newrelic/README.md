@@ -9,15 +9,18 @@ Track 7 of 8 in the 2026-05-12 observability rollout
 ```
 infra/newrelic/
   dashboards/
-    api-overview.json    # rpm, error rate, p95/p99, top endpoints, apdex
-    provisioning.json    # Custom/Provision/{Success,Fail}, anon-tier recycles
-    deploy.json          # /deploy/* build duration, success/fail, active deploys
-    worker.json          # River throughput, retries, expire-job lag
+    api-overview.json       # rpm, error rate, p95/p99, top endpoints, apdex
+    billing-dunning.json    # failed-charge → 7-day grace → recovered / terminated funnel
+    provisioning.json       # Custom/Provision/{Success,Fail}, anon-tier recycles
+    deploy.json             # /deploy/* build duration, success/fail, active deploys
+    worker.json             # River throughput, retries, expire-job lag
   alerts/
-    error-rate-high.json # error rate > 1% over 5m
-    p95-latency-high.json# p95 > 500ms over 5m
-    worker-stalled.json  # no jobs processed in 10m
-    nats-down.json       # >=3 NATS error logs in 5m
+    dunning-recovery-rate-low.json # 7d rolling recovery rate < 30%
+    error-rate-high.json           # error rate > 1% over 5m
+    p95-latency-high.json          # p95 > 500ms over 5m
+    payment-failure-spike.json     # >10 grace_started in 1h
+    worker-stalled.json            # no jobs processed in 10m
+    nats-down.json                 # >=3 NATS error logs in 5m
   policies/
     instant-api.json     # umbrella policy alerts attach to via policyName
   tests/
