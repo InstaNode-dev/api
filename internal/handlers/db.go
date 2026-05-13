@@ -11,7 +11,7 @@ package handlers
 //	  "name":           "my-db",
 //	  "connection_url": "postgres://usr_<token>:<pass>@postgres-customers:5432/db_<token>",
 //	  "tier":           "anonymous",
-//	  "env":            "production",
+//	  "env":            "development",
 //	  "limits":         { "storage_mb": 10, "connections": 3, "expires_in": "24h" },
 //	  "note":           "Works now. Free forever with a free account: <url>"
 //	}

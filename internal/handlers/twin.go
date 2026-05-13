@@ -29,7 +29,9 @@ package handlers
 // already covers the multi-service case end-to-end.
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"time"
@@ -65,6 +67,12 @@ func NewTwinHandler(dbH *DBHandler, cacheH *CacheHandler, nosqlH *NoSQLHandler) 
 type provisionTwinRequest struct {
 	Env  string `json:"env"`
 	Name string `json:"name"`
+	// ApprovalID is the manual-trigger escape for the email-link approval
+	// workflow (migration 026). When the operator has clicked the
+	// approval link OUTSIDE the worker poll loop, they can pass
+	// approval_id here to have the API run the twin provision
+	// immediately. Empty in the normal flow. Dev-env twins ignore it.
+	ApprovalID string `json:"approval_id,omitempty"`
 }
 
 // ProvisionTwin handles POST /api/v1/resources/:id/provision-twin.
@@ -159,6 +167,42 @@ func (h *TwinHandler) ProvisionTwin(c *fiber.Ctx) error {
 	}
 	if !multiEnvTierAllowed(team.PlanTier) {
 		return respondMultiEnvUpgradeRequired(c, team.PlanTier)
+	}
+
+	// Email-link approval gate. Per product directive (2026-05-12): any
+	// twin provision targeting a non-development env requires the
+	// operator to click a single-use email link before the twin is
+	// actually created. Dev-env twins bypass this gate entirely.
+	//
+	// The pending path short-circuits BEFORE we call into the per-type
+	// handler — no DB row is created in the resources table, no
+	// downstream provisioner call is made. The cached payload carries
+	// everything needed to replay the call once approval lands.
+	if normalisedEnv != envDevelopment && body.ApprovalID == "" {
+		row, pendingErr := h.beginTwinApproval(c, team, source, body, normalisedEnv)
+		if pendingErr != nil {
+			return pendingErr
+		}
+		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+			"ok":           true,
+			"status":       "pending_approval",
+			"approval_id":  row.ID.String(),
+			"expires_at":   row.ExpiresAt.UTC().Format(time.RFC3339),
+			"from":         source.Env,
+			"to":           normalisedEnv,
+			"source":       tokenStr,
+			"agent_action": newAgentActionPromoteApprovalSent(normalisedEnv, row.RequestedByEmail),
+			"note":         "Click the link in your email to approve the twin. Dev-env twins skip this step.",
+		})
+	}
+	if body.ApprovalID != "" {
+		// Manual-trigger fallback. Verify the approval_id matches an
+		// approved resource_twin row for THIS team with matching
+		// from/to envs, and flip it to executed before continuing.
+		// Reuse stack.go's consumer — it's kind-agnostic.
+		if err := h.consumeApprovedTwin(c, team, body, source.Env, normalisedEnv); err != nil {
+			return err
+		}
 	}
 
 	// Validate the family link. ValidateFamilyParent does the heavy lifting:
@@ -304,4 +348,122 @@ func derefUUID(p *uuid.UUID) string {
 		return ""
 	}
 	return p.String()
+}
+
+// beginTwinApproval persists a pending row to promote_approvals and emits
+// the audit_log event the Brevo forwarder picks up to send the approval
+// email. Mirrors stack.beginPromoteApproval — the prompt deliberately
+// kept the two helpers separate so kind-specific metadata (stack_slug
+// vs resource_id + resource_type) stays close to its handler.
+func (h *TwinHandler) beginTwinApproval(
+	c *fiber.Ctx,
+	team *models.Team,
+	source *models.Resource,
+	body provisionTwinRequest,
+	toEnv string,
+) (*models.PromoteApproval, error) {
+	payload, mErr := json.Marshal(body)
+	if mErr != nil {
+		return nil, respondError(c, fiber.StatusBadRequest, "invalid_body",
+			"Failed to marshal provision-twin payload")
+	}
+
+	requestedBy := middleware.GetEmail(c)
+	if requestedBy == "" {
+		return nil, respondError(c, fiber.StatusBadRequest, "missing_email",
+			"Approval workflow needs an authenticated email on the session token")
+	}
+
+	srcName := ""
+	if source.Name.Valid {
+		srcName = source.Name.String
+	}
+	row, err := CreatePromoteApprovalAndEmit(c.Context(), h.dbH.db, PromoteApprovalRequest{
+		TeamID:           team.ID,
+		RequestedByEmail: requestedBy,
+		PromoteKind:      models.PromoteApprovalKindResourceTwin,
+		PromotePayload:   payload,
+		FromEnv:          source.Env,
+		ToEnv:            toEnv,
+		Summary: "Twin approval requested: " + source.ResourceType + " " +
+			source.Env + " → " + toEnv,
+		EmailMetaExtras: map[string]any{
+			"resource_id":   source.ID.String(),
+			"resource_type": source.ResourceType,
+			"resource_name": srcName,
+		},
+	})
+	if err != nil {
+		slog.Error("twin.approval_insert_failed",
+			"error", err, "team_id", team.ID, "source_id", source.ID,
+			"to", toEnv, "request_id", middleware.GetRequestID(c))
+		return nil, respondError(c, fiber.StatusServiceUnavailable, "approval_failed",
+			"Failed to persist twin approval request")
+	}
+	return row, nil
+}
+
+// consumeApprovedTwin is the twin counterpart of stack.consumeApprovedPromote.
+// Verifies an explicit approval_id matches an approved-but-not-executed
+// resource_twin row for THIS team with matching from/to, then atomically
+// flips it to 'executed' before we proceed to call the per-type provisioner.
+func (h *TwinHandler) consumeApprovedTwin(
+	c *fiber.Ctx,
+	team *models.Team,
+	body provisionTwinRequest,
+	from, to string,
+) error {
+	id, err := uuid.Parse(body.ApprovalID)
+	if err != nil {
+		return respondError(c, fiber.StatusBadRequest, "invalid_approval_id",
+			"approval_id must be a valid UUID")
+	}
+	row, err := models.GetPromoteApprovalByID(c.Context(), h.dbH.db, id)
+	if errors.Is(err, models.ErrPromoteApprovalNotFound) {
+		return respondError(c, fiber.StatusNotFound, "approval_not_found",
+			"approval_id does not match any approval row")
+	}
+	if err != nil {
+		slog.Error("twin.approval_lookup_failed",
+			"error", err, "approval_id", id,
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusServiceUnavailable, "lookup_failed",
+			"Failed to look up approval")
+	}
+	if row.TeamID != team.ID {
+		return respondError(c, fiber.StatusNotFound, "approval_not_found",
+			"approval_id does not match any approval row for this team")
+	}
+	if row.Status != models.PromoteApprovalStatusApproved {
+		return respondError(c, fiber.StatusConflict, "approval_not_approved",
+			"approval row is in status="+row.Status+" — must be 'approved' to consume")
+	}
+	if row.PromoteKind != models.PromoteApprovalKindResourceTwin ||
+		row.FromEnv != from || row.ToEnv != to {
+		return respondError(c, fiber.StatusBadRequest, "approval_mismatch",
+			"approval_id's recorded (kind,from,to) does not match this request")
+	}
+	if row.ExpiresAt.Before(time.Now().UTC()) {
+		return respondError(c, fiber.StatusGone, "approval_expired",
+			"approval window has fully expired")
+	}
+	ok, err := models.MarkPromoteApprovalExecuted(c.Context(), h.dbH.db, id)
+	if err != nil {
+		slog.Error("twin.approval_execute_failed",
+			"error", err, "approval_id", id,
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusServiceUnavailable, "execute_failed",
+			"Failed to mark approval executed")
+	}
+	if !ok {
+		return respondError(c, fiber.StatusConflict, "approval_already_executed",
+			"approval row has already been executed")
+	}
+	go emitPromoteAuditEvent(context.Background(), h.dbH.db, row, models.AuditKindPromoteExecuted,
+		"Twin executed via approval "+row.ID.String()+" ("+from+" → "+to+")",
+		map[string]any{
+			"approval_id": row.ID.String(),
+			"executed_by": middleware.GetEmail(c),
+		})
+	return nil
 }

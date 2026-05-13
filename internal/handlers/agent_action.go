@@ -72,6 +72,27 @@ import "fmt"
 // tries to use a multi-env workflow (stack family read, stack promote).
 const AgentActionMultiEnvUpgradeRequired = "Tell the user multi-env workflows (staging/production promote, env families) require the Pro plan. Have them upgrade at https://instanode.dev/pricing — takes 30 seconds."
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Resource pause/resume walls (POST /api/v1/resources/:id/pause | /resume)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// AgentActionPauseRequiresPro is returned when a hobby / anonymous / free team
+// tries to pause a resource. Pause/resume is a Pro+ workflow because it shifts
+// billing semantics (a paused row stops counting against the resource-count
+// quota) — keeping it on the paid tier is consistent with the rest of the
+// "stop billing the slot" surface.
+const AgentActionPauseRequiresPro = "Tell the user pausing resources requires the Pro plan. Upgrade at https://instanode.dev/pricing — takes 30 seconds, then retry the pause."
+
+// AgentActionResourceAlreadyPaused is returned by POST /resources/:id/pause
+// when the row is already in 'paused' state. The remedy is "do nothing"
+// (the resource is in the requested state) or call /resume to flip back —
+// both of which the action verb covers via "Have them".
+const AgentActionResourceAlreadyPaused = "Tell the user this resource is already paused. Have them call POST https://instanode.dev/api/v1/resources/:id/resume to bring it back online."
+
+// AgentActionResourceNotPaused is returned by POST /resources/:id/resume when
+// the row isn't in 'paused' state — typically because it's already active.
+const AgentActionResourceNotPaused = "Tell the user this resource isn't paused, so there's nothing to resume. Have them check https://instanode.dev/app to see its current state."
+
 // AgentActionStackPromoteMissingImageRef is returned when the source stack
 // predates the image-ref persistence migration (no cached image to copy).
 const AgentActionStackPromoteMissingImageRef = "Tell the user this stack predates the image-ref persistence migration, so promote has nothing to redeploy. Redeploy the source stack first at https://instanode.dev/app/stacks, then retry the promote."
@@ -283,3 +304,49 @@ func newAgentActionAdminPromoIssued(teamID, code string) string {
 		code, teamID,
 	)
 }
+
+<<<<<<< HEAD
+// ─────────────────────────────────────────────────────────────────────────────
+// Promote-approval walls (POST /api/v1/stacks/:slug/promote +
+// POST /api/v1/resources/:id/provision-twin, non-dev target envs)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// newAgentActionPromoteApprovalSent is returned in the 202 response body when
+// the API has accepted a promote / twin-provision request that targets a
+// non-development env. Names the env, the email recipient, and the next
+// action — the LLM agent re-articulates "go check your inbox" to the human
+// in front of it. Dev-env promotes bypass this code path entirely (immediate
+// execute), so this string never fires for development targets.
+//
+// The 24h validity window is reproduced verbatim so the agent doesn't have
+// to fish it out of the JSON body's expires_at field.
+func newAgentActionPromoteApprovalSent(toEnv, recipientEmail string) string {
+	if recipientEmail == "" {
+		recipientEmail = "the team owner's email"
+	}
+	return fmt.Sprintf(
+		"Tell the user the promote to %s requires email approval. Check %s for a link expiring in 24h. Dev-env promotes skip this step. Track at https://instanode.dev/app/promotions.",
+		toEnv, recipientEmail,
+	)
+}
+
+// AgentActionPromoteTokenExpired is returned by the GET /approve/:token
+// HTML response copy (rendered in-page) and as the agent_action on any
+// retry attempt that hits an expired link. The user must re-request the
+// promote from the dashboard — re-using the same email link will never
+// work because the row's status is now 'expired'.
+const AgentActionPromoteTokenExpired = "Tell the user the approval link expired. Re-request the promote at https://instanode.dev/app — links are valid for 24h."
+=======
+// AgentActionReadOnlySession is returned on every 403 emitted by the
+// RequireWritable middleware when a JWT carries `read_only:true` — i.e. the
+// admin minted an impersonation token to view-as-customer and the agent
+// (or the dashboard the admin is steering) attempted a mutation. Names the
+// specific rejection reason ("read-only impersonated session"), the exact
+// next action ("switch back to your real account"), and a full
+// https://instanode.dev/app URL. The U3 contract test exercises it.
+//
+// Read-only is irrevocable for the lifetime of the impersonation token —
+// there is no "downgrade to writable" path. The remedy is to use the
+// admin's own session token, which never carries this flag.
+const AgentActionReadOnlySession = "Tell the user this is a read-only impersonated session. Mutations are disabled. Switch back to your real account at https://instanode.dev/app to make changes."
+>>>>>>> origin/master

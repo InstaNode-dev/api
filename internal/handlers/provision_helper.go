@@ -386,7 +386,8 @@ type provisionRequestBody struct {
 	Dedicated bool `json:"dedicated"`
 
 	// Env scopes the resource to a named environment (dev/staging/production/...).
-	// Empty defaults to "production". Validated against ^[a-z0-9-]{1,32}$.
+	// Empty defaults to "development" (flipped from "production" by migration
+	// 026 — see models.EnvDefault). Validated against ^[a-z0-9-]{1,32}$.
 	// Body field is overridden by the ?env= query string when both are set.
 	Env string `json:"env"`
 
@@ -410,8 +411,9 @@ func sanitizeName(name string) string {
 // the ?env= query string over the JSON/form body field. Returns the normalised
 // env on success, or an empty string and a 400 response when validation fails.
 //
-// Empty input is treated as "production" — this preserves backwards compatibility
-// for every caller that pre-dates the env feature.
+// Empty input is treated as "development" (post-migration 026 — see
+// models.EnvDefault). Callers that pre-date the env feature land in the
+// lowest-stakes bucket instead of silently writing to production.
 // resolveEnv validates the env scope from the URL query (preferred) or
 // request body (fallback). On success returns (env, nil). On failure it
 // writes the 400 response via respondError and returns (\"\", ErrResponseWritten).

@@ -124,6 +124,8 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS provider_resource_id TEXT`,
 		// 018_resource_family — env-twin linkage (slice 2 of env-aware deployments)
 		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS parent_resource_id UUID REFERENCES resources(id) ON DELETE SET NULL`,
+		// 024_resources_paused_status — pause/resume API (suspend without deletion)
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_token       ON resources(token)`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_fingerprint ON resources(fingerprint) WHERE team_id IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_expires     ON resources(expires_at) WHERE status = 'active'`,
@@ -278,11 +280,17 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_admin_promo_codes_code ON admin_promo_codes(code) WHERE used_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_admin_promo_codes_team ON admin_promo_codes(team_id)`,
-		// 022_deploys_audit — append-only deploy-identity log. Mirrored here
-		// so handler tests bringing up a fresh test DB get the table without
-		// running the SQL migration separately. The unique index backs the
-		// self-report INSERT's ON CONFLICT clause; the service+time index
-		// supports the admin endpoint's default sort.
+		// 024_admin_customer_notes — free-text per-team notes by platform admins.
+		`CREATE TABLE IF NOT EXISTS admin_customer_notes (
+			id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id      UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			body         TEXT NOT NULL,
+			author_email TEXT NOT NULL,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_admin_customer_notes_team ON admin_customer_notes(team_id, created_at DESC)`,
+		// 022_deploys_audit — append-only deploy-identity log. Mirrored so
+		// handler tests get the table without running migrations separately.
 		`CREATE TABLE IF NOT EXISTS deploys_audit (
 			id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			service           TEXT NOT NULL,
@@ -297,12 +305,6 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`CREATE UNIQUE INDEX IF NOT EXISTS uq_deploys_audit_identity ON deploys_audit(service, commit_id, image_digest)`,
 		`CREATE INDEX IF NOT EXISTS idx_deploys_audit_service_time ON deploys_audit(service, applied_at DESC)`,
 		// 027_payment_dunning — failed-charge dunning state machine.
-		// Mirrored here so handler tests that exercise the Razorpay
-		// charge_failed / charged-during-grace paths get the table
-		// without depending on a separate SQL-migration step.
-		// One-active-row invariant enforced by the partial-unique index;
-		// see internal/db/migrations/027_payment_dunning.sql for the
-		// full design rationale.
 		`CREATE TABLE IF NOT EXISTS payment_grace_periods (
 			id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			team_id          UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
@@ -317,6 +319,25 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_payment_grace_active ON payment_grace_periods(status, expires_at)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_grace_team_active ON payment_grace_periods(team_id) WHERE status = 'active'`,
+		// 026_promote_approvals — email-link approval workflow for non-dev env promotions.
+		`CREATE TABLE IF NOT EXISTS promote_approvals (
+			id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			token              TEXT UNIQUE NOT NULL,
+			team_id            UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			requested_by_email TEXT NOT NULL,
+			promote_kind       TEXT NOT NULL,
+			promote_payload    JSONB NOT NULL,
+			from_env           TEXT NOT NULL,
+			to_env             TEXT NOT NULL,
+			status             TEXT NOT NULL DEFAULT 'pending',
+			created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+			expires_at         TIMESTAMPTZ NOT NULL,
+			approved_at        TIMESTAMPTZ,
+			executed_at        TIMESTAMPTZ,
+			rejected_at        TIMESTAMPTZ
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_promote_approvals_token ON promote_approvals(token) WHERE status = 'pending'`,
+		`CREATE INDEX IF NOT EXISTS idx_promote_approvals_pending_exec ON promote_approvals(status) WHERE status = 'approved' AND executed_at IS NULL`,
 	}
 
 	for _, s := range stmts {
@@ -479,6 +500,8 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	api.Get("/resources/:id", resourceH.Get)
 	api.Delete("/resources/:id", resourceH.Delete)
 	api.Post("/resources/:id/rotate-credentials", resourceH.RotateCredentials)
+	api.Post("/resources/:id/pause", resourceH.Pause)
+	api.Post("/resources/:id/resume", resourceH.Resume)
 	// Slice 3 of env-aware deployments — spawn a same-type, same-family
 	// twin in a new env. Tier-gated to Pro+ inside the handler. Wired here
 	// so handler-layer tests (twin_test.go) exercise the full route stack.
