@@ -355,6 +355,13 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Post("/billing/update-payment", billing.UpdatePaymentMethodAPI)
 	api.Post("/billing/change-plan", billing.ChangePlanAPI)
 
+	// Promo code validator — HTTP wrapper around plans.ValidatePromotion.
+	// Separate handler so its (rdb, planRegistry) deps are explicit at the
+	// constructor boundary; rate-limited per-team per-hour to make
+	// brute-forcing seed codes impractical. See billing_promotion.go.
+	billingPromoH := handlers.NewBillingPromotionHandler(rdb, planRegistry)
+	api.Post("/billing/promotion/validate", billingPromoH.ValidatePromotion)
+
 	// §10.20 cached aggregates — see billing_usage.go / team_summary.go.
 	// Both cache per-team in Redis (30s / 5min) with singleflight + Cache-Control
 	// response headers. The dashboard's BillingPage + SidebarUpgradeCard
@@ -366,6 +373,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Get("/deployments", deployH.List)
 	api.Get("/deployments/:id", deployH.Get)
 	api.Delete("/deployments/:id", deployH.Delete)
+	// PATCH edits access-control fields (private + allowed_ips) without a
+	// rebuild. Pro+ tier gate enforced inside the handler; shares
+	// validatePrivateDeployFields with POST /deploy/new so the rule-set is
+	// audited in one place.
+	api.Patch("/deployments/:id", deployH.Patch)
 
 	// Stack management endpoints — Phase 6 (under /api/v1)
 	api.Get("/stacks", stackH.List)

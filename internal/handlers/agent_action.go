@@ -106,6 +106,19 @@ const AgentActionPrivateDeployRequiresPro = "Tell the user private deploys requi
 const AgentActionPrivateDeployRequiresAllowedIPs = "Tell the user a private deploy needs at least one allowed IP or CIDR. Have them pass allowed_ips like [\"1.2.3.4\",\"10.0.0.0/8\"] — see https://instanode.dev/docs/private-deploys."
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Billing promotion walls (POST /api/v1/billing/promotion/validate)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// AgentActionPromotionInvalid is returned in the 200 + ok:false body when a
+// promotion code is rejected (not found, wrong plan, expired, exhausted).
+// The handler returns 200 (not 4xx) so the dashboard renders the red state
+// through its normal success-path parser — but MCP / CLI agents still need
+// LLM-ready copy to tell the user what to do next, which this constant
+// supplies. Names the rejection reason and the fix ("try a different
+// code") and contains the full https://instanode.dev/billing URL.
+const AgentActionPromotionInvalid = "Tell the user this promo code isn't valid for the requested plan. Have them try a different code at https://instanode.dev/billing — promotion codes are case-insensitive."
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Storage / vault tier walls (called from respondErrorWithAgentAction)
 // ─────────────────────────────────────────────────────────────────────────────
 
