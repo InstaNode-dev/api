@@ -280,11 +280,17 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_admin_promo_codes_code ON admin_promo_codes(code) WHERE used_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_admin_promo_codes_team ON admin_promo_codes(team_id)`,
-		// 022_deploys_audit — append-only deploy-identity log. Mirrored here
-		// so handler tests bringing up a fresh test DB get the table without
-		// running the SQL migration separately. The unique index backs the
-		// self-report INSERT's ON CONFLICT clause; the service+time index
-		// supports the admin endpoint's default sort.
+		// 024_admin_customer_notes — free-text per-team notes by platform admins.
+		`CREATE TABLE IF NOT EXISTS admin_customer_notes (
+			id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id      UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			body         TEXT NOT NULL,
+			author_email TEXT NOT NULL,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_admin_customer_notes_team ON admin_customer_notes(team_id, created_at DESC)`,
+		// 022_deploys_audit — append-only deploy-identity log. Mirrored so
+		// handler tests get the table without running migrations separately.
 		`CREATE TABLE IF NOT EXISTS deploys_audit (
 			id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			service           TEXT NOT NULL,
