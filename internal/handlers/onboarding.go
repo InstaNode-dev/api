@@ -1,10 +1,13 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -373,6 +376,11 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 		"request_id", requestID,
 	)
 
+	// Best-effort audit emit — feeds the Loops forwarder for the welcome
+	// email. Fails open: a Loops miss must NEVER fail an otherwise-successful
+	// claim. Detached context so the goroutine outlives the request cycle.
+	go emitOnboardingClaimedAudit(h.db, team.ID, newUser.ID, len(claimedIDs), body.Email)
+
 	resp := fiber.Map{
 		"ok":      true,
 		"team_id": team.ID,
@@ -383,4 +391,37 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 		resp["session_token"] = sessionToken
 	}
 	return c.Status(fiber.StatusCreated).JSON(resp)
+}
+
+// emitOnboardingClaimedAudit writes one audit_log row signalling that an
+// anonymous session was upgraded into a registered team. Best-effort —
+// callers fire this in a goroutine and ignore the outcome. The Loops
+// forwarder picks the row up and triggers the welcome email; a miss here
+// only loses the email, never the claim itself.
+func emitOnboardingClaimedAudit(db *sql.DB, teamID, userID uuid.UUID, resourcesTransferred int, email string) {
+	// Detached context so the goroutine outlives the request cycle.
+	ctx := context.Background()
+
+	// Metadata is serialized into JSONB. Marshal failure is fundamentally
+	// impossible for this fixed shape, but we still fall through with nil
+	// rather than panicking — same convention as experiments.go.
+	metaBlob, _ := json.Marshal(map[string]string{
+		"email":                 email,
+		"resources_transferred": strconv.Itoa(resourcesTransferred),
+	})
+
+	if err := models.InsertAuditEvent(ctx, db, models.AuditEvent{
+		TeamID:   teamID,
+		UserID:   uuid.NullUUID{UUID: userID, Valid: userID != uuid.Nil},
+		Actor:    "user",
+		Kind:     models.AuditKindOnboardingClaimed,
+		Summary:  "team claimed and onboarded",
+		Metadata: metaBlob,
+	}); err != nil {
+		slog.Warn("audit.emit.failed",
+			"kind", models.AuditKindOnboardingClaimed,
+			"team_id", teamID,
+			"error", err,
+		)
+	}
 }

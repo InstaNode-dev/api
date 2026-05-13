@@ -389,6 +389,15 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 
 	tier := h.planIDToTier(sub.PlanID)
 
+	// Snapshot the prior tier BEFORE the update so we can classify the
+	// transition as upgrade / downgrade / same. A miss here just means we
+	// emit no audit row and the Loops lifecycle email is skipped — the
+	// upgrade itself proceeds.
+	fromTier := ""
+	if team, lookupErr := models.GetTeamByID(ctx, h.db, teamID); lookupErr == nil && team != nil {
+		fromTier = team.PlanTier
+	}
+
 	if updateErr := models.UpdatePlanTier(ctx, h.db, teamID, tier); updateErr != nil {
 		slog.Error("billing.subscription.charged.update_plan_failed",
 			"error", updateErr, "team_id", teamID)
@@ -412,6 +421,10 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 	slog.Info("billing.subscription.charged",
 		"team_id", teamID, "plan_tier", tier, "subscription_id", sub.ID)
 	metrics.ConversionFunnel.WithLabelValues("paid").Inc()
+
+	// Best-effort audit emit for the Loops forwarder. Fail-open: an audit
+	// error must not undo the tier update we already committed.
+	emitSubscriptionChangeAudit(ctx, h.db, teamID, fromTier, tier, sub.ID)
 }
 
 // handleSubscriptionCancelled processes subscription.cancelled events (cancel → downgrade to hobby).
@@ -427,6 +440,13 @@ func (h *BillingHandler) handleSubscriptionCancelled(ctx context.Context, c *fib
 		slog.Error("billing.subscription.cancelled.team_resolve_failed",
 			"error", err, "sub_id", sub.ID)
 		return
+	}
+
+	// Snapshot the prior tier so the audit row can capture from→to. Failure
+	// to read it is non-fatal — we just emit with from_tier="".
+	fromTier := ""
+	if team, lookupErr := models.GetTeamByID(ctx, h.db, teamID); lookupErr == nil && team != nil {
+		fromTier = team.PlanTier
 	}
 
 	// Downgrade behaviour: a cancellation with zero paid invoices means the
@@ -446,6 +466,11 @@ func (h *BillingHandler) handleSubscriptionCancelled(ctx context.Context, c *fib
 
 	slog.Info("billing.subscription.cancelled",
 		"team_id", teamID, "subscription_id", sub.ID, "new_tier", tier)
+
+	// Best-effort audit emit for the Loops cancellation email. Fail-open:
+	// the downgrade above is already committed and must not be reverted on
+	// an audit failure.
+	emitSubscriptionCanceledAudit(ctx, h.db, teamID, fromTier, tier, sub.ID)
 }
 
 // handlePaymentFailed processes payment.failed events.
@@ -847,4 +872,102 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 		"effective_date": res.EffectiveDate.UTC().Format(time.RFC3339Nano),
 		"short_url":      res.CheckoutShort,
 	})
+}
+
+// tierRank maps a plan tier name to a totally-ordered rank used to classify
+// transitions as upgrade vs downgrade. Higher rank = more capacity.
+// Unknown tiers map to -1 so any comparison involving them returns the safe
+// "no transition direction" verdict (callers emit nothing rather than a
+// misleading audit row).
+func tierRank(tier string) int {
+	switch strings.ToLower(strings.TrimSpace(tier)) {
+	case "anonymous":
+		return 0
+	case "free":
+		return 1
+	case "hobby":
+		return 2
+	case "growth":
+		return 3
+	case "pro":
+		return 4
+	case "team":
+		return 5
+	}
+	return -1
+}
+
+// emitSubscriptionChangeAudit writes a subscription.upgraded or
+// subscription.downgraded row for the Loops forwarder when a charged-webhook
+// transition strictly changes the team's tier. Same-tier renewals (the
+// monthly Pro→Pro re-charge case) emit nothing — Loops shouldn't send an
+// upgrade email on every renewal.
+//
+// Best-effort: a write failure logs but never surfaces. Called synchronously
+// from the webhook handler because the handler already runs in a request
+// goroutine that completes before Razorpay sees a 200.
+func emitSubscriptionChangeAudit(ctx context.Context, db *sql.DB, teamID uuid.UUID, fromTier, toTier, subID string) {
+	fromR := tierRank(fromTier)
+	toR := tierRank(toTier)
+	// Unknown tiers (-1) or no-change cases produce no audit row.
+	if fromR < 0 || toR < 0 || fromR == toR {
+		return
+	}
+
+	kind := models.AuditKindSubscriptionUpgraded
+	summary := "team upgraded from " + fromTier + " to " + toTier
+	if fromR > toR {
+		kind = models.AuditKindSubscriptionDowngraded
+		summary = "team downgraded from " + fromTier + " to " + toTier
+	}
+
+	meta := map[string]string{
+		"from_tier":       fromTier,
+		"to_tier":         toTier,
+		"subscription_id": subID,
+	}
+	metaBlob, _ := json.Marshal(meta)
+
+	if err := models.InsertAuditEvent(ctx, db, models.AuditEvent{
+		TeamID:   teamID,
+		Actor:    "system",
+		Kind:     kind,
+		Summary:  summary,
+		Metadata: metaBlob,
+	}); err != nil {
+		slog.Warn("audit.emit.failed",
+			"kind", kind,
+			"team_id", teamID,
+			"from_tier", fromTier,
+			"to_tier", toTier,
+			"error", err,
+		)
+	}
+}
+
+// emitSubscriptionCanceledAudit writes the subscription.canceled audit row.
+// Always emits on cancellation (regardless of the courtesy fall-back tier)
+// because the Loops cancellation email is about the cancellation event
+// itself, not the resulting tier delta. Best-effort: failures log only.
+func emitSubscriptionCanceledAudit(ctx context.Context, db *sql.DB, teamID uuid.UUID, fromTier, toTier, subID string) {
+	meta := map[string]string{
+		"from_tier":       fromTier,
+		"to_tier":         toTier,
+		"subscription_id": subID,
+	}
+	metaBlob, _ := json.Marshal(meta)
+
+	if err := models.InsertAuditEvent(ctx, db, models.AuditEvent{
+		TeamID:   teamID,
+		Actor:    "system",
+		Kind:     models.AuditKindSubscriptionCanceled,
+		Summary:  "subscription canceled",
+		Metadata: metaBlob,
+	}); err != nil {
+		slog.Warn("audit.emit.failed",
+			"kind", models.AuditKindSubscriptionCanceled,
+			"team_id", teamID,
+			"error", err,
+		)
+	}
 }
