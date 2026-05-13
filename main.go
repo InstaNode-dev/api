@@ -41,7 +41,13 @@ func main() {
 		Level:     slog.LevelInfo,
 		AddSource: true,
 	})
-	slog.SetDefault(slog.New(logctx.NewHandler(serviceName, base)))
+	ctxH := logctx.NewHandler(serviceName, base)
+	// Default to a non-scrubbing handler. Once cfg.Load() resolves
+	// ADMIN_PATH_PREFIX below, we re-set the default with a Scrubber
+	// wrapped around the same context handler. Until then, any startup
+	// log line predates the admin-routes registration and can't possibly
+	// contain the prefix value anyway (the prefix is unread at this point).
+	slog.SetDefault(slog.New(ctxH))
 
 	shutdownTracer := telemetry.InitTracer("instant-api", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 	defer func() {
@@ -60,6 +66,14 @@ func main() {
 	}
 
 	cfg := config.Load() // panics on missing required env vars
+
+	// Re-set the slog default with the admin-prefix scrubber wrapped on the
+	// outside of the context handler. The scrubber runs LAST so any field
+	// (including ones stamped by middleware downstream) is rewritten before
+	// the JSON encoder sees it. NewLogScrubber returns the inner handler
+	// unchanged when cfg.AdminPathPrefix is empty — zero overhead when
+	// admin routes are disabled.
+	slog.SetDefault(slog.New(middleware.NewLogScrubber(ctxH, cfg.AdminPathPrefix)))
 
 	database := db.ConnectPostgres(cfg.DatabaseURL)
 	defer database.Close()

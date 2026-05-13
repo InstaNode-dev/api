@@ -451,7 +451,37 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 			portal := &razorpaybilling.Portal{DB: db, Cfg: cfg}
 			return portal.CancelImmediately(subID)
 		}
-		adminGroup := api.Group("/"+cfg.AdminPathPrefix, middleware.RequireAdmin())
+		// Defense-in-depth gates 3-5, chained in strict order:
+		//
+		//   AdminRateLimit  — 30 req/min/fingerprint cap. Returns 403 with
+		//                     a body byte-for-byte identical to the
+		//                     allowlist-miss 403. Runs BEFORE RequireAdmin
+		//                     so an attacker who knows the prefix cannot
+		//                     bypass the limiter by sending invalid JWTs.
+		//   AdminAuditEmit  — after-response middleware. Internally calls
+		//                     c.Next() and observes the FINAL status; logs
+		//                     EVERY hit on the prefix (success AND 403).
+		//                     PathSuffix is the URL with the prefix
+		//                     stripped — the secret prefix MUST NOT land
+		//                     in audit_log.
+		//   RequireAdmin    — ADMIN_EMAILS allowlist check (gate 2).
+		//
+		// Audit MUST sit BEFORE RequireAdmin in the chain. RequireAdmin
+		// returns a 403 directly (no c.Next call) on rejection — any
+		// middleware sitting AFTER it would never run on the rejection
+		// path, so the brute-force-visibility property would silently
+		// break. By sitting BEFORE, the audit middleware's internal
+		// c.Next() dispatches RequireAdmin → handler and observes the
+		// final status either way.
+		//
+		// AdminRateLimit stays first: it short-circuits on excess with
+		// its own 403 (which AdminAuditEmit's c.Next observes as 403 +
+		// IsAdminRateLimited(c)=true → denied_by=rate_limit on the row).
+		adminGroup := api.Group("/"+cfg.AdminPathPrefix,
+			middleware.AdminRateLimit(rdb),
+			middleware.AdminAuditEmit(db, cfg.AdminPathPrefix),
+			middleware.RequireAdmin(),
+		)
 		adminGroup.Get("/customers", adminCustH.List)
 		adminGroup.Get("/customers/:team_id", adminCustH.Detail)
 		adminGroup.Post("/customers/:team_id/tier", adminCustH.ChangeTier)
