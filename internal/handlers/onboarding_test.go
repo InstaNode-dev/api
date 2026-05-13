@@ -402,3 +402,63 @@ func TestOnboarding_JWTWithFutureIssuedAt_Returns400(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"token with future IssuedAt must be rejected with 400")
 }
+
+// TestOnboarding_PostClaim_EmitsAuditLogRow verifies that a successful POST
+// /claim writes one audit_log row with kind = "onboarding.claimed". The row
+// drives the Loops "welcome" lifecycle email; if the emit is silently dropped
+// the user gets no email even though their claim succeeded.
+//
+// The audit write runs in a detached goroutine, so the test polls for up to
+// ~2s for the row to land (same pattern as TestExperimentsConverted_*).
+func TestOnboarding_PostClaim_EmitsAuditLogRow(t *testing.T) {
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
+	defer cleanRedis()
+
+	app, cleanApp := testhelpers.NewTestApp(t, db, rdb)
+	defer cleanApp()
+
+	fp := testhelpers.UniqueFingerprint(t)
+	res := testhelpers.MustProvisionCacheFull(t, app, fp)
+	require.NotEmpty(t, res.JWT, "provision response must include an onboarding JWT")
+	defer db.Exec(`DELETE FROM resources WHERE token = $1`, res.Token)
+
+	email := testhelpers.UniqueEmail(t)
+	body := map[string]any{
+		"jwt":       res.JWT,
+		"email":     email,
+		"team_name": "audit-claim-" + uuid.NewString()[:8],
+	}
+	claimResp := testhelpers.PostJSON(t, app, "/claim", body)
+	defer claimResp.Body.Close()
+	require.Equal(t, http.StatusCreated, claimResp.StatusCode)
+
+	// Resolve the team_id that was created by the claim so we can scope the
+	// audit_log lookup. The claim response carries it directly.
+	var claimBody map[string]any
+	testhelpers.DecodeJSON(t, claimResp, &claimBody)
+	teamID, _ := claimBody["team_id"].(string)
+	require.NotEmpty(t, teamID, "claim response must carry team_id")
+	defer db.Exec(`DELETE FROM teams WHERE id = $1::uuid`, teamID)
+
+	// The audit write is async — poll for up to ~2s for the row to land.
+	var kind, summary, metaText string
+	for i := 0; i < 40; i++ {
+		err := db.QueryRow(`
+			SELECT kind, summary, metadata::text
+			  FROM audit_log
+			 WHERE team_id = $1::uuid AND kind = 'onboarding.claimed'
+			 ORDER BY created_at DESC
+			 LIMIT 1`, teamID).Scan(&kind, &summary, &metaText)
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	require.Equal(t, "onboarding.claimed", kind,
+		"audit_log row with kind='onboarding.claimed' must exist after a successful claim")
+	assert.NotEmpty(t, summary)
+	assert.Contains(t, metaText, email,
+		"audit metadata should capture the claiming user's email for Loops payload")
+}

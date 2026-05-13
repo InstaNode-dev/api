@@ -189,6 +189,23 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			ts          TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_vault_audit_team_ts ON vault_audit_log (team_id, ts DESC)`,
+		// 012_audit_log — per-team event stream consumed by the dashboard's
+		// Recent Activity feed. Mirrored here so callers that bring up a fresh
+		// test DB via SetupTestDB get the table without needing the SQL
+		// migrations to have been applied separately.
+		`CREATE TABLE IF NOT EXISTS audit_log (
+			id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id       UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			user_id       UUID REFERENCES users(id) ON DELETE SET NULL,
+			actor         TEXT NOT NULL DEFAULT 'agent',
+			kind          TEXT NOT NULL,
+			resource_type TEXT,
+			resource_id   UUID,
+			summary       TEXT NOT NULL,
+			metadata      JSONB,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_team_at ON audit_log (team_id, created_at DESC)`,
 		// 003_deployments — Phase 6 container deployments
 		`CREATE TABLE IF NOT EXISTS deployments (
 			id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
