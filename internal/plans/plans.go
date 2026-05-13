@@ -16,3 +16,14 @@ func Default() *Registry { return commonplans.Default() }
 // base tier (e.g. "pro_yearly" -> "pro"). Re-exported from common/plans so
 // handlers in this module don't need to import the shared package directly.
 func CanonicalTier(tier string) string { return commonplans.CanonicalTier(tier) }
+
+// Rank returns the totally-ordered rank of the given plan tier. Higher rank
+// = more capacity (anonymous=0, free=1, hobby=2, growth=3, pro=4, team=5).
+// Unknown tiers return -1 — callers MUST guard against the sentinel when
+// comparing two ranks (a negative rank means "no transition direction").
+//
+// Re-exported from common/plans so api handlers don't need to import the
+// shared package directly. The yearly variants are NOT auto-normalised —
+// pass them through CanonicalTier first if you want "pro_yearly" to rank
+// the same as "pro".
+func Rank(tier string) int { return commonplans.Rank(tier) }
