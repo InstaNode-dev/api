@@ -24,6 +24,7 @@ import (
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
+	"instant.dev/internal/plans"
 	"instant.dev/internal/razorpaybilling"
 )
 
@@ -999,29 +1000,6 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 	})
 }
 
-// tierRank maps a plan tier name to a totally-ordered rank used to classify
-// transitions as upgrade vs downgrade. Higher rank = more capacity.
-// Unknown tiers map to -1 so any comparison involving them returns the safe
-// "no transition direction" verdict (callers emit nothing rather than a
-// misleading audit row).
-func tierRank(tier string) int {
-	switch strings.ToLower(strings.TrimSpace(tier)) {
-	case "anonymous":
-		return 0
-	case "free":
-		return 1
-	case "hobby":
-		return 2
-	case "growth":
-		return 3
-	case "pro":
-		return 4
-	case "team":
-		return 5
-	}
-	return -1
-}
-
 // emitSubscriptionChangeAudit writes a subscription.upgraded or
 // subscription.downgraded row for the Loops forwarder when a charged-webhook
 // transition strictly changes the team's tier. Same-tier renewals (the
@@ -1032,8 +1010,8 @@ func tierRank(tier string) int {
 // from the webhook handler because the handler already runs in a request
 // goroutine that completes before Razorpay sees a 200.
 func emitSubscriptionChangeAudit(ctx context.Context, db *sql.DB, teamID uuid.UUID, fromTier, toTier, subID string) {
-	fromR := tierRank(fromTier)
-	toR := tierRank(toTier)
+	fromR := plans.Rank(fromTier)
+	toR := plans.Rank(toTier)
 	// Unknown tiers (-1) or no-change cases produce no audit row.
 	if fromR < 0 || toR < 0 || fromR == toR {
 		return
