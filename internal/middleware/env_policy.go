@@ -6,7 +6,8 @@ package middleware
 // RequireEnvAccess(action) returns a Fiber handler that:
 //   - looks up the authenticated team's env_policy JSONB row
 //   - reads the env scope from the request (query "?env=" first, then JSON
-//     body field "env" or "to", then "production" as a safe default)
+//     body field "env" or "to", then "development" as a safe default
+//     — flipped from "production" by migration 026)
 //   - reads the authenticated user's team role (populated by
 //     PopulateTeamRole upstream)
 //   - rejects with 403 + agent_action when role is not in the allowlist
@@ -69,9 +70,10 @@ const (
 )
 
 // envPolicyDefaultEnv is the env name used when neither the query string nor
-// the request body declares one. Matches resolveEnv's "empty → production"
-// default in handlers/provision_helper.go.
-const envPolicyDefaultEnv = "production"
+// the request body declares one. Matches resolveEnv's "empty → development"
+// default in handlers/provision_helper.go (flipped from "production" by
+// migration 026 — see models.EnvDefault).
+const envPolicyDefaultEnv = "development"
 
 // envPolicyLookupTimeout caps the DB call to read teams.env_policy. Kept
 // short because this middleware runs on every gated request — slow lookups
