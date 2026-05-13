@@ -416,7 +416,16 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 		h.handleSubscriptionCharged(ctx, c, event)
 	case "subscription.cancelled":
 		h.handleSubscriptionCancelled(ctx, c, event)
+	case "subscription.charged_failed":
+		// Razorpay's documented event name for a failed subscription
+		// charge. Triggers the dunning state machine — see
+		// handleSubscriptionChargeFailed for the 7-day grace contract.
+		h.handleSubscriptionChargeFailed(ctx, c, event)
 	case "payment.failed":
+		// Legacy single-payment failure email path. When the failed
+		// payment belongs to an active subscription we ALSO open a
+		// grace period (idempotent — partial-unique index swallows
+		// duplicate calls). See handlePaymentFailed below.
 		h.handlePaymentFailed(ctx, c, event)
 	default:
 		span.SetAttributes(attribute.String("rzp.event.unhandled", "true"))
@@ -490,6 +499,13 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 	// Best-effort audit emit for the Loops forwarder. Fail-open: an audit
 	// error must not undo the tier update we already committed.
 	emitSubscriptionChangeAudit(ctx, h.db, teamID, fromTier, tier, sub.ID)
+
+	// Dunning recovery path: a successful charge during an active grace
+	// window means the customer's card recovered before the 7-day clock
+	// elapsed. Flip the grace row to 'recovered' and emit the audit row
+	// the Brevo forwarder picks up for the "back in good standing" email.
+	// Fail-open: a recovery-flip miss does not roll back the tier update.
+	maybeRecoverPaymentGrace(ctx, h.db, teamID, sub.ID)
 
 	// Admin-code redemption: if the subscription notes carry an
 	// admin_promo_code_id (stamped at checkout time by CreateCheckoutAPI),
@@ -630,6 +646,151 @@ func (h *BillingHandler) handlePaymentFailed(ctx context.Context, c *fiber.Ctx, 
 
 	slog.Info("billing.payment.failed.email_sent",
 		"to", pay.Email, "payment_id", pay.ID)
+}
+
+// handleSubscriptionChargeFailed processes subscription.charged_failed
+// events — the start of the dunning state machine.
+//
+// Flow:
+//   1. Resolve the team from the subscription's notes (or fall back to
+//      the DB lookup by subscription_id).
+//   2. Attempt to INSERT a new active grace row. The partial-unique
+//      index uq_payment_grace_team_active makes the call idempotent:
+//      a redelivery of the same charge_failed event hits the constraint
+//      and the model returns ErrPaymentGraceAlreadyActive, which we
+//      treat as a silent no-op (the grace clock is already running).
+//   3. Emit the payment.grace_started audit row so the worker's Brevo
+//      forwarder kicks off the first reminder email. Best-effort.
+//
+// Fail-open everywhere: the webhook always returns 200 to Razorpay even
+// when team resolution / INSERT / audit emit fails. Razorpay re-fires
+// charge_failed on every retry attempt anyway, so a single missed event
+// gets fixed on the next attempt.
+func (h *BillingHandler) handleSubscriptionChargeFailed(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) {
+	sub, ok := parseSubscriptionEntity(event)
+	if !ok {
+		slog.Error("billing.subscription.charged_failed.parse_failed")
+		return
+	}
+
+	teamID, err := resolveTeamFromNotes(ctx, h, sub)
+	if err != nil {
+		slog.Error("billing.subscription.charged_failed.team_resolve_failed",
+			"error", err, "sub_id", sub.ID)
+		return
+	}
+
+	// Extract attempted-amount metadata from the optional payment entity
+	// (when Razorpay bundles the failed payment under payload.payment as
+	// well). Missing is fine — the email template falls back to the
+	// subscription's known monthly amount in that case.
+	attemptedAmount := int64(0)
+	if event.Payload.Payment != nil {
+		var pay rzpPaymentEntity
+		if err := json.Unmarshal(event.Payload.Payment.Entity, &pay); err == nil {
+			attemptedAmount = pay.Amount
+		}
+	}
+
+	startGracePeriodForTeam(ctx, h.db, teamID, sub.ID, attemptedAmount)
+}
+
+// startGracePeriodForTeam centralises the grace-start logic so both
+// subscription.charged_failed AND payment.failed (when it carries a
+// subscription reference) can fire it. The function is idempotent —
+// callers can invoke it multiple times for the same subscription event
+// stream and only the first one creates the row.
+//
+// attemptedAmount is in paise (Razorpay's smallest unit). Zero means
+// "unknown / not present in the event payload" — surfaced as `null` in
+// the audit metadata.
+func startGracePeriodForTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID, subscriptionID string, attemptedAmount int64) {
+	if db == nil || teamID == uuid.Nil || strings.TrimSpace(subscriptionID) == "" {
+		return
+	}
+
+	startedAt := time.Now().UTC()
+	expiresAt := startedAt.Add(time.Duration(models.PaymentGracePeriodGraceDays) * 24 * time.Hour)
+
+	grace, err := models.CreatePaymentGracePeriod(ctx, db, models.CreatePaymentGracePeriodParams{
+		TeamID:         teamID,
+		SubscriptionID: subscriptionID,
+		StartedAt:      startedAt,
+		ExpiresAt:      expiresAt,
+	})
+	if err != nil {
+		if errors.Is(err, models.ErrPaymentGraceAlreadyActive) {
+			// Idempotent redelivery — grace clock already started.
+			slog.Info("billing.subscription.charged_failed.grace_already_active",
+				"team_id", teamID, "subscription_id", subscriptionID)
+			return
+		}
+		slog.Error("billing.subscription.charged_failed.grace_create_failed",
+			"error", err, "team_id", teamID, "subscription_id", subscriptionID)
+		return
+	}
+
+	slog.Info("billing.subscription.charged_failed.grace_started",
+		"team_id", teamID,
+		"subscription_id", subscriptionID,
+		"grace_id", grace.ID,
+		"expires_at", grace.ExpiresAt,
+	)
+
+	emitPaymentGraceStartedAudit(ctx, db, teamID, subscriptionID, grace, attemptedAmount)
+}
+
+// maybeRecoverPaymentGrace is the dual of startGracePeriodForTeam — it
+// runs from handleSubscriptionCharged on every successful charge,
+// checks whether the team had an active grace row, and if so flips it
+// to 'recovered' + emits the audit row. The recovery path is fail-open:
+// failures here do not roll back the tier elevation that already
+// committed in handleSubscriptionCharged.
+//
+// Returns nothing because callers don't need to react — the email is
+// sent off the audit row by the Brevo forwarder, not synchronously.
+func maybeRecoverPaymentGrace(ctx context.Context, db *sql.DB, teamID uuid.UUID, subscriptionID string) {
+	if db == nil || teamID == uuid.Nil {
+		return
+	}
+
+	// Snapshot the row so the audit metadata can reference its lifecycle
+	// timestamps (started_at, etc.). A miss here just means we emit a
+	// thinner audit row — the recovery itself still flips.
+	active, err := models.GetActivePaymentGracePeriod(ctx, db, teamID)
+	if err != nil {
+		slog.Warn("billing.subscription.charged.grace_lookup_failed",
+			"error", err, "team_id", teamID)
+		return
+	}
+	if active == nil {
+		// Normal happy-path renewal — no grace was in flight.
+		return
+	}
+
+	recoveredAt := time.Now().UTC()
+	flipped, err := models.MarkPaymentGraceRecovered(ctx, db, teamID, recoveredAt)
+	if err != nil {
+		slog.Error("billing.subscription.charged.grace_recover_failed",
+			"error", err, "team_id", teamID, "grace_id", active.ID)
+		return
+	}
+	if !flipped {
+		// Race: another worker beat us to it. The Brevo email will
+		// already have fired off the first flip's audit row, so we
+		// don't emit a duplicate.
+		slog.Info("billing.subscription.charged.grace_already_recovered",
+			"team_id", teamID, "grace_id", active.ID)
+		return
+	}
+
+	slog.Info("billing.subscription.charged.grace_recovered",
+		"team_id", teamID,
+		"grace_id", active.ID,
+		"subscription_id", subscriptionID,
+	)
+
+	emitPaymentGraceRecoveredAudit(ctx, db, teamID, subscriptionID, active, recoveredAt)
 }
 
 // parseSubscriptionEntity extracts the subscription entity from a webhook event.
@@ -1091,6 +1252,79 @@ func emitSubscriptionCanceledAudit(ctx context.Context, db *sql.DB, teamID uuid.
 	}); err != nil {
 		slog.Warn("audit.emit.failed",
 			"kind", models.AuditKindSubscriptionCanceled,
+			"team_id", teamID,
+			"error", err,
+		)
+	}
+}
+
+// emitPaymentGraceStartedAudit writes the payment.grace_started audit
+// row consumed by the Brevo forwarder. Metadata carries the recovery
+// deadline + attempted-amount so the
+// `instanode-payment-grace-started-v1` template can render "your card
+// failed for ₹X, you have until $expires_at to update payment."
+//
+// Fail-open: an audit miss does NOT roll back the grace-row INSERT we
+// already committed. The Brevo follow-up will be missed (no first
+// reminder email until the worker's 6h reminder kicks in) but the state
+// machine is intact and the customer's account still terminates on the
+// 7-day clock.
+func emitPaymentGraceStartedAudit(ctx context.Context, db *sql.DB, teamID uuid.UUID, subscriptionID string, grace *models.PaymentGracePeriod, attemptedAmountPaise int64) {
+	meta := map[string]any{
+		"subscription_id":  subscriptionID,
+		"grace_id":         grace.ID.String(),
+		"started_at":       grace.StartedAt.UTC().Format(time.RFC3339),
+		"expires_at":       grace.ExpiresAt.UTC().Format(time.RFC3339),
+		"attempted_amount": nil,
+	}
+	if attemptedAmountPaise > 0 {
+		meta["attempted_amount"] = attemptedAmountPaise
+	}
+	metaBlob, _ := json.Marshal(meta)
+
+	if err := models.InsertAuditEvent(ctx, db, models.AuditEvent{
+		TeamID:   teamID,
+		Actor:    "system",
+		Kind:     models.AuditKindPaymentGraceStarted,
+		Summary:  "payment failed — 7-day grace period started",
+		Metadata: metaBlob,
+	}); err != nil {
+		slog.Warn("audit.emit.failed",
+			"kind", models.AuditKindPaymentGraceStarted,
+			"team_id", teamID,
+			"error", err,
+		)
+	}
+}
+
+// emitPaymentGraceRecoveredAudit writes the payment.grace_recovered
+// audit row consumed by the Brevo forwarder for the "you're back in
+// good standing" recovery email
+// (template: instanode-payment-grace-recovered-v1). Metadata carries
+// the grace lifecycle timestamps so the email can render "your account
+// was at risk for N days" copy.
+//
+// Same fail-open invariant as the started audit: a miss here does not
+// roll back the MarkPaymentGraceRecovered flip — the state machine is
+// the source of truth, the audit row is the trigger for the email.
+func emitPaymentGraceRecoveredAudit(ctx context.Context, db *sql.DB, teamID uuid.UUID, subscriptionID string, grace *models.PaymentGracePeriod, recoveredAt time.Time) {
+	meta := map[string]any{
+		"subscription_id": subscriptionID,
+		"grace_id":        grace.ID.String(),
+		"started_at":      grace.StartedAt.UTC().Format(time.RFC3339),
+		"recovered_at":    recoveredAt.UTC().Format(time.RFC3339),
+	}
+	metaBlob, _ := json.Marshal(meta)
+
+	if err := models.InsertAuditEvent(ctx, db, models.AuditEvent{
+		TeamID:   teamID,
+		Actor:    "system",
+		Kind:     models.AuditKindPaymentGraceRecovered,
+		Summary:  "payment recovered — back in good standing",
+		Metadata: metaBlob,
+	}); err != nil {
+		slog.Warn("audit.emit.failed",
+			"kind", models.AuditKindPaymentGraceRecovered,
 			"team_id", teamID,
 			"error", err,
 		)

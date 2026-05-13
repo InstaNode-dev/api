@@ -1,0 +1,97 @@
+{
+  "name": "instant-api — billing dunning",
+  "description": "Failed-charge → 7-day grace → recover/terminate funnel. Tracks customers currently in dunning, reminder cadence, recovery rate, and auto-termination volume. Source: Log records emitted by api/internal/handlers/billing.go (billing.subscription.charged_failed.grace_started, billing.subscription.charged.grace_recovered) and worker job-completed records for payment_grace_reminder / payment_grace_terminator (worker repo, separate PR). The api Fiber NR middleware also emits Transaction events on /razorpay/webhook for endpoint health.",
+  "permissions": "PUBLIC_READ_WRITE",
+  "pages": [
+    {
+      "name": "Dunning",
+      "description": "Payment-failure dunning funnel: grace started → reminders → recovered / terminated",
+      "widgets": [
+        {
+          "title": "Customers in active grace (current)",
+          "layout": { "column": 1, "row": 1, "width": 4, "height": 3 },
+          "visualization": { "id": "viz.billboard" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
+                "query": "SELECT filter(uniqueCount(team_id), WHERE message LIKE '%billing.subscription.charged_failed.grace_started%') - filter(uniqueCount(team_id), WHERE message LIKE '%billing.subscription.charged.grace_recovered%' OR message LIKE '%payment.grace_terminated%') AS 'in grace' FROM Log WHERE service = 'api' SINCE 7 days ago"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Grace started over time (per day)",
+          "layout": { "column": 5, "row": 1, "width": 8, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
+                "query": "SELECT count(*) AS 'grace_started' FROM Log WHERE service = 'api' AND message LIKE '%billing.subscription.charged_failed.grace_started%' TIMESERIES 1 day"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Reminders sent per day (worker job)",
+          "layout": { "column": 1, "row": 4, "width": 6, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
+                "query": "SELECT count(*) FROM Log WHERE service = 'worker' AND job_kind = 'payment_grace_reminder' AND message LIKE '%job.completed%' TIMESERIES 1 day"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Recovery rate (% recovered vs total resolved, last 30d)",
+          "layout": { "column": 7, "row": 4, "width": 6, "height": 3 },
+          "visualization": { "id": "viz.billboard" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
+                "query": "SELECT (filter(count(*), WHERE message LIKE '%billing.subscription.charged.grace_recovered%') / (filter(count(*), WHERE message LIKE '%billing.subscription.charged.grace_recovered%') + filter(count(*), WHERE message LIKE '%payment.grace_terminated%'))) * 100 AS 'recovery_rate_pct' FROM Log WHERE service IN ('api', 'worker') SINCE 30 days ago"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Auto-terminations per week (worker terminator job)",
+          "layout": { "column": 1, "row": 7, "width": 6, "height": 3 },
+          "visualization": { "id": "viz.bar" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
+                "query": "SELECT count(*) FROM Log WHERE service = 'worker' AND job_kind = 'payment_grace_terminator' AND message LIKE '%job.completed%' TIMESERIES 1 week SINCE 12 weeks ago"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "/razorpay/webhook latency (p95 ms)",
+          "layout": { "column": 7, "row": 7, "width": 6, "height": 3 },
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountIds": ["${NEW_RELIC_ACCOUNT_ID}"],
+                "query": "SELECT percentile(duration, 95) * 1000 AS 'p95 ms' FROM Transaction WHERE appName LIKE 'instant-api%' AND name LIKE '%/razorpay/webhook%' TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        }
+      ]
+    }
+  ]
+}
