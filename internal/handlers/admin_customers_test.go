@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -423,6 +424,249 @@ func indexByte(s string, c byte) int {
 		}
 	}
 	return -1
+}
+
+// adminSeedTeamWithEmail seeds a team at the given tier with a caller-
+// supplied owner email (rather than the random UniqueEmail one). Needed
+// for the substring-search tests below where we assert specific tokens
+// like "fou" against "founder@…" — UniqueEmail's UUID prefix can't drive
+// that. Returns the teamID.
+func adminSeedTeamWithEmail(t *testing.T, db *sql.DB, tier, email string) uuid.UUID {
+	t.Helper()
+	ctx := context.Background()
+	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, tier))
+	_, err := models.CreateUser(ctx, db, teamID, email, "", "", "owner")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		db.Exec(`DELETE FROM resources WHERE team_id = $1`, teamID)
+		db.Exec(`DELETE FROM users WHERE team_id = $1`, teamID)
+		db.Exec(`DELETE FROM audit_log WHERE team_id = $1`, teamID)
+		db.Exec(`DELETE FROM admin_promo_codes WHERE team_id = $1`, teamID)
+		db.Exec(`DELETE FROM teams WHERE id = $1`, teamID)
+	})
+	return teamID
+}
+
+// uniqueTagForTest returns a short hex token unique to this test run.
+// We splice it into the seeded email so q=<tag> only matches THIS test's
+// team — keeps the substring-search assertions stable against pollution
+// from sibling tests in the same DB.
+func uniqueTagForTest(t *testing.T) string {
+	t.Helper()
+	return uuid.NewString()[:6]
+}
+
+// TestAdminList_QueryByEmail_SubstringPrefixMatches asserts the "?q=fou
+// matches founder@…" semantics — i.e. that the WHERE clause uses
+// substring matching (LIKE '%q%'), not equality. The existing
+// TestAdminList_QueryByEmail_FindsMatchingTeam covers substring matching
+// against a UUID-derived token; this test specifically pins the
+// human-readable prefix case the founder will actually type into the
+// dashboard search box.
+func TestAdminList_QueryByEmail_SubstringPrefixMatches(t *testing.T) {
+	db, cleanup := adminAppNeedsDB(t)
+	defer cleanup()
+	t.Setenv("ADMIN_EMAILS", adminCallerEmail)
+	app := adminApp(t, db, adminCallerEmail)
+
+	// "<tag>founder@x.com" — the tag prefixes the email so the substring
+	// "<tag>fou" is a contiguous slice of the actual stored email. This
+	// isolates the team from sibling tests that may also seed
+	// "founder"-prefixed emails (the tag is unique per test run). If
+	// we put the tag AFTER "founder" the substring "fou<tag>" wouldn't
+	// be contiguous in the stored email — LIKE '%fou<tag>%' would miss.
+	tag := uniqueTagForTest(t)
+	email := tag + "founder@x.com"
+	teamID := adminSeedTeamWithEmail(t, db, "hobby", email)
+
+	// "<tag>fou" → contiguous substring of "<tag>founder@x.com".
+	status, body := adminDoJSON(t, app, "GET",
+		"/api/v1/admin/customers?q="+tag+"fou", nil)
+	require.Equal(t, http.StatusOK, status, "body=%v", body)
+	customers, _ := body["customers"].([]any)
+	found := false
+	for _, c := range customers {
+		row, _ := c.(map[string]any)
+		if row["team_id"] == teamID.String() {
+			found = true
+			assert.Equal(t, email, row["primary_email"])
+		}
+	}
+	assert.True(t, found, "q=%sfou must match seeded email %q", tag, email)
+}
+
+// TestAdminList_QueryByEmail_CaseInsensitive asserts q=FOUNDER matches
+// "founder@x.com". The handler lowercases both sides (q and email column
+// via lower(email)), and migration 023 adds an idx_users_email_lower
+// functional index to make this cheap. The migration index is required
+// for production scale; this test only asserts the semantics, not the
+// EXPLAIN plan.
+func TestAdminList_QueryByEmail_CaseInsensitive(t *testing.T) {
+	db, cleanup := adminAppNeedsDB(t)
+	defer cleanup()
+	t.Setenv("ADMIN_EMAILS", adminCallerEmail)
+	app := adminApp(t, db, adminCallerEmail)
+
+	tag := uniqueTagForTest(t)
+	email := tag + "founder@x.com"
+	teamID := adminSeedTeamWithEmail(t, db, "hobby", email)
+
+	// Upper-case the query — should still match the lower-case stored email.
+	// The tag prefixes the literal substring so it's a contiguous slice.
+	status, body := adminDoJSON(t, app, "GET",
+		"/api/v1/admin/customers?q="+strings.ToUpper(tag)+"FOUNDER", nil)
+	require.Equal(t, http.StatusOK, status, "body=%v", body)
+	customers, _ := body["customers"].([]any)
+	found := false
+	for _, c := range customers {
+		row, _ := c.(map[string]any)
+		if row["team_id"] == teamID.String() {
+			found = true
+		}
+	}
+	assert.True(t, found, "case-insensitive q=%sFOUNDER must match %q",
+		strings.ToUpper(tag), email)
+}
+
+// TestAdminList_MultiTierFilter_ReturnsBothTiers asserts that
+// ?tier=hobby,pro produces a WHERE plan_tier IN ('hobby','pro') —
+// returning both seeded teams while excluding a third 'team'-tier seed.
+//
+// The dashboard's filter-pills UI sends the selected pills as a
+// comma-joined list in one request; the handler must OR them.
+func TestAdminList_MultiTierFilter_ReturnsBothTiers(t *testing.T) {
+	db, cleanup := adminAppNeedsDB(t)
+	defer cleanup()
+	t.Setenv("ADMIN_EMAILS", adminCallerEmail)
+	app := adminApp(t, db, adminCallerEmail)
+
+	hobbyID, _ := adminSeedTeam(t, db, "hobby")
+	proID, _ := adminSeedTeam(t, db, "pro")
+	teamTierID, _ := adminSeedTeam(t, db, "team")
+
+	// Page through (the test DB may carry stale rows; we walk pages
+	// until we've seen the seeded IDs we care about — same pattern as
+	// TestAdminList_SortByMRR_HigherTierFirst above).
+	sawHobby := false
+	sawPro := false
+	sawTeam := false
+	offset := 0
+	for offset < 5000 {
+		status, body := adminDoJSON(t, app, "GET",
+			"/api/v1/admin/customers?tier=hobby,pro&limit=500&offset="+itoa(offset), nil)
+		require.Equal(t, http.StatusOK, status)
+		customers, _ := body["customers"].([]any)
+		if len(customers) == 0 {
+			break
+		}
+		for _, c := range customers {
+			row, _ := c.(map[string]any)
+			id, _ := row["team_id"].(string)
+			tier, _ := row["tier"].(string)
+			// Every returned row must be hobby OR pro — never team.
+			assert.Contains(t, []string{"hobby", "pro"}, tier,
+				"tier=hobby,pro filter must exclude tier=%s row %s", tier, id)
+			switch id {
+			case hobbyID.String():
+				sawHobby = true
+			case proID.String():
+				sawPro = true
+			case teamTierID.String():
+				sawTeam = true
+			}
+		}
+		offset += 500
+	}
+	assert.True(t, sawHobby, "seeded hobby team must appear under tier=hobby,pro")
+	assert.True(t, sawPro, "seeded pro team must appear under tier=hobby,pro")
+	assert.False(t, sawTeam, "seeded team-tier team must NOT appear under tier=hobby,pro")
+}
+
+// TestAdminList_BogusTierValue_ReturnsEmptyList — UI-stable contract: a
+// typo'd or stale-build tier value (e.g. ?tier=platinum) must return an
+// empty list with 200, not a 400 error. The dashboard filter pills are
+// "OR a set of values"; an unknown pill should render "no results" not
+// an error banner.
+//
+// Note this is a deliberate behavior change vs the PR #48 baseline,
+// which 400'd on `tier=platinum`. Multi-tier callers (tier=hobby,pro)
+// keep the valid tiers and silently drop unknowns — only the all-unknown
+// case short-circuits to empty.
+func TestAdminList_BogusTierValue_ReturnsEmptyList(t *testing.T) {
+	db, cleanup := adminAppNeedsDB(t)
+	defer cleanup()
+	t.Setenv("ADMIN_EMAILS", adminCallerEmail)
+	app := adminApp(t, db, adminCallerEmail)
+
+	// Seed something so we can assert it does NOT come back.
+	_, _ = adminSeedTeam(t, db, "pro")
+
+	status, body := adminDoJSON(t, app, "GET",
+		"/api/v1/admin/customers?tier=platinum", nil)
+	require.Equal(t, http.StatusOK, status, "body=%v", body)
+	assert.Equal(t, true, body["ok"])
+	customers, ok := body["customers"].([]any)
+	require.True(t, ok, "customers must be an array even when empty")
+	assert.Empty(t, customers, "unknown tier value must return empty list")
+	// total mirrors the empty page — 0, not the count of all teams.
+	total, _ := body["total"].(float64)
+	assert.Equal(t, float64(0), total)
+}
+
+// TestAdminList_Pagination_LimitAndOffset asserts that limit + offset
+// produce non-overlapping pages and that the cumulative pages cover the
+// full sorted result without duplicates. This is the regression guard:
+// a future change that breaks the LIMIT/OFFSET parameter binding (e.g.
+// off-by-one in the $N counter when args were appended for q + tier)
+// would silently return overlapping pages.
+func TestAdminList_Pagination_LimitAndOffset(t *testing.T) {
+	db, cleanup := adminAppNeedsDB(t)
+	defer cleanup()
+	t.Setenv("ADMIN_EMAILS", adminCallerEmail)
+	app := adminApp(t, db, adminCallerEmail)
+
+	// Seed three teams with a shared, unique email tag so we can scope
+	// the pagination assertion to ONLY these three rows. Without the
+	// tag, sibling tests pollute the result set and we can't make a
+	// deterministic page-equality assertion.
+	tag := uniqueTagForTest(t)
+	idA := adminSeedTeamWithEmail(t, db, "hobby", "alpha"+tag+"@x.com")
+	idB := adminSeedTeamWithEmail(t, db, "pro", "bravo"+tag+"@x.com")
+	idC := adminSeedTeamWithEmail(t, db, "team", "charlie"+tag+"@x.com")
+
+	// Page 1: limit=2, offset=0 → 2 rows.
+	status, body := adminDoJSON(t, app, "GET",
+		"/api/v1/admin/customers?q="+tag+"&limit=2&offset=0", nil)
+	require.Equal(t, http.StatusOK, status)
+	page1, _ := body["customers"].([]any)
+	require.Len(t, page1, 2, "page 1 must contain exactly limit=2 rows (body=%v)", body)
+	total, _ := body["total"].(float64)
+	assert.Equal(t, float64(3), total, "total must reflect the full filtered count, not the page size")
+
+	// Page 2: limit=2, offset=2 → 1 row (the remaining one).
+	status, body = adminDoJSON(t, app, "GET",
+		"/api/v1/admin/customers?q="+tag+"&limit=2&offset=2", nil)
+	require.Equal(t, http.StatusOK, status)
+	page2, _ := body["customers"].([]any)
+	require.Len(t, page2, 1, "page 2 must contain the single remaining row")
+
+	// Union of page1 + page2 must equal all three seeded IDs, no dupes.
+	seen := map[string]bool{}
+	for _, c := range page1 {
+		row, _ := c.(map[string]any)
+		id, _ := row["team_id"].(string)
+		seen[id] = true
+	}
+	for _, c := range page2 {
+		row, _ := c.(map[string]any)
+		id, _ := row["team_id"].(string)
+		assert.False(t, seen[id], "page 2 row %s must not also appear on page 1", id)
+		seen[id] = true
+	}
+	assert.True(t, seen[idA.String()], "team A must appear across the two pages")
+	assert.True(t, seen[idB.String()], "team B must appear across the two pages")
+	assert.True(t, seen[idC.String()], "team C must appear across the two pages")
+	assert.Equal(t, 3, len(seen), "exactly 3 distinct team_ids across the two pages")
 }
 
 // TestAdminList_InvalidSortBy_400 — unknown sort_by produces a structured
