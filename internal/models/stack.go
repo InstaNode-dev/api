@@ -170,8 +170,10 @@ func scanStackService(row interface {
 
 // CreateStack inserts a new stack row. Namespace is set to "instant-stack-" + slug.
 //
-// Env defaults to "production" when CreateStackParams.Env is empty. ParentStackID
-// is nullable — set only when the row is created by the promote endpoint.
+// Env defaults to EnvDefault ("development") when CreateStackParams.Env is empty
+// — flipped from "production" by migration 026 so accidental no-env creates land
+// in the lowest-stakes bucket. ParentStackID is nullable — set only when the
+// row is created by the promote endpoint.
 func CreateStack(ctx context.Context, db *sql.DB, p CreateStackParams) (*Stack, error) {
 	tier := p.Tier
 	if tier == "" {
@@ -179,7 +181,7 @@ func CreateStack(ctx context.Context, db *sql.DB, p CreateStackParams) (*Stack, 
 	}
 	env := p.Env
 	if env == "" {
-		env = "production"
+		env = EnvDefault
 	}
 	namespace := "instant-stack-" + p.Slug
 

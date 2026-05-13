@@ -39,6 +39,11 @@ func agentActionContractCases() map[string]string {
 		"AgentActionPromotionAlreadyUsed":              AgentActionPromotionAlreadyUsed,
 		"AgentActionPromotionExpired":                  AgentActionPromotionExpired,
 		"AgentActionPromoteTokenExpired":               AgentActionPromoteTokenExpired,
+		"AgentActionReadOnlySession":                   AgentActionReadOnlySession,
+		"AgentActionNotifyWebhookInvalid":              AgentActionNotifyWebhookInvalid,
+		"AgentActionPauseRequiresPro":                  AgentActionPauseRequiresPro,
+		"AgentActionResourceAlreadyPaused":             AgentActionResourceAlreadyPaused,
+		"AgentActionResourceNotPaused":                 AgentActionResourceNotPaused,
 
 		// Builders — representative inputs covering tier/env/role/limit
 		// interpolation.
@@ -102,6 +107,7 @@ func assertContract(t *testing.T, name, s string) {
 		"Redeploy", "redeploy",
 		"Re-request", "re-request", // promote approval link expired
 		"Confirm", "confirm",
+		"Switch", "switch", // read-only impersonation
 		"check ", "Check ", // bindings cross-team / not-found
 		"use ", "Use ", // bindings not-found
 		"must be ", // bindings invalid-uuid → action is "must be a UUID"

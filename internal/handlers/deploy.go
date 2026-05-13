@@ -129,6 +129,17 @@ func deploymentToMap(d *models.Deployment) fiber.Map {
 		"created_at":  d.CreatedAt,
 		"updated_at":  d.UpdatedAt,
 		"team_id":     d.TeamID,
+		// notify_webhook surface (migration 026): URL is echoed back (the
+		// caller supplied it, so no secret is leaked); secret + state +
+		// attempts are emitted only when a webhook is configured so we
+		// don't pollute the shape for legacy callers. The plaintext
+		// secret is NEVER returned — only its lifecycle metadata.
+		"notify_webhook": d.NotifyWebhook,
+		"notify_state":   d.NotifyState,
+	}
+	if d.NotifyWebhook != "" {
+		m["notify_attempts"] = d.NotifyAttempts
+		m["notify_secret_set"] = d.NotifyWebhookSecret != ""
 	}
 	if d.ErrorMessage != "" {
 		m["error"] = d.ErrorMessage
@@ -273,8 +284,9 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 	}
 
 	// Optional environment scope: ?env=staging or multipart "env" field.
-	// Empty defaults to "production". Validation is centralised in
-	// models.NormalizeEnv via resolveEnv.
+	// Empty defaults to "development" (post-migration 026 — see
+	// models.EnvDefault). Validation is centralised in models.NormalizeEnv
+	// via resolveEnv.
 	envBody := ""
 	if vals := form.Value["env"]; len(vals) > 0 {
 		envBody = vals[0]
@@ -380,6 +392,22 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		return privErr // respondError already called inside parsePrivateDeployFields
 	}
 
+	// ── Notify webhook fields (migration 026) ────────────────────────────────
+	//
+	// Optional async notification: when the deploy reaches a terminal state
+	// (healthy / failed) the worker POSTs to this URL. SSRF + scheme gate
+	// fires here, before any DB write, so the row never carries an unsafe
+	// URL. Secret is AES-256-GCM encrypted before persistence.
+	//
+	// Worker-side dispatcher is a separate PR — this PR only persists the
+	// fields. notify_state defaults to 'pending' when a URL is supplied
+	// (see CreateDeployment) so the future worker scan picks it up
+	// immediately on terminal-state arrival.
+	notifyURL, notifySecret, notifyErr := parseNotifyWebhookFields(c, form, h.cfg.AESKey)
+	if notifyErr != nil {
+		return notifyErr // respondError already called inside parseNotifyWebhookFields
+	}
+
 	// ── Tier-limit enforcement (plans.yaml: deployments_apps) ────────────────
 	//
 	// Count the team's currently-active deployments and reject when over the
@@ -406,14 +434,16 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 	}
 
 	saved, err := models.CreateDeployment(c.Context(), h.db, models.CreateDeploymentParams{
-		TeamID:     team.ID,
-		AppID:      appID,
-		Port:       port,
-		Tier:       team.PlanTier,
-		Env:        environment,
-		EnvVars:    initEnv,
-		Private:    private,
-		AllowedIPs: allowedIPs,
+		TeamID:              team.ID,
+		AppID:               appID,
+		Port:                port,
+		Tier:                team.PlanTier,
+		Env:                 environment,
+		EnvVars:             initEnv,
+		Private:             private,
+		AllowedIPs:          allowedIPs,
+		NotifyWebhook:       notifyURL,
+		NotifyWebhookSecret: notifySecret,
 	})
 	if err != nil {
 		slog.Error("deploy.new.db_create_failed",
