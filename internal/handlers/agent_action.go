@@ -283,3 +283,16 @@ func newAgentActionAdminPromoIssued(teamID, code string) string {
 		code, teamID,
 	)
 }
+
+// AgentActionReadOnlySession is returned on every 403 emitted by the
+// RequireWritable middleware when a JWT carries `read_only:true` — i.e. the
+// admin minted an impersonation token to view-as-customer and the agent
+// (or the dashboard the admin is steering) attempted a mutation. Names the
+// specific rejection reason ("read-only impersonated session"), the exact
+// next action ("switch back to your real account"), and a full
+// https://instanode.dev/app URL. The U3 contract test exercises it.
+//
+// Read-only is irrevocable for the lifetime of the impersonation token —
+// there is no "downgrade to writable" path. The remedy is to use the
+// admin's own session token, which never carries this flag.
+const AgentActionReadOnlySession = "Tell the user this is a read-only impersonated session. Mutations are disabled. Switch back to your real account at https://instanode.dev/app to make changes."

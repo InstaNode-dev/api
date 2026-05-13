@@ -204,12 +204,22 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// Provisioning — Phase 2+ (gated by IsServiceEnabled in each handler)
 	// OptionalAuth is registered per-route rather than via app.Group("/", ...) to avoid
 	// accidentally applying it globally to all routes (Fiber's "/" group prefix matches everything).
-	app.Post("/db/new", middleware.OptionalAuth(cfg), dbH.NewDB)
-	app.Post("/cache/new", middleware.OptionalAuth(cfg), cacheH.NewCache)
-	app.Post("/nosql/new", middleware.OptionalAuth(cfg), nosqlH.NewNoSQL)
-	app.Post("/queue/new", middleware.OptionalAuth(cfg), queueH.NewQueue)
-	app.Post("/storage/new", middleware.OptionalAuth(cfg), storageH.NewStorage)
-	app.Post("/webhook/new", middleware.OptionalAuth(cfg), webhookH.NewWebhook)
+	//
+	// RequireWritable runs AFTER OptionalAuth on every mutating provisioning
+	// endpoint so an impersonated (read-only) session presenting an
+	// Authorization header is 403'd before the handler runs. Anonymous (no
+	// header) callers fall through — OptionalAuth never sets the read_only
+	// local, and RequireWritable is a no-op for unset locals. The same
+	// invariant covers /webhook/receive/:token: that route never reads
+	// Authorization headers in practice, but installing the gate keeps
+	// the policy uniform — see test #5 in PR #024 for the explicit
+	// "POST /db/new under an impersonated session must 403" assertion.
+	app.Post("/db/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), dbH.NewDB)
+	app.Post("/cache/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), cacheH.NewCache)
+	app.Post("/nosql/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), nosqlH.NewNoSQL)
+	app.Post("/queue/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), queueH.NewQueue)
+	app.Post("/storage/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), storageH.NewStorage)
+	app.Post("/webhook/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), webhookH.NewWebhook)
 	app.Post("/webhook/receive/:token", webhookH.Receive)
 	app.Get("/resources/:token/logs", logsH.ResourceLogs)
 
@@ -218,7 +228,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// env scope arrives as a multipart form field (not JSON or query), so
 	// we provide a custom env-lookup that reads c.FormValue("env") and
 	// falls back to "production" for the policy check.
-	deployGroup := app.Group("/deploy", middleware.RequireAuth(cfg), middleware.PopulateTeamRole())
+	// RequireWritable on the deploy group rejects impersonated sessions
+	// before any mutating deploy handler runs. GETs (deployGroup.Get) are
+	// no-ops under the middleware so the impersonated admin can still
+	// inspect deploy state — which is the entire point of view-as-customer.
+	deployGroup := app.Group("/deploy", middleware.RequireAuth(cfg), middleware.PopulateTeamRole(), middleware.RequireWritable())
 	deployGroup.Post("/new",
 		middleware.RequireEnvAccess(middleware.EnvPolicyActionDeploy,
 			middleware.WithEnvLookup(func(c *fiber.Ctx) (string, error) {
@@ -239,12 +253,15 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// Stacks — Phase 6 multi-service.
 	// New/Get/Logs/Delete use OptionalAuth (anonymous stacks supported, same as /db/new etc.).
 	// UpdateEnv/Redeploy require auth (mutations on owned stacks).
-	app.Post("/stacks/new", middleware.OptionalAuth(cfg), stackH.New)
+	// RequireWritable rejects impersonated sessions on all mutating
+	// stack endpoints (POST/PATCH/DELETE) so an admin viewing the
+	// customer's stack page can't accidentally redeploy / nuke it.
+	app.Post("/stacks/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), stackH.New)
 	app.Get("/stacks/:slug", middleware.OptionalAuth(cfg), stackH.Get)
 	app.Get("/stacks/:slug/logs/:svc", middleware.OptionalAuth(cfg), stackH.Logs)
-	app.Delete("/stacks/:slug", middleware.OptionalAuth(cfg), stackH.Delete)
-	app.Patch("/stacks/:slug/env", middleware.RequireAuth(cfg), stackH.UpdateEnv)
-	app.Post("/stacks/:slug/redeploy", middleware.RequireAuth(cfg), stackH.Redeploy)
+	app.Delete("/stacks/:slug", middleware.OptionalAuth(cfg), middleware.RequireWritable(), stackH.Delete)
+	app.Patch("/stacks/:slug/env", middleware.RequireAuth(cfg), middleware.RequireWritable(), stackH.UpdateEnv)
+	app.Post("/stacks/:slug/redeploy", middleware.RequireAuth(cfg), middleware.RequireWritable(), stackH.Redeploy)
 
 	// OAuth — POST handler serves the existing programmatic / SPA flow.
 	// Google login is intentionally NOT supported; if you need it, register
@@ -273,7 +290,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	billing := handlers.NewBillingHandler(db, cfg, emailClient)
 	// Legacy alias kept for backward compatibility; canonical path is
 	// /api/v1/billing/checkout (registered under the /api/v1 group below).
-	app.Post("/billing/checkout", middleware.RequireAuth(cfg), billing.CreateCheckoutAPI)
+	// RequireWritable rejects impersonated sessions — an admin viewing-as-
+	// customer must not be able to start a checkout on the customer's
+	// behalf. The canonical /api/v1 alias is already gated by the api
+	// group's RequireWritable.
+	app.Post("/billing/checkout", middleware.RequireAuth(cfg), middleware.RequireWritable(), billing.CreateCheckoutAPI)
 	app.Post("/razorpay/webhook", billing.RazorpayWebhook)
 
 	// §10.20 cached-aggregation endpoints. Separate handlers from BillingHandler
@@ -297,7 +318,18 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	middleware.SetRoleLookupDB(db)  // populate auth_team_role on every RequireAuth
 	middleware.SetAPIKeyDB(db)      // enable PAT auth path in RequireAuth
 	middleware.SetEnvPolicyDB(db)   // RequireEnvAccess reads teams.env_policy
-	api := app.Group("/api/v1", middleware.RequireAuth(cfg), middleware.PopulateTeamRole())
+	// RequireWritable gates every mutating route under /api/v1/* against
+	// the read_only JWT flag minted by the admin-impersonation endpoint
+	// (POST /api/v1/admin/customers/:team_id/impersonate). GET/HEAD/OPTIONS
+	// fall through unconditionally — the impersonated admin's whole reason
+	// for holding the token is to *read* the customer's dashboard state.
+	//
+	// One deliberate exemption: the impersonation-mint endpoint itself
+	// (registered below inside the admin group). It is called by an admin
+	// holding a *normal* (writable) session, so the gate would never fire
+	// there — but the brief calls out the exemption explicitly, and the
+	// audit-comment in router.go is where reviewers expect to find it.
+	api := app.Group("/api/v1", middleware.RequireAuth(cfg), middleware.PopulateTeamRole(), middleware.RequireWritable())
 
 	// /whoami — identity probe for agents. Returning 401 here is the canonical
 	// "your token is bad"; returning anything else from this endpoint means
@@ -451,11 +483,36 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 			portal := &razorpaybilling.Portal{DB: db, Cfg: cfg}
 			return portal.CancelImmediately(subID)
 		}
+		adminNotesH := handlers.NewAdminCustomerNotesHandler(db)
+		adminImpersonateH := handlers.NewAdminImpersonateHandler(db, cfg)
+
 		adminGroup := api.Group("/"+cfg.AdminPathPrefix, middleware.RequireAdmin())
 		adminGroup.Get("/customers", adminCustH.List)
 		adminGroup.Get("/customers/:team_id", adminCustH.Detail)
 		adminGroup.Post("/customers/:team_id/tier", adminCustH.ChangeTier)
 		adminGroup.Post("/customers/:team_id/promo", adminCustH.IssuePromo)
+
+		// Notes — free-text per-team admin annotations. List/Create are
+		// nested under /admin/customers/:team_id so the URL space mirrors
+		// the dashboard's Customer Detail drawer; Delete addresses by note
+		// id directly so the dashboard doesn't have to round-trip the
+		// team_id on every row's delete-button.
+		adminGroup.Get("/customers/:team_id/notes", adminNotesH.ListNotes)
+		adminGroup.Post("/customers/:team_id/notes", adminNotesH.CreateNote)
+		adminGroup.Delete("/notes/:note_id", adminNotesH.DeleteNote)
+
+		// Impersonation — mint a 10-minute read-only JWT for the target
+		// team so the admin can view-as-customer. Every mutating endpoint
+		// is gated by RequireWritable (installed on the /api/v1 group
+		// above) against the minted token's read_only=true claim — the
+		// impersonating session can browse but cannot write.
+		//
+		// This route is the one deliberate exemption from RequireWritable —
+		// but it's only theoretical: the admin minting the read-only token
+		// holds a normal (writable) session, so the gate would never fire
+		// here. Documenting the exemption keeps reviewers from "fixing"
+		// a non-bug.
+		adminGroup.Post("/customers/:team_id/impersonate", adminImpersonateH.Impersonate)
 	}
 
 	// Quota-wall nudge endpoint — Track U1. Returns the most recent

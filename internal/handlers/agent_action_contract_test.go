@@ -38,6 +38,7 @@ func agentActionContractCases() map[string]string {
 		"AgentActionPromotionInvalid":                  AgentActionPromotionInvalid,
 		"AgentActionPromotionAlreadyUsed":              AgentActionPromotionAlreadyUsed,
 		"AgentActionPromotionExpired":                  AgentActionPromotionExpired,
+		"AgentActionReadOnlySession":                   AgentActionReadOnlySession,
 
 		// Builders — representative inputs covering tier/env/role/limit
 		// interpolation.
@@ -99,6 +100,7 @@ func assertContract(t *testing.T, name, s string) {
 		"Remove", "remove", // family-disabled
 		"Redeploy", "redeploy",
 		"Confirm", "confirm",
+		"Switch", "switch", // read-only impersonation
 		"check ", "Check ", // bindings cross-team / not-found
 		"use ", "Use ", // bindings not-found
 		"must be ", // bindings invalid-uuid → action is "must be a UUID"
