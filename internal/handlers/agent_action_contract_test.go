@@ -34,6 +34,7 @@ func agentActionContractCases() map[string]string {
 		"RecycleGateAgentAction":                       RecycleGateAgentAction,
 		"AgentActionPrivateDeployRequiresPro":          AgentActionPrivateDeployRequiresPro,
 		"AgentActionPrivateDeployRequiresAllowedIPs":   AgentActionPrivateDeployRequiresAllowedIPs,
+		"AgentActionPromotionInvalid":                  AgentActionPromotionInvalid,
 
 		// Builders — representative inputs covering tier/env/role/limit
 		// interpolation.
