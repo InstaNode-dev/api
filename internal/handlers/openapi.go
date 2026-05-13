@@ -1208,6 +1208,35 @@ const openAPISpec = `{
           "404": { "description": "Not found" }
         }
       },
+      "patch": {
+        "summary": "Update access-control fields (private + allowed_ips) in place",
+        "description": "Edits the private flag and allowed_ips list on an existing deployment without rebuilding the image. The dashboard PrivacyPanel writes here. Body fields are optional: sending only 'allowed_ips' keeps the current private state; sending 'private': false clears the allow-list regardless of allowed_ips. allowed_ips uses REPLACE semantics (the supplied list is the new authoritative list, not merged into the existing one) — matches REST conventions and avoids silent allow-list growth across multiple PATCHes. Validation reuses the POST /deploy/new rule-set: Pro+ tier required (returns 402 with private_deploy_requires_pro), private=true with empty allowed_ips returns 400, invalid IPs/CIDRs surface verbatim, >32 entries returns too_many_allowed_ips. Compute layer patches the live Ingress annotations via the same helper POST uses (no image rebuild, no pod restart).",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "private": { "type": "boolean", "description": "Flip the deploy public ↔ private. When false, the allow-list is cleared regardless of allowed_ips in the same body." },
+                  "allowed_ips": { "type": "array", "items": { "type": "string" }, "description": "REPLACE the allow-list with this exact set of IPs/CIDRs. Max 32 entries; each must be a valid IP literal or CIDR." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Access control updated", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
+          "400": { "description": "Bad request — missing_fields (empty body), private_deploy_requires_allowed_ips, invalid_allowed_ip, too_many_allowed_ips, or invalid_body" },
+          "401": { "description": "Unauthorized" },
+          "402": { "description": "private_deploy_requires_pro — hobby/anonymous/free trying to flip a deploy private. agent_action points to https://instanode.dev/pricing." },
+          "403": { "description": "Not your deployment" },
+          "404": { "description": "Not found" },
+          "503": { "description": "compute_update_failed (ingress patch failed) or update_failed (DB write failed)" }
+        }
+      },
       "delete": {
         "summary": "Tear down + delete a deployment (alias of DELETE /deploy/{id})",
         "security": [{ "bearerAuth": [] }],
