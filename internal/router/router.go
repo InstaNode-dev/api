@@ -18,6 +18,7 @@ import (
 	"instant.dev/internal/email"
 	"instant.dev/internal/handlers"
 	"instant.dev/internal/middleware"
+	"instant.dev/internal/migrations"
 	"instant.dev/internal/plans"
 	"instant.dev/internal/providers/compute/k8s"
 	storageprovider "instant.dev/internal/providers/storage"
@@ -164,17 +165,28 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 
 	// ── Routes ───────────────────────────────────────────────────────────────
 
-	// Health check — emits buildinfo so operators / canaries / dashboards
-	// can verify which commit is actually running. All three fields are
-	// always present; uninstrumented binaries return the "dev" sentinel
-	// rather than empty strings so the wire shape stays stable.
+	// Health check — emits buildinfo (so operators / canaries / dashboards
+	// can verify which commit is actually running) plus migration state
+	// (so the same probe answers "did my migrations apply" alongside "is
+	// my image stale"). The migration read is cached for 60s per pod
+	// so /healthz stays <10ms p99 under readiness-probe traffic.
+	//
+	// Uninstrumented binaries return the "dev" sentinel rather than empty
+	// strings so the wire shape stays stable. When the DB is unreachable
+	// migration_status becomes "unknown" but the response stays 200 — the
+	// service is up, only the tracking read failed.
+	migrationReader := migrations.NewReader(db, 0, nil)
 	app.Get("/healthz", func(c *fiber.Ctx) error {
+		mstate := migrationReader.Get(c.UserContext())
 		return c.JSON(fiber.Map{
-			"ok":         true,
-			"service":    "instant.dev",
-			"commit_id":  buildinfo.GitSHA,
-			"build_time": buildinfo.BuildTime,
-			"version":    buildinfo.Version,
+			"ok":                true,
+			"service":           "instant.dev",
+			"commit_id":         buildinfo.GitSHA,
+			"build_time":        buildinfo.BuildTime,
+			"version":           buildinfo.Version,
+			"migration_version": mstate.Filename,
+			"migration_count":   mstate.Count,
+			"migration_status":  mstate.Status,
 		})
 	})
 
