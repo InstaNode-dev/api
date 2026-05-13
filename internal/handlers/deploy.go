@@ -273,8 +273,9 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 	}
 
 	// Optional environment scope: ?env=staging or multipart "env" field.
-	// Empty defaults to "production". Validation is centralised in
-	// models.NormalizeEnv via resolveEnv.
+	// Empty defaults to "development" (post-migration 026 — see
+	// models.EnvDefault). Validation is centralised in models.NormalizeEnv
+	// via resolveEnv.
 	envBody := ""
 	if vals := form.Value["env"]; len(vals) > 0 {
 		envBody = vals[0]

@@ -10,9 +10,26 @@ import (
 	"github.com/google/uuid"
 )
 
-// EnvProduction is the default environment used when callers omit one.
-// All migration-backfilled rows start at this value.
+// EnvProduction names the "production" environment. Kept as a typed constant
+// because several listing/promotion code paths still reference it by name.
+// NOTE: this is no longer the default — see EnvDevelopment.
 const EnvProduction = "production"
+
+// EnvDevelopment is the default environment used when callers omit one.
+// Migration 026 flipped the DB column DEFAULT to match.
+//
+// WHY (product directive, 2026-05-13): accidental no-env provisions should
+// land in the lowest-stakes bucket. Defaulting to "production" silently
+// merged experimental work with real prod state — the new default sends
+// no-env callers to "development" so the mistake is recoverable. Callers
+// that explicitly send env="production" continue to work unchanged
+// (validated by envPattern; behaviour identical pre/post this change).
+const EnvDevelopment = "development"
+
+// EnvDefault is the canonical name for the default env. Use this in new code
+// instead of referencing EnvDevelopment directly so a future change to the
+// default doesn't ripple through every call site.
+const EnvDefault = EnvDevelopment
 
 // Canonical resource_type strings used by the handlers and model layer.
 // Keep these in one place so callers performing same-type checks (e.g.
@@ -31,11 +48,16 @@ const (
 // background jobs, internal endpoints) gets the same guarantee.
 var envPattern = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
 
-// NormalizeEnv coerces an empty env to EnvProduction (backwards compat) and
+// NormalizeEnv coerces an empty env to EnvDefault (currently "development") and
 // validates the format. Returns (env, true) when valid, ("", false) otherwise.
+//
+// The default flipped from "production" → "development" in migration 026
+// (2026-05-13) so accidental no-env provisions land in the lowest-stakes
+// bucket. Callers that explicitly pass "production" continue to work
+// unchanged.
 func NormalizeEnv(env string) (string, bool) {
 	if env == "" {
-		return EnvProduction, true
+		return EnvDefault, true
 	}
 	if !envPattern.MatchString(env) {
 		return "", false
@@ -53,7 +75,7 @@ type Resource struct {
 	ConnectionURL      sql.NullString // AES-256-GCM encrypted
 	KeyPrefix          sql.NullString // provisioner key prefix (e.g. "pool_abc:") for Redis
 	Tier               string
-	Env                string // dev | staging | production | <custom>; defaults to "production"
+	Env                string // dev | staging | production | <custom>; defaults to "development" (mig 026)
 	Fingerprint        sql.NullString
 	CloudVendor        sql.NullString
 	CountryCode        sql.NullString
@@ -85,7 +107,7 @@ type CreateResourceParams struct {
 	ResourceType     string
 	Name             string
 	Tier             string
-	Env              string // empty string is normalised to EnvProduction
+	Env              string // empty string is normalised to EnvDefault ("development")
 	Fingerprint      string
 	CloudVendor      string
 	CountryCode      string
@@ -143,7 +165,7 @@ func CreateResource(ctx context.Context, db *sql.DB, p CreateResourceParams) (*R
 
 	env := p.Env
 	if env == "" {
-		env = EnvProduction
+		env = EnvDefault
 	}
 
 	row := db.QueryRowContext(ctx, `
@@ -285,11 +307,12 @@ func ListResourcesByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]*
 }
 
 // ListResourcesByTeamAndEnv returns all active resources for a team filtered to
-// a single environment. Empty env is normalised to "production" so callers that
-// omit the param see prod resources by default.
+// a single environment. Empty env is normalised to EnvDefault ("development")
+// so callers that omit the param see the default env's resources — matches
+// the post-migration-026 default for /db/new and friends.
 func ListResourcesByTeamAndEnv(ctx context.Context, db *sql.DB, teamID uuid.UUID, env string) ([]*Resource, error) {
 	if env == "" {
-		env = EnvProduction
+		env = EnvDefault
 	}
 	rows, err := db.QueryContext(ctx, `
 		SELECT `+resourceColumns+`
