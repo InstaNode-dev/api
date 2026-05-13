@@ -416,16 +416,34 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	auditH := handlers.NewAuditHandler(db)
 	api.Get("/audit", auditH.List)
 
-	// Admin / customer-management surface (Track A). Gated by RequireAdmin
-	// which reads the JWT email against ADMIN_EMAILS (closed by default —
-	// an empty/unset env var rejects every caller). See
-	// internal/middleware/admin.go for the allowlist contract.
-	adminCustH := handlers.NewAdminCustomersHandler(db, planRegistry)
-	adminGroup := api.Group("/admin", middleware.RequireAdmin())
-	adminGroup.Get("/customers", adminCustH.List)
-	adminGroup.Get("/customers/:team_id", adminCustH.Detail)
-	adminGroup.Post("/customers/:team_id/tier", adminCustH.ChangeTier)
-	adminGroup.Post("/customers/:team_id/promo", adminCustH.IssuePromo)
+	// Admin / customer-management surface (Track A). Two independent gates:
+	//
+	//   Gate 1 — UNGUESSABLE PATH PREFIX (cfg.AdminPathPrefix). When the
+	//            env var ADMIN_PATH_PREFIX is empty/unset, the admin routes
+	//            are NOT registered at all. /api/v1/admin/customers returns
+	//            404, drive-by scanners get no signal. When set, routes
+	//            register under /api/v1/<prefix>/customers/... — the literal
+	//            /api/v1/admin/customers is never a valid route.
+	//
+	//   Gate 2 — ADMIN_EMAILS ALLOWLIST (middleware.RequireAdmin). Reads
+	//            the JWT email against ADMIN_EMAILS, closed by default —
+	//            an unset/empty env var rejects every caller. See
+	//            internal/middleware/admin.go for the allowlist contract.
+	//
+	// Either gate alone is insufficient: the path is a secret with the same
+	// blast radius as a session token, and the allowlist is the second factor.
+	// Defense in depth, not security-through-obscurity-alone.
+	//
+	// IMPORTANT: the admin endpoints are intentionally NOT documented in
+	// the public OpenAPI spec (/openapi.json). See handlers/openapi.go.
+	if cfg.AdminPathPrefix != "" {
+		adminCustH := handlers.NewAdminCustomersHandler(db, planRegistry)
+		adminGroup := api.Group("/"+cfg.AdminPathPrefix, middleware.RequireAdmin())
+		adminGroup.Get("/customers", adminCustH.List)
+		adminGroup.Get("/customers/:team_id", adminCustH.Detail)
+		adminGroup.Post("/customers/:team_id/tier", adminCustH.ChangeTier)
+		adminGroup.Post("/customers/:team_id/promo", adminCustH.IssuePromo)
+	}
 
 	// Quota-wall nudge endpoint — Track U1. Returns the most recent
 	// near_quota_wall row (written by the worker's QuotaWallNudgeWorker)
