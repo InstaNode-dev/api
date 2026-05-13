@@ -38,10 +38,12 @@ func agentActionContractCases() map[string]string {
 		"AgentActionPromotionInvalid":                  AgentActionPromotionInvalid,
 		"AgentActionPromotionAlreadyUsed":              AgentActionPromotionAlreadyUsed,
 		"AgentActionPromotionExpired":                  AgentActionPromotionExpired,
+		"AgentActionPromoteTokenExpired":               AgentActionPromoteTokenExpired,
 
 		// Builders — representative inputs covering tier/env/role/limit
 		// interpolation.
 		"newAgentActionDeploymentLimitReached(hobby,1)":  newAgentActionDeploymentLimitReached("hobby", 1),
+		"newAgentActionPromoteApprovalSent(prod,email)":  newAgentActionPromoteApprovalSent("production", "owner@example.com"),
 		"newAgentActionStorageLimitReached(hobby,500)":   newAgentActionStorageLimitReached("hobby", 500),
 		"newAgentActionVaultQuotaExceeded(hobby,50)":     newAgentActionVaultQuotaExceeded("hobby", 50),
 		"newAgentActionEnvPolicyDenied(prod,deploy)":     newAgentActionEnvPolicyDenied("production", "deploy", "owner", "developer"),
@@ -98,6 +100,7 @@ func assertContract(t *testing.T, name, s string) {
 		"email",
 		"Remove", "remove", // family-disabled
 		"Redeploy", "redeploy",
+		"Re-request", "re-request", // promote approval link expired
 		"Confirm", "confirm",
 		"check ", "Check ", // bindings cross-team / not-found
 		"use ", "Use ", // bindings not-found

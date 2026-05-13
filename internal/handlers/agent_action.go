@@ -283,3 +283,34 @@ func newAgentActionAdminPromoIssued(teamID, code string) string {
 		code, teamID,
 	)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Promote-approval walls (POST /api/v1/stacks/:slug/promote +
+// POST /api/v1/resources/:id/provision-twin, non-dev target envs)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// newAgentActionPromoteApprovalSent is returned in the 202 response body when
+// the API has accepted a promote / twin-provision request that targets a
+// non-development env. Names the env, the email recipient, and the next
+// action — the LLM agent re-articulates "go check your inbox" to the human
+// in front of it. Dev-env promotes bypass this code path entirely (immediate
+// execute), so this string never fires for development targets.
+//
+// The 24h validity window is reproduced verbatim so the agent doesn't have
+// to fish it out of the JSON body's expires_at field.
+func newAgentActionPromoteApprovalSent(toEnv, recipientEmail string) string {
+	if recipientEmail == "" {
+		recipientEmail = "the team owner's email"
+	}
+	return fmt.Sprintf(
+		"Tell the user the promote to %s requires email approval. Check %s for a link expiring in 24h. Dev-env promotes skip this step. Track at https://instanode.dev/app/promotions.",
+		toEnv, recipientEmail,
+	)
+}
+
+// AgentActionPromoteTokenExpired is returned by the GET /approve/:token
+// HTML response copy (rendered in-page) and as the agent_action on any
+// retry attempt that hits an expired link. The user must re-request the
+// promote from the dashboard — re-using the same email link will never
+// work because the row's status is now 'expired'.
+const AgentActionPromoteTokenExpired = "Tell the user the approval link expired. Re-request the promote at https://instanode.dev/app — links are valid for 24h."

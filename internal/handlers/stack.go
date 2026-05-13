@@ -1243,6 +1243,12 @@ func (h *StackHandler) Family(c *fiber.Ctx) error {
 
 // ── POST /api/v1/stacks/:slug/promote ────────────────────────────────────────
 
+// envDevelopment is the only env name that bypasses the email-link approval
+// gate (migration 026). Held as a const so the stack.Promote and
+// twin.ProvisionTwin handlers agree on the exact string — drift between the
+// two would let a typo'd "dev" sneak past one gate but not the other.
+const envDevelopment = "development"
+
 // promoteBody is the JSON body for POST /api/v1/stacks/:slug/promote.
 //
 //	From:      source env (e.g. "staging"). Defaults to the source stack's env.
@@ -1257,10 +1263,18 @@ func (h *StackHandler) Family(c *fiber.Ctx) error {
 //	           Pointer-typed so we can distinguish "field omitted" (= true)
 //	           from "explicitly false".
 type promoteBody struct {
-	From      string `json:"from"`
-	To        string `json:"to"`
-	Name      string `json:"name"`
-	CopyVault *bool  `json:"copy_vault,omitempty"`
+	From       string `json:"from"`
+	To         string `json:"to"`
+	Name       string `json:"name"`
+	CopyVault  *bool  `json:"copy_vault,omitempty"`
+	// ApprovalID is the manual-trigger escape for the email-link approval
+	// workflow (migration 026). When the operator has clicked the approval
+	// link OUTSIDE the worker poll loop, they can pass approval_id here to
+	// have the API replay the promote immediately. Empty in the normal
+	// flow — the worker (separate PR) consumes approved rows on its own
+	// cadence and never round-trips through this body. Dev-env promotes
+	// ignore this field.
+	ApprovalID string `json:"approval_id,omitempty"`
 }
 
 // promoteCopyVaultDefault is the value used when the request body omits the
@@ -1508,6 +1522,53 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 	if source.Env != from {
 		return respondError(c, fiber.StatusConflict, "env_mismatch",
 			fmt.Sprintf("Source stack %s is in env %q, not %q", slug, source.Env, from))
+	}
+
+	// Email-link approval gate. Per product directive (2026-05-12): any
+	// promote targeting a non-development env requires the operator to
+	// click a single-use email link before the promote actually runs.
+	// Dev-env promotes bypass this gate entirely — the inner-loop dev
+	// experience stays one-call, no inbox round-trip. See
+	// migration 026_promote_approvals.sql for the table backing the
+	// pending row.
+	//
+	// The pending path is short-circuit: we don't pull source services,
+	// don't copy vault refs, and don't trigger compute work. The cached
+	// promote_payload carries everything the worker (or the manual
+	// re-call path) needs to replay this exact promote after approval.
+	//
+	// Optional escape: if the body carries an explicit approval_id that
+	// matches an approved (status='approved') row for this team + same
+	// from/to, we proceed to execute immediately. This is the
+	// "manual trigger" path the worker will replace.
+	if to != envDevelopment && body.ApprovalID == "" {
+		row, pendingErr := h.beginPromoteApproval(c, team, source, body, from, to)
+		if pendingErr != nil {
+			return pendingErr
+		}
+		// 202 — accepted but not yet executed. Body shape is documented
+		// in OpenAPI; carries the agent_action string so a MCP/CLI caller
+		// can tell the user "check your email."
+		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+			"ok":           true,
+			"status":       "pending_approval",
+			"approval_id":  row.ID.String(),
+			"expires_at":   row.ExpiresAt.UTC().Format(time.RFC3339),
+			"from":         from,
+			"to":           to,
+			"source":       slug,
+			"agent_action": newAgentActionPromoteApprovalSent(to, row.RequestedByEmail),
+			"note":         "Click the link in your email to approve the promote. Dev-env promotes skip this step.",
+		})
+	}
+	// approval_id supplied — verify it matches an approved, non-executed
+	// row for THIS team, with matching from/to/kind. The worker (when it
+	// lands) will short-circuit this branch and run the promote on its
+	// own poll cadence; until then this path is the manual trigger.
+	if body.ApprovalID != "" {
+		if err := h.consumeApprovedPromote(c, team, body, from, to, models.PromoteApprovalKindStack); err != nil {
+			return err
+		}
 	}
 
 	// Step A: Pull the source's services. If ANY service is missing
@@ -1790,6 +1851,142 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 		"vault_keys_copied": copiedVaultKeys,
 		"note":              "Promoted to " + to + ". Poll GET /stacks/" + target.Slug + " for status.",
 	})
+}
+
+// beginPromoteApproval persists a pending row to promote_approvals and emits
+// the audit_log event the Brevo forwarder picks up to send the approval
+// email. Returns the row on success, or a respondError-style sentinel on
+// any input validation failure (the response has already been written).
+//
+// Why this lives in stack.go (not a generic shared helper): the request
+// body decoding + the "summary" line that lands in the audit row are
+// stack-specific. Twin.ProvisionTwin has its own near-identical helper
+// in twin.go so the kind-specific metadata stays close to the call site.
+func (h *StackHandler) beginPromoteApproval(
+	c *fiber.Ctx,
+	team *models.Team,
+	source *models.Stack,
+	body promoteBody,
+	from, to string,
+) (*models.PromoteApproval, error) {
+	// Capture the original JSON payload so the worker (or a manual
+	// re-call with approval_id) can replay this exact promote without
+	// re-fetching state that may have changed in the meantime.
+	payload, mErr := json.Marshal(body)
+	if mErr != nil {
+		return nil, respondError(c, fiber.StatusBadRequest, "invalid_body",
+			"Failed to marshal promote payload")
+	}
+
+	requestedBy := middleware.GetEmail(c)
+	if requestedBy == "" {
+		// We require an authenticated email to issue an approval link —
+		// the email IS the approver identity. RequireAuth runs on this
+		// route, so the only realistic miss is a token without an email
+		// claim (legacy / service tokens). Tell the caller cleanly.
+		return nil, respondError(c, fiber.StatusBadRequest, "missing_email",
+			"Approval workflow needs an authenticated email on the session token")
+	}
+
+	row, err := CreatePromoteApprovalAndEmit(c.Context(), h.db, PromoteApprovalRequest{
+		TeamID:           team.ID,
+		RequestedByEmail: requestedBy,
+		PromoteKind:      models.PromoteApprovalKindStack,
+		PromotePayload:   payload,
+		FromEnv:          from,
+		ToEnv:            to,
+		Summary:          "Promote approval requested: " + source.Slug + " " + from + " → " + to,
+		EmailMetaExtras: map[string]any{
+			"stack_slug": source.Slug,
+			"stack_name": source.Name,
+		},
+	})
+	if err != nil {
+		slog.Error("stack.promote.approval_insert_failed",
+			"error", err, "team_id", team.ID, "source_slug", source.Slug,
+			"from", from, "to", to,
+			"request_id", middleware.GetRequestID(c))
+		return nil, respondError(c, fiber.StatusServiceUnavailable, "approval_failed",
+			"Failed to persist promote approval request")
+	}
+	return row, nil
+}
+
+// consumeApprovedPromote verifies that an explicit approval_id supplied
+// by the caller matches an APPROVED but NOT-YET-EXECUTED row for the
+// same team / from / to / kind, and atomically flips the row to
+// 'executed'. Used by the manual-trigger fallback path until the
+// worker-side polling lands.
+//
+// Why we check from/to/kind in addition to the id: the approval row's
+// payload is what the worker would replay. If a caller passes an
+// approval_id for env=preprod but the request is to=production, we
+// refuse — the row's authority covers the env pair it was issued for,
+// not whatever the caller is asking for now.
+func (h *StackHandler) consumeApprovedPromote(
+	c *fiber.Ctx,
+	team *models.Team,
+	body promoteBody,
+	from, to, kind string,
+) error {
+	id, err := uuid.Parse(body.ApprovalID)
+	if err != nil {
+		return respondError(c, fiber.StatusBadRequest, "invalid_approval_id",
+			"approval_id must be a valid UUID")
+	}
+	row, err := models.GetPromoteApprovalByID(c.Context(), h.db, id)
+	if errors.Is(err, models.ErrPromoteApprovalNotFound) {
+		return respondError(c, fiber.StatusNotFound, "approval_not_found",
+			"approval_id does not match any approval row")
+	}
+	if err != nil {
+		slog.Error("stack.promote.approval_lookup_failed",
+			"error", err, "approval_id", id,
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusServiceUnavailable, "lookup_failed",
+			"Failed to look up approval")
+	}
+	if row.TeamID != team.ID {
+		// Cross-team — same posture as stack ownership: 404 not 403.
+		return respondError(c, fiber.StatusNotFound, "approval_not_found",
+			"approval_id does not match any approval row for this team")
+	}
+	if row.Status != models.PromoteApprovalStatusApproved {
+		return respondError(c, fiber.StatusConflict, "approval_not_approved",
+			"approval row is in status="+row.Status+" — must be 'approved' to consume")
+	}
+	if row.PromoteKind != kind || row.FromEnv != from || row.ToEnv != to {
+		return respondError(c, fiber.StatusBadRequest, "approval_mismatch",
+			"approval_id's recorded (kind,from,to) does not match this request")
+	}
+	if row.ExpiresAt.Before(time.Now().UTC()) {
+		// Even approved rows have an outer expiry — once the 24h window
+		// has fully passed since the original request we refuse to
+		// execute. This is belt-and-suspenders defence; the worker
+		// repo's polling job would refuse for the same reason.
+		return respondError(c, fiber.StatusGone, "approval_expired",
+			"approval window has fully expired")
+	}
+	ok, err := models.MarkPromoteApprovalExecuted(c.Context(), h.db, id)
+	if err != nil {
+		slog.Error("stack.promote.approval_execute_failed",
+			"error", err, "approval_id", id,
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusServiceUnavailable, "execute_failed",
+			"Failed to mark approval executed")
+	}
+	if !ok {
+		return respondError(c, fiber.StatusConflict, "approval_already_executed",
+			"approval row has already been executed")
+	}
+	// Audit the executed transition. Best-effort, never blocks.
+	go emitPromoteAuditEvent(context.Background(), h.db, row, models.AuditKindPromoteExecuted,
+		"Promote executed via approval "+row.ID.String()+" ("+from+" → "+to+")",
+		map[string]any{
+			"approval_id": row.ID.String(),
+			"executed_by": middleware.GetEmail(c),
+		})
+	return nil
 }
 
 // toString stringifies an optional UUID pointer for JSON responses (returns ""
