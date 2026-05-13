@@ -609,6 +609,42 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/resources/{id}/pause": {
+      "post": {
+        "summary": "Pause a resource (suspend without deletion)",
+        "description": "Sets status to 'paused' and runs the provider-side revoke (REVOKE CONNECT for postgres, ACL SETUSER off for redis, revokeRolesFromUser for mongodb; queue/storage/webhook are pure status flips). The connection URL is preserved on resume — no re-issuance. Paused resources STOP counting against the per-type resource quota, but storage_bytes STILL counts toward the storage cap so pause-and-bloat is not a valid escape. Tier-gated to Pro+. Idempotent error: a second pause on an already-paused resource returns 409 already_paused.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Resource paused", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string", "format": "uuid" }, "token": { "type": "string", "format": "uuid" }, "status": { "type": "string", "enum": ["paused"] }, "message": { "type": "string" } } } } } },
+          "400": { "description": "invalid_id — :id is not a valid UUID" },
+          "401": { "description": "Unauthorized — session token required" },
+          "402": { "description": "upgrade_required — pause/resume requires Pro+. Body: { error: 'upgrade_required', upgrade_url, agent_action }." },
+          "403": { "description": "Forbidden — caller doesn't own the resource" },
+          "404": { "description": "not_found — resource doesn't exist" },
+          "409": { "description": "already_paused — the resource is already paused (idempotent error)" },
+          "503": { "description": "provider_failed — the provider-side revoke failed; the DB row is unchanged" }
+        }
+      }
+    },
+    "/api/v1/resources/{id}/resume": {
+      "post": {
+        "summary": "Resume a paused resource (restore from same data)",
+        "description": "Flips status from 'paused' back to 'active' and re-grants the provider-side connection (GRANT CONNECT / ACL on / grantRolesToUser). The connection URL is preserved unchanged — no re-issuance, no new password — so any existing client config still works. Tier-gated to Pro+ in symmetry with pause.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Resource resumed", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string", "format": "uuid" }, "token": { "type": "string", "format": "uuid" }, "status": { "type": "string", "enum": ["active"] }, "message": { "type": "string" } } } } } },
+          "400": { "description": "invalid_id" },
+          "401": { "description": "Unauthorized" },
+          "402": { "description": "upgrade_required — pause/resume requires Pro+" },
+          "403": { "description": "Forbidden" },
+          "404": { "description": "not_found" },
+          "409": { "description": "not_paused — the resource isn't currently paused" },
+          "503": { "description": "provider_failed — the provider-side grant failed; the DB row is unchanged" }
+        }
+      }
+    },
     "/api/v1/resources/families": {
       "get": {
         "summary": "List resource families for the authenticated team",

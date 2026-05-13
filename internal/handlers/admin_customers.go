@@ -649,9 +649,14 @@ func (h *AdminCustomersHandler) ChangeTier(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "db_failed", "Failed to update tier")
 	}
 
-	fromR := adminTierRank(fromTier)
-	toR := adminTierRank(req.Tier)
-	isDemote := toR < fromR && fromR > 0 && toR >= 0
+	fromR := plans.Rank(fromTier)
+	toR := plans.Rank(req.Tier)
+	// Guard against the -1 sentinel (unknown tier on either side).
+	// adminAllowedTiers already restricts req.Tier to {free,hobby,pro,team}
+	// at validate-time, but fromTier comes straight from the DB and could
+	// historically have been anonymous/growth on some teams — treat any
+	// negative rank as "no transition direction" rather than guessing.
+	isDemote := fromR >= 0 && toR >= 0 && toR < fromR
 
 	// Promote existing permanent resources only when this is a real
 	// promotion (rank goes up). Downgrades leave existing rows on their
@@ -898,23 +903,6 @@ func (h *AdminCustomersHandler) computeMRR(tier string) (int, int) {
 	canonical := plans.CanonicalTier(tier)
 	monthly := h.plans.PriceMonthly(canonical)
 	return monthly, monthly * 12
-}
-
-// adminTierRank returns the rank of a tier for promote-vs-downgrade
-// detection. Higher = more privileged. Unknown tiers rank as -1 so they
-// never trigger an unintended elevation.
-func adminTierRank(tier string) int {
-	switch tier {
-	case AdminTierTeam:
-		return 4
-	case AdminTierPro:
-		return 3
-	case AdminTierHobby:
-		return 2
-	case AdminTierFree:
-		return 1
-	}
-	return -1
 }
 
 // adminParseTierFilter parses the ?tier query value into the deduped set
