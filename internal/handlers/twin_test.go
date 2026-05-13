@@ -226,6 +226,11 @@ func TestProvisionTwin_SameEnv_Returns400(t *testing.T) {
 //     family — the migration-level partial unique index is the schema
 //     guard; the handler returns a friendly 409 instead of leaking the
 //     Postgres constraint string.
+//
+//     Uses env="development" so the migration-026 email-link approval
+//     gate is bypassed (dev-env twins execute immediately). The
+//     duplicate-twin guard is the contract under test here, not the
+//     approval flow — that lives in promote_approval_test.go.
 func TestProvisionTwin_DuplicateInEnv_Returns409(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
@@ -238,10 +243,10 @@ func TestProvisionTwin_DuplicateInEnv_Returns409(t *testing.T) {
 	jwt := twinJWT(t, db, teamID)
 
 	rootID, sourceToken := seedTwinSource(t, db, teamID, "postgres", "pro")
-	// Pre-existing staging sibling occupies the target slot.
-	seedTwinSibling(t, db, teamID, rootID, "postgres", "pro", "staging")
+	// Pre-existing development sibling occupies the target slot.
+	seedTwinSibling(t, db, teamID, rootID, "postgres", "pro", "development")
 
-	resp := postTwin(t, app, sourceToken, jwt, map[string]any{"env": "staging"})
+	resp := postTwin(t, app, sourceToken, jwt, map[string]any{"env": "development"})
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusConflict, resp.StatusCode)
 
@@ -319,6 +324,12 @@ func TestProvisionTwin_BadEnv_Returns400(t *testing.T) {
 //     posture as MustProvisionDB) so this stays green on minimal dev
 //     machines. The DB row is also asserted directly to confirm
 //     parent_resource_id points at the family root.
+//
+//     Uses env="development" so the migration-026 email-link approval
+//     gate is bypassed — the happy-path provisioning contract is the
+//     contract under test here, NOT the approval flow. Non-dev happy-
+//     path coverage lives in promote_approval_test.go via the
+//     manual-trigger approval_id branch.
 func TestProvisionTwin_Pro_HappyPath_Returns201(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
@@ -334,8 +345,8 @@ func TestProvisionTwin_Pro_HappyPath_Returns201(t *testing.T) {
 	rootID, sourceToken := seedTwinSource(t, db, teamID, "postgres", "pro")
 
 	resp := postTwin(t, app, sourceToken, jwt, map[string]any{
-		"env":  "staging",
-		"name": "my-app-db-staging",
+		"env":  "development",
+		"name": "my-app-db-development",
 	})
 	defer resp.Body.Close()
 
@@ -368,7 +379,7 @@ func TestProvisionTwin_Pro_HappyPath_Returns201(t *testing.T) {
 	assert.NotEmpty(t, ok.Token)
 	assert.NotEmpty(t, ok.ConnectionURL, "twin must carry a fresh connection_url")
 	assert.Equal(t, "pro", ok.Tier, "twin inherits source.Tier")
-	assert.Equal(t, "staging", ok.Env)
+	assert.Equal(t, "development", ok.Env)
 	assert.Equal(t, rootID, ok.FamilyRootID, "twin's family_root_id must point at the source root")
 
 	// Verify the DB row carries the linkage. Belt-and-braces — the JSON
@@ -381,5 +392,5 @@ func TestProvisionTwin_Pro_HappyPath_Returns201(t *testing.T) {
 	).Scan(&parentID, &env))
 	require.True(t, parentID.Valid, "twin row must have parent_resource_id set")
 	assert.Equal(t, rootID, parentID.String, "DB row parent_resource_id must equal source root id")
-	assert.Equal(t, "staging", env)
+	assert.Equal(t, "development", env)
 }

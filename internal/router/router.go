@@ -213,6 +213,13 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Get("/claim/preview", onboardH.ClaimPreview)
 	app.Post("/claim", onboardH.Claim)
 
+	// Email-link approval workflow for non-dev env promotions (migration 026).
+	// Public, token-IS-the-credential route — never sits inside the /api/v1
+	// RequireAuth group. Rate-limited per-IP inside the handler (defends the
+	// token space against brute-force).
+	promoteApprovalH := handlers.NewPromoteApprovalHandler(db, rdb)
+	app.Get("/approve/:token", promoteApprovalH.Approve)
+
 	// Provisioning — Phase 2+ (gated by IsServiceEnabled in each handler)
 	// OptionalAuth is registered per-route rather than via app.Group("/", ...) to avoid
 	// accidentally applying it globally to all routes (Fiber's "/" group prefix matches everything).
@@ -549,6 +556,14 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		// Deploy-identity append-only log (PR #57). Answers "which binary at $TIME?"
 		deploysAuditH := handlers.NewDeploysAuditHandler(db)
 		adminGroup.Get("/deploys", deploysAuditH.List)
+
+		// Promote-approval admin surface (migration 026). Read-only list
+		// + a reject endpoint that flips a pending row to rejected. The
+		// public GET /approve/:token route is wired ABOVE outside the
+		// admin gate — clicking the email link does NOT require an
+		// admin session (the token IS the credential there).
+		adminGroup.Get("/promotions", promoteApprovalH.List)
+		adminGroup.Post("/promotions/:id/reject", promoteApprovalH.Reject)
 	}
 
 	// Quota-wall nudge endpoint — Track U1. Returns the most recent

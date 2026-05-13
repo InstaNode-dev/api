@@ -45,27 +45,21 @@ const (
 	// the call failed — operator must reconcile in the Razorpay dashboard."
 	AuditKindSubscriptionCanceledByAdmin = "subscription.canceled_by_admin"
 
-	// AuditKindAdminAccess fires on every hit to the admin route prefix —
-	// success (2xx) AND rejected (403). Written by middleware.AdminAuditEmit
-	// installed on the admin route group after RequireAdmin. Drives the BI
-	// query "who accessed what admin surface and when" and supplies the
-	// raw signal an SOC dashboard pivots on if leaked admin credentials
-	// are suspected.
-	//
-	// Metadata shape (verified by middleware.adminAuditMetadata):
-	//
-	//	{
-	//	  "email":            "<caller's JWT email, lowercased>",
-	//	  "ip":               "<client IP — same source as the fingerprint>",
-	//	  "path_suffix":      "<path with the secret prefix stripped, e.g. customers/:team_id/tier>",
-	//	  "http_status":      <int>,
-	//	  "user_agent_brief": "<first 120 chars of UA, scrubbed of tokens>"
-	//	}
-	//
-	// CRITICAL: path_suffix is the SUFFIX only — the unguessable
-	// ADMIN_PATH_PREFIX is stripped before persistence. Storing the
-	// full path would defeat the whole point of the prefix gate
-	// (a DB read would leak the secret to anyone with audit_log access).
-	// The metadata blob is asserted prefix-free in tests via grep.
+	// AuditKindPromoteApprovalRequested fires when the agent API creates a
+	// pending promote_approvals row (target env != development).
+	AuditKindPromoteApprovalRequested = "promote.approval_requested"
+
+	// AuditKindPromoteApproved fires when the user clicks the email link.
+	AuditKindPromoteApproved = "promote.approved"
+
+	// AuditKindPromoteRejected fires when an admin marks a row 'rejected'.
+	AuditKindPromoteRejected = "promote.rejected"
+
+	// AuditKindPromoteExecuted fires when the worker executes the cached promote.
+	AuditKindPromoteExecuted = "promote.executed"
+
+	// AuditKindAdminAccess fires on every hit to the admin route prefix.
+	// path_suffix MUST be the suffix only — the unguessable
+	// ADMIN_PATH_PREFIX is stripped before persistence.
 	AuditKindAdminAccess = "admin.access"
 )

@@ -304,6 +304,27 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS uq_deploys_audit_identity ON deploys_audit(service, commit_id, image_digest)`,
 		`CREATE INDEX IF NOT EXISTS idx_deploys_audit_service_time ON deploys_audit(service, applied_at DESC)`,
+		// 026_promote_approvals — email-link approval workflow for non-dev
+		// env promotions. Mirrored here so handler tests bringing up a fresh
+		// test DB get the table without running the SQL migration separately.
+		`CREATE TABLE IF NOT EXISTS promote_approvals (
+			id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			token              TEXT UNIQUE NOT NULL,
+			team_id            UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			requested_by_email TEXT NOT NULL,
+			promote_kind       TEXT NOT NULL,
+			promote_payload    JSONB NOT NULL,
+			from_env           TEXT NOT NULL,
+			to_env             TEXT NOT NULL,
+			status             TEXT NOT NULL DEFAULT 'pending',
+			created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+			expires_at         TIMESTAMPTZ NOT NULL,
+			approved_at        TIMESTAMPTZ,
+			executed_at        TIMESTAMPTZ,
+			rejected_at        TIMESTAMPTZ
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_promote_approvals_token ON promote_approvals(token) WHERE status = 'pending'`,
+		`CREATE INDEX IF NOT EXISTS idx_promote_approvals_pending_exec ON promote_approvals(status) WHERE status = 'approved' AND executed_at IS NULL`,
 	}
 
 	for _, s := range stmts {
