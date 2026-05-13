@@ -1,6 +1,6 @@
 {
   "name": "instant-api — p95 latency > 500ms (5m)",
-  "type": "NRQL",
+  "policyName": "instant-api alerts",
   "description": "Page when instant-api p95 latency exceeds 500ms sustained for 5 minutes. Tracks user-visible slowness on provisioning + dashboard read paths.",
   "enabled": true,
   "nrql": {
