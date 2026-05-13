@@ -18,12 +18,23 @@ infra/newrelic/
     p95-latency-high.json# p95 > 500ms over 5m
     worker-stalled.json  # no jobs processed in 10m
     nats-down.json       # >=3 NATS error logs in 5m
+  policies/
+    instant-api.json     # umbrella policy alerts attach to via policyName
+  tests/
+    bake_test.sh         # schema-shape regression tests (run pre-merge)
 ```
 
 Each JSON file is a stand-alone dashboard or alert condition payload in the shape
-NR's NerdGraph schema expects. The `accountIds: [0]` placeholders in dashboard
-queries are rewritten by the apply tooling (see below) to the real account ID
-before the API call.
+NR's NerdGraph schema expects. The `accountIds: ["${NEW_RELIC_ACCOUNT_ID}"]`
+substitution token in dashboard queries is rewritten by the apply tooling (see
+below) to the real account ID before the API call. Both `apply.sh` and the
+Terraform path read the same source files — neither needs a special pre-flight
+adapter step.
+
+Alert JSON files include a `policyName` field that links them to the umbrella
+policy declared in `policies/instant-api.json`. There is no `type` discriminator
+on alert JSON — the mutation name (`alertsNrqlConditionStaticCreate`) encodes
+that, and including `"type": "NRQL"` causes NerdGraph to reject the payload.
 
 ## Required env
 
@@ -59,8 +70,8 @@ provider "newrelic" {
 resource "newrelic_one_dashboard_json" "api_overview" {
   json = replace(
     file("${path.module}/dashboards/api-overview.json"),
-    "\"accountIds\": [0]",
-    "\"accountIds\": [${var.account_id}]",
+    "\"${NEW_RELIC_ACCOUNT_ID}\"",
+    tostring(var.account_id),
   )
 }
 
@@ -163,12 +174,22 @@ see `infra/k8s/README.md` (owned by track 6) for that procedure.
 ## Validation
 
 ```bash
-# Every JSON file must parse
-find infra/newrelic -name '*.json' -exec jq empty {} \;
+# Every JSON file must parse + the schema-shape bake assertions must hold
+bash infra/newrelic/tests/bake_test.sh
 
 # NRQL queries are not lintable offline — copy a query into the NR UI's
 # "Query your data" tool to sanity-check syntax after any edit.
 ```
+
+`bake_test.sh` enforces:
+
+- Every dashboard/alert/policy file parses as JSON.
+- Dashboards use the `"${NEW_RELIC_ACCOUNT_ID}"` substitution token, never
+  the legacy `[0]` placeholder.
+- Alerts have no top-level `"type"` field — NerdGraph rejects it on the
+  `NrqlConditionStaticInput` mutation.
+- Every alert has `policyName: "instant-api alerts"` linking to
+  `policies/instant-api.json`.
 
 ## Dependencies
 

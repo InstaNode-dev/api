@@ -1,0 +1,4 @@
+{
+  "name": "instant-api alerts",
+  "incidentPreference": "PER_CONDITION_AND_TARGET"
+}

@@ -1,6 +1,6 @@
 {
   "name": "instant-worker — no jobs processed in 10m",
-  "type": "NRQL",
+  "policyName": "instant-api alerts",
   "description": "Page when the worker has processed zero jobs for 10 minutes. Catches stalled River pollers, deadlocks against the platform DB, and pod crash loops missed by k8s readiness probes. Source: Log records emitted by River job middleware in track 4.",
   "enabled": true,
   "nrql": {
