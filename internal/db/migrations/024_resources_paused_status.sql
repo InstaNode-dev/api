@@ -20,10 +20,14 @@
 -- production schemas (where it was implicit). After the drop the new
 -- constraint is added that includes 'paused' as a permitted value.
 
+-- `reaped` is a legacy status produced by a prior worker cleanup job — ~220
+-- rows in prod carry it. Keep it in the allowed set so this migration is
+-- non-destructive; collapsing it into 'deleted' would erase the historical
+-- distinction between worker-reaped and user-deleted resources.
 ALTER TABLE resources DROP CONSTRAINT IF EXISTS resources_status_check;
 ALTER TABLE resources
     ADD CONSTRAINT resources_status_check
-    CHECK (status IN ('active', 'paused', 'expired', 'deleted'));
+    CHECK (status IN ('active', 'paused', 'expired', 'deleted', 'reaped'));
 
 ALTER TABLE resources ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ;
 
