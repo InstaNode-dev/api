@@ -1,6 +1,6 @@
 {
   "name": "instant-api — error rate > 1% (5m)",
-  "type": "NRQL",
+  "policyName": "instant-api alerts",
   "description": "Page when instant-api error rate exceeds 1% sustained for 5 minutes. Sourced from Transaction events emitted by track 3's Fiber NR middleware.",
   "enabled": true,
   "nrql": {
