@@ -430,6 +430,538 @@ func (h *ResourceHandler) RotateCredentials(c *fiber.Ctx) error {
 	})
 }
 
+// Pause handles POST /api/v1/resources/:id/pause — suspends a resource without
+// deleting it. Tier-gated to Pro+ (multi-env workflow). Sets resources.status =
+// 'paused' and stamps paused_at; the provider-side action revokes the
+// connection so paused resources don't accept new connections while paused.
+//
+// Atomicity rule: the provider-side revoke runs BEFORE the DB flip. If the
+// revoke fails, the DB row is left in 'active' and the caller gets a 503 —
+// the iron rule is "provider failures during pause should NOT change the DB
+// row state." If the DB flip fails after a successful revoke, we attempt to
+// roll the revoke back (best-effort grant on the way out).
+//
+// Errors:
+//
+//	400 invalid_id
+//	401 unauthorized
+//	402 upgrade_required (hobby/free) — carries agent_action + upgrade_url
+//	403 forbidden       (caller doesn't own resource)
+//	404 not_found
+//	409 already_paused  (idempotent error — row is already paused)
+//	503 provider_failed / pause_failed (transient infra)
+func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
+	requestID := middleware.GetRequestID(c)
+	ctx := c.UserContext()
+
+	teamID, err := parseTeamID(middleware.GetTeamID(c))
+	if err != nil {
+		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Valid session token required")
+	}
+
+	tokenStr := c.Params("id")
+	token, parseErr := uuid.Parse(tokenStr)
+	if parseErr != nil {
+		return respondError(c, fiber.StatusBadRequest, "invalid_id", "Resource ID must be a valid UUID")
+	}
+
+	resource, err := models.GetResourceByToken(ctx, h.db, token)
+	if err != nil {
+		var notFound *models.ErrResourceNotFound
+		if errors.As(err, &notFound) {
+			return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
+		}
+		slog.Error("resource.pause.lookup_failed", "error", err, "token", tokenStr, "request_id", requestID)
+		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch resource")
+	}
+
+	if !resource.TeamID.Valid || resource.TeamID.UUID != teamID {
+		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this resource")
+	}
+
+	// Cheap idempotency-error check up front: if the row is already paused
+	// we return 409 without touching the provider. Saves a wasteful REVOKE
+	// round-trip on a no-op call.
+	if resource.Status == "paused" {
+		return respondErrorWithAgentAction(c, fiber.StatusConflict, "already_paused",
+			"Resource is already paused.",
+			AgentActionResourceAlreadyPaused, "")
+	}
+	if resource.Status != "active" {
+		return respondError(c, fiber.StatusConflict, "invalid_state",
+			"Resource is "+resource.Status+" and cannot be paused")
+	}
+
+	// Tier gate: pause/resume is a Pro+ feature. Looked up after authz so an
+	// unauthenticated / wrong-team caller never learns the tier policy.
+	team, err := models.GetTeamByID(ctx, h.db, teamID)
+	if err != nil {
+		slog.Error("resource.pause.team_lookup_failed", "error", err, "team_id", teamID, "request_id", requestID)
+		return respondError(c, fiber.StatusServiceUnavailable, "team_lookup_failed", "Failed to look up team")
+	}
+	if !multiEnvTierAllowed(team.PlanTier) {
+		return respondPauseUpgradeRequired(c, team.PlanTier)
+	}
+
+	// Provider-side revoke FIRST. If this fails, the DB row stays 'active'
+	// and the caller gets a 503 — the iron-rule atomicity guarantee.
+	if provErr := h.pauseProvider(ctx, resource); provErr != nil {
+		slog.Error("resource.pause.provider_failed",
+			"error", provErr,
+			"resource_id", resource.ID,
+			"resource_type", resource.ResourceType,
+			"request_id", requestID,
+		)
+		return respondError(c, fiber.StatusServiceUnavailable, "provider_failed",
+			"Failed to suspend the underlying resource. The pause was not applied; retry in a few seconds.")
+	}
+
+	// DB flip. Wrapped in a defensive rollback: if the UPDATE fails after a
+	// successful provider revoke, undo the revoke so the resource stays
+	// reachable. Best-effort — a rollback failure is logged but the user
+	// still sees the original error.
+	if pauseErr := models.PauseResource(ctx, h.db, resource.ID); pauseErr != nil {
+		if errors.Is(pauseErr, models.ErrResourceNotActive) {
+			// Race: another caller flipped it between our SELECT and UPDATE.
+			// Roll back the revoke so the row's effective state matches the
+			// DB (which a parallel caller may have left as paused already —
+			// in which case the rollback is a no-op).
+			if rbErr := h.resumeProvider(context.Background(), resource); rbErr != nil {
+				slog.Warn("resource.pause.race_rollback_failed",
+					"error", rbErr, "resource_id", resource.ID, "request_id", requestID)
+			}
+			return respondErrorWithAgentAction(c, fiber.StatusConflict, "already_paused",
+				"Resource is already paused.",
+				AgentActionResourceAlreadyPaused, "")
+		}
+		slog.Error("resource.pause.db_update_failed",
+			"error", pauseErr, "resource_id", resource.ID, "request_id", requestID)
+		if rbErr := h.resumeProvider(context.Background(), resource); rbErr != nil {
+			slog.Warn("resource.pause.rollback_failed",
+				"error", rbErr, "resource_id", resource.ID, "request_id", requestID)
+		}
+		return respondError(c, fiber.StatusServiceUnavailable, "pause_failed",
+			"Failed to record pause; the resource was reverted to active.")
+	}
+
+	// Invalidate cached resource entry so subsequent GETs reflect the new state.
+	h.rdb.Del(ctx, fmt.Sprintf("res:%s", token.String()))
+
+	// Best-effort audit event. Failure must not block the response.
+	go func() {
+		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+			TeamID:       teamID,
+			Actor:        "agent",
+			Kind:         "resource.paused",
+			ResourceType: resource.ResourceType,
+			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
+			Summary:      "paused <strong>" + resource.ResourceType + "</strong> <code>" + token.String()[:8] + "</code>",
+		})
+	}()
+
+	slog.Info("resource.paused",
+		"resource_id", resource.ID,
+		"resource_type", resource.ResourceType,
+		"team_id", teamID,
+		"request_id", requestID,
+	)
+
+	return c.JSON(fiber.Map{
+		"ok":      true,
+		"id":      resource.ID,
+		"token":   resource.Token,
+		"status":  "paused",
+		"message": "Resource paused. Storage is preserved and the connection URL is unchanged; new connections are refused until resume.",
+	})
+}
+
+// Resume handles POST /api/v1/resources/:id/resume — flips a paused resource
+// back to 'active'. The connection URL is preserved unchanged (same password,
+// same host, same database name) so the customer's existing config still works.
+// Tier-gated to Pro+ in symmetry with Pause.
+//
+// Errors mirror Pause; 409 is `not_paused` when the row isn't in paused state.
+func (h *ResourceHandler) Resume(c *fiber.Ctx) error {
+	requestID := middleware.GetRequestID(c)
+	ctx := c.UserContext()
+
+	teamID, err := parseTeamID(middleware.GetTeamID(c))
+	if err != nil {
+		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Valid session token required")
+	}
+
+	tokenStr := c.Params("id")
+	token, parseErr := uuid.Parse(tokenStr)
+	if parseErr != nil {
+		return respondError(c, fiber.StatusBadRequest, "invalid_id", "Resource ID must be a valid UUID")
+	}
+
+	resource, err := models.GetResourceByToken(ctx, h.db, token)
+	if err != nil {
+		var notFound *models.ErrResourceNotFound
+		if errors.As(err, &notFound) {
+			return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
+		}
+		slog.Error("resource.resume.lookup_failed", "error", err, "token", tokenStr, "request_id", requestID)
+		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch resource")
+	}
+
+	if !resource.TeamID.Valid || resource.TeamID.UUID != teamID {
+		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this resource")
+	}
+
+	if resource.Status != "paused" {
+		return respondErrorWithAgentAction(c, fiber.StatusConflict, "not_paused",
+			"Resource is not paused (current status: "+resource.Status+").",
+			AgentActionResourceNotPaused, "")
+	}
+
+	team, err := models.GetTeamByID(ctx, h.db, teamID)
+	if err != nil {
+		slog.Error("resource.resume.team_lookup_failed", "error", err, "team_id", teamID, "request_id", requestID)
+		return respondError(c, fiber.StatusServiceUnavailable, "team_lookup_failed", "Failed to look up team")
+	}
+	if !multiEnvTierAllowed(team.PlanTier) {
+		return respondPauseUpgradeRequired(c, team.PlanTier)
+	}
+
+	// Provider-side grant FIRST. Iron-rule mirror of Pause: if the grant
+	// fails, the DB row stays 'paused' and the caller gets a 503.
+	if provErr := h.resumeProvider(ctx, resource); provErr != nil {
+		slog.Error("resource.resume.provider_failed",
+			"error", provErr,
+			"resource_id", resource.ID,
+			"resource_type", resource.ResourceType,
+			"request_id", requestID,
+		)
+		return respondError(c, fiber.StatusServiceUnavailable, "provider_failed",
+			"Failed to re-enable the underlying resource. The resume was not applied; retry in a few seconds.")
+	}
+
+	if resumeErr := models.ResumeResource(ctx, h.db, resource.ID); resumeErr != nil {
+		if errors.Is(resumeErr, models.ErrResourceNotPaused) {
+			// Race: someone flipped it back to active between SELECT and UPDATE.
+			// The provider is already granted; no rollback needed (it's an idempotent
+			// "re-grant" of an already-active row).
+			return respondErrorWithAgentAction(c, fiber.StatusConflict, "not_paused",
+				"Resource is not paused.",
+				AgentActionResourceNotPaused, "")
+		}
+		slog.Error("resource.resume.db_update_failed",
+			"error", resumeErr, "resource_id", resource.ID, "request_id", requestID)
+		if rbErr := h.pauseProvider(context.Background(), resource); rbErr != nil {
+			slog.Warn("resource.resume.rollback_failed",
+				"error", rbErr, "resource_id", resource.ID, "request_id", requestID)
+		}
+		return respondError(c, fiber.StatusServiceUnavailable, "resume_failed",
+			"Failed to record resume; the resource was re-suspended.")
+	}
+
+	h.rdb.Del(ctx, fmt.Sprintf("res:%s", token.String()))
+
+	go func() {
+		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+			TeamID:       teamID,
+			Actor:        "agent",
+			Kind:         "resource.resumed",
+			ResourceType: resource.ResourceType,
+			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
+			Summary:      "resumed <strong>" + resource.ResourceType + "</strong> <code>" + token.String()[:8] + "</code>",
+		})
+	}()
+
+	slog.Info("resource.resumed",
+		"resource_id", resource.ID,
+		"resource_type", resource.ResourceType,
+		"team_id", teamID,
+		"request_id", requestID,
+	)
+
+	return c.JSON(fiber.Map{
+		"ok":      true,
+		"id":      resource.ID,
+		"token":   resource.Token,
+		"status":  "active",
+		"message": "Resource resumed. The connection URL is unchanged — your existing config still works.",
+	})
+}
+
+// respondPauseUpgradeRequired is the canonical 402 for pause/resume tier walls.
+// Mirrors respondMultiEnvUpgradeRequired but carries a pause-specific
+// agent_action so the LLM tells the user about the right feature.
+func respondPauseUpgradeRequired(c *fiber.Ctx, currentTier string) error {
+	_ = c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
+		"ok":           false,
+		"error":        "upgrade_required",
+		"message":      "Pausing resources requires the Pro plan or higher. Your team is on the " + currentTier + " plan.",
+		"upgrade_url":  "https://instanode.dev/pricing",
+		"agent_action": AgentActionPauseRequiresPro,
+	})
+	return ErrResponseWritten
+}
+
+// pauseProvider runs the provider-side "stop accepting new connections" action
+// for the given resource. The DB row is NOT touched here — the caller is
+// responsible for the status flip. Returns nil for resource types that don't
+// have a provider-side pause (webhook/queue/storage are pure-status flips).
+func (h *ResourceHandler) pauseProvider(ctx context.Context, r *models.Resource) error {
+	switch r.ResourceType {
+	case models.ResourceTypePostgres:
+		if h.cfg.CustomerDatabaseURL == "" {
+			// No customer DB configured (test path) — no-op so the handler
+			// still exercises the full DB-update / status-flip codepath.
+			return nil
+		}
+		username := extractURLUsername(r.ConnectionURL.String, h.cfg.AESKey)
+		dbName := "db_" + r.Token.String()
+		return revokePostgresConnect(ctx, h.cfg.CustomerDatabaseURL, dbName, username)
+	case models.ResourceTypeRedis:
+		// Decrypt the URL only to extract the username; ACL SETUSER ... off
+		// disables the user reversibly without losing the password. This is
+		// the key reason we don't use ACL DELUSER — DELUSER would require us
+		// to store the password hash and recreate the user on resume, which
+		// is a one-way trip if the encrypted blob is lost.
+		plainURL := decryptOrEmpty(r.ConnectionURL.String, h.cfg.AESKey)
+		if plainURL == "" {
+			return nil // no URL stored — nothing to revoke
+		}
+		username := urlUsername(plainURL)
+		if username == "" {
+			return nil
+		}
+		return setRedisACLEnabled(ctx, plainURL, username, false)
+	case models.ResourceTypeMongoDB:
+		if h.cfg.MongoAdminURI == "" {
+			return nil
+		}
+		username := "usr_" + r.Token.String()
+		return revokeMongoRoles(ctx, h.cfg.MongoAdminURI, username, "db_"+r.Token.String())
+	default:
+		// queue / storage / webhook: status flip is the entire pause.
+		return nil
+	}
+}
+
+// resumeProvider is the inverse of pauseProvider — re-grants connection /
+// re-enables ACL / re-grants role.
+func (h *ResourceHandler) resumeProvider(ctx context.Context, r *models.Resource) error {
+	switch r.ResourceType {
+	case models.ResourceTypePostgres:
+		if h.cfg.CustomerDatabaseURL == "" {
+			return nil
+		}
+		username := extractURLUsername(r.ConnectionURL.String, h.cfg.AESKey)
+		dbName := "db_" + r.Token.String()
+		return grantPostgresConnect(ctx, h.cfg.CustomerDatabaseURL, dbName, username)
+	case models.ResourceTypeRedis:
+		plainURL := decryptOrEmpty(r.ConnectionURL.String, h.cfg.AESKey)
+		if plainURL == "" {
+			return nil
+		}
+		username := urlUsername(plainURL)
+		if username == "" {
+			return nil
+		}
+		return setRedisACLEnabled(ctx, plainURL, username, true)
+	case models.ResourceTypeMongoDB:
+		if h.cfg.MongoAdminURI == "" {
+			return nil
+		}
+		username := "usr_" + r.Token.String()
+		return grantMongoRoles(ctx, h.cfg.MongoAdminURI, username, "db_"+r.Token.String())
+	default:
+		return nil
+	}
+}
+
+// validateSQLIdent rejects identifiers that would let an injection escape the
+// quoted form. We only allow [a-z0-9_-] which is the charset our provisioner
+// uses for db / user names.
+func validateSQLIdent(s string) error {
+	if s == "" {
+		return fmt.Errorf("empty identifier")
+	}
+	for _, ch := range s {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-') {
+			return fmt.Errorf("unsafe identifier %q", s)
+		}
+	}
+	return nil
+}
+
+// revokePostgresConnect runs REVOKE CONNECT ON DATABASE ... FROM <user> on the
+// shared customer DB. Idempotent — Postgres treats revoke-of-not-granted as a
+// success (the grant just isn't there anymore).
+func revokePostgresConnect(ctx context.Context, dsn, dbName, username string) error {
+	if err := validateSQLIdent(dbName); err != nil {
+		return fmt.Errorf("revokePostgresConnect: db: %w", err)
+	}
+	if err := validateSQLIdent(username); err != nil {
+		return fmt.Errorf("revokePostgresConnect: user: %w", err)
+	}
+	conn, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return fmt.Errorf("revokePostgresConnect: open: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx,
+		fmt.Sprintf(`REVOKE CONNECT ON DATABASE %q FROM %q`, dbName, username)); err != nil {
+		return fmt.Errorf("revokePostgresConnect: REVOKE: %w", err)
+	}
+	// Terminate any open sessions so the pause takes effect immediately.
+	if _, err := conn.ExecContext(ctx,
+		`SELECT pg_terminate_backend(pid)
+		   FROM pg_stat_activity
+		  WHERE datname = $1 AND usename = $2 AND pid <> pg_backend_pid()`,
+		dbName, username); err != nil {
+		// Termination failure is non-fatal — the revoke already prevents
+		// new connections; existing ones will time out / be killed on
+		// reconnect attempts.
+		slog.Warn("revokePostgresConnect: pg_terminate_backend", "error", err, "db", dbName, "user", username)
+	}
+	return nil
+}
+
+// grantPostgresConnect re-grants CONNECT. Safe to call on an already-granted
+// role — GRANT is idempotent.
+func grantPostgresConnect(ctx context.Context, dsn, dbName, username string) error {
+	if err := validateSQLIdent(dbName); err != nil {
+		return fmt.Errorf("grantPostgresConnect: db: %w", err)
+	}
+	if err := validateSQLIdent(username); err != nil {
+		return fmt.Errorf("grantPostgresConnect: user: %w", err)
+	}
+	conn, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return fmt.Errorf("grantPostgresConnect: open: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx,
+		fmt.Sprintf(`GRANT CONNECT ON DATABASE %q TO %q`, dbName, username)); err != nil {
+		return fmt.Errorf("grantPostgresConnect: GRANT: %w", err)
+	}
+	return nil
+}
+
+// setRedisACLEnabled toggles ACL user state to "on" (enable) or "off"
+// (disable). The user's password and key-pattern rules are left intact — this
+// is the reversible alternative to ACL DELUSER. See the explanatory comment in
+// ResourceHandler.pauseProvider for why we don't use DELUSER.
+func setRedisACLEnabled(ctx context.Context, originalURL, username string, enable bool) error {
+	opts, err := redis.ParseURL(originalURL)
+	if err != nil {
+		return fmt.Errorf("setRedisACLEnabled: parse url: %w", err)
+	}
+	client := redis.NewClient(opts)
+	defer client.Close()
+	state := "off"
+	if enable {
+		state = "on"
+	}
+	if err := client.Do(ctx, "ACL", "SETUSER", username, state).Err(); err != nil {
+		return fmt.Errorf("setRedisACLEnabled: ACL SETUSER %s: %w", state, err)
+	}
+	return nil
+}
+
+// revokeMongoRoles runs revokeRolesFromUser to remove the readWrite role on
+// the customer DB. The user itself stays — only the role is dropped — so a
+// resume can re-grant cleanly without recreating the user.
+func revokeMongoRoles(ctx context.Context, adminURI, username, dbName string) error {
+	client, err := mongo.Connect(ctx, mongooptions.Client().ApplyURI(adminURI).
+		SetServerSelectionTimeout(3*time.Second))
+	if err != nil {
+		return fmt.Errorf("revokeMongoRoles: connect: %w", err)
+	}
+	defer func() {
+		if discErr := client.Disconnect(ctx); discErr != nil {
+			slog.Warn("revokeMongoRoles: disconnect", "error", discErr)
+		}
+	}()
+	result := client.Database("admin").RunCommand(ctx, bson.D{
+		{Key: "revokeRolesFromUser", Value: username},
+		{Key: "roles", Value: bson.A{
+			bson.D{
+				{Key: "role", Value: "readWrite"},
+				{Key: "db", Value: dbName},
+			},
+		}},
+	})
+	if result.Err() != nil {
+		return fmt.Errorf("revokeMongoRoles: revokeRolesFromUser: %w", result.Err())
+	}
+	return nil
+}
+
+// grantMongoRoles is the inverse — re-grants readWrite on the customer DB.
+func grantMongoRoles(ctx context.Context, adminURI, username, dbName string) error {
+	client, err := mongo.Connect(ctx, mongooptions.Client().ApplyURI(adminURI).
+		SetServerSelectionTimeout(3*time.Second))
+	if err != nil {
+		return fmt.Errorf("grantMongoRoles: connect: %w", err)
+	}
+	defer func() {
+		if discErr := client.Disconnect(ctx); discErr != nil {
+			slog.Warn("grantMongoRoles: disconnect", "error", discErr)
+		}
+	}()
+	result := client.Database("admin").RunCommand(ctx, bson.D{
+		{Key: "grantRolesToUser", Value: username},
+		{Key: "roles", Value: bson.A{
+			bson.D{
+				{Key: "role", Value: "readWrite"},
+				{Key: "db", Value: dbName},
+			},
+		}},
+	})
+	if result.Err() != nil {
+		return fmt.Errorf("grantMongoRoles: grantRolesToUser: %w", result.Err())
+	}
+	return nil
+}
+
+// extractURLUsername decrypts the encrypted connection_url and returns the
+// userinfo username. Returns "" on any failure (the caller treats this as
+// "no provider action needed").
+func extractURLUsername(encryptedURL, aesKeyHex string) string {
+	plain := decryptOrEmpty(encryptedURL, aesKeyHex)
+	if plain == "" {
+		return ""
+	}
+	return urlUsername(plain)
+}
+
+// decryptOrEmpty wraps crypto.Decrypt + key parse. Returns "" if any step
+// fails — used by pause/resume helpers that want a "best-effort, fail open
+// to no-op" semantics.
+func decryptOrEmpty(encryptedURL, aesKeyHex string) string {
+	if encryptedURL == "" {
+		return ""
+	}
+	aesKey, err := crypto.ParseAESKey(aesKeyHex)
+	if err != nil {
+		return ""
+	}
+	plain, err := crypto.Decrypt(aesKey, encryptedURL)
+	if err != nil {
+		return ""
+	}
+	return plain
+}
+
+// urlUsername returns the username component of a URL (the userinfo before ":").
+// Empty when the URL has no userinfo.
+func urlUsername(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	if parsed.User == nil {
+		return ""
+	}
+	return parsed.User.Username()
+}
+
 // parseTeamID parses a UUID from the string stored in fiber.Locals by RequireAuth.
 func parseTeamID(s string) (uuid.UUID, error) {
 	if s == "" {
@@ -460,6 +992,9 @@ func resourceToMap(r *models.Resource) fiber.Map {
 	}
 	if r.ExpiresAt.Valid {
 		m["expires_at"] = r.ExpiresAt.Time
+	}
+	if r.PausedAt.Valid {
+		m["paused_at"] = r.PausedAt.Time
 	}
 	if r.TeamID.Valid {
 		m["team_id"] = r.TeamID.UUID

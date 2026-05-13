@@ -67,7 +67,10 @@ type Resource struct {
 	// root row itself (the root's family id is its own ID). Added by
 	// migration 018_resource_family.sql for slice 2 of env-aware deployments.
 	ParentResourceID *uuid.UUID
-	CreatedAt        time.Time
+	// PausedAt records when status flipped from 'active' to 'paused'. Cleared
+	// (NULL) when the resource resumes. Added by migration 024.
+	PausedAt  sql.NullTime
+	CreatedAt time.Time
 }
 
 // ErrResourceNotFound is returned when a resource lookup yields no rows.
@@ -103,7 +106,7 @@ type CreateResourceParams struct {
 // makes it easy to add a new column without touching half a dozen functions.
 const resourceColumns = `id, team_id, token, resource_type, name, connection_url, key_prefix, tier,
        env, fingerprint, cloud_vendor, country_code, status, migration_status,
-       expires_at, storage_bytes, provider_resource_id, created_request_id, parent_resource_id, created_at`
+       expires_at, storage_bytes, provider_resource_id, created_request_id, parent_resource_id, paused_at, created_at`
 
 // scanResource reads a single resources row in the order defined by resourceColumns.
 func scanResource(row interface {
@@ -115,7 +118,7 @@ func scanResource(row interface {
 		&r.ID, &r.TeamID, &r.Token, &r.ResourceType, &r.Name, &r.ConnectionURL, &r.KeyPrefix,
 		&r.Tier, &r.Env, &r.Fingerprint, &r.CloudVendor, &r.CountryCode, &r.Status,
 		&r.MigrationStatus, &r.ExpiresAt, &r.StorageBytes, &r.ProviderResourceID, &r.CreatedRequestID,
-		&parentID, &r.CreatedAt,
+		&parentID, &r.PausedAt, &r.CreatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -255,6 +258,61 @@ func SoftDeleteResource(ctx context.Context, db *sql.DB, id uuid.UUID) error {
 	return nil
 }
 
+// ErrResourceNotActive is returned by PauseResource when the row exists but
+// status != 'active'. The handler maps this to 409 conflict (already paused
+// or terminal). Distinct error type so the handler doesn't have to second-guess
+// whether a zero-rows-affected was idempotency or a missing row.
+var ErrResourceNotActive = fmt.Errorf("models: resource is not active")
+
+// ErrResourceNotPaused is the resume-side counterpart — caller asked to resume
+// a row that isn't currently paused.
+var ErrResourceNotPaused = fmt.Errorf("models: resource is not paused")
+
+// PauseResource flips status from 'active' → 'paused' atomically and stamps
+// paused_at. Returns ErrResourceNotActive when the row is missing or already
+// not active (so the caller can return a typed 409 / 404 without a follow-up
+// SELECT). The atomic WHERE status='active' guard makes concurrent pause
+// requests idempotent: only the first one writes; the second observes
+// ErrResourceNotActive.
+//
+// Caller is expected to have already verified team ownership and Pro+ tier —
+// this function does no authz of its own.
+func PauseResource(ctx context.Context, db *sql.DB, id uuid.UUID) error {
+	res, err := db.ExecContext(ctx, `
+		UPDATE resources
+		   SET status = 'paused', paused_at = now()
+		 WHERE id = $1 AND status = 'active'
+	`, id)
+	if err != nil {
+		return fmt.Errorf("models.PauseResource: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrResourceNotActive
+	}
+	return nil
+}
+
+// ResumeResource flips status from 'paused' → 'active' and clears paused_at.
+// Returns ErrResourceNotPaused when the row is missing or not currently paused
+// (mirror of PauseResource). The connection_url is preserved unchanged — the
+// caller's credentials remain valid.
+func ResumeResource(ctx context.Context, db *sql.DB, id uuid.UUID) error {
+	res, err := db.ExecContext(ctx, `
+		UPDATE resources
+		   SET status = 'active', paused_at = NULL
+		 WHERE id = $1 AND status = 'paused'
+	`, id)
+	if err != nil {
+		return fmt.Errorf("models.ResumeResource: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrResourceNotPaused
+	}
+	return nil
+}
+
 // ListResourcesByTeam returns all active resources for a team across every environment.
 // Equivalent to ListResourcesByTeamAndEnv with env="" — kept as the dashboard's
 // "give me everything I own" entry point.
@@ -386,12 +444,21 @@ func ElevateResourceTiersByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUI
 	return nil
 }
 
-// SumStorageBytesByTeamAndType returns total storage_bytes for active resources of a given type for a team.
+// SumStorageBytesByTeamAndType returns total storage_bytes for active or paused
+// resources of a given type for a team. Paused resources STILL count toward
+// storage limits — pausing stops billing for the slot but the on-disk data is
+// preserved, so the storage cap is what prevents pause-and-bloat. Deleted /
+// expired rows are excluded.
+//
 // Sums across ALL environments — storage quotas are per-team, not per-env.
 func SumStorageBytesByTeamAndType(ctx context.Context, db *sql.DB, teamID uuid.UUID, resourceType string) (int64, error) {
 	var total int64
 	err := db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(storage_bytes), 0) FROM resources WHERE team_id = $1 AND resource_type = $2 AND status = 'active'`,
+		`SELECT COALESCE(SUM(storage_bytes), 0)
+		   FROM resources
+		  WHERE team_id = $1
+		    AND resource_type = $2
+		    AND status IN ('active', 'paused')`,
 		teamID, resourceType,
 	).Scan(&total)
 	if err != nil {

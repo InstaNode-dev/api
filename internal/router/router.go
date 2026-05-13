@@ -351,6 +351,14 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		resourceH.Delete,
 	)
 	api.Post("/resources/:id/rotate-credentials", resourceH.RotateCredentials)
+	// Pause / Resume — Pro+ "suspend without deletion." Tier gate is
+	// enforced inside the handler so the 402 response shape matches the
+	// other multi-env walls. POST not PATCH because the side-effects (REVOKE
+	// CONNECT, ACL off, revokeRolesFromUser) are not idempotent at the
+	// provider level even though the DB flip is — POST signals "command,
+	// not state replacement."
+	api.Post("/resources/:id/pause", resourceH.Pause)
+	api.Post("/resources/:id/resume", resourceH.Resume)
 	// Slice 3 of env-aware deployments — spawn a same-type, same-family
 	// twin in a new env. Tier-gated to Pro+ inside the handler. The
 	// resource type the source row carries determines which low-level
