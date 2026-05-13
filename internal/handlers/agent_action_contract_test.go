@@ -38,7 +38,14 @@ func agentActionContractCases() map[string]string {
 		"AgentActionPromotionInvalid":                  AgentActionPromotionInvalid,
 		"AgentActionPromotionAlreadyUsed":              AgentActionPromotionAlreadyUsed,
 		"AgentActionPromotionExpired":                  AgentActionPromotionExpired,
+<<<<<<< HEAD
 		"AgentActionReadOnlySession":                   AgentActionReadOnlySession,
+=======
+		"AgentActionNotifyWebhookInvalid":              AgentActionNotifyWebhookInvalid,
+		"AgentActionPauseRequiresPro":                  AgentActionPauseRequiresPro,
+		"AgentActionResourceAlreadyPaused":             AgentActionResourceAlreadyPaused,
+		"AgentActionResourceNotPaused":                 AgentActionResourceNotPaused,
+>>>>>>> origin/master
 
 		// Builders — representative inputs covering tier/env/role/limit
 		// interpolation.

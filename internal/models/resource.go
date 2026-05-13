@@ -10,9 +10,26 @@ import (
 	"github.com/google/uuid"
 )
 
-// EnvProduction is the default environment used when callers omit one.
-// All migration-backfilled rows start at this value.
+// EnvProduction names the "production" environment. Kept as a typed constant
+// because several listing/promotion code paths still reference it by name.
+// NOTE: this is no longer the default — see EnvDevelopment.
 const EnvProduction = "production"
+
+// EnvDevelopment is the default environment used when callers omit one.
+// Migration 026 flipped the DB column DEFAULT to match.
+//
+// WHY (product directive, 2026-05-13): accidental no-env provisions should
+// land in the lowest-stakes bucket. Defaulting to "production" silently
+// merged experimental work with real prod state — the new default sends
+// no-env callers to "development" so the mistake is recoverable. Callers
+// that explicitly send env="production" continue to work unchanged
+// (validated by envPattern; behaviour identical pre/post this change).
+const EnvDevelopment = "development"
+
+// EnvDefault is the canonical name for the default env. Use this in new code
+// instead of referencing EnvDevelopment directly so a future change to the
+// default doesn't ripple through every call site.
+const EnvDefault = EnvDevelopment
 
 // Canonical resource_type strings used by the handlers and model layer.
 // Keep these in one place so callers performing same-type checks (e.g.
@@ -31,11 +48,16 @@ const (
 // background jobs, internal endpoints) gets the same guarantee.
 var envPattern = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
 
-// NormalizeEnv coerces an empty env to EnvProduction (backwards compat) and
+// NormalizeEnv coerces an empty env to EnvDefault (currently "development") and
 // validates the format. Returns (env, true) when valid, ("", false) otherwise.
+//
+// The default flipped from "production" → "development" in migration 026
+// (2026-05-13) so accidental no-env provisions land in the lowest-stakes
+// bucket. Callers that explicitly pass "production" continue to work
+// unchanged.
 func NormalizeEnv(env string) (string, bool) {
 	if env == "" {
-		return EnvProduction, true
+		return EnvDefault, true
 	}
 	if !envPattern.MatchString(env) {
 		return "", false
@@ -53,7 +75,7 @@ type Resource struct {
 	ConnectionURL      sql.NullString // AES-256-GCM encrypted
 	KeyPrefix          sql.NullString // provisioner key prefix (e.g. "pool_abc:") for Redis
 	Tier               string
-	Env                string // dev | staging | production | <custom>; defaults to "production"
+	Env                string // dev | staging | production | <custom>; defaults to "development" (mig 026)
 	Fingerprint        sql.NullString
 	CloudVendor        sql.NullString
 	CountryCode        sql.NullString
@@ -67,7 +89,10 @@ type Resource struct {
 	// root row itself (the root's family id is its own ID). Added by
 	// migration 018_resource_family.sql for slice 2 of env-aware deployments.
 	ParentResourceID *uuid.UUID
-	CreatedAt        time.Time
+	// PausedAt records when status flipped from 'active' to 'paused'. Cleared
+	// (NULL) when the resource resumes. Added by migration 024.
+	PausedAt  sql.NullTime
+	CreatedAt time.Time
 }
 
 // ErrResourceNotFound is returned when a resource lookup yields no rows.
@@ -85,7 +110,7 @@ type CreateResourceParams struct {
 	ResourceType     string
 	Name             string
 	Tier             string
-	Env              string // empty string is normalised to EnvProduction
+	Env              string // empty string is normalised to EnvDefault ("development")
 	Fingerprint      string
 	CloudVendor      string
 	CountryCode      string
@@ -103,7 +128,7 @@ type CreateResourceParams struct {
 // makes it easy to add a new column without touching half a dozen functions.
 const resourceColumns = `id, team_id, token, resource_type, name, connection_url, key_prefix, tier,
        env, fingerprint, cloud_vendor, country_code, status, migration_status,
-       expires_at, storage_bytes, provider_resource_id, created_request_id, parent_resource_id, created_at`
+       expires_at, storage_bytes, provider_resource_id, created_request_id, parent_resource_id, paused_at, created_at`
 
 // scanResource reads a single resources row in the order defined by resourceColumns.
 func scanResource(row interface {
@@ -115,7 +140,7 @@ func scanResource(row interface {
 		&r.ID, &r.TeamID, &r.Token, &r.ResourceType, &r.Name, &r.ConnectionURL, &r.KeyPrefix,
 		&r.Tier, &r.Env, &r.Fingerprint, &r.CloudVendor, &r.CountryCode, &r.Status,
 		&r.MigrationStatus, &r.ExpiresAt, &r.StorageBytes, &r.ProviderResourceID, &r.CreatedRequestID,
-		&parentID, &r.CreatedAt,
+		&parentID, &r.PausedAt, &r.CreatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -143,7 +168,7 @@ func CreateResource(ctx context.Context, db *sql.DB, p CreateResourceParams) (*R
 
 	env := p.Env
 	if env == "" {
-		env = EnvProduction
+		env = EnvDefault
 	}
 
 	row := db.QueryRowContext(ctx, `
@@ -255,6 +280,61 @@ func SoftDeleteResource(ctx context.Context, db *sql.DB, id uuid.UUID) error {
 	return nil
 }
 
+// ErrResourceNotActive is returned by PauseResource when the row exists but
+// status != 'active'. The handler maps this to 409 conflict (already paused
+// or terminal). Distinct error type so the handler doesn't have to second-guess
+// whether a zero-rows-affected was idempotency or a missing row.
+var ErrResourceNotActive = fmt.Errorf("models: resource is not active")
+
+// ErrResourceNotPaused is the resume-side counterpart — caller asked to resume
+// a row that isn't currently paused.
+var ErrResourceNotPaused = fmt.Errorf("models: resource is not paused")
+
+// PauseResource flips status from 'active' → 'paused' atomically and stamps
+// paused_at. Returns ErrResourceNotActive when the row is missing or already
+// not active (so the caller can return a typed 409 / 404 without a follow-up
+// SELECT). The atomic WHERE status='active' guard makes concurrent pause
+// requests idempotent: only the first one writes; the second observes
+// ErrResourceNotActive.
+//
+// Caller is expected to have already verified team ownership and Pro+ tier —
+// this function does no authz of its own.
+func PauseResource(ctx context.Context, db *sql.DB, id uuid.UUID) error {
+	res, err := db.ExecContext(ctx, `
+		UPDATE resources
+		   SET status = 'paused', paused_at = now()
+		 WHERE id = $1 AND status = 'active'
+	`, id)
+	if err != nil {
+		return fmt.Errorf("models.PauseResource: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrResourceNotActive
+	}
+	return nil
+}
+
+// ResumeResource flips status from 'paused' → 'active' and clears paused_at.
+// Returns ErrResourceNotPaused when the row is missing or not currently paused
+// (mirror of PauseResource). The connection_url is preserved unchanged — the
+// caller's credentials remain valid.
+func ResumeResource(ctx context.Context, db *sql.DB, id uuid.UUID) error {
+	res, err := db.ExecContext(ctx, `
+		UPDATE resources
+		   SET status = 'active', paused_at = NULL
+		 WHERE id = $1 AND status = 'paused'
+	`, id)
+	if err != nil {
+		return fmt.Errorf("models.ResumeResource: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrResourceNotPaused
+	}
+	return nil
+}
+
 // ListResourcesByTeam returns all active resources for a team across every environment.
 // Equivalent to ListResourcesByTeamAndEnv with env="" — kept as the dashboard's
 // "give me everything I own" entry point.
@@ -285,11 +365,12 @@ func ListResourcesByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]*
 }
 
 // ListResourcesByTeamAndEnv returns all active resources for a team filtered to
-// a single environment. Empty env is normalised to "production" so callers that
-// omit the param see prod resources by default.
+// a single environment. Empty env is normalised to EnvDefault ("development")
+// so callers that omit the param see the default env's resources — matches
+// the post-migration-026 default for /db/new and friends.
 func ListResourcesByTeamAndEnv(ctx context.Context, db *sql.DB, teamID uuid.UUID, env string) ([]*Resource, error) {
 	if env == "" {
-		env = EnvProduction
+		env = EnvDefault
 	}
 	rows, err := db.QueryContext(ctx, `
 		SELECT `+resourceColumns+`
@@ -386,12 +467,21 @@ func ElevateResourceTiersByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUI
 	return nil
 }
 
-// SumStorageBytesByTeamAndType returns total storage_bytes for active resources of a given type for a team.
+// SumStorageBytesByTeamAndType returns total storage_bytes for active or paused
+// resources of a given type for a team. Paused resources STILL count toward
+// storage limits — pausing stops billing for the slot but the on-disk data is
+// preserved, so the storage cap is what prevents pause-and-bloat. Deleted /
+// expired rows are excluded.
+//
 // Sums across ALL environments — storage quotas are per-team, not per-env.
 func SumStorageBytesByTeamAndType(ctx context.Context, db *sql.DB, teamID uuid.UUID, resourceType string) (int64, error) {
 	var total int64
 	err := db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(storage_bytes), 0) FROM resources WHERE team_id = $1 AND resource_type = $2 AND status = 'active'`,
+		`SELECT COALESCE(SUM(storage_bytes), 0)
+		   FROM resources
+		  WHERE team_id = $1
+		    AND resource_type = $2
+		    AND status IN ('active', 'paused')`,
 		teamID, resourceType,
 	).Scan(&total)
 	if err != nil {
