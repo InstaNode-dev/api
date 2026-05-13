@@ -1107,6 +1107,31 @@ func (p *K8sProvider) applyServiceInNS(ctx context.Context, ns, name, deployName
 	return nodePort, nil
 }
 
+// ingressWhitelistAnnotation is the nginx ingress controller annotation that
+// gates inbound traffic to a whitelist of IPs/CIDRs. Centralised here so the
+// create path (applyIngressForDeploy) and the update path
+// (UpdateAccessControl) refer to the same key — a typo in one used to silently
+// produce a public ingress.
+const ingressWhitelistAnnotation = "nginx.ingress.kubernetes.io/whitelist-source-range"
+
+// buildIngressAccessAnnotations is the single source of truth for the access-
+// control annotations applied to a deploy's Ingress. Both the create path
+// (applyIngressForDeploy → POST /deploy/new) and the update path
+// (UpdateAccessControl → PATCH /api/v1/deployments/:id) call this so the
+// "private=true with N IPs" → annotation mapping cannot drift between the two.
+//
+// Returns a fresh map (callers may merge it into a larger annotations map).
+// Empty allowedIPs on private=true is treated as "skip the annotation" — the
+// handler validates non-empty up front; this is belt-and-suspenders against
+// an accidental "allow nobody" ingress.
+func buildIngressAccessAnnotations(private bool, allowedIPs []string) map[string]string {
+	out := map[string]string{}
+	if private && len(allowedIPs) > 0 {
+		out[ingressWhitelistAnnotation] = strings.Join(allowedIPs, ",")
+	}
+	return out
+}
+
 // applyIngressForDeploy creates an Ingress for a single-service /deploy/new app.
 //
 // Mirrors the pattern used by K8sStackProvider.createIngress: when DEPLOY_DOMAIN
@@ -1152,12 +1177,11 @@ func (p *K8sProvider) applyIngressForDeploy(ctx context.Context, ns, svcName, ap
 		}}
 		scheme = "https"
 	}
-	// Private deploy → nginx whitelist-source-range. Empty allowedIPs here
-	// would silently lock everyone out, so the handler enforces non-empty
-	// before this is reached. Belt-and-suspenders: skip the annotation when
-	// the slice is empty to avoid an accidental "allow nobody" Ingress.
-	if private && len(allowedIPs) > 0 {
-		annotations["nginx.ingress.kubernetes.io/whitelist-source-range"] = strings.Join(allowedIPs, ",")
+	// Private deploy → nginx whitelist-source-range. Centralised via
+	// buildIngressAccessAnnotations so the create path and the PATCH-update
+	// path (UpdateAccessControl) can never diverge on the annotation key.
+	for k, v := range buildIngressAccessAnnotations(private, allowedIPs) {
+		annotations[k] = v
 	}
 	publicURL := scheme + "://" + host
 
@@ -1210,6 +1234,73 @@ func (p *K8sProvider) applyIngressForDeploy(ctx context.Context, ns, svcName, ap
 		return "", fmt.Errorf("create ingress %q in %q: %w", "app-"+appID, ns, err)
 	}
 	return publicURL, nil
+}
+
+// UpdateAccessControl patches the access-control annotations on an existing
+// deploy's Ingress without rebuilding the image. Backs PATCH
+// /api/v1/deployments/:id so a Pro+ user can flip a deploy public ↔ private or
+// edit the allowed_ips list in-place.
+//
+// Semantics:
+//
+//   - private=false → strip the whitelist-source-range annotation entirely
+//     (the Ingress becomes public). allowedIPs is ignored.
+//   - private=true with non-empty allowedIPs → set the annotation to the
+//     comma-joined list (REPLACE semantics — the new list is the new truth,
+//     no append).
+//   - private=true with empty allowedIPs is a no-op at the k8s layer
+//     (handler validates non-empty up front; this is belt-and-suspenders).
+//
+// When DEPLOY_DOMAIN is unset (local dev) the deploy has no Ingress and this
+// is a no-op — same warn breadcrumb the create path emits. Returns
+// IsNotFound-style errors for callers that want to surface 404 separately
+// from generic 503; today the handler treats either as a 503 because the
+// DB row already reflects the intent and a redeploy heals divergence.
+func (p *K8sProvider) UpdateAccessControl(ctx context.Context, appID string, private bool, allowedIPs []string) error {
+	domain := os.Getenv("DEPLOY_DOMAIN")
+	if domain == "" {
+		slog.Warn("k8s.UpdateAccessControl: DEPLOY_DOMAIN unset; no Ingress to patch — DB-only update",
+			"app_id", appID,
+		)
+		return nil
+	}
+	ns := deployNamespace(appID)
+	name := "app-" + appID
+
+	ing, err := p.clientset.NetworkingV1().Ingresses(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// The deploy row exists but the Ingress hasn't been created yet
+			// (e.g. PATCH lands during the building window). Skip — the next
+			// runDeploy will pick up the new private/allowed_ips from the DB
+			// row via opts.Private / opts.AllowedIPs.
+			slog.Info("k8s.UpdateAccessControl: ingress not yet created — DB-only update",
+				"app_id", appID, "namespace", ns)
+			return nil
+		}
+		return fmt.Errorf("get ingress %q in %q: %w", name, ns, err)
+	}
+
+	if ing.Annotations == nil {
+		ing.Annotations = map[string]string{}
+	}
+	// Strip any prior whitelist annotation first so private=false reliably
+	// produces a public Ingress regardless of what was there before.
+	delete(ing.Annotations, ingressWhitelistAnnotation)
+	for k, v := range buildIngressAccessAnnotations(private, allowedIPs) {
+		ing.Annotations[k] = v
+	}
+
+	if _, err := p.clientset.NetworkingV1().Ingresses(ns).Update(ctx, ing, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("update ingress %q in %q: %w", name, ns, err)
+	}
+	slog.Info("k8s.UpdateAccessControl: ingress annotations patched",
+		"app_id", appID,
+		"namespace", ns,
+		"private", private,
+		"allowed_ip_count", len(allowedIPs),
+	)
+	return nil
 }
 
 // deployIngressURL returns the public Ingress URL for an appID if DEPLOY_DOMAIN

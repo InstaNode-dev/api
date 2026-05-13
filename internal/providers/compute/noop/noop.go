@@ -76,3 +76,14 @@ func (n *NoopProvider) Redeploy(_ context.Context, providerID string, _ []byte, 
 		UpdatedAt:  time.Now(),
 	}, nil
 }
+
+// UpdateAccessControl logs a warning and returns nil. Tests use this — the
+// DB-only update is the user-visible change.
+func (n *NoopProvider) UpdateAccessControl(_ context.Context, appID string, private bool, allowedIPs []string) error {
+	slog.Warn("compute.noop: UpdateAccessControl called but compute is disabled",
+		"app_id", appID,
+		"private", private,
+		"allowed_ip_count", len(allowedIPs),
+	)
+	return nil
+}
