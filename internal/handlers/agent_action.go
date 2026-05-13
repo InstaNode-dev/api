@@ -118,6 +118,23 @@ const AgentActionPrivateDeployRequiresAllowedIPs = "Tell the user a private depl
 // code") and contains the full https://instanode.dev/billing URL.
 const AgentActionPromotionInvalid = "Tell the user this promo code isn't valid for the requested plan. Have them try a different code at https://instanode.dev/billing — promotion codes are case-insensitive."
 
+// AgentActionPromotionAlreadyUsed is returned in the 200 + ok:false body when
+// an admin-issued single-use promo code is presented at /promotion/validate
+// but its used_at column is already non-null. The wall is distinct from
+// AgentActionPromotionInvalid because the remedy is different — "try a
+// different code" is wrong advice when the code itself was valid but already
+// redeemed (typically by another teammate). The sentence names the specific
+// reason ("already redeemed by someone on this team") and the exact next
+// action ("ask the admin who issued it for a new one") with the full URL.
+const AgentActionPromotionAlreadyUsed = "Tell the user this promo code has already been redeemed by someone on this team. Ask the admin who issued it for a new one at https://instanode.dev/billing."
+
+// AgentActionPromotionExpired is returned when an admin-issued promo code's
+// expires_at is in the past. The plans-yaml path's "expired" branch shares
+// the AgentActionPromotionInvalid copy via classifyPromotionError, but for
+// admin codes we want a distinct "this code has expired, ask for a fresh
+// one" sentence because the remedy is different from "try another code."
+const AgentActionPromotionExpired = "Tell the user this promo code has expired. Ask the admin who issued it for a fresh code at https://instanode.dev/billing — admin codes have a fixed validity window."
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Storage / vault tier walls (called from respondErrorWithAgentAction)
 // ─────────────────────────────────────────────────────────────────────────────
