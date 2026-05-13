@@ -170,3 +170,73 @@ var (
 	ErrInvalidPromoDuration = errors.New("valid_for_days must be > 0")
 	ErrInvalidPromoValue    = errors.New("value must be >= 0")
 )
+
+// ErrAdminPromoCodeNotFound is returned by GetAdminPromoCodeByCode when no row
+// matches the (code, team_id) tuple. Wrapped as a sentinel so handlers can
+// distinguish "no such code for this team" (caller error → 200+ok:false)
+// from a transient DB failure (→ 503).
+var ErrAdminPromoCodeNotFound = errors.New("admin promo code not found")
+
+// ErrAdminPromoCodeAlreadyUsed is returned by MarkAdminPromoCodeUsed when the
+// UPDATE matched zero rows because used_at was already set (or the row no
+// longer exists). Lets the caller fall through cleanly without re-querying.
+var ErrAdminPromoCodeAlreadyUsed = errors.New("admin promo code already redeemed")
+
+// GetAdminPromoCodeByCode looks up an admin-issued promo code by its public
+// `code` string, scoped to the supplied teamID. Returns the row even if
+// used_at is set or expires_at is in the past — the caller (validate
+// handler) inspects those fields to surface the right error code.
+//
+// Scoping by team_id is the whole point of the row's existence: admin codes
+// are single-team — leaking the existence of a code that belongs to another
+// team would be a cross-team information disclosure. The query is therefore
+// (code, team_id) and `not found` covers both "no such code" and "code
+// exists but belongs to a different team."
+//
+// Returns ErrAdminPromoCodeNotFound when no row matches. Any other error is
+// a transient DB failure.
+func GetAdminPromoCodeByCode(ctx context.Context, db *sql.DB, code string, teamID uuid.UUID) (*AdminPromoCode, error) {
+	row := &AdminPromoCode{}
+	err := db.QueryRowContext(ctx, `
+		SELECT id, code, team_id, issued_by_email, kind, value, applies_to, used_at, expires_at, created_at
+		FROM admin_promo_codes
+		WHERE code = $1 AND team_id = $2
+	`, strings.ToUpper(strings.TrimSpace(code)), teamID).Scan(
+		&row.ID, &row.Code, &row.TeamID, &row.IssuedByEmail, &row.Kind,
+		&row.Value, &row.AppliesTo, &row.UsedAt, &row.ExpiresAt, &row.CreatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, ErrAdminPromoCodeNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("models.GetAdminPromoCodeByCode: %w", err)
+	}
+	return row, nil
+}
+
+// MarkAdminPromoCodeUsed atomically transitions a row from used_at IS NULL to
+// used_at = now(). Uses `WHERE used_at IS NULL` in the predicate so two
+// concurrent webhook callers racing on the same code can't both succeed:
+// the second UPDATE matches zero rows and returns ErrAdminPromoCodeAlreadyUsed.
+//
+// The caller is expected to treat ErrAdminPromoCodeAlreadyUsed as a no-op
+// (the code was successfully redeemed by the racing caller — there is nothing
+// to do).
+func MarkAdminPromoCodeUsed(ctx context.Context, db *sql.DB, id uuid.UUID) error {
+	res, err := db.ExecContext(ctx, `
+		UPDATE admin_promo_codes
+		   SET used_at = now()
+		 WHERE id = $1 AND used_at IS NULL
+	`, id)
+	if err != nil {
+		return fmt.Errorf("models.MarkAdminPromoCodeUsed: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("models.MarkAdminPromoCodeUsed: rows_affected: %w", err)
+	}
+	if n == 0 {
+		return ErrAdminPromoCodeAlreadyUsed
+	}
+	return nil
+}

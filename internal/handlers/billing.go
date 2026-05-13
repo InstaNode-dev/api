@@ -27,6 +27,13 @@ import (
 	"instant.dev/internal/razorpaybilling"
 )
 
+// checkoutNoteAdminPromoCodeID is the Razorpay subscription `notes` key we
+// use to round-trip an admin_promo_codes.id from checkout to the activation
+// webhook. The webhook reads this exact key to look up the row to mark used.
+// Kept as a named constant (per the project's named-constants convention) so
+// the checkout side and the webhook side cannot drift.
+const checkoutNoteAdminPromoCodeID = "admin_promo_code_id"
+
 // BillingHandler handles billing and Razorpay webhook endpoints.
 type BillingHandler struct {
 	db    *sql.DB
@@ -59,9 +66,21 @@ func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient *email.Client
 // "yearly". Any other value is rejected as 400 invalid_frequency. The team's
 // canonical tier (the value stored on teams.plan_tier) is unchanged by
 // frequency — only the underlying Razorpay subscription differs.
+//
+// PromotionCode is an optional admin-issued promo code (one of the rows in
+// admin_promo_codes). When set, we resolve the code's DB row server-side and
+// stamp its id into the Razorpay subscription `notes` field — the webhook
+// handler then marks used_at = now() on subscription.activated /
+// subscription.charged. We do NOT forward the code text to Razorpay's
+// `offer_id` field today (Razorpay's offer model is separate from our
+// admin-issued codes); the discount is bookkeeping-only at this layer
+// pending the offer-mapping migration. Plans-yaml codes (LAUNCH50 etc.) are
+// still allowed in this field but produce no notes side-effect — they're
+// handled at validate-time via plans.Registry and never need DB tracking.
 type checkoutRequest struct {
 	Plan          string `json:"plan"`
 	PlanFrequency string `json:"plan_frequency"`
+	PromotionCode string `json:"promotion_code"`
 }
 
 // razorpayPlanIDs returns the configured monthly Razorpay plan_id for each
@@ -222,16 +241,62 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	if frequency == "yearly" {
 		totalCount = 1
 	}
+	notes := map[string]interface{}{
+		"team_id":        teamID.String(),
+		"plan":           plan,
+		"plan_frequency": frequency,
+	}
+
+	// Admin-code redemption: if the caller supplied a promotion_code and it
+	// matches an admin_promo_codes row for THIS team, stamp the row's id
+	// into the subscription notes so the webhook handler can mark used_at
+	// on activation. Cross-team codes don't match (the lookup is scoped by
+	// team_id). Plans-yaml codes (LAUNCH50 etc.) also don't match — those
+	// flow through the plans registry and need no DB bookkeeping.
+	//
+	// Failures here are best-effort: an unknown code, an already-used code,
+	// or a transient DB error should not block the checkout itself.
+	// /promotion/validate is the user-facing gate that surfaces the
+	// "already used / expired" copy. This branch only writes the bookkeeping
+	// hook used by the activation webhook.
+	if rawCode := strings.TrimSpace(body.PromotionCode); rawCode != "" && h.db != nil {
+		row, lookupErr := models.GetAdminPromoCodeByCode(c.Context(), h.db, rawCode, teamID)
+		switch {
+		case lookupErr == nil && !row.UsedAt.Valid && !row.ExpiresAt.IsZero() && time.Now().UTC().Before(row.ExpiresAt):
+			notes[checkoutNoteAdminPromoCodeID] = row.ID.String()
+		case lookupErr == nil:
+			// Row exists but is expired / used — leave notes untouched. The
+			// /promotion/validate gate should have caught this; if the
+			// client bypassed it, we silently drop the bookkeeping.
+			slog.Info("billing.checkout.promo_code_unusable",
+				"team_id", teamID,
+				"code", strings.ToUpper(rawCode),
+				"used", row.UsedAt.Valid,
+				"expired", time.Now().UTC().After(row.ExpiresAt),
+				"request_id", requestID,
+			)
+		case errors.Is(lookupErr, models.ErrAdminPromoCodeNotFound):
+			// Unknown / cross-team / plans-yaml code — no DB bookkeeping
+			// needed. Plans-yaml codes flow through Razorpay's own
+			// offer/coupon channel if configured server-side.
+		default:
+			// Transient DB failure on the lookup — log but proceed with
+			// checkout. Better to let the user pay than block on a brownout
+			// in the bookkeeping path.
+			slog.Warn("billing.checkout.promo_code_lookup_failed",
+				"error", lookupErr,
+				"team_id", teamID,
+				"request_id", requestID,
+			)
+		}
+	}
+
 	subBody := map[string]interface{}{
 		"plan_id":         planID,
 		"total_count":     totalCount,
 		"quantity":        1,
 		"customer_notify": 1,
-		"notes": map[string]interface{}{
-			"team_id":        teamID.String(),
-			"plan":           plan,
-			"plan_frequency": frequency,
-		},
+		"notes":           notes,
 	}
 
 	sub, err := client.Subscription.Create(subBody, nil)
@@ -425,6 +490,66 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 	// Best-effort audit emit for the Loops forwarder. Fail-open: an audit
 	// error must not undo the tier update we already committed.
 	emitSubscriptionChangeAudit(ctx, h.db, teamID, fromTier, tier, sub.ID)
+
+	// Admin-code redemption: if the subscription notes carry an
+	// admin_promo_code_id (stamped at checkout time by CreateCheckoutAPI),
+	// mark the corresponding admin_promo_codes row as used. Best-effort:
+	// failures log only — the tier upgrade is already committed. The brief
+	// names the trigger event as subscription.activated; Razorpay's
+	// subscription.charged is the equivalent for subscriptions paid by
+	// invoice (which is our checkout flow), so we hook here instead.
+	// MarkAdminPromoCodeUsed uses `WHERE used_at IS NULL` so two concurrent
+	// webhook deliveries can't double-spend the code — the second one
+	// returns ErrAdminPromoCodeAlreadyUsed and we log + return.
+	maybeMarkAdminPromoCodeUsed(ctx, h.db, sub, teamID)
+}
+
+// maybeMarkAdminPromoCodeUsed marks an admin-issued promo code as redeemed
+// when the subscription notes carry one. Best-effort, no caller cares about
+// the outcome — failures log and return. Race-safe via the
+// `WHERE used_at IS NULL` predicate on MarkAdminPromoCodeUsed.
+func maybeMarkAdminPromoCodeUsed(ctx context.Context, db *sql.DB, sub rzpSubscriptionEntity, teamID uuid.UUID) {
+	if db == nil {
+		return
+	}
+	idStr := strings.TrimSpace(sub.Notes[checkoutNoteAdminPromoCodeID])
+	if idStr == "" {
+		return
+	}
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		slog.Warn("billing.subscription.charged.admin_promo_id_invalid",
+			"team_id", teamID,
+			"subscription_id", sub.ID,
+			"notes_id", idStr,
+			"error", err,
+		)
+		return
+	}
+	if err := models.MarkAdminPromoCodeUsed(ctx, db, id); err != nil {
+		if errors.Is(err, models.ErrAdminPromoCodeAlreadyUsed) {
+			// Either a redelivery of the same webhook (idempotent) or a
+			// concurrent caller won the race. Either way: nothing to do.
+			slog.Info("billing.subscription.charged.admin_promo_already_used",
+				"team_id", teamID,
+				"subscription_id", sub.ID,
+				"admin_promo_code_id", id,
+			)
+			return
+		}
+		slog.Warn("billing.subscription.charged.admin_promo_mark_used_failed",
+			"team_id", teamID,
+			"subscription_id", sub.ID,
+			"admin_promo_code_id", id,
+			"error", err,
+		)
+		return
+	}
+	slog.Info("billing.subscription.charged.admin_promo_redeemed",
+		"team_id", teamID,
+		"subscription_id", sub.ID,
+		"admin_promo_code_id", id,
+	)
 }
 
 // handleSubscriptionCancelled processes subscription.cancelled events (cancel → downgrade to hobby).
