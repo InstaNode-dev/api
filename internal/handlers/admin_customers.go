@@ -168,8 +168,16 @@ type CustomerListItem struct {
 // Query params:
 //
 //	q         — case-insensitive substring match on users.email (the team's
-//	             primary email, picked as the earliest-joined owner)
-//	tier      — exact match on teams.plan_tier ("free", "hobby", "pro", "team")
+//	             primary email, picked as the earliest-joined owner). Uses
+//	             lower(email) LIKE lower('%q%') so "FOUNDER" matches
+//	             "founder@x.com" and "fou" matches "founder@x.com".
+//	tier      — exact match on teams.plan_tier ("free", "hobby", "pro", "team").
+//	             Empty string → no filter. Multi-value via comma:
+//	             tier=hobby,pro → WHERE plan_tier IN ('hobby','pro').
+//	             Unknown tier values are silently dropped from the IN list
+//	             (rather than 400-ing) so the dashboard's filter pills are
+//	             stable: a typo / stale UI value returns an empty list, not
+//	             an error banner.
 //	sort_by   — mrr | last_active | created_at | storage_bytes (default: mrr)
 //	limit     — 1..adminListMaxLimit (default: adminListDefaultLimit)
 //	offset    — >= 0 (default: 0)
@@ -177,20 +185,36 @@ type CustomerListItem struct {
 // Response: { ok, customers: [...], total }
 func (h *AdminCustomersHandler) List(c *fiber.Ctx) error {
 	q := strings.TrimSpace(c.Query("q"))
-	tier := strings.TrimSpace(c.Query("tier"))
+	tierRaw := strings.TrimSpace(c.Query("tier"))
 	sortBy := strings.TrimSpace(c.Query("sort_by"))
 	limit := adminParseLimit(c.Query("limit"), adminListDefaultLimit, adminListMaxLimit)
 	offset := adminParseOffset(c.Query("offset"))
 
-	if tier != "" && !adminAllowedTiers[tier] {
-		return respondError(c, fiber.StatusBadRequest, "invalid_tier",
-			fmt.Sprintf("tier must be one of: %s, %s, %s, %s", AdminTierFree, AdminTierHobby, AdminTierPro, AdminTierTeam))
-	}
+	// Parse the tier filter. Empty → no filter. Otherwise split on comma
+	// (so the dashboard filter pills can OR multiple tiers in one call),
+	// validate each value against the closed set, drop unknowns. If every
+	// value is unknown we short-circuit to an empty result — see comment
+	// on tierAllUnknown below for why this is "UI-stable" rather than 400.
+	tiers, tierAllUnknown := adminParseTierFilter(tierRaw)
 
 	orderClause, err := adminOrderClause(sortBy)
 	if err != nil {
 		return respondError(c, fiber.StatusBadRequest, "invalid_sort_by",
 			fmt.Sprintf("sort_by must be one of: %s, %s, %s, %s", AdminSortMRR, AdminSortLastActive, AdminSortCreatedAt, AdminSortStorageBytes))
+	}
+
+	// If the user passed only bogus tier values (e.g. stale pill from an
+	// older UI build), return an empty list rather than 400. The
+	// dashboard's filter UI is "OR a set of pills"; an unknown pill should
+	// degrade gracefully ("no customers match that filter") instead of
+	// hard-erroring. This is the same posture as `tier=` (no filter, but
+	// also no results expected to surface) — UI-stable wins over strict.
+	if tierAllUnknown {
+		return c.JSON(fiber.Map{
+			"ok":        true,
+			"customers": []CustomerListItem{},
+			"total":     0,
+		})
 	}
 
 	// Build the aggregation. One CTE per dimension keeps the query plan
@@ -210,9 +234,23 @@ func (h *AdminCustomersHandler) List(c *fiber.Ctx) error {
 		args = append(args, "%"+strings.ToLower(q)+"%")
 		whereParts = append(whereParts, fmt.Sprintf("lower(coalesce(u.email,'')) LIKE $%d", len(args)))
 	}
-	if tier != "" {
-		args = append(args, tier)
+	if len(tiers) == 1 {
+		// Single-tier path preserves the existing exact-match query
+		// shape (`t.plan_tier = $N`) so PR #48's planner stats stay
+		// valid and the EXPLAIN doesn't change for the dominant case.
+		args = append(args, tiers[0])
 		whereParts = append(whereParts, fmt.Sprintf("t.plan_tier = $%d", len(args)))
+	} else if len(tiers) > 1 {
+		// Multi-tier path: build a parameterized IN list. Each tier value
+		// has already been validated against adminAllowedTiers, so no
+		// further escaping is needed beyond the $N placeholders.
+		placeholders := make([]string, 0, len(tiers))
+		for _, t := range tiers {
+			args = append(args, t)
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+		}
+		whereParts = append(whereParts,
+			fmt.Sprintf("t.plan_tier IN (%s)", strings.Join(placeholders, ",")))
 	}
 	where := strings.Join(whereParts, " AND ")
 
@@ -877,6 +915,57 @@ func adminTierRank(tier string) int {
 		return 1
 	}
 	return -1
+}
+
+// adminParseTierFilter parses the ?tier query value into the deduped set
+// of valid tier strings to OR together in the WHERE clause.
+//
+// Return contract:
+//
+//	raw=""              → (nil,   false)  — no filter, fetch everything
+//	raw="pro"           → (["pro"], false) — single-tier (preserves PR #48 path)
+//	raw="hobby,pro"     → (["hobby","pro"], false)
+//	raw="hobby, ,pro"   → (["hobby","pro"], false)  — whitespace/empty tolerated
+//	raw="HOBBY"         → (["hobby"], false)         — case-insensitive
+//	raw="platinum"      → (nil, true)  — all values unknown; caller short-circuits to empty list
+//	raw="pro,platinum"  → (["pro"], false) — partial-unknown: keep the valid ones
+//
+// The "all unknown → empty list" branch keeps the dashboard filter pills
+// UI-stable: a stale or typo'd value renders "no results" rather than a
+// 400 error banner. See the comment in List() for the full rationale.
+func adminParseTierFilter(raw string) ([]string, bool) {
+	if raw == "" {
+		return nil, false
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := map[string]bool{}
+	sawAny := false
+	for _, p := range parts {
+		v := strings.ToLower(strings.TrimSpace(p))
+		if v == "" {
+			continue
+		}
+		sawAny = true
+		if !adminAllowedTiers[v] {
+			continue
+		}
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	if len(out) == 0 {
+		// Distinguish "no values at all (whitespace, commas)" — treat as
+		// no filter — from "values present but all unknown" — caller
+		// short-circuits to an empty result.
+		if !sawAny {
+			return nil, false
+		}
+		return nil, true
+	}
+	return out, false
 }
 
 // adminParseLimit clamps a ?limit query value into [1, max], defaulting to
