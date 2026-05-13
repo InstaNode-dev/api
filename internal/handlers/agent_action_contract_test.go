@@ -36,6 +36,8 @@ func agentActionContractCases() map[string]string {
 		"AgentActionPrivateDeployRequiresAllowedIPs":   AgentActionPrivateDeployRequiresAllowedIPs,
 		"AgentActionAdminRequired":                     AgentActionAdminRequired,
 		"AgentActionPromotionInvalid":                  AgentActionPromotionInvalid,
+		"AgentActionPromotionAlreadyUsed":              AgentActionPromotionAlreadyUsed,
+		"AgentActionPromotionExpired":                  AgentActionPromotionExpired,
 
 		// Builders — representative inputs covering tier/env/role/limit
 		// interpolation.

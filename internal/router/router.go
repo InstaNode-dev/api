@@ -355,11 +355,12 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Post("/billing/update-payment", billing.UpdatePaymentMethodAPI)
 	api.Post("/billing/change-plan", billing.ChangePlanAPI)
 
-	// Promo code validator — HTTP wrapper around plans.ValidatePromotion.
-	// Separate handler so its (rdb, planRegistry) deps are explicit at the
-	// constructor boundary; rate-limited per-team per-hour to make
-	// brute-forcing seed codes impractical. See billing_promotion.go.
-	billingPromoH := handlers.NewBillingPromotionHandler(rdb, planRegistry)
+	// Promo code validator — HTTP wrapper around plans.ValidatePromotion +
+	// admin_promo_codes lookup. Separate handler so its (db, rdb,
+	// planRegistry) deps are explicit at the constructor boundary;
+	// rate-limited per-team per-hour to make brute-forcing seed codes
+	// impractical. See billing_promotion.go.
+	billingPromoH := handlers.NewBillingPromotionHandler(db, rdb, planRegistry)
 	api.Post("/billing/promotion/validate", billingPromoH.ValidatePromotion)
 
 	// §10.20 cached aggregates — see billing_usage.go / team_summary.go.

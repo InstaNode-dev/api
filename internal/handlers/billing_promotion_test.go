@@ -120,7 +120,11 @@ func newPromoApp(t *testing.T, rdb *redis.Client, reg *plans.Registry, authentic
 			return c.Next()
 		})
 	}
-	h := handlers.NewBillingPromotionHandler(rdb, reg)
+	// db=nil — the existing PR #47 tests cover only the plans-yaml path, so
+	// the admin-code fallback in BillingPromotionHandler is never reached.
+	// Passing nil keeps these tests hermetic (no TEST_DATABASE_URL needed)
+	// and exercises the "db is nil → skip admin fallback" branch.
+	h := handlers.NewBillingPromotionHandler(nil, rdb, reg)
 	app.Post("/api/v1/billing/promotion/validate", h.ValidatePromotion)
 	return app
 }
