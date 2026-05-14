@@ -501,6 +501,7 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	cliAuthH := handlers.NewCLIAuthHandler(db, rdb, cfg, planReg)
 	resourceH := handlers.NewResourceHandler(db, rdb, cfg, planReg, nil, nil)
 	dbH := handlers.NewDBHandler(db, rdb, cfg, nil, planReg)
+	vectorH := handlers.NewVectorHandler(db, rdb, cfg, nil, planReg)
 	cacheH := handlers.NewCacheHandler(db, rdb, cfg, nil, planReg)
 	nosqlH := handlers.NewNoSQLHandler(db, rdb, cfg, nil, planReg)
 
@@ -513,6 +514,9 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	// internal/router/router.go so handler tests exercise the same chain.
 	dbGroup := app.Group("/db", middleware.OptionalAuth(cfg))
 	dbGroup.Post("/new", middleware.Idempotency(rdb, "db.new"), dbH.NewDB)
+
+	vectorGroup := app.Group("/vector", middleware.OptionalAuth(cfg))
+	vectorGroup.Post("/new", vectorH.NewVector)
 
 	cacheGroup := app.Group("/cache", middleware.OptionalAuth(cfg))
 	cacheGroup.Post("/new", middleware.Idempotency(rdb, "cache.new"), cacheH.NewCache)
