@@ -551,7 +551,11 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 	// Optional human-readable name.
 	name := ""
 	if names := form.Value["name"]; len(names) > 0 {
-		name = sanitizeName(names[0])
+		clean, sanErr := sanitizeNameForRequest(c, names[0])
+		if sanErr != nil {
+			return sanErr
+		}
+		name = clean
 	}
 
 	// Anonymous stacks: nil TeamID + 24h TTL + fingerprint (same model as /db/new).
@@ -1695,7 +1699,10 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 			return respondError(c, fiber.StatusInternalServerError, "internal_error",
 				"Failed to generate stack ID")
 		}
-		name := sanitizeName(body.Name)
+		name, sanErr := sanitizeNameForRequest(c, body.Name)
+		if sanErr != nil {
+			return sanErr
+		}
 		if name == "" {
 			name = source.Name
 		}
