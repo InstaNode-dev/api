@@ -152,6 +152,12 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"last_owner": {
 		AgentAction: "Tell the user the team needs at least one owner. Have them promote another member to owner at https://instanode.dev/app/team before changing or removing this one.",
 	},
+	"cannot_remove_primary": {
+		AgentAction: "Tell the user they can't remove the primary user — every team needs a primary. Have them promote another member first via POST https://instanode.dev/api/v1/team/members/<other_user_id>/promote-to-primary, then retry the removal.",
+	},
+	"cannot_assign_owner_role": {
+		AgentAction: "Tell the user the owner role can't be assigned via PATCH role — ownership transfers atomically. Have them call POST https://instanode.dev/api/v1/team/members/<user_id>/promote-to-primary instead.",
+	},
 
 	// ── Fiber-default 4xx routing errors ───────────────────────────────────
 	// The default Fiber 404/405/413/415 paths flow through the ErrorHandler

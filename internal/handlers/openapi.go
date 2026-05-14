@@ -1577,15 +1577,19 @@ const openAPISpec = `{
     "/api/v1/team/members/invite": {
       "post": {
         "summary": "Invite a user to the team (owner or admin)",
-        "description": "Two flows under the same endpoint: role='member' uses the legacy owner-controlled seat flow (owner-only, enforces tier seat limit); role='admin'/'developer'/'viewer' uses the RBAC token flow (single-use token emailed out, accepted at POST /api/v1/invitations/{token}/accept).",
+        "description": "Two flows under the same endpoint: role='member' uses the legacy owner-controlled seat flow (owner-only); role='admin'/'developer'/'viewer' uses the RBAC token flow (single-use token emailed out, accepted at POST /api/v1/invitations/{token}/accept). BOTH flows enforce the per-tier seat limit. Rate-limited to 10 invites/hour/team via Redis sliding counter; over-cap returns 429. Idempotency-Key header is honored (24h cache, replays carry X-Idempotent-Replay: true).",
         "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string" }, "description": "Optional opaque key (≤255 chars). When present the response is cached for 24h scoped to (team_id, key); subsequent calls with the same key replay the cached response verbatim and set X-Idempotent-Replay: true." }
+        ],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["email"], "properties": { "email": { "type": "string", "format": "email" }, "role": { "type": "string", "enum": ["admin", "developer", "viewer", "member"], "default": "member" } } } } } },
         "responses": {
           "201": { "description": "Invitation created" },
           "400": { "description": "Body invalid, missing email, or invalid role" },
           "401": { "description": "Unauthorized" },
           "403": { "description": "Owner/admin role required" },
-          "409": { "description": "Member limit reached / duplicate / already-a-member" }
+          "409": { "description": "Member limit reached / duplicate / already-a-member" },
+          "429": { "description": "Rate limit exceeded (10 invites/hour/team)" }
         }
       }
     },
@@ -1604,15 +1608,45 @@ const openAPISpec = `{
     "/api/v1/team/members/{user_id}": {
       "delete": {
         "summary": "Remove a member from the team (owner only)",
+        "description": "Refuses when the target is the team's primary user — every team needs a primary. Promote another member via POST .../promote-to-primary first. On success the removed user is reassigned to a freshly-created personal team; that team's UUID is returned in orphan_team_id so the caller can audit it.",
         "security": [{ "bearerAuth": [] }],
         "parameters": [{ "name": "user_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
         "responses": {
-          "200": { "description": "Member removed" },
-          "400": { "description": "Invalid user id" },
+          "200": { "description": "Member removed; response includes orphan_team_id", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "orphan_team_id": { "type": "string", "format": "uuid", "description": "UUID of the freshly-created personal team the removed user was reassigned to." } } } } } },
+          "400": { "description": "Invalid user id, or target is the team's primary user (error code cannot_remove_primary)" },
           "401": { "description": "Unauthorized" },
           "403": { "description": "Owner only" },
           "404": { "description": "User not in team" },
           "409": { "description": "Cannot remove the owner" }
+        }
+      },
+      "patch": {
+        "summary": "Change a member's role (owner only)",
+        "description": "Updates users.role for the target. Allowed roles: admin, developer, viewer, member (legacy alias of developer). Owner role is NOT assignable here — use POST .../promote-to-primary for an atomic ownership transfer.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "user_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["role"], "properties": { "role": { "type": "string", "enum": ["admin", "developer", "viewer", "member"] } } } } } },
+        "responses": {
+          "200": { "description": "Role updated", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "user_id": { "type": "string", "format": "uuid" }, "role": { "type": "string" } } } } } },
+          "400": { "description": "Invalid user id, invalid role, or attempt to assign owner (error code cannot_assign_owner_role)" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Owner only" },
+          "404": { "description": "User not on this team" }
+        }
+      }
+    },
+    "/api/v1/team/members/{user_id}/promote-to-primary": {
+      "post": {
+        "summary": "Atomically transfer team primary + owner to the target user (owner only)",
+        "description": "Owner-only. Demotes the current primary (is_primary=false, role=admin) and promotes the target (is_primary=true, role=owner) inside one transaction so the partial unique index uq_users_one_primary_per_team can never observe a two-primary state. Idempotent: promoting the existing primary is a no-op.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "user_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Primary transferred", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "team_id": { "type": "string", "format": "uuid" }, "primary_user_id": { "type": "string", "format": "uuid" } } } } } },
+          "400": { "description": "Invalid user id" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Owner only" },
+          "404": { "description": "Target user not on this team" }
         }
       }
     },
@@ -1643,11 +1677,11 @@ const openAPISpec = `{
     "/api/v1/team/invitations/{id}/accept": {
       "post": {
         "summary": "Accept an invitation by its row id (authenticated user)",
-        "description": "Authenticated counterpart to POST /api/v1/invitations/{token}/accept — this one accepts by the invitation row id (UUID) and trusts the caller's session for identity. Use the token-based public endpoint when accepting from a link in an email.",
+        "description": "Authenticated counterpart to POST /api/v1/invitations/{token}/accept — this one accepts by the invitation row id (UUID) and trusts the caller's session for identity. Use the token-based public endpoint when accepting from a link in an email. If the invitation requested role=owner but the team already has an owner, the user is silently downgraded to member and the response carries a warning field explaining the demote — use POST /api/v1/team/members/{user_id}/promote-to-primary for an atomic ownership transfer.",
         "security": [{ "bearerAuth": [] }],
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
         "responses": {
-          "200": { "description": "Accepted" },
+          "200": { "description": "Accepted; response includes the granted role and an optional warning when an owner request was silently downgraded.", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "role": { "type": "string" }, "warning": { "type": "string", "description": "Present iff the invitation requested role=owner but a silent downgrade to member occurred." } } } } } },
           "401": { "description": "Unauthorized" },
           "404": { "description": "Invitation not found" },
           "409": { "description": "Expired, already used, or member-limit reached" }
