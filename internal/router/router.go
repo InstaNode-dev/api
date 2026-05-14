@@ -254,12 +254,19 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// Authorization headers in practice, but installing the gate keeps
 	// the policy uniform — see test #5 in PR #024 for the explicit
 	// "POST /db/new under an impersonated session must 403" assertion.
-	app.Post("/db/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), dbH.NewDB)
-	app.Post("/cache/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), cacheH.NewCache)
-	app.Post("/nosql/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), nosqlH.NewNoSQL)
-	app.Post("/queue/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), queueH.NewQueue)
-	app.Post("/storage/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), storageH.NewStorage)
-	app.Post("/webhook/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), webhookH.NewWebhook)
+	// Idempotency middleware (per-endpoint, AFTER OptionalAuth + RequireWritable
+	// so the scope can read auth_team_id when present, falling back to the
+	// fingerprint set by the global Fingerprint() middleware). Rate-limit
+	// runs at app.Use scope above, so replays still consume rate budget —
+	// this is the intentional anti-abuse posture documented in
+	// internal/middleware/idempotency.go. See that file for the full
+	// rationale on the rate-budget vs quota-budget split.
+	app.Post("/db/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "db.new"), dbH.NewDB)
+	app.Post("/cache/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "cache.new"), cacheH.NewCache)
+	app.Post("/nosql/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "nosql.new"), nosqlH.NewNoSQL)
+	app.Post("/queue/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "queue.new"), queueH.NewQueue)
+	app.Post("/storage/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "storage.new"), storageH.NewStorage)
+	app.Post("/webhook/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "webhook.new"), webhookH.NewWebhook)
 	app.Post("/webhook/receive/:token", webhookH.Receive)
 	app.Get("/resources/:token/logs", logsH.ResourceLogs)
 
@@ -292,6 +299,14 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 				return "", nil
 			}),
 		),
+		// Idempotency runs AFTER env-policy so a rejected env doesn't get
+		// cached as a 4xx and replay on a future approved env. (Same key,
+		// same body, but the policy state may differ — replaying the cached
+		// 403 would be wrong. The downside is a tiny window where two
+		// concurrent POSTs with the same key both pass policy and race the
+		// cache write; the per-request 5xx-not-cached rule and the
+		// per-fingerprint rate-limit cap the blast radius.)
+		middleware.Idempotency(rdb, "deploy.new"),
 		deployH.New,
 	)
 	deployGroup.Get("/:id", deployH.Get)
