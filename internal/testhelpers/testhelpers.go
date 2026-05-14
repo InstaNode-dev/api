@@ -591,6 +591,7 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	api.Get("/resources/families", resourceH.ListFamilies)
 	api.Get("/resources/:id/family", resourceH.Family)
 	api.Get("/resources/:id", resourceH.Get)
+	api.Get("/resources/:id/credentials", resourceH.GetCredentials)
 	api.Delete("/resources/:id", resourceH.Delete)
 	api.Post("/resources/:id/rotate-credentials", resourceH.RotateCredentials)
 	api.Post("/resources/:id/pause", resourceH.Pause)
@@ -627,6 +628,13 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	// auth middleware + JSON handler) end-to-end.
 	experimentsH := handlers.NewExperimentsHandler(db)
 	api.Post("/experiments/converted", experimentsH.Converted)
+
+	// W7-C customer-facing audit export — JSON + CSV. Wired in tests so
+	// the handler-layer tests in audit_export_test.go exercise the full
+	// route stack (auth middleware + JSON / CSV handlers + tier gate).
+	auditH := handlers.NewAuditHandler(db)
+	api.Get("/audit", auditH.List)
+	api.Get("/audit.csv", auditH.ListCSV)
 
 	return app, func() { app.Shutdown() }
 }

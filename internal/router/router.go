@@ -606,9 +606,19 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Get("/auth/api-keys", apiKeysH.List)
 	api.Delete("/auth/api-keys/:id", apiKeysH.Revoke)
 
-	// Per-team audit log — feeds the dashboard's Recent Activity panel.
+	// Per-team audit log — customer-facing export.
+	//
+	//   GET /api/v1/audit       → JSON, cursor-paginated, tier-gated.
+	//   GET /api/v1/audit.csv   → text/csv, streamed (for piping into
+	//                              a customer's own SIEM).
+	//
+	// Tier gate: anonymous/free → 402; hobby = 30d, pro = 90d,
+	// growth/team = unlimited lookback. admin.* rows are never returned
+	// regardless of tier — those are reserved for the operator audit
+	// feed at /api/v1/<admin-prefix>/customers. See handlers/audit.go.
 	auditH := handlers.NewAuditHandler(db)
 	api.Get("/audit", auditH.List)
+	api.Get("/audit.csv", auditH.ListCSV)
 
 	// Admin / customer-management surface (Track A). Two independent gates:
 	//
