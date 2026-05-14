@@ -78,8 +78,14 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
 	var body provisionRequestBody
-	_ = c.BodyParser(&body)
-	body.Name = sanitizeName(body.Name)
+	if err := parseProvisionBody(c, &body); err != nil {
+		return err
+	}
+	cleanName, sanErr := sanitizeNameForRequest(c, body.Name)
+	if sanErr != nil {
+		return sanErr
+	}
+	body.Name = cleanName
 
 	env, envErr := resolveEnv(c, body.Env)
 	if envErr != nil {
@@ -145,7 +151,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 					"upgrade_jwt":    jwtToken,
 				}
 				setInternalURL(dedupResp, existing.Tier, connectionURL, "mongodb")
-				return c.JSON(dedupResp)
+				return respondOK(c, dedupResp)
 			}
 			// Empty connection_url means provisioning failed mid-flight on the existing
 			// resource. Fall through to provision a fresh one rather than returning
@@ -275,7 +281,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 		nosqlResp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
 	}
-	return c.Status(fiber.StatusCreated).JSON(nosqlResp)
+	return respondCreated(c, nosqlResp)
 }
 
 func (h *NoSQLHandler) newNoSQLAuthenticated(
@@ -403,7 +409,7 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 		nosqlAuthResp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
 	}
-	return c.Status(fiber.StatusCreated).JSON(nosqlAuthResp)
+	return respondCreated(c, nosqlAuthResp)
 }
 
 // decryptConnectionURL decrypts an AES-encrypted connection URL stored in the DB.
@@ -470,7 +476,7 @@ func (h *NoSQLHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) 
 		resp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
 	}
-	return c.Status(fiber.StatusCreated).JSON(resp)
+	return respondCreated(c, resp)
 }
 
 // ProvisionForTwinCore is the fiber-free implementation of ProvisionForTwin.

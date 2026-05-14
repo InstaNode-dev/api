@@ -646,6 +646,14 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	// full rationale (BugBash #Q29).
 	app.All("/webhook/receive/:token", webhookH.Receive)
 
+	// /queue/new and /auth/cli are wired so handler-level tests can hit
+	// every body-parsing surface Wave FIX-D introduced. Both endpoints
+	// existed in production already (internal/router/router.go) but were
+	// previously absent from the test app.
+	queueH := handlers.NewQueueHandler(db, rdb, cfg, nil, planReg)
+	app.Post("/queue/new", middleware.OptionalAuth(cfg), middleware.Idempotency(rdb, "queue.new"), queueH.NewQueue)
+	app.Post("/auth/cli", cliAuthH.CreateCLISession)
+
 	// Phase 6: deploy
 	deployH := handlers.NewDeployHandler(db, rdb, cfg, planReg)
 	deployGroup := app.Group("/deploy", middleware.RequireAuth(cfg))

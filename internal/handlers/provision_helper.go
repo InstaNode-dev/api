@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -413,14 +414,42 @@ type provisionRequestBody struct {
 // in names like "Smith & Co Postgres") because React's text rendering
 // already escapes it; the strip targets the script-tag sink specifically.
 //
+// Wave FIX-D additions (#Q70/#Q71):
+//   - Invalid UTF-8 → rejected with an error. Go's JSON decoder silently
+//     replaces invalid bytes with U+FFFD (the replacement character), which
+//     means a hostile or malformed name slipped past sanitizeName before.
+//     We now reject at the boundary so resources.name only ever holds valid
+//     UTF-8.
+//   - Control characters (U+0000–U+001F, U+007F DEL) → silently stripped.
+//     CRLF, NUL, BEL, etc. in a name break log lines, terminal output, and
+//     audit summaries; they have no legitimate use in a human-readable
+//     label. Strip rather than reject so a stray \r from a copy-pasted name
+//     doesn't 400 the caller.
+//
 // We deliberately do NOT HTML-escape (replace `<` with `&lt;`) because the
 // resource name is also displayed in CLI output, slack messages, and email
 // subjects where the user expects the original characters. Stripping is
 // the only transformation that's safe across every downstream renderer.
-func sanitizeName(name string) string {
+//
+// Returns (name, nil) on success, ("", ErrResponseWritten) when the caller
+// MUST stop — the 400 response has already been written via respondError.
+// The Fiber-aware variant lives in sanitizeNameForRequest below.
+func sanitizeName(name string) (string, error) {
 	if name == "" {
-		return ""
+		return "", nil
 	}
+	if !utf8.ValidString(name) {
+		return "", errInvalidUTF8Name
+	}
+	// Strip control characters first (CRLF, NUL, BEL, ...). These have no
+	// legitimate place in a human-readable name; CRLF in particular would
+	// inject newlines into structured log lines and audit summaries.
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, name)
 	// Strip HTML-injection vectors. Replace with empty string rather than
 	// a placeholder so a paste of "<bad>name" cleanly becomes "name"
 	// rather than something like "[stripped]name" the user must explain.
@@ -432,9 +461,76 @@ func sanitizeName(name string) string {
 	)
 	name = stripper.Replace(name)
 	if len(name) > 120 {
-		return name[:120]
+		name = name[:120]
 	}
-	return name
+	return name, nil
+}
+
+// errInvalidUTF8Name is the sentinel sanitizeName returns when the input
+// contains invalid UTF-8 bytes. Handlers convert this into the canonical
+// 400 invalid_name response via sanitizeNameForRequest.
+var errInvalidUTF8Name = errors.New("name contains invalid UTF-8 bytes")
+
+// sanitizeNameForRequest wraps sanitizeName with Fiber-aware error handling.
+// On invalid UTF-8 it writes a 400 invalid_name response via respondError
+// and returns ErrResponseWritten — the caller's standard error propagation
+// (`if err != nil { return err }`) does the right thing.
+//
+// Use this from every POST handler that accepts a `name` body field. The
+// plain sanitizeName remains exported within the package for non-Fiber
+// callers (k8s job naming, future internal use).
+func sanitizeNameForRequest(c *fiber.Ctx, name string) (string, error) {
+	clean, err := sanitizeName(name)
+	if err == nil {
+		return clean, nil
+	}
+	if errors.Is(err, errInvalidUTF8Name) {
+		return "", respondError(c, fiber.StatusBadRequest, "invalid_name",
+			"Field 'name' contains invalid UTF-8 bytes. Use only valid UTF-8 text.")
+	}
+	// Unknown sanitize error — surface as 400 rather than 500. The only
+	// failure mode today is invalid UTF-8; future additions land here.
+	return "", respondError(c, fiber.StatusBadRequest, "invalid_name",
+		"Field 'name' could not be sanitized: "+err.Error())
+}
+
+// parseProvisionBody reads and parses the optional JSON request body into v.
+// Empty bodies are tolerated (every provisioning endpoint accepts a bare
+// POST with no body). Non-empty bodies that fail to parse — BOM-prefixed
+// JSON, comments, trailing commas, wrong-type fields, invalid UTF-8 —
+// produce a 400 invalid_body response instead of being silently swallowed.
+//
+// Wave FIX-D (#125 / #S18 / #Q67 / #Q70 / #Q71): before this helper every
+// provisioning handler did `_ = c.BodyParser(&body)` which silently ate
+// every parse error. The result was a 201 with empty fields and zero-value
+// coercions (name: 12345 → name: ""), which is indistinguishable from a
+// bare POST and hides real bugs in client code.
+//
+// Invalid-UTF-8 (#Q70): Go's encoding/json package silently rewrites
+// invalid UTF-8 bytes in string literals as U+FFFD (the Unicode replacement
+// character) during Unmarshal. By the time c.BodyParser hands us the
+// decoded struct the original bytes are gone. The only place to reject
+// invalid UTF-8 is the raw request body — we do that here, BEFORE the
+// JSON decoder gets a chance to coerce.
+//
+// On error this helper writes the response via respondError and returns
+// ErrResponseWritten. Standard caller pattern:
+//
+//	if err := parseProvisionBody(c, &body); err != nil { return err }
+func parseProvisionBody(c *fiber.Ctx, v any) error {
+	raw := c.Body()
+	if len(raw) == 0 {
+		return nil
+	}
+	if !utf8.Valid(raw) {
+		return respondError(c, fiber.StatusBadRequest, "invalid_body",
+			"Request body contains invalid UTF-8 bytes. Send valid UTF-8 JSON.")
+	}
+	if err := c.BodyParser(v); err != nil {
+		return respondError(c, fiber.StatusBadRequest, "invalid_body",
+			"Request body could not be parsed as JSON: "+err.Error())
+	}
+	return nil
 }
 
 // resolveEnv extracts the requested environment from the request, preferring
@@ -454,8 +550,19 @@ func sanitizeName(name string) string {
 //
 // The ErrResponseWritten sentinel propagates up; the ErrorHandler
 // recognises it and does not overwrite the response.
+//
+// Side effect (Wave FIX-D, #Q15): when the resolved env differs from what
+// the caller supplied — today that only happens when the caller sent
+// nothing and we defaulted to "development" per migration 026 — this
+// stashes a short machine-readable reason in c.Locals under
+// envOverrideReasonKey. Callers wire that reason into their JSON
+// response via decorateEnvOverride so an agent can tell the difference
+// between "I wrote to dev intentionally" and "I sent no env and the API
+// defaulted me to dev." We don't 4xx on override (back-compat): the
+// signal is a response field, not a refusal.
 func resolveEnv(c *fiber.Ctx, bodyEnv string) (string, error) {
-	raw := c.Query("env")
+	rawQuery := c.Query("env")
+	raw := rawQuery
 	if raw == "" {
 		raw = bodyEnv
 	}
@@ -464,7 +571,64 @@ func resolveEnv(c *fiber.Ctx, bodyEnv string) (string, error) {
 		return "", respondError(c, fiber.StatusBadRequest, "invalid_env",
 			"env must match ^[a-z0-9-]{1,32}$ (lowercase letters, digits, dashes; max 32 chars)")
 	}
+	if reason := envOverrideReason(rawQuery, bodyEnv, env); reason != "" {
+		c.Locals(envOverrideReasonKey, reason)
+	}
 	return env, nil
+}
+
+// envOverrideReasonKey is the Locals key under which resolveEnv stashes the
+// machine-readable reason for any env override applied to a request. Read
+// via decorateEnvOverride; tests can assert it directly.
+const envOverrideReasonKey = "env_override_reason"
+
+// envOverrideReason returns the short machine-readable reason for any env
+// override applied to a request. Returns "" when the caller's input was
+// used verbatim (no override happened).
+//
+// Current triggers:
+//   - "default_no_env_specified" — caller sent no env, defaulted to
+//     EnvDefault ("development") per migration 026.
+//
+// Future triggers (placeholder — none wired today): tier_policy_downgrade
+// when a tier-policy refuses production and rewrites to staging, etc.
+func envOverrideReason(rawQuery, rawBody, resolved string) string {
+	if rawQuery == "" && rawBody == "" && resolved == models.EnvDefault {
+		return "default_no_env_specified"
+	}
+	return ""
+}
+
+// decorateEnvOverride injects "env_override_reason" into a response map
+// when resolveEnv stashed one on the request. No-op when the caller passed
+// an explicit env, so existing happy-path responses keep their compact
+// shape. Pass every fiber.Map the handler returns via c.JSON / c.Status.JSON.
+func decorateEnvOverride(c *fiber.Ctx, resp fiber.Map) fiber.Map {
+	if v, ok := c.Locals(envOverrideReasonKey).(string); ok && v != "" {
+		resp["env_override_reason"] = v
+	}
+	return resp
+}
+
+// respondCreated writes a 201 JSON response after applying any pending
+// env-override decoration. Single chokepoint so handlers don't have to
+// remember to call decorateEnvOverride at every response site.
+//
+// Use:
+//
+//	return respondCreated(c, fiber.Map{ "ok": true, "id": ..., "env": env })
+//
+// Equivalent to the prior c.Status(fiber.StatusCreated).JSON(resp), but
+// also stamps env_override_reason when resolveEnv flagged the request.
+func respondCreated(c *fiber.Ctx, resp fiber.Map) error {
+	return c.Status(fiber.StatusCreated).JSON(decorateEnvOverride(c, resp))
+}
+
+// respondOK writes a 200 JSON response with the same env-override decoration.
+// Mirror of respondCreated for endpoints that re-emit existing resources
+// (e.g. the fingerprint-dedup branch returns the existing resource at 200).
+func respondOK(c *fiber.Ctx, resp fiber.Map) error {
+	return c.JSON(decorateEnvOverride(c, resp))
 }
 
 // resolveFamilyParent parses the body's optional parent_resource_id and
