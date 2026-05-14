@@ -54,6 +54,25 @@ import (
 // does NOT match the current request body, return 409 conflict (the agent
 // reused a key for a different request — almost certainly a bug).
 //
+// Precedence vs handler-internal fingerprint dedup (W11, 2026-05-14): the
+// middleware sits BEFORE the handler in the per-route chain (see
+// internal/router/router.go), so a cached idempotency hit short-circuits
+// before the handler's fingerprint-dedup branch ever runs. This is the
+// load-bearing ordering for the W11 contract that Idempotency-Key wins
+// against fingerprint dedup:
+//   - With Idempotency-Key + cached: replay the cached token (whatever it
+//     was on the first call), even if fingerprint dedup would now hand out
+//     a different existing resource. X-Idempotent-Replay: true.
+//   - With Idempotency-Key + no cache: handler runs; its fingerprint-dedup
+//     branch may apply on the first call. The response is then cached so
+//     subsequent same-key calls replay the same token.
+//   - Without Idempotency-Key: handler's fingerprint-dedup is the only
+//     dedup layer. X-Idempotent-Replay is NEVER set on this path — that
+//     header is reserved exclusively for the idempotency middleware so
+//     upstream agents can branch reliably on "this was a replay vs a
+//     fingerprint dedup hit vs a fresh provision".
+// E2E coverage: e2e/w11_hardening_e2e_test.go pins all three branches.
+//
 // 5xx responses are NOT cached so retries trigger fresh attempts; 2xx and
 // 4xx ARE cached (a 402 quota_exceeded should replay so the agent sees
 // the same upgrade prompt rather than retry-storming the wall).
