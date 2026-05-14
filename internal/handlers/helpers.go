@@ -203,6 +203,22 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the replay-protection store is temporarily degraded. Retry in 30 seconds — token is valid; see https://instanode.dev/status for live recovery info.",
 		UpgradeURL:  "https://instanode.dev/status",
 	},
+
+	// ── Email-confirmed deletion (Wave FIX-I, migration 044) ──────────────
+	// Generic fallback when respondError is called with these codes and no
+	// per-call agent_action override is supplied. The deploy/stack handlers
+	// always pass a templated sentence via respondErrorWithAgentAction
+	// (because the masked email + ttl are dynamic), but a 410-from-cron or
+	// a worker calling the codepath without context lands here.
+	"deletion_token_invalid": {
+		AgentAction: AgentActionDeletionTokenExpiredOrUsed,
+	},
+	"deletion_already_pending": {
+		AgentAction: AgentActionDeletionAlreadyPending,
+	},
+	"deletion_email_disabled": {
+		AgentAction: AgentActionDeletionEmailDisabled,
+	},
 }
 
 // ErrorResponse is the canonical JSON shape for every 4xx/5xx response.

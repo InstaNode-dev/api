@@ -199,6 +199,56 @@ func TestBrevoProvider_FormatsBody(t *testing.T) {
 	}
 }
 
+// TestSendDeletionConfirmation_FormatsBody drives a fake Brevo server
+// and asserts the deletion-confirm email carries the resource label, the
+// TTL in minutes, and the full confirmation link. Wave FIX-I.
+func TestSendDeletionConfirmation_FormatsBody(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	rewrite := &urlRewriter{base: srv.URL, inner: http.DefaultTransport}
+	c := email.New(email.Config{
+		Provider:    "brevo",
+		BrevoAPIKey: "xkeysib-test",
+		HTTPClient:  &http.Client{Transport: rewrite},
+	})
+
+	link := "https://api.instanode.dev/auth/email/confirm-deletion?t=del_abc123"
+	if err := c.SendDeletionConfirmation(
+		context.Background(),
+		"owner@example.com",
+		"deployment my-app",
+		link,
+		15,
+	); err != nil {
+		t.Fatalf("SendDeletionConfirmation: %v", err)
+	}
+
+	subj, _ := gotBody["subject"].(string)
+	if !strings.Contains(subj, "Confirm deletion") {
+		t.Errorf("subject: want 'Confirm deletion', got %q", subj)
+	}
+	if !strings.Contains(subj, "deployment my-app") {
+		t.Errorf("subject: must name the resource, got %q", subj)
+	}
+	if !strings.Contains(subj, "15") {
+		t.Errorf("subject: must surface the TTL minutes, got %q", subj)
+	}
+	txt, _ := gotBody["textContent"].(string)
+	if !strings.Contains(txt, link) {
+		t.Errorf("textContent: must embed the confirmation link, got %q", txt)
+	}
+	html, _ := gotBody["htmlContent"].(string)
+	if !strings.Contains(html, link) {
+		t.Errorf("htmlContent: must embed the confirmation link, got %q", html)
+	}
+}
+
 // TestBrevoProvider_HandlesUnauthorized — Brevo returns 401 on bad api-key;
 // the provider must surface a non-nil error so callers (magic_link.go etc.)
 // can log + retry instead of silently dropping the email.

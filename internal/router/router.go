@@ -206,6 +206,14 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	logsH := handlers.NewLogsHandler(db)
 	deployH := handlers.NewDeployHandler(db, rdb, cfg, planRegistry)
 	stackH := handlers.NewStackHandler(db, rdb, cfg, planRegistry)
+	// Wire the shared email client for the two-step deletion flow
+	// (Wave FIX-I). Constructed separately so existing tests that
+	// instantiate the handlers directly can opt out of the email path
+	// without touching the constructor signature. emailClient may be
+	// nil on a misconfigured boot — the handlers detect that and fall
+	// back to immediate destruction.
+	deployH.SetEmailClient(emailClient)
+	stackH.SetEmailClient(emailClient)
 
 	// Custom-domain handler shares the k8s stack provider so EnsureCustomDomainIngress
 	// can update the same Ingress namespace the stack lives in. We construct a
@@ -442,6 +450,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	mlH := handlers.NewMagicLinkHandlerWithMailer(db, cfg, mlMailer, authH)
 	app.Post("/auth/email/start", mlH.Start)
 	app.Get("/auth/email/callback", mlH.Callback)
+	// Wave FIX-I — email-link 302 to the dashboard's confirm-deletion
+	// page. The API does NOT process the token here (a click is
+	// navigation, not action); the dashboard's authenticated POST is
+	// the real confirm step.
+	app.Get("/auth/email/confirm-deletion", handlers.EmailConfirmDeletionRedirectHandler(cfg.DashboardBaseURL))
 
 	// CLI device-flow login — POST creates session, GET polls for completion
 	app.Post("/auth/cli", cliAuthH.CreateCLISession)
@@ -688,6 +701,13 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Get("/deployments", deployH.List)
 	api.Get("/deployments/:id", deployH.Get)
 	api.Delete("/deployments/:id", deployH.Delete)
+	// Wave FIX-I — two-step email-confirmed deletion. POST confirms
+	// (validates ?token=<plaintext> against the hashed pending row),
+	// DELETE cancels (the dashboard's "I changed my mind" path). Both
+	// inherit RequireAuth + RequireWritable from the /api/v1 group —
+	// anonymous deploys never enter this flow.
+	api.Post("/deployments/:id/confirm-deletion", deployH.ConfirmDelete)
+	api.Delete("/deployments/:id/confirm-deletion", deployH.CancelDelete)
 	// PATCH edits access-control fields (private + allowed_ips) without a
 	// rebuild. Pro+ tier gate enforced inside the handler; shares
 	// validatePrivateDeployFields with POST /deploy/new so the rule-set is
@@ -708,6 +728,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 
 	// Stack management endpoints — Phase 6 (under /api/v1)
 	api.Get("/stacks", stackH.List)
+	// Wave FIX-I — stack-side two-step deletion. Same contract as the
+	// deploy-side endpoints; the shared resolver lives in
+	// handlers/deletion_confirm.go.
+	api.Post("/stacks/:slug/confirm-deletion", stackH.ConfirmDelete)
+	api.Delete("/stacks/:slug/confirm-deletion", stackH.CancelDelete)
 
 	// Env promotion — Pro+ "promote staging → production" + sibling envs.
 	// Tier gate (pro/team/growth) is enforced inside the handler so the

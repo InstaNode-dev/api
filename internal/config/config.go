@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -111,6 +112,23 @@ type Config struct {
 
 	MetricsToken     string // METRICS_TOKEN — if set, required as Bearer token to access /metrics
 	DashboardBaseURL string // DASHBOARD_BASE_URL — where to redirect onboarding flows (default: http://localhost:5173)
+
+	// APIPublicURL is the externally-routable base URL the API runs at
+	// — used to construct fully-qualified links in outbound emails
+	// (deletion-confirm, etc). Empty in local dev where the dashboard
+	// (DASHBOARD_BASE_URL) handles user-facing URL composition; set in
+	// production to "https://api.instanode.dev" so an email click reaches
+	// the public ingress, not the in-cluster ClusterIP. Read from
+	// API_PUBLIC_URL.
+	APIPublicURL string
+
+	// DeletionConfirmationTTLMinutes is the lifetime of a pending_deletions
+	// row before the worker's pending_deletion_expirer flips it to
+	// 'expired'. Defaults to 15. Read from DELETION_CONFIRMATION_TTL_MINUTES.
+	// Configurable post-deploy via ConfigMap so a misconfigured email
+	// backend that delays delivery doesn't permanently strand users at the
+	// default — flip to 30/60 and re-rollout.
+	DeletionConfirmationTTLMinutes int
 
 	// FamilyBindingsEnabled controls the "family:<root_id>" syntax in
 	// POST /deploy/new resource_bindings (slice 4 of env-aware deployments).
@@ -315,6 +333,24 @@ func Load() *Config {
 	cfg.KubeNamespaceApps = getenv("KUBE_NAMESPACE_APPS", "instant-apps")
 	cfg.MetricsToken = os.Getenv("METRICS_TOKEN") // empty = open (local dev)
 	cfg.DashboardBaseURL = getenv("DASHBOARD_BASE_URL", "http://localhost:5173")
+	cfg.APIPublicURL = strings.TrimRight(getenv("API_PUBLIC_URL", ""), "/")
+	// Parse DELETION_CONFIRMATION_TTL_MINUTES; fall back to 15 on
+	// empty/invalid. We deliberately accept an invalid value silently
+	// (rather than panic) because a typo on a periphery env var should
+	// never stop the api from booting — the default is safe and the WARN
+	// log surfaces the bad value to operators.
+	cfg.DeletionConfirmationTTLMinutes = 15
+	if raw := strings.TrimSpace(os.Getenv("DELETION_CONFIRMATION_TTL_MINUTES")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			cfg.DeletionConfirmationTTLMinutes = n
+		} else {
+			slog.Warn("config.deletion_confirmation_ttl.invalid",
+				"raw", raw,
+				"fallback_minutes", cfg.DeletionConfirmationTTLMinutes,
+				"note", "set DELETION_CONFIRMATION_TTL_MINUTES to a positive integer to override",
+			)
+		}
+	}
 	// FAMILY_BINDINGS_ENABLED: default true. Only "false" / "0" disables.
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("FAMILY_BINDINGS_ENABLED"))) {
 	case "false", "0", "no":
