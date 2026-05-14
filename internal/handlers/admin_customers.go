@@ -259,10 +259,16 @@ func (h *AdminCustomersHandler) List(c *fiber.Ctx) error {
 
 	query := fmt.Sprintf(`
 		WITH primary_user AS (
+			-- Migration 029 added users.is_primary as the authoritative
+			-- "primary user" flag, enforced by uq_users_one_primary_per_team.
+			-- We prefer is_primary=true rows, falling back to the legacy
+			-- earliest-created-member rule for teams whose backfill is
+			-- racing with new signups (defensive only — at-most-one-primary
+			-- is a DB invariant).
 			SELECT DISTINCT ON (team_id) team_id, email, created_at
 			FROM users
 			WHERE team_id IS NOT NULL
-			ORDER BY team_id, (role = 'owner') DESC, created_at ASC
+			ORDER BY team_id, is_primary DESC, (role = 'owner') DESC, created_at ASC
 		),
 		resource_agg AS (
 			SELECT team_id,

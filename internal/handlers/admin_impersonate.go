@@ -228,19 +228,21 @@ type targetUserRow struct {
 	Email string
 }
 
-// resolveTargetUser picks the team's nominal "primary" user — owner role
-// when present, else earliest-joined member. The result is what backs the
-// minted JWT's `uid` claim. Same DISTINCT ON ordering the
-// admin-customer-list query uses (admin_customers.go's primary_user CTE)
-// so an admin who clicks "view as" on a team listed in the dashboard
-// gets impersonated as the same user the dashboard surfaces.
+// resolveTargetUser picks the team's nominal "primary" user — the row
+// flagged by migration 029's users.is_primary boolean. Falls back to
+// the legacy earliest-created-member rule if no primary is set (defensive
+// against teams whose backfill is in flight). The result is what backs
+// the minted JWT's `uid` claim, and the admin-customer-list query reads
+// from the same column (admin_customers.go's primary_user CTE) so an
+// admin who clicks "view as" on a team listed in the dashboard gets
+// impersonated as the same user the dashboard surfaces.
 func (h *AdminImpersonateHandler) resolveTargetUser(ctx context.Context, teamID uuid.UUID) (*targetUserRow, error) {
 	row := &targetUserRow{}
 	err := h.db.QueryRowContext(ctx, `
 		SELECT id, email
 		FROM users
 		WHERE team_id = $1
-		ORDER BY (role = 'owner') DESC, created_at ASC
+		ORDER BY is_primary DESC, (role = 'owner') DESC, created_at ASC
 		LIMIT 1
 	`, teamID).Scan(&row.ID, &row.Email)
 	if err != nil {
