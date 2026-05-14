@@ -1706,13 +1706,92 @@ const openAPISpec = `{
         }
       },
       "delete": {
-        "summary": "Tear down + delete a deployment (alias of DELETE /deploy/{id})",
+        "summary": "Tear down + delete a deployment (two-step for paid tiers; immediate for anon/free or with bypass header)",
+        "description": "Wave FIX-I two-step deletion. PAID TIERS (hobby/pro/team/growth) with a verified owner email: the API does NOT immediately tear down — it queues a pending_deletions row, emails the owner a confirmation link (15-minute TTL by default; configurable via DELETION_CONFIRMATION_TTL_MINUTES), and returns 202 with deletion_status='pending_confirmation'. The agent CANNOT confirm on the user's behalf — only the human can, by either clicking the email link (which 302s through GET /auth/email/confirm-deletion to the dashboard) or by POSTing the token directly to POST /api/v1/deployments/{id}/confirm-deletion?token=<tok>. The deployment slot is NOT freed until the row flips to status='confirmed'. To cancel a pending deletion the user calls DELETE /api/v1/deployments/{id}/confirm-deletion (the same path, DELETE verb). ANONYMOUS / FREE tiers, or callers that set X-Skip-Email-Confirmation: yes, get the back-compat immediate-destruction path with 200 OK.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "X-Skip-Email-Confirmation", "in": "header", "required": false, "schema": { "type": "string", "enum": ["yes"] }, "description": "Set to 'yes' to bypass the two-step email-confirmed flow for paid tiers. Reserved for agents that have already obtained explicit user consent." }
+        ],
+        "responses": {
+          "200": { "description": "Immediate destruction path (anonymous/free tier OR header bypass): deployment torn down synchronously." },
+          "202": { "description": "Two-step path (paid tier, email wired, no bypass header): pending_deletions row queued + confirmation email sent. Body carries deletion_status='pending_confirmation', confirmation_sent_to (masked), confirmation_expires_at, agent_action (verbatim LLM copy), cancellation_note." },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Not your deployment" },
+          "409": { "description": "deletion_already_pending — a pending email is already in flight for this resource. Cancel it first via DELETE /confirm-deletion, then retry." },
+          "422": { "description": "deletion_email_disabled — paid team has no verified owner email on file." },
+          "503": { "description": "email_send_failed — transient email-backend failure; safe to retry." }
+        }
+      }
+    },
+    "/api/v1/deployments/{id}/confirm-deletion": {
+      "post": {
+        "summary": "Confirm a pending deletion (paid tiers, Wave FIX-I)",
+        "description": "Step 2 of the two-step deletion flow. The user (NOT the agent) clicks the email link, which 302s through /auth/email/confirm-deletion to the dashboard's /app/confirm-deletion page, which POSTs here with the plaintext token. The handler hashes the token, validates against pending_deletions.confirmation_token_hash + status='pending' + expires_at > now(), atomically flips the row to 'confirmed' via CAS, then runs the actual deprovision (compute.Teardown + DELETE FROM deployments). A double-click resolves to 410 on the loser. The handler emits deploy.deletion_confirmed in audit_log.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "token", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Plaintext confirmation token from the email link (starts with 'del_'). Stored only as sha256 hash server-side." }
+        ],
+        "responses": {
+          "200": { "description": "Deletion confirmed. Body: { ok, id, resource_type, deletion_status='confirmed', freed_at, agent_action, note }." },
+          "400": { "description": "missing_token — query parameter omitted." },
+          "401": { "description": "Unauthorized" },
+          "410": { "description": "deletion_token_invalid — token expired, already used, or never existed. agent_action tells the user to call DELETE again to mint a fresh email." },
+          "503": { "description": "deletion_lookup_failed / deletion_mark_failed / deletion_email_disabled — transient DB failure or email backend not wired." }
+        }
+      },
+      "delete": {
+        "summary": "Cancel a pending deletion (paid tiers, Wave FIX-I)",
+        "description": "Cancels an in-flight pending_deletions row without consuming the token. The resource stays active and the slot stays consumed. Caller must own the resource (same team gate as DELETE /api/v1/deployments/{id}). Emits deploy.deletion_cancelled in audit_log.",
         "security": [{ "bearerAuth": [] }],
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
         "responses": {
-          "200": { "description": "Deletion enqueued" },
+          "200": { "description": "Cancellation confirmed. Body: { ok, id, resource_type, deletion_status='cancelled', agent_action, note }." },
           "401": { "description": "Unauthorized" },
-          "403": { "description": "Not your deployment" }
+          "403": { "description": "Not your deployment" },
+          "404": { "description": "No pending deletion to cancel for this resource." },
+          "410": { "description": "Pending row is already resolved (confirmed/cancelled/expired)." }
+        }
+      }
+    },
+    "/api/v1/stacks/{slug}/confirm-deletion": {
+      "post": {
+        "summary": "Confirm a pending stack deletion (paid tiers, Wave FIX-I)",
+        "description": "Stack-side counterpart of POST /api/v1/deployments/{id}/confirm-deletion. Same contract — see that endpoint for the full flow.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "token", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Stack deletion confirmed." },
+          "400": { "description": "missing_token" },
+          "401": { "description": "Unauthorized" },
+          "410": { "description": "deletion_token_invalid" }
+        }
+      },
+      "delete": {
+        "summary": "Cancel a pending stack deletion (paid tiers, Wave FIX-I)",
+        "description": "Stack-side counterpart of DELETE /api/v1/deployments/{id}/confirm-deletion.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Cancellation confirmed." },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Not your stack" },
+          "404": { "description": "No pending deletion to cancel" }
+        }
+      }
+    },
+    "/auth/email/confirm-deletion": {
+      "get": {
+        "summary": "Email-link 302 redirect to the dashboard confirm page (Wave FIX-I)",
+        "description": "The href in deletion-confirm emails. Validates that ?t=<token> is present and 302s to <DASHBOARD_BASE_URL>/app/confirm-deletion?t=<token>. The API does NOT validate the token here — a click is navigation, not action; the dashboard's authenticated POST is the real confirm step.",
+        "parameters": [{ "name": "t", "in": "query", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "302": { "description": "Redirect to dashboard confirm page" },
+          "400": { "description": "Missing token query parameter" }
         }
       }
     },

@@ -255,4 +255,47 @@ const (
 	// empty if the row lookup itself failed), ip, user_agent}. Surface
 	// to on-call so a leaked secret OR a misconfigured customer is loud.
 	AuditKindGitHubSignatureFailed = "github.signature_failed"
+
+	// Email-confirmed deletion lifecycle (Wave FIX-I, migration 044).
+	// Two-step destruction for paid-tier deploys + stacks: the agent calls
+	// DELETE → API queues a pending_deletions row + emails the user, who
+	// confirms via POST /confirm-deletion?token=<tok>. Each kind below
+	// captures one inflection point so the audit log reconstructs the
+	// full chain (request → email-sent → confirm | cancel | expire).
+	//
+	// AuditKindDeployDeletionRequested fires on DELETE /api/v1/deployments/:id
+	// once the pending_deletions row lands. Metadata: {deploy_id, team_id,
+	// pending_deletion_id, expires_at, email_sent_to (masked)}.
+	AuditKindDeployDeletionRequested = "deploy.deletion_requested"
+
+	// AuditKindDeployDeletionConfirmed fires when POST
+	// /api/v1/deployments/:id/confirm-deletion?token=<tok> resolves a
+	// valid pending row. Emitted BEFORE the actual deprovision call so
+	// the audit ordering reads request → confirm → (deprovision side
+	// effects). Metadata: {deploy_id, team_id, pending_deletion_id,
+	// freed_at, age_seconds_in_pending}.
+	AuditKindDeployDeletionConfirmed = "deploy.deletion_confirmed"
+
+	// AuditKindDeployDeletionCancelled fires when DELETE
+	// /api/v1/deployments/:id/confirm-deletion cancels a pending row.
+	// The resource remains active and the slot stays consumed.
+	// Metadata: {deploy_id, team_id, pending_deletion_id}.
+	AuditKindDeployDeletionCancelled = "deploy.deletion_cancelled"
+
+	// AuditKindDeployDeletionExpired fires when the worker's
+	// pending_deletion_expirer flips a row past its TTL to status=expired.
+	// The resource remains active (no destruction without explicit
+	// confirmation). Metadata: {deploy_id, team_id,
+	// pending_deletion_id, age_seconds}.
+	AuditKindDeployDeletionExpired = "deploy.deletion_expired"
+
+	// AuditKindStackDeletionRequested / Confirmed / Cancelled / Expired
+	// mirror the deploy.* kinds for the /api/v1/stacks/:slug flow.
+	// Identical metadata schema except {stack_id, stack_slug} replace
+	// {deploy_id} so a single downstream forwarder can branch on the
+	// resource_type discriminator without parsing the kind.
+	AuditKindStackDeletionRequested = "stack.deletion_requested"
+	AuditKindStackDeletionConfirmed = "stack.deletion_confirmed"
+	AuditKindStackDeletionCancelled = "stack.deletion_cancelled"
+	AuditKindStackDeletionExpired   = "stack.deletion_expired"
 )
