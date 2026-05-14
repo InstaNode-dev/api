@@ -82,25 +82,33 @@ func (h *MagicLinkHandler) Start(c *fiber.Ctx) error {
 
 	link := canonicalAPIBase + "/auth/email/callback?t=" + plaintext
 	sendErr := h.mail.SendMagicLink(c.Context(), emailAddr, link)
-	if sendErr != nil {
-		// Already logged inside email client; we still 202 to the caller so
-		// a probing client cannot fingerprint provider state. The row exists
-		// in magic_links — an operator can re-send manually.
-		slog.Warn("magic_link.start.email_send_failed", "error", sendErr, "request_id", requestID)
-	} else {
-		// Only log the cheerful success line when the provider actually
-		// accepted the message. Previously this fired unconditionally
-		// after the warn line above, causing the false-success telemetry
-		// that hid the 2026-05-14 RESEND_API_KEY=CHANGE_ME outage from NR
-		// alerting (every magic-link request appeared "sent").
-		slog.Info("magic_link.start.sent",
-			"request_id", requestID,
-			// email is intentionally NOT logged at info level to avoid PII spread —
-			// trace through the magic_links table by created_at if needed.
-		)
-	}
+	logMagicLinkSendResult(sendErr, requestID)
 
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"ok": true})
+}
+
+// logMagicLinkSendResult logs the success/failure of an email send attempt.
+// Exposed (package-private) for unit testing — the false-success-telemetry
+// bug of 2026-05-14 (the .sent log fired unconditionally AFTER the warn
+// line, hiding the RESEND_API_KEY=CHANGE_ME outage from NR) is exactly
+// the class of bug that is only catchable by an assertion against the
+// emitted log fields. Keep the two branches mutually exclusive: exactly
+// one of {email_send_failed, sent} must fire per call. The .sent line is
+// what NR alerts off; do not move it back outside the else branch.
+//
+// email is intentionally NOT logged at info level to avoid PII spread —
+// trace through the magic_links table by created_at if needed.
+func logMagicLinkSendResult(sendErr error, requestID string) {
+	if sendErr != nil {
+		slog.Warn("magic_link.start.email_send_failed",
+			"error", sendErr,
+			"request_id", requestID,
+		)
+		return
+	}
+	slog.Info("magic_link.start.sent",
+		"request_id", requestID,
+	)
 }
 
 // Callback handles GET /auth/email/callback?t=<plaintext>.
