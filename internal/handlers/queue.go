@@ -94,8 +94,14 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
 	var body provisionRequestBody
-	_ = c.BodyParser(&body)
-	body.Name = sanitizeName(body.Name)
+	if err := parseProvisionBody(c, &body); err != nil {
+		return err
+	}
+	cleanName, sanErr := sanitizeNameForRequest(c, body.Name)
+	if sanErr != nil {
+		return sanErr
+	}
+	body.Name = cleanName
 
 	env, envErr := resolveEnv(c, body.Env)
 	if envErr != nil {
@@ -155,7 +161,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 					"upgrade_jwt":    jwtToken,
 				}
 				setInternalURL(dedupResp, existing.Tier, connectionURL, "queue")
-				return c.JSON(dedupResp)
+				return respondOK(c, dedupResp)
 			}
 			// Empty connection_url means provisioning failed mid-flight on the existing
 			// resource. Fall through to provision a fresh one rather than returning
@@ -258,7 +264,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 	}
 
 	// internal_url omitted on the anonymous path — see internal_url.go.
-	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+	return respondCreated(c, fiber.Map{
 		"ok":             true,
 		"id":             resource.ID.String(),
 		"token":          tokenStr,
@@ -388,7 +394,7 @@ func (h *QueueHandler) newQueueAuthenticated(
 		},
 	}
 	setInternalURL(resp, tier, creds.URL, "queue")
-	return c.Status(fiber.StatusCreated).JSON(resp)
+	return respondCreated(c, resp)
 }
 
 // decryptConnectionURL decrypts an AES-encrypted connection URL stored in the DB.

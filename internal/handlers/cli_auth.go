@@ -72,8 +72,12 @@ func (h *CLIAuthHandler) CreateCLISession(c *fiber.Ctx) error {
 	var body struct {
 		AnonTokens []string `json:"anon_tokens"`
 	}
-	// Body is optional — anonymous tokens are a nice-to-have.
-	_ = c.BodyParser(&body)
+	// Body is optional — anonymous tokens are a nice-to-have. But when it IS
+	// present, malformed JSON must surface as 400 invalid_body rather than
+	// being silently swallowed (Wave FIX-D #125).
+	if err := parseProvisionBody(c, &body); err != nil {
+		return err
+	}
 
 	sessionID, err := generateSessionID()
 	if err != nil {

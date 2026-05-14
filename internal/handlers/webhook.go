@@ -122,8 +122,14 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
 	var body provisionRequestBody
-	_ = c.BodyParser(&body)
-	body.Name = sanitizeName(body.Name)
+	if err := parseProvisionBody(c, &body); err != nil {
+		return err
+	}
+	cleanName, sanErr := sanitizeNameForRequest(c, body.Name)
+	if sanErr != nil {
+		return sanErr
+	}
+	body.Name = cleanName
 
 	env, envErr := resolveEnv(c, body.Env)
 	if envErr != nil {
@@ -177,7 +183,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 			if existing.ExpiresAt.Valid {
 				resp["expires_at"] = existing.ExpiresAt.Time
 			}
-			return c.JSON(resp)
+			return respondOK(c, resp)
 		}
 	}
 
@@ -250,7 +256,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 		metrics.RedisErrors.WithLabelValues("recycle_mark").Inc()
 	}
 
-	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+	return respondCreated(c, fiber.Map{
 		"ok":          true,
 		"id":          resource.ID.String(),
 		"token":       tokenStr,
@@ -330,7 +336,7 @@ func (h *WebhookHandler) newWebhookAuthenticated(
 	)
 	metrics.ProvisionsTotal.WithLabelValues("webhook", team.PlanTier).Inc()
 
-	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+	return respondCreated(c, fiber.Map{
 		"ok":          true,
 		"id":          resource.ID.String(),
 		"token":       tokenStr,

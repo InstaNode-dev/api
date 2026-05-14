@@ -336,7 +336,11 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 	// Optional name field.
 	name := ""
 	if names := form.Value["name"]; len(names) > 0 {
-		name = sanitizeName(names[0])
+		clean, sanErr := sanitizeNameForRequest(c, names[0])
+		if sanErr != nil {
+			return sanErr
+		}
+		name = clean
 	}
 
 	// Optional port field (default 8080).

@@ -108,8 +108,14 @@ func (h *TwinHandler) ProvisionTwin(c *fiber.Ctx) error {
 	}
 
 	var body provisionTwinRequest
-	_ = c.BodyParser(&body)
-	body.Name = sanitizeName(body.Name)
+	if err := parseProvisionBody(c, &body); err != nil {
+		return err
+	}
+	cleanName, sanErr := sanitizeNameForRequest(c, body.Name)
+	if sanErr != nil {
+		return sanErr
+	}
+	body.Name = cleanName
 
 	if body.Env == "" {
 		return respondError(c, fiber.StatusBadRequest, "missing_env",
