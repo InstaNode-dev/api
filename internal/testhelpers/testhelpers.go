@@ -604,7 +604,7 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 		KeyPrefix: "rl",
 	}))
 
-	onboardH := handlers.NewOnboardingHandler(db, cfg, email.New(""))
+	onboardH := handlers.NewOnboardingHandler(db, cfg, email.NewNoop())
 	cliAuthH := handlers.NewCLIAuthHandler(db, rdb, cfg, planReg)
 	resourceH := handlers.NewResourceHandler(db, rdb, cfg, planReg, nil, nil)
 	dbH := handlers.NewDBHandler(db, rdb, cfg, nil, planReg)

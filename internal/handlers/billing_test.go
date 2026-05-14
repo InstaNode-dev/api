@@ -43,7 +43,7 @@ func billingTestApp(t *testing.T) *fiber.App {
 		RazorpayWebhookSecret: testWebhookSecret,
 	}
 
-	emailClient := email.New("") // noop
+	emailClient := email.NewNoop() // noop
 	billing := handlers.NewBillingHandler(nil, cfg, emailClient)
 
 	app := fiber.New(fiber.Config{
@@ -404,7 +404,7 @@ func billingWebhookDBApp(t *testing.T, db *sql.DB) (*fiber.App, *config.Config) 
 		RazorpayPlanIDPro:   "plan_test_pro",
 		RazorpayPlanIDTeam:  "plan_test_team",
 	}
-	bh := handlers.NewBillingHandler(db, cfg, email.New(""))
+	bh := handlers.NewBillingHandler(db, cfg, email.NewNoop())
 
 	app := fiber.New(fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
@@ -695,7 +695,7 @@ func billingStateApp(t *testing.T, db *sql.DB, teamID string, fetch func(string)
 		RazorpayKeyID:     "rzp_test_dummy",
 		RazorpayKeySecret: "rzp_test_dummy_secret",
 	}
-	mail := email.New("") // noop
+	mail := email.NewNoop() // noop
 
 	bh := handlers.NewBillingHandler(db, cfg, mail)
 	if fetch != nil {
@@ -881,7 +881,7 @@ func TestGetBillingState_NoTrialStatus(t *testing.T) {
 // 503 not-configured branches). The team_id local is fixed.
 func checkoutAppNoDB(t *testing.T, cfg *config.Config) *fiber.App {
 	t.Helper()
-	bh := handlers.NewBillingHandler(nil, cfg, email.New(""))
+	bh := handlers.NewBillingHandler(nil, cfg, email.NewNoop())
 	app := fiber.New(fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
 			if errors.Is(err, handlers.ErrResponseWritten) {
@@ -1015,7 +1015,7 @@ func TestPlanIDToTier_MapsYearlyPlanIDsToCanonicalTier(t *testing.T) {
 		RazorpayPlanIDTeam:        "plan_monthly_team",
 		RazorpayPlanIDTeamYearly:  "plan_yearly_team",
 	}
-	bh := handlers.NewBillingHandler(nil, cfg, email.New(""))
+	bh := handlers.NewBillingHandler(nil, cfg, email.NewNoop())
 	cases := []struct {
 		planID string
 		want   string
