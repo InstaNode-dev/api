@@ -153,7 +153,9 @@ func (h *GitHubDeployHandler) Connect(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch deployment")
 	}
 	if d.TeamID != team.ID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this deployment")
+		// 404 not 403: never confirm the existence of deployments owned
+		// by other teams.
+		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
 	}
 
 	var body connectGitHubBody
@@ -266,7 +268,9 @@ func (h *GitHubDeployHandler) Get(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch deployment")
 	}
 	if d.TeamID != team.ID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this deployment")
+		// 404 not 403: never confirm the existence of deployments owned
+		// by other teams.
+		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
 	}
 
 	conn, err := models.GetGitHubConnectionByAppID(c.Context(), h.db, d.ID)
@@ -312,7 +316,9 @@ func (h *GitHubDeployHandler) Disconnect(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch deployment")
 	}
 	if d.TeamID != team.ID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this deployment")
+		// 404 not 403: never confirm the existence of deployments owned
+		// by other teams.
+		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
 	}
 
 	conn, lookupErr := models.GetGitHubConnectionByAppID(c.Context(), h.db, d.ID)

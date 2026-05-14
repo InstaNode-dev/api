@@ -186,8 +186,9 @@ func TestCreateBackup_Free_402(t *testing.T) {
 	assert.Contains(t, action, "Tell the user")
 }
 
-// TestCreateBackup_CrossTeam_403 — Team B cannot back up Team A's resource.
-func TestCreateBackup_CrossTeam_403(t *testing.T) {
+// TestCreateBackup_CrossTeam_404 — Team B cannot back up Team A's resource.
+// Returns 404 (not 403) — cross-team access must not leak existence.
+func TestCreateBackup_CrossTeam_404(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -214,7 +215,7 @@ func TestCreateBackup_CrossTeam_403(t *testing.T) {
 
 	resp := doBackupRequest(t, &fiberAppShim{test: app.Test}, http.MethodPost, jwtB, resourceToken, "/backup", nil)
 	defer resp.Body.Close()
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
 // TestCreateBackup_InvalidUUID_400 — bad :id param → 400 invalid_id.
@@ -306,8 +307,9 @@ func TestListBackups_HappyPath(t *testing.T) {
 	assert.Equal(t, "scheduled", body.Items[0]["backup_kind"])
 }
 
-// TestListBackups_CrossTeam_403 — Team B cannot list Team A's backups.
-func TestListBackups_CrossTeam_403(t *testing.T) {
+// TestListBackups_CrossTeam_404 — Team B cannot list Team A's backups.
+// Returns 404 (not 403) — cross-team access must not leak existence.
+func TestListBackups_CrossTeam_404(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -334,7 +336,7 @@ func TestListBackups_CrossTeam_403(t *testing.T) {
 
 	resp := doBackupRequest(t, &fiberAppShim{test: app.Test}, http.MethodGet, jwtB, resourceToken, "/backups", nil)
 	defer resp.Body.Close()
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

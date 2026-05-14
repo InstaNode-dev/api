@@ -194,7 +194,9 @@ func (h *DeployHandler) Patch(c *fiber.Ctx) error {
 	}
 
 	if d.TeamID != team.ID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this deployment")
+		// 404 not 403: never confirm the existence of deployments owned
+		// by other teams.
+		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
 	}
 
 	var body patchAccessControlBody
