@@ -462,14 +462,25 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Get("/auth/me", middleware.RequireAuth(cfg), cliAuthH.GetCurrentUser)
 
 	// Billing
-	billing := handlers.NewBillingHandler(db, cfg, emailClient)
+	// WithRedis wires the BB2-D5 server-side checkout dedup guard (SETNX
+	// `team_checkout_inflight:<team_id>` with 60s TTL). Without it, two
+	// concurrent POSTs to /api/v1/billing/checkout for the same team each
+	// create a Razorpay subscription — real revenue loss. Tests can
+	// construct the handler without WithRedis() and the guard fails open.
+	billing := handlers.NewBillingHandler(db, cfg, emailClient).WithRedis(rdb)
 	// Legacy alias kept for backward compatibility; canonical path is
 	// /api/v1/billing/checkout (registered under the /api/v1 group below).
 	// RequireWritable rejects impersonated sessions — an admin viewing-as-
 	// customer must not be able to start a checkout on the customer's
 	// behalf. The canonical /api/v1 alias is already gated by the api
 	// group's RequireWritable.
-	app.Post("/billing/checkout", middleware.RequireAuth(cfg), middleware.RequireWritable(), billing.CreateCheckoutAPI)
+	//
+	// Idempotency-Key middleware is the BB2-D5 braces — when a caller
+	// supplies a stable key (Stripe/AWS-style), retries on the same key
+	// replay the cached response instead of hitting Razorpay again. The
+	// server-side SETNX inside CreateCheckoutAPI is the belt that covers
+	// callers that DON'T send an Idempotency-Key (today's dashboard).
+	app.Post("/billing/checkout", middleware.RequireAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "billing.checkout"), billing.CreateCheckoutAPI)
 	app.Post("/razorpay/webhook", billing.RazorpayWebhook)
 
 	// Internal machine-to-machine terminate endpoint. Called by the
@@ -666,7 +677,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Post("/team/restore", middleware.RequireRole("owner"), teamDelH.Restore)
 
 	api.Get("/billing", billing.GetBillingState)
-	api.Post("/billing/checkout", billing.CreateCheckoutAPI)
+	// Idempotency-Key braces — see the /billing/checkout legacy alias above
+	// for the full BB2-D5 belt+braces rationale. Both route registrations
+	// MUST carry the middleware; consolidating to one route is out of scope
+	// (would be a nicer refactor but requires touching more callers).
+	api.Post("/billing/checkout", middleware.Idempotency(rdb, "billing.checkout"), billing.CreateCheckoutAPI)
 	// Self-serve POST /billing/cancel was removed per policy — see project
 	// memory project_no_self_serve_cancel_downgrade.md. Cancellation flows
 	// through Razorpay's own dashboard, executed by support staff, which
