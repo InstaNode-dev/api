@@ -58,11 +58,12 @@ func newUsageWallApp(t *testing.T, db *sql.DB, teamID uuid.UUID) *fiber.App {
 // tier one) wants this to return a non-team tier so the audit query
 // proceeds.
 func expectTeamLookup(mock sqlmock.Sqlmock, teamID uuid.UUID, tier string) {
+	// Wave FIX-J: GetTeamByID includes default_deployment_ttl_policy.
 	mock.ExpectQuery(`SELECT.*FROM teams WHERE id`).
 		WithArgs(teamID).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "name", "plan_tier", "stripe_customer_id", "created_at",
-		}).AddRow(teamID, sql.NullString{}, tier, sql.NullString{}, time.Now()))
+			"id", "name", "plan_tier", "stripe_customer_id", "created_at", "default_deployment_ttl_policy",
+		}).AddRow(teamID, sql.NullString{}, tier, sql.NullString{}, time.Now(), "auto_24h"))
 }
 
 // TestUsageWall_ReturnsLatestRowWithMetadata is the headline test: an

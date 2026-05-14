@@ -277,6 +277,18 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`CREATE INDEX IF NOT EXISTS idx_deployments_token ON deployments(token) WHERE token IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_deployments_resource_id ON deployments(resource_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_deployments_team_env ON deployments(team_id, env)`,
+		// 045_deploy_ttl — Wave FIX-J. Default 24h TTL + reminder cadence.
+		// Mirrored here so handler unit tests see the same columns the API
+		// drives in production. The CHECK constraint is omitted (handlers
+		// validate; production migration carries it) to keep the test DDL
+		// flexible against future enum additions.
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS ttl_policy TEXT NOT NULL DEFAULT 'auto_24h'`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS reminders_sent INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS last_reminder_at TIMESTAMPTZ`,
+		`CREATE INDEX IF NOT EXISTS idx_deployments_expires_pending ON deployments (expires_at) WHERE expires_at IS NOT NULL AND status NOT IN ('deleted', 'expired')`,
+		// teams.default_deployment_ttl_policy — Wave FIX-J team preference.
+		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS default_deployment_ttl_policy TEXT NOT NULL DEFAULT 'auto_24h'`,
 		// 012_audit_log — per-team event stream consumed by the dashboard's
 		// Recent Activity feed AND by the admin customer-detail endpoint.
 		`CREATE TABLE IF NOT EXISTS audit_log (
@@ -732,6 +744,16 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	// Wave FIX-I — two-step email-confirmed deletion endpoints.
 	api.Post("/deployments/:id/confirm-deletion", deployH.ConfirmDelete)
 	api.Delete("/deployments/:id/confirm-deletion", deployH.CancelDelete)
+	// Wave FIX-J: keeper endpoints + team settings. Mirrored from
+	// router.go so handler tests cover the same surface.
+	api.Post("/deployments/:id/make-permanent", deployH.MakePermanent)
+	api.Post("/deployments/:id/ttl", deployH.SetTTL)
+	teamSettingsH := handlers.NewTeamSettingsHandler(db)
+	api.Get("/team/settings", teamSettingsH.Get)
+	api.Patch("/team/settings",
+		middleware.RequireRole("admin"),
+		teamSettingsH.Update,
+	)
 
 	// GitHub auto-deploy (migration 035) — wired into the test app so the
 	// happy-path / idempotency / signature-mismatch tests in

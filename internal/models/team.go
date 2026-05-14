@@ -23,7 +23,14 @@ type Team struct {
 	Name                   sql.NullString
 	PlanTier               string
 	RazorpaySubscriptionID sql.NullString
-	CreatedAt              time.Time
+	// DefaultDeploymentTTLPolicy is the team's preferred default for
+	// POST /deploy/new (Wave FIX-J — migration 045). Valid values:
+	//   "auto_24h"  — deploys default to a 24h TTL (server default)
+	//   "permanent" — deploys default to NO TTL (user explicitly opted in)
+	// Per-request ttl_policy in the deploy body always overrides this.
+	// Only owner/admin can mutate via PATCH /api/v1/team/settings.
+	DefaultDeploymentTTLPolicy string
+	CreatedAt                  time.Time
 }
 
 // User represents an authenticated user belonging to a team.
@@ -67,9 +74,11 @@ func CreateTeam(ctx context.Context, db *sql.DB, name string) (*Team, error) {
 	t := &Team{}
 	err := db.QueryRowContext(ctx, `
 		INSERT INTO teams (name, plan_tier) VALUES ($1, 'free')
-		RETURNING id, name, plan_tier, stripe_customer_id, created_at
+		RETURNING id, name, plan_tier, stripe_customer_id, created_at,
+		          COALESCE(default_deployment_ttl_policy, 'auto_24h')
 	`, name).Scan(
 		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.CreatedAt,
+		&t.DefaultDeploymentTTLPolicy,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("models.CreateTeam: %w", err)
@@ -81,10 +90,12 @@ func CreateTeam(ctx context.Context, db *sql.DB, name string) (*Team, error) {
 func GetTeamByID(ctx context.Context, db *sql.DB, id uuid.UUID) (*Team, error) {
 	t := &Team{}
 	err := db.QueryRowContext(ctx, `
-		SELECT id, name, plan_tier, stripe_customer_id, created_at
+		SELECT id, name, plan_tier, stripe_customer_id, created_at,
+		       COALESCE(default_deployment_ttl_policy, 'auto_24h')
 		FROM teams WHERE id = $1
 	`, id).Scan(
 		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.CreatedAt,
+		&t.DefaultDeploymentTTLPolicy,
 	)
 	if err == sql.ErrNoRows {
 		return nil, &ErrTeamNotFound{ID: id}
@@ -93,6 +104,19 @@ func GetTeamByID(ctx context.Context, db *sql.DB, id uuid.UUID) (*Team, error) {
 		return nil, fmt.Errorf("models.GetTeamByID: %w", err)
 	}
 	return t, nil
+}
+
+// UpdateTeamDefaultDeploymentTTLPolicy sets the team's default TTL policy.
+// Valid values: "auto_24h" | "permanent". Caller validates input.
+// Backs PATCH /api/v1/team/settings (Wave FIX-J — migration 045).
+func UpdateTeamDefaultDeploymentTTLPolicy(ctx context.Context, db *sql.DB, teamID uuid.UUID, policy string) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE teams SET default_deployment_ttl_policy = $1 WHERE id = $2
+	`, policy, teamID)
+	if err != nil {
+		return fmt.Errorf("models.UpdateTeamDefaultDeploymentTTLPolicy: %w", err)
+	}
+	return nil
 }
 
 // CreateUser inserts a new user and returns it. role must be "owner" or "member"; empty defaults to "member".
@@ -225,10 +249,12 @@ func UpdatePlanTier(ctx context.Context, db *sql.DB, teamID uuid.UUID, tier stri
 func GetTeamByRazorpaySubscriptionID(ctx context.Context, db *sql.DB, subscriptionID string) (*Team, error) {
 	t := &Team{}
 	err := db.QueryRowContext(ctx, `
-		SELECT id, name, plan_tier, stripe_customer_id, created_at
+		SELECT id, name, plan_tier, stripe_customer_id, created_at,
+		       COALESCE(default_deployment_ttl_policy, 'auto_24h')
 		FROM teams WHERE stripe_customer_id = $1
 	`, subscriptionID).Scan(
 		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.CreatedAt,
+		&t.DefaultDeploymentTTLPolicy,
 	)
 	if err == sql.ErrNoRows {
 		return nil, &ErrTeamNotFound{}

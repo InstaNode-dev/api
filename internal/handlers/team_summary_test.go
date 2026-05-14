@@ -31,11 +31,12 @@ import (
 //	4) COUNT(*) FROM users WHERE team_id  (CountTeamMembers)
 //	5) COUNT(DISTINCT key) FROM vault_secrets (CountVaultKeysByTeam)
 func expectTeamSummaryQueries(mock sqlmock.Sqlmock, teamID uuid.UUID) {
+	// Wave FIX-J: GetTeamByID includes default_deployment_ttl_policy.
 	mock.ExpectQuery(`SELECT.*FROM teams WHERE id`).
 		WithArgs(teamID).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "name", "plan_tier", "stripe_customer_id", "created_at",
-		}).AddRow(teamID, sql.NullString{}, "pro", sql.NullString{}, time.Now()))
+			"id", "name", "plan_tier", "stripe_customer_id", "created_at", "default_deployment_ttl_policy",
+		}).AddRow(teamID, sql.NullString{}, "pro", sql.NullString{}, time.Now(), "auto_24h"))
 
 	// resource_type breakdown — one row per type. The handler bins each
 	// row into the typed struct; unknown types fold into `other`.

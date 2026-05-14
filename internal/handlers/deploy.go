@@ -208,6 +208,24 @@ func deploymentToMap(d *models.Deployment) fiber.Map {
 	if d.ResourceID.Valid {
 		m["resource_id"] = d.ResourceID.UUID
 	}
+	// TTL surface (Wave FIX-J — migration 045).
+	//
+	// ttl_policy is always emitted so the dashboard/CLI/agent can branch on
+	// "is this permanent or auto-expiring?" without having to special-case
+	// a missing key. expires_at is omitted when permanent (NULL); the
+	// frontend treats absent expires_at as "permanent forever".
+	m["ttl_policy"] = d.TTLPolicy
+	if d.ExpiresAt.Valid {
+		m["expires_at"] = d.ExpiresAt.Time.UTC().Format(time.RFC3339)
+		m["reminders_sent"] = d.RemindersSent
+		// make_permanent_url + extend_ttl_url are absolute https links so the
+		// LLM agent can paste them verbatim — same posture as the agent_action
+		// strings. Stays consistent regardless of which host the API is
+		// reached at (we hard-code the public host on purpose; internal
+		// callers don't need a TTL nudge).
+		m["make_permanent_url"] = "https://api.instanode.dev/api/v1/deployments/" + d.ID.String() + "/make-permanent"
+		m["extend_ttl_url"] = "https://api.instanode.dev/api/v1/deployments/" + d.ID.String() + "/ttl"
+	}
 	return m
 }
 
@@ -521,6 +539,39 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		}
 	}
 
+	// ── TTL policy resolution (Wave FIX-J — migration 045) ──────────────────
+	//
+	// Resolution order:
+	//   1. anonymous tier → forced to auto_24h regardless of caller intent
+	//      (matches the existing anon-resource 24h rule).
+	//   2. request body ttl_policy field (if present + valid) wins.
+	//   3. team.DefaultDeploymentTTLPolicy ('auto_24h' | 'permanent').
+	//   4. fallthrough → 'auto_24h' (the server default).
+	//
+	// We surface the resolved policy in the 202 response + emit the
+	// auto_24h agent_action when the policy ends up being auto_24h, so the
+	// agent can relay the three keep-it-permanent routes to the user.
+	ttlPolicy := team.DefaultDeploymentTTLPolicy
+	if ttlPolicy == "" {
+		ttlPolicy = models.DeployTTLPolicyAuto24h
+	}
+	if vals := form.Value["ttl_policy"]; len(vals) > 0 && vals[0] != "" {
+		requested := strings.TrimSpace(strings.ToLower(vals[0]))
+		switch requested {
+		case models.DeployTTLPolicyAuto24h, models.DeployTTLPolicyPermanent:
+			ttlPolicy = requested
+		default:
+			return respondError(c, fiber.StatusBadRequest, "invalid_ttl_policy",
+				"Field 'ttl_policy' must be one of: auto_24h, permanent")
+		}
+	}
+	if team.PlanTier == "anonymous" {
+		// Anonymous tier is FORCED to auto_24h — no permanent deploys
+		// without claiming. This matches the existing anonymous-resource
+		// 24h TTL rule.
+		ttlPolicy = models.DeployTTLPolicyAuto24h
+	}
+
 	saved, err := models.CreateDeployment(c.Context(), h.db, models.CreateDeploymentParams{
 		TeamID:              team.ID,
 		AppID:               appID,
@@ -532,6 +583,7 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		AllowedIPs:          allowedIPs,
 		NotifyWebhook:       notifyURL,
 		NotifyWebhookSecret: notifySecret,
+		TTLPolicy:           ttlPolicy,
 	})
 	if err != nil {
 		slog.Error("deploy.new.db_create_failed",
@@ -545,9 +597,22 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 	// inserted — BEFORE the async build runs. Reaching healthy or failed is
 	// reported separately via deploy.healthy / deploy.failed from runDeploy.
 	emitDeployAudit(h.db, models.AuditKindDeployCreated, saved, map[string]any{
-		"env":      saved.Env,
-		"app_name": saved.AppID,
+		"env":        saved.Env,
+		"app_name":   saved.AppID,
+		"ttl_policy": saved.TTLPolicy,
 	})
+
+	// Wave FIX-J: when the caller explicitly opted in to permanent at
+	// /deploy/new time, also emit deploy.made_permanent so the audit feed
+	// shows the inflection point. We tag the source so a later
+	// dashboard subscriber can distinguish "permanent from the start" vs
+	// "made permanent later via the endpoint".
+	if saved.TTLPolicy == models.DeployTTLPolicyPermanent {
+		emitDeployAudit(h.db, models.AuditKindDeployMadePermanent, saved, map[string]any{
+			"source":                "deploy_new",
+			"previous_ttl_policy":   "auto_24h",
+		})
+	}
 
 	// Launch async provisioning; return 202 immediately.
 	go h.runDeploy(saved, tarball)
@@ -555,13 +620,27 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 	slog.Info("deploy.new.accepted",
 		"app_id", appID, "team_id", team.ID,
 		"port", port, "tier", team.PlanTier,
+		"ttl_policy", saved.TTLPolicy,
 		"request_id", middleware.GetRequestID(c))
 
-	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+	resp := fiber.Map{
 		"ok":   true,
 		"item": deploymentToMap(saved),
 		"note": "Deployment is building. Poll GET /deploy/" + appID + " for status.",
-	})
+	}
+
+	// Wave FIX-J: when the deploy is on the auto_24h default, the response
+	// carries a verbatim agent_action sentence telling the LLM about the
+	// three explicit routes to keep it permanent. This is the success-path
+	// agent_action — sibling to the 4xx wall copy in agent_action.go.
+	if saved.TTLPolicy == models.DeployTTLPolicyAuto24h && saved.ExpiresAt.Valid {
+		resp["agent_action"] = newAgentActionDeployAutoExpire24h(
+			saved.ID.String(),
+			saved.ExpiresAt.Time.UTC().Format(time.RFC3339),
+		)
+	}
+
+	return c.Status(fiber.StatusAccepted).JSON(resp)
 }
 
 // ── GET /deploy/:id ───────────────────────────────────────────────────────────

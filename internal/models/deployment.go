@@ -46,6 +46,29 @@ type Deployment struct {
 	NotifyState          string   // 'unset' | 'pending' | 'sent' | 'failed'
 	NotifyAttempts       int      // dispatch retry counter (worker bumps on 5xx/network)
 	ErrorMessage         string
+	// TTL fields (Wave FIX-J — migration 045).
+	//
+	// ExpiresAt: when the deploy auto-expires. Zero (sql NULL) means
+	// permanent. Set by CreateDeployment when ttl_policy='auto_24h' (default)
+	// to now()+24h. SetDeploymentTTL and MakeDeploymentPermanent mutate this
+	// field after the row is created.
+	//
+	// TTLPolicy: 'auto_24h' (server default) | 'permanent' (user opted in
+	// to keeping it forever) | 'custom' (user set a non-24h TTL via POST
+	// /deployments/:id/ttl). The deployment_expirer worker only deletes
+	// rows where ttl_policy != 'permanent' AND expires_at < now().
+	//
+	// RemindersSent: 0..6, count of reminder emails sent so far. The
+	// deployment_reminder worker advances one step per 2h tick, starting
+	// at T-12h before expires_at.
+	//
+	// LastReminderAt: wall-clock of the most recent reminder dispatched.
+	// Combined with RemindersSent forms the CAS guard that prevents
+	// duplicate sends inside the 60s tick window.
+	ExpiresAt        sql.NullTime
+	TTLPolicy        string
+	RemindersSent    int
+	LastReminderAt   sql.NullTime
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
 }
@@ -71,7 +94,30 @@ type CreateDeploymentParams struct {
 	AllowedIPs          []string // each entry must already be a valid IP or CIDR
 	NotifyWebhook       string   // empty = no webhook; non-empty = validated https URL
 	NotifyWebhookSecret string   // empty = no HMAC; non-empty = AES ciphertext
+	// TTLPolicy chooses the lifecycle for this deploy. Valid values are
+	// "auto_24h" (default — expires_at set to now()+24h), "permanent"
+	// (expires_at = NULL, never auto-expires), or "custom" (caller sets
+	// expires_at via the TTLHours field). Empty defaults to "auto_24h".
+	//
+	// Per-tier override: anonymous tier is FORCED to auto_24h regardless
+	// of caller intent; the handler enforces that before populating this
+	// struct, so by the time we hit the DB we trust the caller.
+	TTLPolicy string
+	// TTLHours, when TTLPolicy="custom", sets expires_at = now()+TTLHours.
+	// Ignored for auto_24h (always 24h) and permanent (NULL). Range
+	// 1..8760 (1h..1y) — the handler enforces the bound BEFORE this struct
+	// is constructed; the model trusts the input.
+	TTLHours int
 }
+
+// DeployTTLPolicyAuto24h is the default TTL policy — auto-expire after 24h.
+const DeployTTLPolicyAuto24h = "auto_24h"
+
+// DeployTTLPolicyPermanent disables TTL — the deploy never auto-expires.
+const DeployTTLPolicyPermanent = "permanent"
+
+// DeployTTLPolicyCustom is a user-chosen non-24h TTL set via POST /deployments/:id/ttl.
+const DeployTTLPolicyCustom = "custom"
 
 // ErrDeploymentNotFound is returned when a deployment lookup yields no rows.
 type ErrDeploymentNotFound struct {
@@ -88,7 +134,8 @@ func (e *ErrDeploymentNotFound) Error() string {
 // in this file's scanDeployment continue to compile-fail loudly on drift.
 const deploymentColumns = `id, team_id, resource_id, app_id, provider_id, status, app_url,
        env_vars, port, tier, env, private, allowed_ips, error_message, created_at, updated_at,
-       notify_webhook, notify_webhook_secret, notify_state, notify_attempts`
+       notify_webhook, notify_webhook_secret, notify_state, notify_attempts,
+       expires_at, ttl_policy, reminders_sent, last_reminder_at`
 
 // scanDeployment reads a single deployments row into a Deployment struct.
 // env_vars is stored as JSONB; error_message, provider_id, and app_url are nullable.
@@ -114,6 +161,10 @@ func scanDeployment(row interface {
 		&errorMessage,
 		&d.CreatedAt, &d.UpdatedAt,
 		&notifyWebhook, &notifyWebhookSecret, &d.NotifyState, &d.NotifyAttempts,
+		// migration 045 (Wave FIX-J): nullable expires_at + last_reminder_at,
+		// NOT NULL ttl_policy + reminders_sent. Order MUST match the trailing
+		// 4 columns appended in deploymentColumns above.
+		&d.ExpiresAt, &d.TTLPolicy, &d.RemindersSent, &d.LastReminderAt,
 	); err != nil {
 		return nil, err
 	}
@@ -211,15 +262,45 @@ func CreateDeployment(ctx context.Context, db *sql.DB, p CreateDeploymentParams)
 		}
 	}
 
+	// TTL policy resolution (migration 045 — Wave FIX-J). Empty defaults to
+	// auto_24h. The handler is responsible for forcing 'auto_24h' on the
+	// anonymous tier; this layer trusts the input. We compute expires_at
+	// here (rather than letting the DB compute it) so the value round-trips
+	// through scanDeployment without an extra refresh query.
+	ttlPolicy := p.TTLPolicy
+	if ttlPolicy == "" {
+		ttlPolicy = DeployTTLPolicyAuto24h
+	}
+	var expiresAt interface{} // NULL = permanent
+	switch ttlPolicy {
+	case DeployTTLPolicyAuto24h:
+		expiresAt = time.Now().UTC().Add(24 * time.Hour)
+	case DeployTTLPolicyCustom:
+		hours := p.TTLHours
+		if hours < 1 {
+			hours = 24
+		}
+		expiresAt = time.Now().UTC().Add(time.Duration(hours) * time.Hour)
+	case DeployTTLPolicyPermanent:
+		expiresAt = nil
+	default:
+		// Unknown policy — fall back to auto_24h (defensive; the handler
+		// validates ahead of this so we should never reach this branch).
+		ttlPolicy = DeployTTLPolicyAuto24h
+		expiresAt = time.Now().UTC().Add(24 * time.Hour)
+	}
+
 	row := db.QueryRowContext(ctx, `
 		INSERT INTO deployments
 			(team_id, resource_id, app_id, port, tier, env, env_vars, private, allowed_ips,
-			 notify_webhook, notify_webhook_secret, notify_state)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			 notify_webhook, notify_webhook_secret, notify_state,
+			 expires_at, ttl_policy)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING `+deploymentColumns,
 		p.TeamID, resourceID, p.AppID, port, p.Tier, env, envVarsJSON,
 		p.Private, allowedIPs,
-		notifyWebhook, notifyWebhookSecret, notifyState)
+		notifyWebhook, notifyWebhookSecret, notifyState,
+		expiresAt, ttlPolicy)
 
 	d, err := scanDeployment(row)
 	if err != nil {
@@ -408,6 +489,183 @@ func DeleteDeployment(ctx context.Context, db *sql.DB, id uuid.UUID) error {
 	return nil
 }
 
+// MakeDeploymentPermanent sets expires_at = NULL and ttl_policy = 'permanent'.
+// Backs POST /api/v1/deployments/:id/make-permanent. Idempotent — calling
+// twice is a no-op (the second UPDATE still touches updated_at, which is
+// fine for auditing the "kept" event).
+//
+// Wave FIX-J: this is the explicit opt-in that prevents the
+// deployment_expirer worker from sweeping the row. Once made permanent the
+// row only goes away when the user explicitly DELETEs it.
+func MakeDeploymentPermanent(ctx context.Context, db *sql.DB, id uuid.UUID) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE deployments
+		SET expires_at = NULL, ttl_policy = 'permanent', updated_at = now()
+		WHERE id = $1
+	`, id)
+	if err != nil {
+		return fmt.Errorf("models.MakeDeploymentPermanent: %w", err)
+	}
+	return nil
+}
+
+// SetDeploymentTTL sets expires_at = now()+hours and ttl_policy = 'custom'.
+// Backs POST /api/v1/deployments/:id/ttl. Callers must validate hours
+// (1..8760) BEFORE invoking this — the model trusts its input. Resets
+// reminders_sent so a freshly-extended deploy gets the full 6-email
+// warning cycle again instead of skipping reminders that fired earlier.
+func SetDeploymentTTL(ctx context.Context, db *sql.DB, id uuid.UUID, hours int) error {
+	expiresAt := time.Now().UTC().Add(time.Duration(hours) * time.Hour)
+	_, err := db.ExecContext(ctx, `
+		UPDATE deployments
+		SET expires_at = $1,
+		    ttl_policy = 'custom',
+		    reminders_sent = 0,
+		    last_reminder_at = NULL,
+		    updated_at = now()
+		WHERE id = $2
+	`, expiresAt, id)
+	if err != nil {
+		return fmt.Errorf("models.SetDeploymentTTL: %w", err)
+	}
+	return nil
+}
+
+// GetDeploymentsExpiringSoon returns deployments whose expires_at falls
+// within the next `window` from now AND whose last_reminder_at is either
+// NULL or older than `reminderCooldown`. Used by the worker's
+// deployment_reminder job to dedupe sends across 60s ticks while still
+// firing 6 reminders over the final 12h. Caller is responsible for
+// stamping last_reminder_at + reminders_sent after dispatch.
+//
+// Returns rows with ttl_policy != 'permanent' only; permanent deploys
+// have NULL expires_at and never match the WHERE clause regardless of
+// the policy check, but we filter explicitly for safety in case of a
+// future schema drift where a permanent row gets a non-null expires_at.
+//
+// reminderCooldown is the minimum gap between two reminders for the
+// same deployment. Default in the worker is 2h.
+func GetDeploymentsExpiringSoon(ctx context.Context, db *sql.DB, window, reminderCooldown time.Duration) ([]*Deployment, error) {
+	now := time.Now().UTC()
+	cutoff := now.Add(window)
+	cooldownBefore := now.Add(-reminderCooldown)
+	rows, err := db.QueryContext(ctx, `
+		SELECT `+deploymentColumns+`
+		FROM deployments
+		WHERE expires_at IS NOT NULL
+		  AND ttl_policy != 'permanent'
+		  AND status NOT IN ('deleted', 'expired')
+		  AND expires_at > $1
+		  AND expires_at <= $2
+		  AND reminders_sent < 6
+		  AND (last_reminder_at IS NULL OR last_reminder_at <= $3)
+		ORDER BY expires_at ASC
+		LIMIT 500
+	`, now, cutoff, cooldownBefore)
+	if err != nil {
+		return nil, fmt.Errorf("models.GetDeploymentsExpiringSoon: %w", err)
+	}
+	defer rows.Close()
+	var results []*Deployment
+	for rows.Next() {
+		d, err := scanDeployment(rows)
+		if err != nil {
+			return nil, fmt.Errorf("models.GetDeploymentsExpiringSoon scan: %w", err)
+		}
+		results = append(results, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("models.GetDeploymentsExpiringSoon rows: %w", err)
+	}
+	return results, nil
+}
+
+// AdvanceDeploymentReminder atomically increments reminders_sent and stamps
+// last_reminder_at = now() — but only when the row still matches the
+// "ready to dispatch" predicate. Returns true when the row was advanced
+// (caller is responsible for sending the email AFTER this returns true),
+// false when another tick already advanced it.
+//
+// The CAS is on (reminders_sent < 6) AND
+// (last_reminder_at IS NULL OR last_reminder_at <= now() - cooldown).
+// expectedRemindersSent must match the value the caller read; this
+// prevents a race where two workers both read reminders_sent=2, both
+// see the cooldown gate satisfied, and both fire — only the first
+// CAS succeeds.
+func AdvanceDeploymentReminder(ctx context.Context, db *sql.DB, id uuid.UUID, expectedRemindersSent int, cooldown time.Duration) (bool, error) {
+	cooldownBefore := time.Now().UTC().Add(-cooldown)
+	res, err := db.ExecContext(ctx, `
+		UPDATE deployments
+		SET reminders_sent = reminders_sent + 1,
+		    last_reminder_at = now()
+		WHERE id = $1
+		  AND reminders_sent = $2
+		  AND reminders_sent < 6
+		  AND (last_reminder_at IS NULL OR last_reminder_at <= $3)
+	`, id, expectedRemindersSent, cooldownBefore)
+	if err != nil {
+		return false, fmt.Errorf("models.AdvanceDeploymentReminder: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("models.AdvanceDeploymentReminder rows: %w", err)
+	}
+	return n == 1, nil
+}
+
+// GetExpiredDeployments returns deployments whose expires_at < now() and
+// whose ttl_policy != 'permanent' and whose status is not already
+// 'expired'/'deleted'. Used by the worker's deployment_expirer job to
+// drive the actual teardown.
+func GetExpiredDeployments(ctx context.Context, db *sql.DB, limit int) ([]*Deployment, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	now := time.Now().UTC()
+	rows, err := db.QueryContext(ctx, `
+		SELECT `+deploymentColumns+`
+		FROM deployments
+		WHERE expires_at IS NOT NULL
+		  AND ttl_policy != 'permanent'
+		  AND status NOT IN ('deleted', 'expired')
+		  AND expires_at < $1
+		ORDER BY expires_at ASC
+		LIMIT $2
+	`, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("models.GetExpiredDeployments: %w", err)
+	}
+	defer rows.Close()
+	var results []*Deployment
+	for rows.Next() {
+		d, err := scanDeployment(rows)
+		if err != nil {
+			return nil, fmt.Errorf("models.GetExpiredDeployments scan: %w", err)
+		}
+		results = append(results, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("models.GetExpiredDeployments rows: %w", err)
+	}
+	return results, nil
+}
+
+// MarkDeploymentExpired flips a deploy's status to 'expired'. Distinct
+// from DELETE (which removes the row entirely) — expired rows stay
+// around so the dashboard can still render them with an "expired" badge
+// and the user can read the audit trail of what happened.
+func MarkDeploymentExpired(ctx context.Context, db *sql.DB, id uuid.UUID) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE deployments
+		SET status = 'expired', updated_at = now()
+		WHERE id = $1 AND status NOT IN ('deleted', 'expired')
+	`, id)
+	if err != nil {
+		return fmt.Errorf("models.MarkDeploymentExpired: %w", err)
+	}
+	return nil
+}
+
 // CountActiveDeploymentsByTeam counts deployments for a team that have not been
 // torn down. Used by POST /deploy/new to enforce the per-tier deployments_apps
 // cap from plans.yaml.
@@ -421,7 +679,7 @@ func CountActiveDeploymentsByTeam(ctx context.Context, db *sql.DB, teamID uuid.U
 	var n int
 	err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM deployments
-		WHERE team_id = $1 AND status != 'deleted'
+		WHERE team_id = $1 AND status NOT IN ('deleted', 'expired')
 	`, teamID).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("models.CountActiveDeploymentsByTeam: %w", err)
