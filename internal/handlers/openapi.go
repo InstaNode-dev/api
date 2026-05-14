@@ -1458,6 +1458,30 @@ const openAPISpec = `{
       }
     },
     "/api/v1/team": {
+      "get": {
+        "summary": "Get the caller's team record",
+        "description": "Returns the public-safe subset of the caller's team row: id, name, plan_tier, has_active_subscription (mirror of teams.razorpay_subscription_id IS NOT NULL), and created_at. Distinct from GET /api/v1/team/summary (cached aggregate counts) and GET /api/v1/team/members (member roster). Use this when the dashboard's TeamPage opens or after PATCH /api/v1/team to read back the new name.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Team record", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "team": { "$ref": "#/components/schemas/TeamSelf" } }, "required": ["ok", "team"] } } } },
+          "401": { "description": "Missing or invalid session token", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "404": { "description": "Team not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "503": { "description": "Lookup failed (transient DB error). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      },
+      "patch": {
+        "summary": "Rename the caller's team",
+        "description": "Updates the team's display name. Only the 'name' field is mutable here — plan_tier, subscription state, and member roster flow through dedicated paths (Razorpay webhook for tier; /api/v1/admin/customers/:id/tier for admin demote; /api/v1/team/members/* for membership). Read-only sessions (admin impersonation) are blocked by the route's RequireWritable gate before this handler runs.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 200, "description": "New display name. Whitespace is trimmed. Must be 1-200 chars after trim." } } } } } },
+        "responses": {
+          "200": { "description": "Team updated", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "team": { "$ref": "#/components/schemas/TeamSelf" } }, "required": ["ok", "team"] } } } },
+          "400": { "description": "Body invalid, name missing, or name longer than 200 chars", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "401": { "description": "Missing or invalid session token", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "403": { "description": "Read-only session (admin impersonation) — mutations are blocked", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "503": { "description": "Update failed (transient DB error). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      },
       "delete": {
         "summary": "Request team deletion (GDPR Article 17, owner only, 30-day grace)",
         "description": "Begins right-to-be-forgotten for the caller's team. Owner role required. Body must include confirm_team_slug matching the team's visible slug (defense-in-depth: typo / paste-error short-circuits before any state change). Effect: teams.status flips to deletion_requested, deletion_requested_at = now(), every team resource is paused (status='paused', paused_at=now()), and the active Razorpay subscription is best-effort cancelled. After 30 days the worker's team_deletion_executor hard-destroys customer DBs / S3 backups / PII fields and flips status to tombstoned. Inside the 30-day window the owner can call POST /api/v1/team/restore to halt deletion.",
@@ -2012,6 +2036,62 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/capabilities": {
+      "get": {
+        "summary": "Tier capabilities matrix (public)",
+        "description": "Returns the full tier matrix as JSON so AI agents can discover 'what can I do at which tier' without provisioning-and-failing or scraping llms.txt. Iterates the live plans registry — a tier added in plans.yaml automatically appears here without a code change. Tiers are sorted by the upgrade ladder (anonymous → free → hobby → hobby_plus → growth → pro → team). *_yearly variants are excluded; their annual discount surfaces on the canonical monthly row via annual_discount_percent. Public, unauthenticated.",
+        "responses": {
+          "200": { "description": "Capability matrix", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CapabilitiesResponse" } } } },
+          "503": { "description": "plans.yaml registry failed to load", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      }
+    },
+    "/api/v1/incidents": {
+      "get": {
+        "summary": "Current and recent incidents (public)",
+        "description": "Returns the open incident feed. Today the items array is always empty — the field is reserved for the future incident-feed worker, so dashboards and status pages can wire the response now and have it light up as soon as the worker writes its first row. Public, unauthenticated.",
+        "responses": {
+          "200": { "description": "Incident list", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IncidentsResponse" } } } }
+        }
+      }
+    },
+    "/api/v1/status": {
+      "get": {
+        "summary": "Live component-level health (public, cached 60s)",
+        "description": "Server-side aggregate driven by the worker's uptime_prober job (about one probe per minute per component). Replaces the dashboard's prior client-side probe loop. Response includes per-component current_status (operational | degraded | down), 7d and 30d uptime percentages, 96 booleans of 15-minute-bucketed last_24h_samples for the bar chart, and a current_incidents array (empty until the incident-feed worker ships). Cached 60s in Redis under one shared key — the payload is identical for every caller. Public, unauthenticated.",
+        "responses": {
+          "200": {
+            "description": "Status payload",
+            "headers": {
+              "Cache-Control": {
+                "schema": { "type": "string", "example": "public, max-age=60, stale-while-revalidate=60" },
+                "description": "60s public cache (the response is identical for every caller). stale-while-revalidate=60 lets browsers serve the stale value during the next refresh — useful during incidents when the API itself may be slow."
+              }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StatusResponse" } } }
+          },
+          "500": { "description": "Failed to compute status (transient DB error). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      }
+    },
+    "/llms.txt": {
+      "get": {
+        "summary": "Agent discovery doc (302 to marketing)",
+        "description": "Agents that land on api.instanode.dev/llms.txt are redirected (302 Found) to instanode.dev/llms.txt — the source-of-truth surface for the LLM-targeted product docs. Companion of /llms-full.txt. Public, no auth.",
+        "responses": {
+          "302": { "description": "Redirect to https://instanode.dev/llms.txt", "headers": { "Location": { "schema": { "type": "string", "format": "uri" } } } }
+        }
+      }
+    },
+    "/llms-full.txt": {
+      "get": {
+        "summary": "Full LLM-targeted product docs (302 to marketing)",
+        "description": "Agents that land on api.instanode.dev/llms-full.txt are redirected (302 Found) to instanode.dev/llms-full.txt — the long-form companion to /llms.txt. Public, no auth.",
+        "responses": {
+          "302": { "description": "Redirect to https://instanode.dev/llms-full.txt", "headers": { "Location": { "schema": { "type": "string", "format": "uri" } } } }
+        }
+      }
+    },
     "/internal/set-tier": {
       "post": {
         "summary": "Internal: forcibly elevate a team's tier (dev only)",
@@ -2513,6 +2593,98 @@ const openAPISpec = `{
           "actor_email_masked": { "type": ["string", "null"], "description": "Partial-redacted email of the acting user. Format: first character of local-part + '***' + '@' + full domain (e.g. 'm***@example.com'). Null when actor_user_id is null or the user row has been deleted." }
         },
         "required": ["id", "kind", "created_at"]
+      },
+      "TeamSelf": {
+        "type": "object",
+        "description": "Public-safe team record returned by GET /api/v1/team and PATCH /api/v1/team. Distinct from the cached aggregate at /api/v1/team/summary (counts panel) and the member roster at /api/v1/team/members.",
+        "properties": {
+          "id":                       { "type": "string", "format": "uuid" },
+          "name":                     { "type": "string", "description": "Display name. Empty string when never set." },
+          "plan_tier":                { "type": "string", "description": "Current plan tier. Source of truth: teams.plan_tier (Razorpay webhook authoritative). Values include anonymous, free, hobby, hobby_plus, growth, pro, team and their *_yearly variants." },
+          "has_active_subscription":  { "type": "boolean", "description": "Mirror of teams.razorpay_subscription_id IS NOT NULL — true once the team has been wired to a Razorpay subscription." },
+          "created_at":               { "type": "string", "format": "date-time", "description": "When the team row was created. UTC, second precision." }
+        },
+        "required": ["id", "name", "plan_tier", "has_active_subscription", "created_at"]
+      },
+      "TierCapabilities": {
+        "type": "object",
+        "description": "Capability row for one tier in the /api/v1/capabilities matrix. Adding a new tier in plans.yaml automatically produces a new row.",
+        "properties": {
+          "tier":                    { "type": "string", "description": "Canonical tier name (e.g. 'hobby', 'pro'). *_yearly variants are not surfaced; the canonical monthly tier represents the capability bundle." },
+          "display_name":            { "type": "string", "description": "Human-readable name for the tier, e.g. 'Hobby' or 'Pro'." },
+          "price_usd_monthly":       { "type": "integer", "description": "Monthly price in whole USD (cents/100). 0 for free/anonymous tiers." },
+          "paid_from_day_one":       { "type": "boolean", "description": "True iff price_usd_monthly > 0. Mirrors project policy: no trial — paid tiers are paid from signup." },
+          "storage_limit_mb":        { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Per-service storage cap in MB. Keys: postgres, redis, mongodb, queue, storage, webhook, vector. -1 sentinel means 'unlimited'." },
+          "connections_limit":       { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Per-service concurrent-connection cap. Keys mirror storage_limit_mb. -1 = unlimited." },
+          "deployments_apps":        { "type": "integer", "description": "Max number of /deploy/new apps allowed. -1 = unlimited." },
+          "backup_retention_days":   { "type": "integer" },
+          "backup_restore_enabled":  { "type": "boolean" },
+          "manual_backups_per_day":  { "type": "integer" },
+          "annual_discount_percent": { "type": "integer", "description": "Discount percent of the {tier}_yearly variant vs 12x the monthly. 0 when no yearly variant exists." },
+          "upgrade_url":             { "type": "string", "format": "uri" }
+        },
+        "required": ["tier", "display_name", "price_usd_monthly", "paid_from_day_one", "storage_limit_mb", "connections_limit", "deployments_apps", "upgrade_url"]
+      },
+      "CapabilitiesResponse": {
+        "type": "object",
+        "properties": {
+          "ok":      { "type": "boolean" },
+          "tiers":   { "type": "array", "items": { "$ref": "#/components/schemas/TierCapabilities" }, "description": "Tier rows in upgrade-ladder order (anonymous first → team last)." },
+          "docs":    { "type": "string", "format": "uri", "description": "Pointer to the LLM-targeted product docs surface." },
+          "contact": { "type": "string", "description": "Mailto link for enterprise inquiries." }
+        },
+        "required": ["ok", "tiers"]
+      },
+      "Incident": {
+        "type": "object",
+        "description": "One incident row. The future incident-feed worker will populate these; today the items array is always empty.",
+        "properties": {
+          "id":          { "type": "string" },
+          "title":       { "type": "string" },
+          "severity":    { "type": "string", "enum": ["info", "minor", "major", "critical"] },
+          "status":      { "type": "string", "enum": ["investigating", "identified", "monitoring", "resolved"] },
+          "started_at":  { "type": "string", "format": "date-time" },
+          "resolved_at": { "type": "string", "format": "date-time", "description": "Omitted while status != 'resolved'." },
+          "summary":     { "type": "string" },
+          "url":         { "type": "string", "format": "uri", "description": "Optional link to the public incident write-up." }
+        },
+        "required": ["id", "title", "severity", "status", "started_at", "summary"]
+      },
+      "IncidentsResponse": {
+        "type": "object",
+        "properties": {
+          "ok":          { "type": "boolean" },
+          "items":       { "type": "array", "items": { "$ref": "#/components/schemas/Incident" } },
+          "total":       { "type": "integer", "description": "Equal to items.length today; the field is reserved for future pagination." },
+          "status_page": { "type": "string", "format": "uri", "description": "Companion human-readable status page." }
+        },
+        "required": ["ok", "items", "total"]
+      },
+      "ComponentStatus": {
+        "type": "object",
+        "description": "One row of the /api/v1/status components array. last_24h_samples is exactly 96 booleans (96 x 15min = 24h), oldest first.",
+        "properties": {
+          "slug":             { "type": "string", "description": "Stable component identifier (e.g. 'api', 'provisioner', 'worker', 'marketing')." },
+          "name":             { "type": "string", "description": "Display name for the dashboard's status page." },
+          "category":         { "type": "string", "enum": ["core", "compute", "edge"], "description": "Ordering bucket. Render order: core then compute then edge." },
+          "description":      { "type": "string", "description": "Optional one-liner describing the component. Omitted when blank." },
+          "current_status":   { "type": "string", "enum": ["operational", "degraded", "down"], "description": "Derived from the most recent 15-minute slot with data. 'operational' = 100% healthy probes; 'degraded' = at least 50% healthy; 'down' = less than 50%. No data falls open to 'operational'." },
+          "uptime_7d_pct":    { "type": "number", "description": "Percent healthy across the last 7 days. -1 sentinel = no samples in the window." },
+          "uptime_30d_pct":   { "type": "number", "description": "Percent healthy across the last 30 days. -1 sentinel = no samples in the window." },
+          "last_24h_samples": { "type": "array", "items": { "type": "boolean" }, "minItems": 96, "maxItems": 96, "description": "96 x 15-minute slots, oldest first. true = slot healthy; false = slot had at least one unhealthy probe. Empty slots inherit the previous slot's value to keep the bar continuous." }
+        },
+        "required": ["slug", "name", "category", "current_status", "uptime_7d_pct", "uptime_30d_pct", "last_24h_samples"]
+      },
+      "StatusResponse": {
+        "type": "object",
+        "properties": {
+          "ok":                { "type": "boolean" },
+          "freshness_seconds": { "type": "integer", "description": "Cache window the server enforces. Matches Cache-Control max-age." },
+          "as_of":             { "type": "string", "format": "date-time", "description": "Wall-clock at which the underlying aggregation ran. Stable across multiple replays of the same cache entry." },
+          "components":        { "type": "array", "items": { "$ref": "#/components/schemas/ComponentStatus" }, "description": "Rendered in display order — core services first, then compute, then edge." },
+          "current_incidents": { "type": "array", "items": { "$ref": "#/components/schemas/Incident" }, "description": "Open incidents at the time of the snapshot. Today this is always empty — the field is reserved for the future incident-feed worker." }
+        },
+        "required": ["ok", "freshness_seconds", "as_of", "components", "current_incidents"]
       }
     }
   }

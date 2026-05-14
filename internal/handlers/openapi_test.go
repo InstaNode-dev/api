@@ -2,6 +2,10 @@ package handlers
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -318,4 +322,167 @@ func digMap(root map[string]any, keys ...string) (map[string]any, bool) {
 		cur = next
 	}
 	return cur, true
+}
+
+// TestOpenAPI_CoversAllRegisteredRoutes is the regression gate for H4 — every
+// (method, path) registered in router.go MUST also appear in openapi.go. The
+// previous "did the writer remember to document it?" trust model burned us
+// repeatedly in Retro-3 (capabilities, status, incidents, /api/v1/team
+// GET/PATCH, llms.txt all shipped without spec entries). This test enumerates
+// the live route registrations by string-parsing router.go and asserts each
+// one is described in the OpenAPI Paths map.
+//
+// Intentionally hidden routes are whitelisted with explicit justification
+// below — admin/* (unguessable prefix), email-provider receivers (ops-only),
+// worker M2M, and dashboard-only telemetry surfaces.
+//
+// Why parse router.go as text instead of running the live Fiber app: building
+// the app would require a real DB pool, Redis client, plans registry, GeoDB
+// pointers, etc. — the test would be an integration test, not a unit test.
+// The string parser is good enough because every route in router.go uses one
+// of the documented registration patterns (app.Get("/path"), api.Post(...),
+// deployGroup.Patch(...), etc.) — the test is calibrated against the live
+// file and any new registration style would surface as a failure here.
+func TestOpenAPI_CoversAllRegisteredRoutes(t *testing.T) {
+	var spec map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &spec); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	paths, _ := spec["paths"].(map[string]any)
+	if paths == nil {
+		t.Fatal("openAPISpec missing paths map")
+	}
+
+	// Locate router.go relative to this test file. Do NOT hardcode an
+	// absolute path; CI runs from a checkout root that differs per platform.
+	routerPath := filepath.Join("..", "router", "router.go")
+	src, err := os.ReadFile(routerPath)
+	if err != nil {
+		t.Fatalf("read router.go: %v", err)
+	}
+
+	routes := extractRouterRoutes(string(src))
+	if len(routes) == 0 {
+		t.Fatal("extractRouterRoutes returned 0 — the parser is out of sync with router.go syntax")
+	}
+
+	// Whitelist of (method, openapi-path) tuples intentionally omitted from
+	// the public spec. Categories:
+	//
+	//   1. admin/* routes — already filtered via r.isAdmin below. The
+	//      adminGroup registrations sit under the unguessable
+	//      ADMIN_PATH_PREFIX in production; documenting them defeats the
+	//      prefix gate. See router.go's "Gate 1" comment.
+	//   2. Email-provider feedback receivers (Brevo, SES) — public, HMAC/SNS-
+	//      verified, configured by ops, not consumed by callers reading
+	//      the spec.
+	//   3. Worker-to-api machine-to-machine internal terminate — shared-
+	//      secret auth, no agent should call it directly.
+	//   4. Dashboard-only telemetry surfaces — usage/wall (read by the
+	//      dashboard's polling nudge banner) and experiments/converted
+	//      (A/B click sink). Agents shouldn't drive these and adding them
+	//      to the agent-facing spec would muddy the contract.
+	intentionallyHidden := map[string]bool{
+		"POST /api/v1/email/webhook/brevo":   true,
+		"POST /api/v1/email/webhook/ses":     true,
+		"POST /internal/teams/{id}/terminate": true,
+		"GET /api/v1/usage/wall":              true,
+		"POST /api/v1/experiments/converted":  true,
+	}
+
+	var missing []string
+	for _, r := range routes {
+		if r.isAdmin {
+			continue
+		}
+		openapiPath := fiberParamsToOpenAPI(r.path)
+
+		key := r.method + " " + openapiPath
+		if intentionallyHidden[key] {
+			continue
+		}
+
+		entry, ok := paths[openapiPath].(map[string]any)
+		if !ok {
+			missing = append(missing, key+"  (no path entry)")
+			continue
+		}
+		methodKey := strings.ToLower(r.method)
+		if _, ok := entry[methodKey].(map[string]any); !ok {
+			missing = append(missing, key+"  (path entry exists, method missing)")
+		}
+	}
+
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Errorf("OpenAPI spec is missing %d route(s) that router.go registers. Add them to internal/handlers/openapi.go (and a schema if appropriate) or extend the intentionallyHidden whitelist in this test with a comment justifying the omission:\n  %s",
+			len(missing), strings.Join(missing, "\n  "))
+	}
+}
+
+// routerRoute is one (method, path, isAdmin) triple extracted from router.go.
+type routerRoute struct {
+	method  string // "GET", "POST", "PUT", "PATCH", "DELETE"
+	path    string // e.g. "/db/new", "/api/v1/team" — already prefixed
+	isAdmin bool   // true if registered on adminGroup
+}
+
+// extractRouterRoutes walks router.go's source text and emits one routerRoute
+// per registration. Supports the five Fiber registration patterns the live
+// router uses:
+//
+//   - app.<Method>("/path", ...)         registered at root
+//   - api.<Method>("/path", ...)         prefixed with /api/v1
+//   - adminGroup.<Method>("/path", ...)  admin (filtered out by caller)
+//   - deployGroup.<Method>("/path", ...) prefixed with /deploy
+//   - internal.<Method>("/path", ...)    prefixed with /internal (dev-only)
+//
+// The parser is intentionally conservative — it expects a literal "(" right
+// after the method name and a quoted path as the first argument. Anything
+// else (interpolated paths, dynamic registration) is skipped, which is fine
+// because router.go uses only literal paths today.
+func extractRouterRoutes(src string) []routerRoute {
+	patterns := []struct {
+		groupRe   *regexp.Regexp
+		urlPrefix string
+		isAdmin   bool
+	}{
+		{regexp.MustCompile(`\bapp\.(Get|Post|Put|Patch|Delete)\("([^"]+)"`), "", false},
+		{regexp.MustCompile(`\bapi\.(Get|Post|Put|Patch|Delete)\("([^"]+)"`), "/api/v1", false},
+		{regexp.MustCompile(`\badminGroup\.(Get|Post|Put|Patch|Delete)\("([^"]+)"`), "/api/v1/<admin>", true},
+		{regexp.MustCompile(`\bdeployGroup\.(Get|Post|Put|Patch|Delete)\("([^"]+)"`), "/deploy", false},
+		{regexp.MustCompile(`\binternal\.(Get|Post|Put|Patch|Delete)\("([^"]+)"`), "/internal", false},
+	}
+
+	var out []routerRoute
+	for _, p := range patterns {
+		for _, m := range p.groupRe.FindAllStringSubmatch(src, -1) {
+			method := strings.ToUpper(m[1])
+			path := m[2]
+			if p.urlPrefix != "" {
+				if !strings.HasPrefix(path, "/") {
+					path = "/" + path
+				}
+				path = p.urlPrefix + path
+			}
+			out = append(out, routerRoute{method: method, path: path, isAdmin: p.isAdmin})
+		}
+	}
+	return out
+}
+
+// fiberParamsToOpenAPI converts ":param" segments to "{param}" so the
+// extracted router path can be looked up directly in the OpenAPI paths map.
+// e.g. "/api/v1/resources/:id/family" → "/api/v1/resources/{id}/family".
+func fiberParamsToOpenAPI(path string) string {
+	if !strings.Contains(path, ":") {
+		return path
+	}
+	segments := strings.Split(path, "/")
+	for i, seg := range segments {
+		if strings.HasPrefix(seg, ":") {
+			segments[i] = "{" + seg[1:] + "}"
+		}
+	}
+	return strings.Join(segments, "/")
 }
