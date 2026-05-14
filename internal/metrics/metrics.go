@@ -84,6 +84,33 @@ var (
 		Name: "instant_geoip_db_age_hours",
 		Help: "Age of MaxMind GeoLite2 database in hours",
 	})
+
+	// StorageIAMUsersCreated counts successful per-tenant MinIO IAM user
+	// creations on /storage/new. Drives the storage_iam_users gauge (via
+	// rate() in NR) and the "shared-key fallback" alert: if this counter
+	// stops moving while /storage/new traffic keeps increasing, something
+	// silently fell back to shared-key mode and on-call should investigate.
+	StorageIAMUsersCreated = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_storage_iam_users_created_total",
+		Help: "Per-tenant MinIO IAM users minted on /storage/new (admin mode)",
+	})
+
+	// StorageIAMUsersDeleted counts successful per-tenant MinIO IAM user
+	// deletions on DELETE /api/v1/resources/:id and worker-driven expiry.
+	StorageIAMUsersDeleted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_storage_iam_users_deleted_total",
+		Help: "Per-tenant MinIO IAM users removed at resource deprovision (admin mode)",
+	})
+
+	// StorageIAMUsersFailed counts IAM-user lifecycle failures. The
+	// `op` label is "create" or "delete"; the `phase` label narrows
+	// "create" failures to "add_user" / "add_policy" / "set_policy" so
+	// on-call can tell whether MinIO admin is rejecting the user, the
+	// policy doc, or the binding.
+	StorageIAMUsersFailed = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_storage_iam_users_failed_total",
+		Help: "Per-tenant MinIO IAM user create/delete failures",
+	}, []string{"op", "phase"})
 )
 
 // StatusClass converts an HTTP status code to a label-safe class string.

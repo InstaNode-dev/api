@@ -61,7 +61,8 @@ type Config struct {
 	//                   prefix to every customer (trust-based isolation).
 	// Defaults to "minio-admin" when ObjectStoreBackend is empty AND the
 	// legacy MINIO_* env vars are set; otherwise "shared-key".
-	ObjectStoreBackend    string // OBJECT_STORE_BACKEND — "minio-admin" or "shared-key"
+	ObjectStoreMode       string // OBJECT_STORE_MODE — "admin" (default) or "shared_key"; alias of ObjectStoreBackend
+	ObjectStoreBackend    string // OBJECT_STORE_BACKEND — "minio-admin" or "shared-key" (legacy alias of OBJECT_STORE_MODE)
 	ObjectStoreEndpoint   string // OBJECT_STORE_ENDPOINT — host:port for admin/bucket ops
 	ObjectStorePublicURL  string // OBJECT_STORE_PUBLIC_URL — customer-facing base, e.g. "https://s3.instanode.dev"
 	ObjectStoreAccessKey  string // OBJECT_STORE_ACCESS_KEY — master access key
@@ -69,6 +70,14 @@ type Config struct {
 	ObjectStoreBucket     string // OBJECT_STORE_BUCKET — shared bucket (default: instant-shared)
 	ObjectStoreRegion     string // OBJECT_STORE_REGION — e.g. "nyc3" for DO Spaces, "us-east-1" for AWS S3
 	ObjectStoreSecure     bool   // OBJECT_STORE_SECURE — true for TLS-terminated endpoints (DO Spaces, AWS S3); default false for in-cluster MinIO
+
+	// ObjectStoreAllowSharedKey is the explicit operator escape hatch that
+	// permits shared-key mode in production. Without this flag, the router
+	// refuses to start in shared-key mode when ENVIRONMENT=production —
+	// surfacing the "every customer has the master key" loophole at boot
+	// instead of letting it ship silently. Local dev sets ENVIRONMENT=development
+	// so this flag has no effect there.
+	ObjectStoreAllowSharedKey bool // OBJECT_STORE_ALLOW_SHARED_KEY — "true" to opt in
 
 	// Legacy MINIO_* env vars — kept as a fallback so old deployments keep
 	// working without an immediate env-var migration. New deployments should
@@ -218,6 +227,7 @@ func Load() *Config {
 	// New provider-agnostic object-storage env vars. Fall back to the legacy
 	// MINIO_* names so deployments without OBJECT_STORE_* set keep working
 	// unchanged (the LoadFromEnv tail below resolves the effective values).
+	cfg.ObjectStoreMode = os.Getenv("OBJECT_STORE_MODE")
 	cfg.ObjectStoreBackend = os.Getenv("OBJECT_STORE_BACKEND")
 	cfg.ObjectStoreEndpoint = os.Getenv("OBJECT_STORE_ENDPOINT")
 	cfg.ObjectStorePublicURL = os.Getenv("OBJECT_STORE_PUBLIC_URL")
@@ -226,6 +236,7 @@ func Load() *Config {
 	cfg.ObjectStoreBucket = getenv("OBJECT_STORE_BUCKET", "instant-shared")
 	cfg.ObjectStoreRegion = os.Getenv("OBJECT_STORE_REGION")
 	cfg.ObjectStoreSecure = os.Getenv("OBJECT_STORE_SECURE") == "true"
+	cfg.ObjectStoreAllowSharedKey = os.Getenv("OBJECT_STORE_ALLOW_SHARED_KEY") == "true"
 
 	cfg.MinioEndpoint = os.Getenv("MINIO_ENDPOINT")
 	cfg.MinioPublicEndpoint = os.Getenv("MINIO_PUBLIC_ENDPOINT")
@@ -250,14 +261,23 @@ func Load() *Config {
 	if cfg.ObjectStoreBucket == "instant-shared" && cfg.MinioBucketName != "" && cfg.MinioBucketName != "instant-shared" {
 		cfg.ObjectStoreBucket = cfg.MinioBucketName
 	}
+	// Mode resolution precedence:
+	//   1. OBJECT_STORE_MODE (new, operator-facing name)
+	//   2. OBJECT_STORE_BACKEND (legacy alias)
+	//   3. Default → "admin" (BackendMinIOAdmin). This is the secure
+	//      default that closes the shared-key isolation loophole.
+	//      Shared-key mode is now opt-in via OBJECT_STORE_MODE=shared_key
+	//      (or =shared-key); production additionally requires
+	//      OBJECT_STORE_ALLOW_SHARED_KEY=true to actually start.
+	if cfg.ObjectStoreMode == "" {
+		cfg.ObjectStoreMode = cfg.ObjectStoreBackend
+	}
 	if cfg.ObjectStoreBackend == "" {
-		// Default to minio-admin when the legacy MINIO_* vars are present
-		// (preserves existing behavior); shared-key otherwise.
-		if cfg.MinioEndpoint != "" {
-			cfg.ObjectStoreBackend = "minio-admin"
-		} else {
-			cfg.ObjectStoreBackend = "shared-key"
-		}
+		cfg.ObjectStoreBackend = cfg.ObjectStoreMode
+	}
+	if cfg.ObjectStoreMode == "" {
+		cfg.ObjectStoreMode = "admin"
+		cfg.ObjectStoreBackend = "minio-admin"
 	}
 	// Email-feedback webhook auth secrets. Empty values → handler rejects
 	// every inbound webhook (fail-closed). Operators MUST set these in
@@ -393,6 +413,12 @@ func logStartupConfig(cfg *Config) {
 		"minio_endpoint", cfg.MinioEndpoint,
 		"minio_public_endpoint", cfg.MinioPublicEndpoint,
 		"minio_bucket_name", cfg.MinioBucketName,
+		"object_store_mode", cfg.ObjectStoreMode,
+		"object_store_backend", cfg.ObjectStoreBackend,
+		"object_store_endpoint_set", cfg.ObjectStoreEndpoint != "",
+		"object_store_bucket", cfg.ObjectStoreBucket,
+		"object_store_secure", cfg.ObjectStoreSecure,
+		"object_store_allow_shared_key", cfg.ObjectStoreAllowSharedKey,
 		"deploy_domain", cfg.DeployDomain,
 		"compute_provider", cfg.ComputeProvider,
 		"kube_namespace_apps", cfg.KubeNamespaceApps,
