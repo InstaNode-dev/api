@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -112,10 +113,16 @@ func main() {
 	if plansPath == "" {
 		plansPath = "plans.yaml"
 	}
-	planRegistry, err := plans.Load(plansPath)
+	planRegistry, err := loadPlansRegistry(plansPath, cfg.Environment)
 	if err != nil {
-		slog.Warn("plans file not found or invalid — using built-in defaults", "error", err, "path", plansPath)
-		planRegistry = plans.Default()
+		// loadPlansRegistry only returns a non-nil error in production —
+		// dev / staging warn-and-fallback to embedded defaults. Falling
+		// back in prod would silently serve stale limits/pricing because
+		// plans.yaml is the declared single source of truth. Fatal here
+		// so a misconfigured prod pod surfaces as CrashLoopBackoff
+		// (operator-visible) instead of green /healthz with wrong limits.
+		slog.Error("plans.load_failed", "error", err, "path", plansPath, "environment", cfg.Environment)
+		os.Exit(1)
 	}
 
 	var provClient *provisioner.Client
@@ -183,6 +190,55 @@ func initNewRelic(service string) *newrelic.Application {
 	}
 	slog.Info("newrelic.initialized", "app_name", appName)
 	return app
+}
+
+// envProduction is the cfg.Environment value that flips loadPlansRegistry
+// from "warn + fallback" to "fail-loud". Matches the string the rest of
+// the codebase compares against (router policy gates, dev-only routes,
+// etc.). Hoisted to a constant so the comparison isn't a magic string
+// at each callsite.
+const envProduction = "production"
+
+// loadPlansRegistry loads the plans.yaml file at path. Behaviour by env:
+//
+//   - production: a load failure is FATAL. Returns (nil, err) so main()
+//     can log + os.Exit(1). Falling back to common/plans.Default() in
+//     production would silently serve stale limits/pricing because
+//     plans.yaml is the declared single source of truth (per CLAUDE.md).
+//     A configmap drift or missing volume mount must surface as
+//     CrashLoopBackoff, not a green /healthz with wrong limits.
+//
+//   - any other environment (development / staging / test): a load
+//     failure logs slog.Warn("plans.file_not_found") with path + env
+//     and returns the embedded Default() registry so local `make run`
+//     keeps working without an on-disk plans.yaml. The warn key matches
+//     the existing NR alert rule on plans.file_not_found, so configmap
+//     drift in staging trips the same alert pipeline production would.
+//
+// Extracted as a free function so unit tests can pin both branches of
+// the contract (TestLoadPlansRegistry_ProductionFatal /
+// TestLoadPlansRegistry_DevFallsBack in main_test.go) without spinning
+// up main().
+func loadPlansRegistry(path, env string) (*plans.Registry, error) {
+	registry, err := plans.Load(path)
+	if err == nil {
+		return registry, nil
+	}
+	if env == envProduction {
+		return nil, fmt.Errorf("plans.Load %q in production: %w", path, err)
+	}
+	// Dev / staging / test: warn loudly so configmap drift in staging
+	// trips the existing NR alert on plans.file_not_found, but keep
+	// booting against the embedded defaults. The slog key matches what
+	// the alert rule queries — do not rename without coordinating with
+	// the dashboard query.
+	slog.Warn("plans.file_not_found",
+		"error", err,
+		"path", path,
+		"env", env,
+		"fallback", "embedded_defaults",
+	)
+	return plans.Default(), nil
 }
 
 // imageDigestEnvVar names the env var Kubernetes populates via

@@ -6,6 +6,13 @@ import commonplans "instant.dev/common/plans"
 // Registry is an in-memory index of all plan and promotion definitions.
 type Registry = commonplans.Registry
 
+// Plan re-exports the fully resolved configuration for one pricing tier
+// so handlers in this module don't need to import the shared package
+// directly. capabilities.go uses this to receive the registry's Plan map
+// from Registry.All() and read DisplayName / PriceMonthly / BillingPeriod
+// without an extra import line.
+type Plan = commonplans.Plan
+
 // Load reads and parses a plans YAML file and returns a validated Registry.
 func Load(path string) (*Registry, error) { return commonplans.Load(path) }
 
