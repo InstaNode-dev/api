@@ -174,6 +174,11 @@ func TestAgentActionContract_RegistryCoverage(t *testing.T) {
 		"webhook_inactive", "resource_not_found",
 		// Permission denied.
 		"forbidden", "last_owner",
+		// Fiber-default 4xx routing errors (W12 retro-3 fix — these used
+		// to leave agent_action empty when /openapi.json was probed,
+		// agents got 404 with no remediation guidance).
+		"not_found", "method_not_allowed", "payload_too_large",
+		"unsupported_media_type",
 	}
 	for _, code := range expectedCodes {
 		_, ok := codeToAgentAction[code]
