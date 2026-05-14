@@ -610,6 +610,7 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	api.Get("/resources/:id/family", resourceH.Family)
 	api.Get("/resources/:id", resourceH.Get)
 	api.Get("/resources/:id/credentials", resourceH.GetCredentials)
+	api.Get("/resources/:id/metrics", resourceH.Metrics)
 	api.Delete("/resources/:id", resourceH.Delete)
 	api.Post("/resources/:id/rotate-credentials", resourceH.RotateCredentials)
 	api.Post("/resources/:id/pause", resourceH.Pause)
