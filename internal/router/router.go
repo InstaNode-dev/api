@@ -342,7 +342,12 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Post("/queue/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "queue.new"), queueH.NewQueue)
 	app.Post("/storage/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "storage.new"), storageH.NewStorage)
 	app.Post("/webhook/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "webhook.new"), webhookH.NewWebhook)
-	app.Post("/webhook/receive/:token", webhookH.Receive)
+	// /webhook/receive/:token is registered with app.All so any HTTP method
+	// (GET for Slack URL verification, POST for the bulk of webhook senders,
+	// PUT/DELETE for a handful of esoteric flows) reaches the handler
+	// instead of bouncing off a 405. Auth is the token in the URL — no
+	// session middleware applies (BugBash #Q29).
+	app.All("/webhook/receive/:token", webhookH.Receive)
 	app.Get("/resources/:token/logs", logsH.ResourceLogs)
 
 	// GitHub auto-deploy receiver (migration 035) — PUBLIC, signed.
