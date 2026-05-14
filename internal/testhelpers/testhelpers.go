@@ -406,6 +406,10 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_backups_resource ON resource_backups(resource_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_backups_pending  ON resource_backups(status) WHERE status IN ('pending','running')`,
+		// 043_backup_sha256 — FIX-H integrity column. Worker computes
+		// SHA-256 of the gzipped pg_dump during finalize; restore handler
+		// verifies before pg_restore. Nullable on legacy rows.
+		`ALTER TABLE resource_backups ADD COLUMN IF NOT EXISTS sha256 TEXT`,
 		`CREATE TABLE IF NOT EXISTS resource_restores (
 			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			resource_id     UUID NOT NULL REFERENCES resources(id) ON DELETE CASCADE,

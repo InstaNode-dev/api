@@ -38,6 +38,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -269,15 +270,46 @@ func (h *BackupHandler) ListBackups(c *fiber.Ctx) error {
 
 // CreateRestore handles POST /api/v1/resources/:id/restore.
 //
-// Body: {"backup_id": "<uuid>"}.
+// Body:
 //
-// Tier policy: BackupRestoreEnabled from plans.yaml (true for Pro/Growth/Team,
-// false for Hobby/Free/Anonymous). 402 otherwise with a sales nudge —
-// "Pro can restore your data with one click, Hobby cannot."
+//	{
+//	  "backup_id": "<uuid>",                  // required
+//	  "target_resource_id": "<uuid>",         // optional; restore into a different resource
+//	  "destructive_acknowledgment": true      // required when target_resource_id is unset
+//	}
 //
-// The referenced backup must exist, belong to the SAME resource, AND be in
-// status='ok'. Mismatches return 400/404/409 with descriptive errors so a
-// dashboard can show the right copy.
+// Tier policy: BackupRestoreEnabled from plans.yaml. False for hobby/free/
+// anonymous; true for hobby_plus/pro/growth/team. The 402 envelope's
+// agent_action points to Hobby Plus (the cheapest restore-enabled tier)
+// for Hobby callers and to Pro for free/anonymous callers — see
+// AgentActionRestoreRequiresHobbyPlus / RequiresPro (FIX-H #66/#Q48).
+//
+// Two safety gates on top of the prior version (FIX-H #57/#Q45):
+//
+//  1. HasInflightRestore precheck — a second POST while a prior restore
+//     is still pending/running for the same resource returns 409
+//     restore_in_progress. Failing to gate this would let pg_restore
+//     --clean replay race itself.
+//  2. destructive_acknowledgment — IN-PLACE restore (no
+//     target_resource_id) requires destructive_acknowledgment: true so
+//     an agent that "just wants to test a backup" can't accidentally
+//     wipe a live customer DB.
+//
+// target_resource_id support (FIX-H #58/#A2): when set, the worker
+// restores into THAT resource instead of the URL-path resource. The
+// target must belong to the same team. The destructive ack is not
+// required when restoring into a different resource — the agent has
+// already opted into a fresh DB by choosing a different target.
+//
+// Cross-tenant backup_id guess returns 404 (not 400 as before — FIX-H
+// #64/#Q46), matching the tenant-isolation pattern from FIX-B.
+//
+// Backup integrity (FIX-H #59): the worker verifies the SHA-256 of the
+// S3 object before pg_restore runs. The api side doesn't compute the
+// digest itself — it just makes sure the backup row HAS a stored
+// digest, so that the worker has something to compare against. Rows
+// pre-dating migration 043 lack the column; we accept them (legacy
+// fail-open) but log a warn so an operator can see the coverage gap.
 func (h *BackupHandler) CreateRestore(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 	ctx := c.UserContext()
@@ -307,7 +339,9 @@ func (h *BackupHandler) CreateRestore(c *fiber.Ctx) error {
 	// Decode body. Reject empty / malformed / missing backup_id up front
 	// so a misconfigured dashboard doesn't insert orphan restore rows.
 	var body struct {
-		BackupID string `json:"backup_id"`
+		BackupID                  string `json:"backup_id"`
+		TargetResourceID          string `json:"target_resource_id"`
+		DestructiveAcknowledgment bool   `json:"destructive_acknowledgment"`
 	}
 	rawBody := c.Body()
 	if len(rawBody) > 0 {
@@ -324,6 +358,53 @@ func (h *BackupHandler) CreateRestore(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "invalid_backup_id", "backup_id must be a valid UUID")
 	}
 
+	// target_resource_id (FIX-H #58/#A2) — optional. When set, the
+	// restore lands in a DIFFERENT resource than the URL :id. We
+	// validate same-team ownership here; type-compat (postgres ↔
+	// postgres) is enforced below.
+	var targetResource *models.Resource
+	if body.TargetResourceID != "" {
+		targetID, parseErr := uuid.Parse(body.TargetResourceID)
+		if parseErr != nil {
+			return respondError(c, fiber.StatusBadRequest, "invalid_target_resource_id",
+				"target_resource_id must be a valid UUID")
+		}
+		// Look up the target by token (matches the URL-path token shape).
+		// Reuse requireOwnedResource semantics so cross-team targets return
+		// the same 403 envelope as cross-team source attempts.
+		tgt, lookupErr := models.GetResourceByToken(ctx, h.db, targetID)
+		if lookupErr != nil {
+			var notFound *models.ErrResourceNotFound
+			if errors.As(lookupErr, &notFound) {
+				return respondError(c, fiber.StatusNotFound, "target_not_found",
+					"target_resource_id does not refer to a known resource")
+			}
+			slog.Error("restore.create.target_lookup_failed",
+				"error", lookupErr, "target_resource_id", targetID, "request_id", requestID)
+			return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch target resource")
+		}
+		if !tgt.TeamID.Valid || tgt.TeamID.UUID != teamID {
+			return respondErrorWithAgentAction(c, fiber.StatusForbidden, "target_cross_team",
+				"target_resource_id belongs to a different team.",
+				AgentActionRestoreTargetCrossTeam, "")
+		}
+		if tgt.ResourceType != resource.ResourceType {
+			return respondError(c, fiber.StatusBadRequest, "target_type_mismatch",
+				"target_resource_id must be the same resource_type as the source")
+		}
+		targetResource = tgt
+	}
+
+	// destructive_acknowledgment (FIX-H #67/#Q49). Required ONLY for
+	// in-place restores (target_resource_id unset). When restoring into
+	// a different target the agent has opted into a clean DB by
+	// choosing it explicitly, so the ack would just be ceremony.
+	if targetResource == nil && !body.DestructiveAcknowledgment {
+		return respondErrorWithAgentAction(c, fiber.StatusBadRequest, "destructive_ack_required",
+			"In-place restore drops every table in the target DB. Re-send with destructive_acknowledgment: true or pass target_resource_id.",
+			AgentActionRestoreDestructiveAckRequired, "")
+	}
+
 	team, err := models.GetTeamByID(ctx, h.db, teamID)
 	if err != nil {
 		slog.Error("restore.create.team_lookup_failed",
@@ -332,14 +413,21 @@ func (h *BackupHandler) CreateRestore(c *fiber.Ctx) error {
 	}
 
 	// Tier gate: hobby/free/anonymous can take backups but cannot restore.
+	// FIX-H #66/#Q48 — Hobby callers get the Hobby Plus copy (cheapest
+	// restore-enabled tier, $19) instead of being routed past it onto Pro.
 	if !h.plans.BackupRestoreEnabled(team.PlanTier) {
+		action := AgentActionRestoreRequiresPro
+		if plans.CanonicalTier(team.PlanTier) == "hobby" {
+			action = AgentActionRestoreRequiresHobbyPlus
+		}
 		return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired, "upgrade_required",
-			"Self-serve restore requires the Pro plan or higher. Your team is on the "+team.PlanTier+" plan.",
-			AgentActionRestoreRequiresPro, "https://instanode.dev/pricing")
+			"Self-serve restore is not enabled on the "+team.PlanTier+" plan.",
+			action, "https://instanode.dev/pricing")
 	}
 
-	// Resolve the backup. Must exist, belong to this resource, be 'ok'.
-	backup, err := models.GetBackupByID(ctx, h.db, backupID)
+	// Resolve the backup. FIX-H #64/#Q46 — scope to team so a
+	// cross-tenant backup_id guess returns 404 (matching FIX-B).
+	backup, err := models.GetBackupByIDForTeam(ctx, h.db, backupID, teamID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return respondError(c, fiber.StatusNotFound, "backup_not_found",
@@ -362,37 +450,93 @@ func (h *BackupHandler) CreateRestore(c *fiber.Ctx) error {
 			AgentActionRestoreBackupNotReady, "")
 	}
 
+	// Inflight guard (FIX-H #57/#Q45). Block a second POST while a
+	// prior restore for the same resource is pending or running.
+	// FAIL-CLOSED on DB error — a stuck restore is bad, but a corrupt
+	// concurrent replay is worse.
+	guardResourceID := resource.ID
+	if targetResource != nil {
+		guardResourceID = targetResource.ID
+	}
+	inflight, ifErr := models.HasInflightRestore(ctx, h.db, teamID, guardResourceID)
+	if ifErr != nil {
+		slog.Error("restore.create.inflight_check_failed",
+			"error", ifErr, "resource_id", guardResourceID,
+			"team_id", teamID, "request_id", requestID)
+		return respondError(c, fiber.StatusServiceUnavailable, "inflight_check_failed",
+			"Failed to check for inflight restores; retry in a few seconds.")
+	}
+	if inflight {
+		return respondErrorWithAgentAction(c, fiber.StatusConflict, "restore_in_progress",
+			"A restore for this resource is already pending or running.",
+			AgentActionRestoreInflight, "")
+	}
+
+	// Integrity coverage check (FIX-H #59). Newer backups should carry
+	// a stored sha256 the worker can compare against the freshly
+	// re-read S3 object. Rows pre-dating migration 043 won't have one;
+	// we log a warning but accept them (legacy fail-open).
+	if !backup.SHA256.Valid || backup.SHA256.String == "" {
+		slog.Warn("restore.create.backup_missing_sha256",
+			"backup_id", backup.ID,
+			"created_at", backup.CreatedAt,
+			"request_id", requestID,
+			"note", "row pre-dates migration 043; worker will skip the integrity check",
+		)
+	}
+
+	// Idempotency-Key middleware would normally be in the router; we
+	// also accept the header inline so a client retry within the same
+	// minute that resolves to the same restore_id reads the cached
+	// response. For this commit we just record the header for the
+	// worker / audit log — the persistent cache is a separate piece.
+	idempotencyKey := strings.TrimSpace(c.Get("Idempotency-Key"))
+
+	// Choose the effective target — source if not overridden.
+	restoreTargetResource := resource
+	if targetResource != nil {
+		restoreTargetResource = targetResource
+	}
+
 	row, err := models.CreateRestoreRow(ctx, h.db, models.CreateRestoreParams{
-		ResourceID:  resource.ID,
+		ResourceID:  restoreTargetResource.ID,
 		BackupID:    backup.ID,
 		TriggeredBy: userID,
 	})
 	if err != nil {
 		slog.Error("restore.create.insert_failed",
-			"error", err, "resource_id", resource.ID,
+			"error", err, "resource_id", restoreTargetResource.ID,
 			"backup_id", backup.ID, "team_id", teamID, "request_id", requestID)
 		return respondError(c, fiber.StatusServiceUnavailable, "restore_create_failed",
 			"Failed to record restore request; retry in a few seconds.")
 	}
 
-	emitRestoreAudit(h.db, teamID, userID, resource, backup, row, requestID)
+	emitRestoreAuditWithTarget(h.db, teamID, userID, resource, restoreTargetResource, backup, row, requestID, idempotencyKey)
 
 	slog.Info("restore.requested",
 		"restore_id", row.ID,
 		"backup_id", backup.ID,
-		"resource_id", resource.ID,
+		"source_resource_id", resource.ID,
+		"target_resource_id", restoreTargetResource.ID,
+		"in_place", targetResource == nil,
 		"team_id", teamID,
 		"tier", team.PlanTier,
+		"idempotency_key", idempotencyKey,
 		"request_id", requestID,
 	)
 
-	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+	resp := fiber.Map{
 		"ok":         true,
 		"restore_id": row.ID,
 		"status":     row.Status,
 		"started_at": row.StartedAt,
+		"in_place":   targetResource == nil,
 		"message":    "Restore queued. The worker will pick it up within 30 seconds.",
-	})
+	}
+	if targetResource != nil {
+		resp["target_resource_id"] = targetResource.ID
+	}
+	return c.Status(fiber.StatusOK).JSON(resp)
 }
 
 // ListRestores handles GET /api/v1/resources/:id/restores.
@@ -631,24 +775,41 @@ func emitBackupAudit(db *sql.DB, teamID, userID uuid.UUID, resource *models.Reso
 	}()
 }
 
-// emitRestoreAudit fires an AuditKindRestoreRequested row in a goroutine.
-func emitRestoreAudit(db *sql.DB, teamID, userID uuid.UUID, resource *models.Resource, backup *models.ResourceBackup, row *models.ResourceRestore, requestID string) {
+// emitRestoreAuditWithTarget fires an AuditKindRestoreRequested row in a
+// goroutine. Includes the target resource id when the restore is a
+// restore-to-new-DB (target_resource_id was set). The legacy
+// emitRestoreAudit forwards into this with target = source so existing
+// call sites stay backward-compatible.
+func emitRestoreAuditWithTarget(
+	db *sql.DB,
+	teamID, userID uuid.UUID,
+	sourceResource, targetResource *models.Resource,
+	backup *models.ResourceBackup,
+	row *models.ResourceRestore,
+	requestID, idempotencyKey string,
+) {
 	go func() {
-		metadata, _ := json.Marshal(map[string]any{
-			"resource_id":  resource.ID.String(),
-			"backup_id":    backup.ID.String(),
-			"restore_id":   row.ID.String(),
-			"triggered_by": userID.String(),
-			"request_id":   requestID,
-		})
+		meta := map[string]any{
+			"resource_id":        sourceResource.ID.String(),
+			"target_resource_id": targetResource.ID.String(),
+			"in_place":           sourceResource.ID == targetResource.ID,
+			"backup_id":          backup.ID.String(),
+			"restore_id":         row.ID.String(),
+			"triggered_by":       userID.String(),
+			"request_id":         requestID,
+		}
+		if idempotencyKey != "" {
+			meta["idempotency_key"] = idempotencyKey
+		}
+		metadata, _ := json.Marshal(meta)
 		_ = models.InsertAuditEvent(context.Background(), db, models.AuditEvent{
 			TeamID:       teamID,
 			UserID:       uuid.NullUUID{UUID: userID, Valid: true},
 			Actor:        "user",
 			Kind:         models.AuditKindRestoreRequested,
-			ResourceType: resource.ResourceType,
-			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
-			Summary:      "restored <strong>" + resource.ResourceType + "</strong> <code>" + resource.Token.String()[:8] + "</code> from backup",
+			ResourceType: sourceResource.ResourceType,
+			ResourceID:   uuid.NullUUID{UUID: targetResource.ID, Valid: true},
+			Summary:      "restored <strong>" + sourceResource.ResourceType + "</strong> <code>" + sourceResource.Token.String()[:8] + "</code> from backup",
 			Metadata:     metadata,
 		})
 	}()

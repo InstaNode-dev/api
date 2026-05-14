@@ -46,7 +46,12 @@ func agentActionContractCases() map[string]string {
 		"AgentActionResourceNotPaused":                 AgentActionResourceNotPaused,
 		"AgentActionBackupRequiresClaim":               AgentActionBackupRequiresClaim,
 		"AgentActionRestoreRequiresPro":                AgentActionRestoreRequiresPro,
+		"AgentActionRestoreRequiresHobbyPlus":          AgentActionRestoreRequiresHobbyPlus,
 		"AgentActionRestoreBackupNotReady":             AgentActionRestoreBackupNotReady,
+		"AgentActionRestoreInflight":                   AgentActionRestoreInflight,
+		"AgentActionRestoreDestructiveAckRequired":     AgentActionRestoreDestructiveAckRequired,
+		"AgentActionRestoreTargetCrossTeam":            AgentActionRestoreTargetCrossTeam,
+		"AgentActionBackupIntegrityFailed":             AgentActionBackupIntegrityFailed,
 		"AgentActionMetricsRequiresUpgrade":            AgentActionMetricsRequiresUpgrade,
 
 		// Builders — representative inputs covering tier/env/role/limit
