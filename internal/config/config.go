@@ -125,6 +125,27 @@ type Config struct {
 	//
 	// Generate with: openssl rand -hex 32 (yields 64 hex chars).
 	AdminPathPrefix string
+
+	// WorkerInternalJWTSecret is the HMAC secret used to verify JWTs on the
+	// `/internal/teams/:id/terminate` route. The worker's
+	// payment_grace_terminator dispatcher signs a short-lived (iat-bounded)
+	// HS256 token with this secret and POSTs to the api; the api verifies
+	// the signature, the `purpose: "internal_terminate"` claim, and that
+	// the `team_id` claim matches the path param.
+	//
+	// MUST be distinct from JWTSecret. JWTSecret signs customer-facing
+	// session + onboarding tokens; reusing the same key here would let a
+	// stolen customer JWT (with a crafted `team_id` claim) terminate any
+	// team if a future code path ever loosened the claim validation. The
+	// two secrets live in independent k8s Secret objects (api's
+	// instant-secrets and worker's instant-infra-secrets) so a compromise
+	// of one does not auto-compromise the other.
+	//
+	// Empty → the internal-terminate route still registers but rejects
+	// every call with 401 (fail-closed). Operators must set
+	// WORKER_INTERNAL_JWT_SECRET in BOTH the api and the worker
+	// (same value, generated via `openssl rand -hex 32`).
+	WorkerInternalJWTSecret string
 }
 
 // ErrMissingConfig is returned when a required env var is absent.
@@ -246,6 +267,7 @@ func Load() *Config {
 	cfg.SESSNSTopicARN = os.Getenv("SES_SNS_SUBSCRIPTION_ARN")
 	cfg.SendGridWebhookKey = os.Getenv("SENDGRID_WEBHOOK_PUBLIC_KEY")
 
+	cfg.WorkerInternalJWTSecret = strings.TrimSpace(os.Getenv("WORKER_INTERNAL_JWT_SECRET"))
 	cfg.DeployDomain = getenv("DEPLOY_DOMAIN", "instant.dev")
 	cfg.ComputeProvider = getenv("COMPUTE_PROVIDER", "noop")
 	cfg.KubeNamespaceApps = getenv("KUBE_NAMESPACE_APPS", "instant-apps")
