@@ -427,6 +427,29 @@ func testConfig() *config.Config {
 	}
 }
 
+// lastBulkTwinHandler captures the *handlers.BulkTwinHandler constructed
+// by the most recent NewTestApp* call so tests can mutate its public
+// QuotaHeadroom field without re-plumbing the router. Tests retrieve it
+// via LastBulkTwinHandler() — guarded against the "called from no test
+// app" case by a nil check.
+//
+// Concurrency note: tests run sequentially within a single Go test binary
+// by default (-parallel handled separately at the t.Parallel boundary).
+// Tests that share an app shouldn't share QuotaHeadroom anyway — each
+// test that needs it calls NewTestApp fresh and then sets it. A global
+// var is the simplest way to avoid widening every NewTestApp signature
+// in this package just for one hook.
+var lastBulkTwinHandler *handlers.BulkTwinHandler
+
+// LastBulkTwinHandler returns the BulkTwinHandler created by the most
+// recent NewTestApp* call. Tests set its QuotaHeadroom field to exercise
+// the partial-fill quota gate. Returns nil if no test app has been
+// constructed in this process yet — callers should defend with t.Skip
+// or a fresh app build.
+func LastBulkTwinHandler() *handlers.BulkTwinHandler {
+	return lastBulkTwinHandler
+}
+
 // NewTestApp creates a Fiber app wired to the provided DB and Redis clients
 // using the same handler/middleware chain as production (minus GeoIP lookup).
 // Routes registered: POST /cache/new, GET /start, POST /claim, /api/v1/resources.
@@ -534,6 +557,14 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	// so handler-layer tests (twin_test.go) exercise the full route stack.
 	twinH := handlers.NewTwinHandler(dbH, cacheH, nosqlH)
 	api.Post("/resources/:id/provision-twin", twinH.ProvisionTwin)
+	// Bulk env-twinning — wired so handler-layer tests
+	// (family_bulk_twin_test.go) exercise the full route stack. The
+	// handler instance is captured in lastBulkTwinHandler so tests can
+	// inject QuotaHeadroom (the partial-fill quota hook) without
+	// touching the router.
+	bulkTwinH := handlers.NewBulkTwinHandler(db, dbH, cacheH, nosqlH, planReg)
+	api.Post("/families/bulk-twin", bulkTwinH.BulkTwin)
+	lastBulkTwinHandler = bulkTwinH
 	api.Get("/webhooks/:token/requests", webhookH.ListRequests)
 	api.Get("/deployments", deployH.List)
 	api.Get("/deployments/:id", deployH.Get)

@@ -318,6 +318,44 @@ type ProvisionForTwinInput struct {
 	Start        time.Time
 }
 
+// TwinResultLimits mirrors the per-tier limit response fields the single-
+// twin handler returns. Held as a struct (rather than fiber.Map) so the
+// fiber-free Core path stays decoupled from the web framework and the
+// bulk handler can render it consistently for every row.
+type TwinResultLimits struct {
+	StorageMB   int
+	Connections int
+}
+
+// TwinProvisionResult is what ProvisionForTwinCore returns on success. The
+// single-twin handler (ProvisionForTwin) renders this as JSON; the bulk-twin
+// handler aggregates many results into a Multi-Status response. Fields mirror
+// the JSON shape one-for-one so the renderer stays trivial.
+type TwinProvisionResult struct {
+	ID              string
+	Token           string
+	Name            string
+	ResourceType    string
+	ConnectionURL   string
+	InternalURL     string
+	Tier            string
+	Env             string
+	FamilyRootID    string
+	KeyPrefix       string // only set for redis twins
+	Limits          TwinResultLimits
+	StorageExceeded bool
+}
+
+// twinCoreErr wraps a message string as an error so ProvisionForTwinCore
+// callers can render it via err.Error() without leaking the wrapper type.
+// Kept package-private — every existing caller already maps the err to a
+// 503 provision_failed response shape, so a typed error gives no win.
+func twinCoreErr(msg string) error { return &twinProvisionError{Msg: msg} }
+
+type twinProvisionError struct{ Msg string }
+
+func (e *twinProvisionError) Error() string { return e.Msg }
+
 // isTwinSupportedType returns true for the resource types the twin endpoint
 // will provision. Out-of-scope types get a clean 400 instead of triggering
 // the dispatch switch's default branch.
