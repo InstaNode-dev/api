@@ -486,27 +486,29 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	app.Get("/auth/me", middleware.RequireAuth(cfg), cliAuthH.GetCurrentUser)
 
 	// Provisioning routes for Phase 2/3/4 services.
+	// Idempotency middleware mirrors the production wiring in
+	// internal/router/router.go so handler tests exercise the same chain.
 	dbGroup := app.Group("/db", middleware.OptionalAuth(cfg))
-	dbGroup.Post("/new", dbH.NewDB)
+	dbGroup.Post("/new", middleware.Idempotency(rdb, "db.new"), dbH.NewDB)
 
 	cacheGroup := app.Group("/cache", middleware.OptionalAuth(cfg))
-	cacheGroup.Post("/new", cacheH.NewCache)
+	cacheGroup.Post("/new", middleware.Idempotency(rdb, "cache.new"), cacheH.NewCache)
 
 	nosqlGroup := app.Group("/nosql", middleware.OptionalAuth(cfg))
-	nosqlGroup.Post("/new", nosqlH.NewNoSQL)
+	nosqlGroup.Post("/new", middleware.Idempotency(rdb, "nosql.new"), nosqlH.NewNoSQL)
 
 	// Authenticated resource management (used by isolation tests)
 	// Phase 5 services: storage + webhook
 	storageH := handlers.NewStorageHandler(db, rdb, cfg, nil, planReg)
 	webhookH := handlers.NewWebhookHandler(db, rdb, cfg, planReg)
-	app.Post("/storage/new", middleware.OptionalAuth(cfg), storageH.NewStorage)
-	app.Post("/webhook/new", middleware.OptionalAuth(cfg), webhookH.NewWebhook)
+	app.Post("/storage/new", middleware.OptionalAuth(cfg), middleware.Idempotency(rdb, "storage.new"), storageH.NewStorage)
+	app.Post("/webhook/new", middleware.OptionalAuth(cfg), middleware.Idempotency(rdb, "webhook.new"), webhookH.NewWebhook)
 	app.Post("/webhook/receive/:token", webhookH.Receive)
 
 	// Phase 6: deploy
 	deployH := handlers.NewDeployHandler(db, rdb, cfg, planReg)
 	deployGroup := app.Group("/deploy", middleware.RequireAuth(cfg))
-	deployGroup.Post("/new", deployH.New)
+	deployGroup.Post("/new", middleware.Idempotency(rdb, "deploy.new"), deployH.New)
 	deployGroup.Get("/:id", deployH.Get)
 	deployGroup.Get("/:id/logs", deployH.Logs)
 	deployGroup.Patch("/:id/env", deployH.UpdateEnv)
