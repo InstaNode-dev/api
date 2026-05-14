@@ -51,11 +51,14 @@ const openAPISpec = `{
     "/db/new": {
       "post": {
         "summary": "Provision a Postgres database",
-        "description": "Returns a real postgres:// connection string with pgvector pre-installed. Anonymous tier: 10MB, 2 connections, 24h TTL.",
+        "description": "Returns a real postgres:// connection string with pgvector pre-installed. Anonymous tier: 10MB, 2 connections, 24h TTL.\n\nSupports Stripe/AWS-style idempotency via the optional Idempotency-Key request header — see the parameter description below.",
+        "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars) that makes this POST safe to retry. The first response is cached for 24h; subsequent calls carrying the same key return the cached response verbatim with X-Idempotent-Replay: true. Reusing a key with a different body returns 409. Replays still consume rate-limit budget (anti-abuse) but do NOT consume quota budget (the original call already did)." }],
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DBProvisionResponse" } } } },
+          "400": { "description": "Invalid Idempotency-Key (empty, >255 chars, or contains non-ASCII-printable characters)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim — anonymous fingerprint that previously provisioned must claim with email before re-provisioning). Includes agent_action with copy the calling agent can show the user, plus upgrade_url and (for the recycle gate) claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "409": { "description": "Idempotency-Key already used with a different request body (error=idempotency_key_conflict). The agent reused a key for a logically different call — generate a new key.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -63,11 +66,14 @@ const openAPISpec = `{
     "/cache/new": {
       "post": {
         "summary": "Provision a Redis cache",
-        "description": "Returns a real redis:// connection string with ACL namespace isolation. Anonymous tier: 5MB memory, 24h TTL.",
+        "description": "Returns a real redis:// connection string with ACL namespace isolation. Anonymous tier: 5MB memory, 24h TTL.\n\nSupports Stripe/AWS-style idempotency via the optional Idempotency-Key request header.",
+        "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars). First response cached for 24h; replays return the cached body with X-Idempotent-Replay: true. Reusing the key with a different body returns 409." }],
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Cache provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CacheProvisionResponse" } } } },
+          "400": { "description": "Invalid Idempotency-Key (empty, >255 chars, or contains non-ASCII-printable characters)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -75,11 +81,14 @@ const openAPISpec = `{
     "/nosql/new": {
       "post": {
         "summary": "Provision a MongoDB database",
-        "description": "Returns a real mongodb:// connection string scoped to a per-token database. Anonymous tier: 5MB, 2 connections, 24h TTL.",
+        "description": "Returns a real mongodb:// connection string scoped to a per-token database. Anonymous tier: 5MB, 2 connections, 24h TTL.\n\nSupports Stripe/AWS-style idempotency via the optional Idempotency-Key request header.",
+        "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars). First response cached for 24h; replays return the cached body with X-Idempotent-Replay: true. Reusing the key with a different body returns 409." }],
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "MongoDB database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NoSQLProvisionResponse" } } } },
+          "400": { "description": "Invalid Idempotency-Key (empty, >255 chars, or contains non-ASCII-printable characters)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -87,11 +96,14 @@ const openAPISpec = `{
     "/queue/new": {
       "post": {
         "summary": "Provision a NATS JetStream queue",
-        "description": "Returns a real nats:// connection string with per-account subject isolation. Anonymous tier: 24h TTL.",
+        "description": "Returns a real nats:// connection string with per-account subject isolation. Anonymous tier: 24h TTL.\n\nSupports Stripe/AWS-style idempotency via the optional Idempotency-Key request header.",
+        "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars). First response cached for 24h; replays return the cached body with X-Idempotent-Replay: true. Reusing the key with a different body returns 409." }],
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Queue provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueProvisionResponse" } } } },
+          "400": { "description": "Invalid Idempotency-Key (empty, >255 chars, or contains non-ASCII-printable characters)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -99,11 +111,14 @@ const openAPISpec = `{
     "/webhook/new": {
       "post": {
         "summary": "Provision a webhook receiver",
-        "description": "Returns a public receive_url that accepts any HTTP method and stores the payload (headers + body) in Redis for 24h.",
+        "description": "Returns a public receive_url that accepts any HTTP method and stores the payload (headers + body) in Redis for 24h.\n\nSupports Stripe/AWS-style idempotency via the optional Idempotency-Key request header.",
+        "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars). First response cached for 24h; replays return the cached body with X-Idempotent-Replay: true. Reusing the key with a different body returns 409." }],
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Webhook receiver provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WebhookProvisionResponse" } } } },
+          "400": { "description": "Invalid Idempotency-Key (empty, >255 chars, or contains non-ASCII-printable characters)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -287,17 +302,18 @@ const openAPISpec = `{
     "/deploy/new": {
       "post": {
         "summary": "Deploy a container application",
-        "description": "Builds a Docker image from the supplied tarball (or pulls an existing image) and rolls it out behind a public HTTPS URL on *.deployment.instanode.dev. Env vars may use the value 'vault://KEY' to reference a secret stored via /api/v1/vault — the plaintext is resolved at deploy time and never persisted in plaintext. The separate 'resource_bindings' field accepts 'family:<family_root_id>' values that resolve at submit time to the connection URL of the family member matching the deploy's env — so one manifest works across staging / production / dev. Raw resource-token UUIDs are also accepted for backward compatibility.",
+        "description": "Builds a Docker image from the supplied tarball (or pulls an existing image) and rolls it out behind a public HTTPS URL on *.deployment.instanode.dev. Env vars may use the value 'vault://KEY' to reference a secret stored via /api/v1/vault — the plaintext is resolved at deploy time and never persisted in plaintext. The separate 'resource_bindings' field accepts 'family:<family_root_id>' values that resolve at submit time to the connection URL of the family member matching the deploy's env — so one manifest works across staging / production / dev. Raw resource-token UUIDs are also accepted for backward compatibility.\n\nSupports Stripe/AWS-style idempotency via the optional Idempotency-Key request header — safe-retry the multipart upload after a transient build failure without creating duplicate apps.",
         "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars). First response cached for 24h; replays return the cached body with X-Idempotent-Replay: true. Note: deploy/new is multipart/form-data, so the body-hash compares the raw form payload — a re-uploaded tarball with even one byte different is treated as a different request (returns 409). Generate a fresh key for each distinct build context." }],
         "requestBody": { "required": true, "content": { "multipart/form-data": { "schema": { "$ref": "#/components/schemas/DeployRequest" } } } },
         "responses": {
           "202": { "description": "Deployment accepted, building", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
-          "400": { "description": "Bad request — invalid env_vars JSON, invalid_resource_binding (resource_bindings value is not a UUID or family:<uuid>), private_deploy_requires_allowed_ips (private=true with no IPs), invalid_allowed_ip (bad CIDR/IP literal), too_many_allowed_ips (>32 entries), or invalid_notify_webhook (URL is not https, unresolvable, or resolves to a private/loopback/link-local IP)" },
+          "400": { "description": "Bad request — invalid env_vars JSON, invalid_resource_binding (resource_bindings value is not a UUID or family:<uuid>), private_deploy_requires_allowed_ips (private=true with no IPs), invalid_allowed_ip (bad CIDR/IP literal), too_many_allowed_ips (>32 entries), invalid_notify_webhook (URL is not https, unresolvable, or resolves to a private/loopback/link-local IP), OR invalid_idempotency_key (empty/>255 chars/non-ASCII-printable)" },
           "401": { "description": "Unauthorized" },
           "402": { "description": "deployment_limit_reached OR private_deploy_requires_pro — hobby/anonymous/free trying to set private=true. agent_action points to https://instanode.dev/pricing." },
           "403": { "description": "Blocked by team env_policy, OR resource_binding_forbidden (binding references a resource owned by a different team)" },
           "404": { "description": "resource_binding_not_found — the resource or family root id supplied in resource_bindings does not exist" },
-          "409": { "description": "no_env_twin — resource_bindings used family:<id> but the family has no member in the deploy's env. agent_action tells the user to call POST /api/v1/resources/:id/provision-twin first." },
+          "409": { "description": "no_env_twin (resource_bindings used family:<id> but the family has no member in the deploy's env — agent_action tells the user to call POST /api/v1/resources/:id/provision-twin first) OR idempotency_key_conflict (the same Idempotency-Key was used with a different request body)" },
           "503": { "description": "Compute backend unavailable or service disabled, OR resource_binding_lookup_failed (transient DB error during binding resolution)" }
         }
       }
@@ -1000,11 +1016,14 @@ const openAPISpec = `{
     "/storage/new": {
       "post": {
         "summary": "Provision S3-compatible object storage",
-        "description": "Returns S3-compatible credentials (access_key_id + secret_access_key) scoped to a per-token prefix inside a shared MinIO/R2 bucket. Anonymous tier: 1024MB, 24h TTL. Returns 503 service_disabled when MINIO_ENDPOINT / R2_API_TOKEN are not configured on the server.",
+        "description": "Returns S3-compatible credentials (access_key_id + secret_access_key) scoped to a per-token prefix inside a shared MinIO/R2 bucket. Anonymous tier: 1024MB, 24h TTL. Returns 503 service_disabled when MINIO_ENDPOINT / R2_API_TOKEN are not configured on the server.\n\nSupports Stripe/AWS-style idempotency via the optional Idempotency-Key request header.",
+        "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars). First response cached for 24h; replays return the cached body with X-Idempotent-Replay: true. Reusing the key with a different body returns 409." }],
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Storage provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StorageProvisionResponse" } } } },
+          "400": { "description": "Invalid Idempotency-Key (empty, >255 chars, or contains non-ASCII-printable characters)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Storage limit reached. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "429": { "description": "Anonymous fingerprint limit exceeded. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Object storage is not configured on this environment", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
