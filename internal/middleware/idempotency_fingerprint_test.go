@@ -484,6 +484,10 @@ func TestFingerprint_AppliedToAllCreateRoutes(t *testing.T) {
 		{path: `"/stacks/:slug/redeploy"`},
 		{path: `"/customers/:team_id/promo"`}, // admin promo
 		{path: `"/teams/:team_id/invitations"`},
+		// FOLLOWUP-6 (2026-05-14): vault rotate creates a new versioned
+		// secret row on every call — BB2-CHROME-3 double-click produced
+		// two versions. Middleware applied to dedup retries.
+		{path: `"/vault/:env/:key/rotate"`},
 	}
 
 	routerSrc := readRouterSource(t)
