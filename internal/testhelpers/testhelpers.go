@@ -851,6 +851,42 @@ func MustProvisionCache(t *testing.T, app *fiber.App, ip string) string {
 	return result.Token
 }
 
+// MustProvisionCacheWithBody POSTs to /cache/new with an explicit JSON
+// body. Use this when a test sends multiple provisions from the same
+// fingerprint and needs each to be considered genuinely distinct by the
+// idempotency middleware's body-fingerprint fallback (which dedups
+// same-fingerprint-same-body POSTs inside its 120s window). The standard
+// MustProvisionCache helper sends an empty body and is fine for one-off
+// calls; reach for this variant the moment a test wants two real provisions.
+func MustProvisionCacheWithBody(t *testing.T, app *fiber.App, ip, body string) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/cache/new", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forwarded-For", ip)
+
+	resp, err := app.Test(req, 5000)
+	if err != nil {
+		t.Fatalf("MustProvisionCacheWithBody: app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("MustProvisionCacheWithBody: expected 201/200, got %d: %s", resp.StatusCode, respBody)
+	}
+
+	var result struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("MustProvisionCacheWithBody: decode: %v", err)
+	}
+	if result.Token == "" {
+		t.Fatal("MustProvisionCacheWithBody: token field is empty in response")
+	}
+	return result.Token
+}
+
 // MustProvisionNoSQL POSTs to /nosql/new and returns the token.
 // The app must be created with NewTestAppWithServices(..., "mongodb").
 func MustProvisionNoSQL(t *testing.T, app *fiber.App, ip string) string {

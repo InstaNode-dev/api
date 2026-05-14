@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,18 +54,26 @@ func TestRateLimit_6thProvisionReturnsExistingTokenFlag(t *testing.T) {
 	fp := testhelpers.UniqueFingerprint(t)
 	ip := testhelpers.FingerprintToIP(fp)
 
-	// Provision 5 cache resources — these should all succeed and create new resources.
+	// Provision 5 cache resources with DISTINCT bodies — the fingerprint
+	// fallback idempotency middleware (2026-05-14) dedups identical
+	// same-fingerprint-same-body POSTs within 120s, so we vary the body
+	// per call to force five real provisions for this test's premise.
 	var firstToken string
 	for i := 0; i < 5; i++ {
-		tok := testhelpers.MustProvisionCache(t, app, ip)
+		body := fmt.Sprintf(`{"name":"call-%d"}`, i)
+		tok := testhelpers.MustProvisionCacheWithBody(t, app, ip, body)
 		if firstToken == "" {
 			firstToken = tok
 		}
 		defer db.Exec(`DELETE FROM resources WHERE token = $1`, tok)
 	}
 
-	// 6th provision from the same fingerprint — must return an existing token.
-	req := httptest.NewRequest(http.MethodPost, "/cache/new", nil)
+	// 6th provision from the same fingerprint — must return an existing
+	// token via the handler-internal dedup path. Use a body that DOESN'T
+	// match any of the 5 above so the middleware's fingerprint cache misses
+	// and the handler is reached (where its per-day cap fires the 200).
+	req := httptest.NewRequest(http.MethodPost, "/cache/new", strings.NewReader(`{"name":"call-6"}`))
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Forwarded-For", ip)
 	resp, err := app.Test(req, 5000)
 	require.NoError(t, err)
@@ -194,11 +203,16 @@ func TestRateLimit_SameFingerprint_CounterNotDoubleIncremented(t *testing.T) {
 	fp := testhelpers.UniqueFingerprint(t)
 	ip := testhelpers.FingerprintToIP(fp)
 
-	// Two provisions from the same fingerprint.
-	tok1 := testhelpers.MustProvisionCache(t, app, ip)
+	// Two provisions from the same fingerprint — but with DISTINCT
+	// request bodies so the fingerprint-fallback idempotency middleware
+	// (2026-05-14) doesn't dedup them. The middleware deliberately
+	// dedups same-fingerprint-same-body POSTs within 120s; this test
+	// is checking that the HANDLER's per-day counter ticks correctly
+	// on TWO genuinely distinct attempts, so we vary the body.
+	tok1 := testhelpers.MustProvisionCacheWithBody(t, app, ip, `{"name":"a"}`)
 	defer db.Exec(`DELETE FROM resources WHERE token = $1`, tok1)
 
-	tok2 := testhelpers.MustProvisionCache(t, app, ip)
+	tok2 := testhelpers.MustProvisionCacheWithBody(t, app, ip, `{"name":"b"}`)
 	defer db.Exec(`DELETE FROM resources WHERE token = $1`, tok2)
 
 	ctx := context.Background()
@@ -273,15 +287,26 @@ func TestRateLimit_ProvisionMiddleware_Integration(t *testing.T) {
 	fp := testhelpers.UniqueFingerprint(t)
 	ip := testhelpers.FingerprintToIP(fp)
 
+	// Each of the 5 distinct provisions sends a distinct body so the
+	// fingerprint-fallback idempotency middleware (added 2026-05-14)
+	// doesn't replay one of them. The middleware deliberately dedups
+	// same-fingerprint-same-body POSTs within 120s — the precise bug
+	// this whole test family used to exercise on /cache/new with an
+	// empty body — so we bypass it here by varying the body. The 6th
+	// call THEN reuses the 5th's body, and the handler's existing
+	// fingerprint dedup (5-per-day cap → 6th replays the last token)
+	// is what produces the 200 we still assert below.
 	for i := 1; i <= 5; i++ {
-		req := httptest.NewRequest(http.MethodPost, "/cache/new", nil)
+		body := strings.NewReader(fmt.Sprintf(`{"name":"call-%d"}`, i))
+		req := httptest.NewRequest(http.MethodPost, "/cache/new", body)
+		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Forwarded-For", ip)
 		resp, err := app.Test(req, 5000)
 		require.NoError(t, err)
 
-		var body map[string]any
-		testhelpers.DecodeJSON(t, resp, &body)
-		tok, _ := body["token"].(string)
+		var rb map[string]any
+		testhelpers.DecodeJSON(t, resp, &rb)
+		tok, _ := rb["token"].(string)
 		if tok != "" {
 			defer db.Exec(`DELETE FROM resources WHERE token = $1`, tok)
 		}
@@ -291,8 +316,15 @@ func TestRateLimit_ProvisionMiddleware_Integration(t *testing.T) {
 			"provision #%d must succeed with 201", i)
 	}
 
-	// 6th call should still be 200 but returns existing token (no new resource).
-	req := httptest.NewRequest(http.MethodPost, "/cache/new", nil)
+	// 6th call (same body as #5 so middleware would replay) — but
+	// we change the body again so we exercise the HANDLER's per-day
+	// dedup path, which is what this test is here to assert. The 6th
+	// call's body matches no prior call's body so the middleware misses;
+	// the handler then sees a 6th provision from the same fingerprint
+	// and replays the existing token with 200 (handler-internal dedup).
+	body := strings.NewReader(`{"name":"call-6"}`)
+	req := httptest.NewRequest(http.MethodPost, "/cache/new", body)
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Forwarded-For", ip)
 	resp, err := app.Test(req, 5000)
 	require.NoError(t, err)

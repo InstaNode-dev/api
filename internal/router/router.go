@@ -417,12 +417,15 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// RequireWritable rejects impersonated sessions on all mutating
 	// stack endpoints (POST/PATCH/DELETE) so an admin viewing the
 	// customer's stack page can't accidentally redeploy / nuke it.
-	app.Post("/stacks/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), stackH.New)
+	// Idempotency middleware on /stacks/new + /stacks/:slug/redeploy
+	// covers accidental double-clicks / agent retries the same way it
+	// does for /deploy/new (multipart-aware fingerprint) and /db/new etc.
+	app.Post("/stacks/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "stacks.new"), stackH.New)
 	app.Get("/stacks/:slug", middleware.OptionalAuth(cfg), stackH.Get)
 	app.Get("/stacks/:slug/logs/:svc", middleware.OptionalAuth(cfg), stackH.Logs)
 	app.Delete("/stacks/:slug", middleware.OptionalAuth(cfg), middleware.RequireWritable(), stackH.Delete)
 	app.Patch("/stacks/:slug/env", middleware.RequireAuth(cfg), middleware.RequireWritable(), stackH.UpdateEnv)
-	app.Post("/stacks/:slug/redeploy", middleware.RequireAuth(cfg), middleware.RequireWritable(), stackH.Redeploy)
+	app.Post("/stacks/:slug/redeploy", middleware.RequireAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "stacks.redeploy"), stackH.Redeploy)
 
 	// OAuth — POST handler serves the existing programmatic / SPA flow.
 	// Google login is intentionally NOT supported; if you need it, register
@@ -462,12 +465,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Get("/auth/me", middleware.RequireAuth(cfg), cliAuthH.GetCurrentUser)
 
 	// Billing
-	// WithRedis wires the BB2-D5 server-side checkout dedup guard (SETNX
-	// `team_checkout_inflight:<team_id>` with 60s TTL). Without it, two
-	// concurrent POSTs to /api/v1/billing/checkout for the same team each
-	// create a Razorpay subscription — real revenue loss. Tests can
-	// construct the handler without WithRedis() and the guard fails open.
-	billing := handlers.NewBillingHandler(db, cfg, emailClient).WithRedis(rdb)
+	billing := handlers.NewBillingHandler(db, cfg, emailClient)
 	// Legacy alias kept for backward compatibility; canonical path is
 	// /api/v1/billing/checkout (registered under the /api/v1 group below).
 	// RequireWritable rejects impersonated sessions — an admin viewing-as-
@@ -475,11 +473,12 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// behalf. The canonical /api/v1 alias is already gated by the api
 	// group's RequireWritable.
 	//
-	// Idempotency-Key middleware is the BB2-D5 braces — when a caller
-	// supplies a stable key (Stripe/AWS-style), retries on the same key
-	// replay the cached response instead of hitting Razorpay again. The
-	// server-side SETNX inside CreateCheckoutAPI is the belt that covers
-	// callers that DON'T send an Idempotency-Key (today's dashboard).
+	// Idempotency middleware: dedup accidental double-submits (cross-tab
+	// clicks, mobile double-taps) before they reach Razorpay. The handler
+	// MAY ALSO have a per-team Redis SETNX guard (FOLLOWUP-2 / BB2-D5);
+	// the two protections stack — SETNX runs inside the handler AFTER
+	// this middleware, so a fingerprint-cache hit short-circuits before
+	// SETNX is ever attempted.
 	app.Post("/billing/checkout", middleware.RequireAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "billing.checkout"), billing.CreateCheckoutAPI)
 	app.Post("/razorpay/webhook", billing.RazorpayWebhook)
 
@@ -621,14 +620,16 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// Slice 3 of env-aware deployments — spawn a same-type, same-family
 	// twin in a new env. Tier-gated to Pro+ inside the handler. The
 	// resource type the source row carries determines which low-level
-	// provisioner (db/cache/nosql) runs.
-	api.Post("/resources/:id/provision-twin", twinH.ProvisionTwin)
+	// provisioner (db/cache/nosql) runs. Idempotency middleware covers
+	// accidental double-creates of the twin resource (one of the most
+	// expensive accidental side-effects on the platform).
+	api.Post("/resources/:id/provision-twin", middleware.Idempotency(rdb, "resources.provision-twin"), twinH.ProvisionTwin)
 	// Bulk env-twinning — one call to twin every "parent" resource in
 	// source_env into target_env. Same Pro+ tier gate. Returns 200 on
 	// full success, 207 Multi-Status when any individual twin fails so
 	// the caller can keep the successful rows and retry just the
 	// failures. See handlers/family_bulk_twin.go for the contract.
-	api.Post("/families/bulk-twin", bulkTwinH.BulkTwin)
+	api.Post("/families/bulk-twin", middleware.Idempotency(rdb, "families.bulk-twin"), bulkTwinH.BulkTwin)
 
 	// Customer backups + restore (migration 031). Tier-gating + per-day
 	// rate-limit live inside the handler; the api group's RequireAuth +
@@ -637,9 +638,13 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// resource_backups / resource_restores within 30s and owns every
 	// state transition past 'pending'.
 	backupH := handlers.NewBackupHandler(db, rdb, planRegistry)
-	api.Post("/resources/:id/backup", backupH.CreateBackup)
+	// Idempotency middleware on the two POST routes — a double-tap on the
+	// dashboard's "Back up now" or "Restore" button would otherwise spawn
+	// two pending rows for the worker to process. The 120s fingerprint
+	// window matches the typical pre-handoff click latency.
+	api.Post("/resources/:id/backup", middleware.Idempotency(rdb, "resources.backup"), backupH.CreateBackup)
 	api.Get("/resources/:id/backups", backupH.ListBackups)
-	api.Post("/resources/:id/restore", backupH.CreateRestore)
+	api.Post("/resources/:id/restore", middleware.Idempotency(rdb, "resources.restore"), backupH.CreateRestore)
 	api.Get("/resources/:id/restores", backupH.ListRestores)
 
 	// Team env-policy (slice 6) — owner edits, any member reads.
@@ -651,7 +656,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Put("/team/env-policy", envPolicyH.Put)
 
 	api.Get("/team/members", teamMembersH.ListMembers)
-	api.Post("/team/members/invite", teamMembersH.InviteMember)
+	// Idempotency middleware: protects against double-clicks on the
+	// "Invite member" form. Without it, a flaky network + retry sends
+	// two invitation emails and creates two pending invitation rows
+	// (each consuming a separate invitation token).
+	api.Post("/team/members/invite", middleware.Idempotency(rdb, "team.members.invite"), teamMembersH.InviteMember)
 	api.Post("/team/members/leave", teamMembersH.LeaveTeam)
 	api.Delete("/team/members/:user_id", teamMembersH.RemoveMember)
 	// PATCH /team/members/:user_id — owner-only role update (admin / developer
@@ -677,10 +686,9 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Post("/team/restore", middleware.RequireRole("owner"), teamDelH.Restore)
 
 	api.Get("/billing", billing.GetBillingState)
-	// Idempotency-Key braces — see the /billing/checkout legacy alias above
-	// for the full BB2-D5 belt+braces rationale. Both route registrations
-	// MUST carry the middleware; consolidating to one route is out of scope
-	// (would be a nicer refactor but requires touching more callers).
+	// Canonical billing checkout. Idempotency middleware: see the legacy
+	// /billing/checkout alias above for the rationale and the FOLLOWUP-2
+	// SETNX stacking note.
 	api.Post("/billing/checkout", middleware.Idempotency(rdb, "billing.checkout"), billing.CreateCheckoutAPI)
 	// Self-serve POST /billing/cancel was removed per policy — see project
 	// memory project_no_self_serve_cancel_downgrade.md. Cancellation flows
@@ -771,8 +779,18 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// Tier gate (pro/team/growth) is enforced inside the handler so the
 	// router doesn't have to know the policy. RequireEnvAccess gates the
 	// target env (read from the "to" field via the default JSON lookup).
+	//
+	// Idempotency middleware: the dev-env promote path executes
+	// immediately (creating a new stack row) and the non-dev path
+	// creates a pending_approval row + sends an email. Both are
+	// vulnerable to double-clicks. The migration-026 approval gate
+	// dedups EXECUTION but not the CREATION of the pending_approval
+	// row, so the middleware is additive — see project memory
+	// project_no_self_serve_cancel_downgrade.md for the related
+	// philosophy on idempotent-by-construction vs. middleware-guarded.
 	api.Post("/stacks/:slug/promote",
 		middleware.RequireEnvAccess(middleware.EnvPolicyActionDeploy),
+		middleware.Idempotency(rdb, "stacks.promote"),
 		stackH.Promote,
 	)
 
@@ -792,8 +810,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Delete("/stacks/:slug/domains/:id", customDomainH.Delete)
 
 	// Personal Access Tokens — long-lived bearer tokens for agents/CI.
+	// Idempotency middleware: a double-click on "Create API key" would
+	// otherwise mint two long-lived tokens; the plaintext is only shown
+	// to the user once, so the second token is also instantly orphaned.
 	apiKeysH := handlers.NewAPIKeysHandler(db)
-	api.Post("/auth/api-keys", apiKeysH.Create)
+	api.Post("/auth/api-keys", middleware.Idempotency(rdb, "auth.api-keys.create"), apiKeysH.Create)
 	api.Get("/auth/api-keys", apiKeysH.List)
 	api.Delete("/auth/api-keys/:id", apiKeysH.Revoke)
 
@@ -859,7 +880,12 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		adminGroup.Get("/customers", adminCustH.List)
 		adminGroup.Get("/customers/:team_id", adminCustH.Detail)
 		adminGroup.Post("/customers/:team_id/tier", adminCustH.ChangeTier)
-		adminGroup.Post("/customers/:team_id/promo", adminCustH.IssuePromo)
+		// Idempotency middleware on promo issuance: an admin double-clicking
+		// "issue $50 credit" must not result in two admin_promo_codes rows.
+		// The handler has no other dedup mechanism — the body carries a
+		// (kind, value, valid_for_days) tuple that's not unique-keyed in
+		// the DB.
+		adminGroup.Post("/customers/:team_id/promo", middleware.Idempotency(rdb, "admin.promo.issue"), adminCustH.IssuePromo)
 
 		// Notes — free-text per-team admin annotations.
 		adminGroup.Get("/customers/:team_id/notes", adminNotesH.ListNotes)
@@ -924,8 +950,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 
 	// Teams + RBAC invitation flow (Phase 3). Public accept route is
 	// registered above the api group so the auth middleware doesn't catch it.
+	// Idempotency middleware: CreateInvitation parallels the older
+	// /team/members/invite route — both mint a single-use token + send
+	// an email, and both should resist double-clicks.
 	teamsH := teamsHPublic // reuse the same handler instance
-	api.Post("/teams/:team_id/invitations", middleware.RequireRole("admin"), teamsH.CreateInvitation)
+	api.Post("/teams/:team_id/invitations", middleware.RequireRole("admin"), middleware.Idempotency(rdb, "teams.invitations.create"), teamsH.CreateInvitation)
 	api.Get("/teams/:team_id/invitations", middleware.RequireRole("admin"), teamsH.ListInvitations)
 	api.Delete("/teams/:team_id/invitations/:id", middleware.RequireRole("admin"), teamsH.RevokeInvitation)
 
