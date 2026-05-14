@@ -77,6 +77,18 @@ import (
 // 4xx ARE cached (a 402 quota_exceeded should replay so the agent sees
 // the same upgrade prompt rather than retry-storming the wall).
 
+// IsResponseWrittenErr reports whether err is the handlers.ErrResponseWritten
+// sentinel — the marker respondError* returns after committing a structured
+// 4xx/5xx body to the wire. The handlers package registers the real check
+// via init() (see handlers/helpers.go) to avoid an import cycle: handlers
+// imports middleware, so middleware cannot import handlers directly.
+//
+// Default returns false so test packages that don't import handlers (none
+// of the middleware-package tests do today) get the pre-BB2-D5 behaviour
+// where any handler error bypasses caching. Production routes always
+// import handlers indirectly via router/router.go, so the init() fires.
+var IsResponseWrittenErr = func(err error) bool { return false }
+
 const (
 	// idempotencyHeader is the request header carrying the opaque key.
 	idempotencyHeader = "Idempotency-Key"
@@ -189,14 +201,25 @@ func Idempotency(rdb *redis.Client, endpoint string) fiber.Handler {
 		}
 
 		// Miss — run the handler, then cache the response.
-		if err := c.Next(); err != nil {
-			return err
+		//
+		// BB2-D5 fix (2026-05-14): handler errors normally bypass caching,
+		// EXCEPT IsResponseWrittenErr, which is the handlers.ErrResponseWritten
+		// sentinel respondError* returns AFTER writing a structured 4xx body
+		// to the wire. That sentinel means "response is fully committed, please
+		// cache it" — without this special case, a 402 quota_exceeded reached
+		// via respondError would skip the cache write and an agent retry with
+		// the same Idempotency-Key would re-run the handler (re-billing,
+		// re-side-effects). Real plumbing errors (DB down, panic-recovered)
+		// return non-sentinel errors and continue to bypass caching.
+		nextErr := c.Next()
+		if nextErr != nil && !IsResponseWrittenErr(nextErr) {
+			return nextErr
 		}
 
 		status := c.Response().StatusCode()
 		// Don't cache 5xx — retries should produce fresh attempts.
 		if status >= 500 {
-			return nil
+			return nextErr
 		}
 
 		// Snapshot the response body. Fiber/fasthttp owns the underlying
@@ -214,7 +237,7 @@ func Idempotency(rdb *redis.Client, endpoint string) fiber.Handler {
 		if jerr != nil {
 			slog.Warn("idempotency.marshal_failed",
 				"error", jerr, "endpoint", endpoint)
-			return nil
+			return nextErr
 		}
 
 		// Set with NX semantics is tempting (only one writer wins on
@@ -233,7 +256,10 @@ func Idempotency(rdb *redis.Client, endpoint string) fiber.Handler {
 			metrics.RedisErrors.WithLabelValues("idempotency").Inc()
 			// Fall through — the response is already on the wire.
 		}
-		return nil
+		// Propagate nextErr (typically nil; or the ErrResponseWritten
+		// sentinel which the Fiber ErrorHandler short-circuits on so the
+		// response we just cached survives unmodified).
+		return nextErr
 	}
 }
 
