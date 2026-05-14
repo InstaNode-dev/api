@@ -324,3 +324,35 @@ const AgentActionPromoteTokenExpired = "Tell the user the approval link expired.
 
 // AgentActionReadOnlySession — RequireWritable middleware returns this on 403 when JWT has read_only:true.
 const AgentActionReadOnlySession = "Tell the user this is a read-only impersonated session. Mutations are disabled. Switch back to your real account at https://instanode.dev/app to make changes."
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Backup / restore walls (migration 031)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// AgentActionBackupRequiresClaim is returned when an anonymous (unclaimed)
+// caller hits POST /api/v1/resources/:id/backup. Backups are a registered-
+// account feature — there is no claim-free path. Names the gated feature
+// and the full claim URL.
+const AgentActionBackupRequiresClaim = "Tell the user backups require a claimed account. Have them claim their resources at https://instanode.dev/app/claim — takes 30 seconds, no card."
+
+// newAgentActionBackupRateLimited builds the 429 copy returned when a team
+// exceeds its manual_backups_per_day cap. Names the tier, the cap, and
+// points hobby callers at the Pro upgrade (where the cap is 100/day).
+func newAgentActionBackupRateLimited(tier string, perDay int) string {
+	return fmt.Sprintf(
+		"Tell the user they've hit the %s tier manual-backup cap (%d/day). Upgrade to Pro for 100/day at https://instanode.dev/pricing — Pro also includes self-serve restore.",
+		tier, perDay,
+	)
+}
+
+// AgentActionRestoreRequiresPro is returned when a hobby/free team hits
+// POST /api/v1/resources/:id/restore. Restore is the Pro upgrade hook —
+// Hobby can take backups but cannot restore from them without upgrading.
+// Names the gated feature, the required tier, and the upgrade URL.
+const AgentActionRestoreRequiresPro = "Tell the user self-serve restore requires Pro tier. Hobby keeps 7-day backups but cannot restore — have them upgrade at https://instanode.dev/pricing for 30-day retention + 1-click restore. Takes 30 seconds."
+
+// AgentActionRestoreBackupNotReady is returned when POST /restore references
+// a backup_id that exists but is not in status='ok' (still pending/running,
+// or failed). The user must wait for the backup to finish (or pick a
+// different one) before they can restore from it.
+const AgentActionRestoreBackupNotReady = "Tell the user this backup is not ready to restore from yet. Have them check https://instanode.dev/app — pending/running backups need a few minutes, failed backups can never be restored."

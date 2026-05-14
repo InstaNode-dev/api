@@ -492,6 +492,18 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// failures. See handlers/family_bulk_twin.go for the contract.
 	api.Post("/families/bulk-twin", bulkTwinH.BulkTwin)
 
+	// Customer backups + restore (migration 031). Tier-gating + per-day
+	// rate-limit live inside the handler; the api group's RequireAuth +
+	// RequireWritable already cover unauthenticated and impersonated
+	// callers. The worker (sibling repo) picks up pending rows from
+	// resource_backups / resource_restores within 30s and owns every
+	// state transition past 'pending'.
+	backupH := handlers.NewBackupHandler(db, rdb, planRegistry)
+	api.Post("/resources/:id/backup", backupH.CreateBackup)
+	api.Get("/resources/:id/backups", backupH.ListBackups)
+	api.Post("/resources/:id/restore", backupH.CreateRestore)
+	api.Get("/resources/:id/restores", backupH.ListRestores)
+
 	// Team env-policy (slice 6) — owner edits, any member reads.
 	// Owner-check is enforced inside Put (with a structured 403 body that
 	// mirrors RequireEnvAccess's shape) rather than via RequireRole, so the

@@ -44,10 +44,14 @@ func agentActionContractCases() map[string]string {
 		"AgentActionPauseRequiresPro":                  AgentActionPauseRequiresPro,
 		"AgentActionResourceAlreadyPaused":             AgentActionResourceAlreadyPaused,
 		"AgentActionResourceNotPaused":                 AgentActionResourceNotPaused,
+		"AgentActionBackupRequiresClaim":               AgentActionBackupRequiresClaim,
+		"AgentActionRestoreRequiresPro":                AgentActionRestoreRequiresPro,
+		"AgentActionRestoreBackupNotReady":             AgentActionRestoreBackupNotReady,
 
 		// Builders — representative inputs covering tier/env/role/limit
 		// interpolation.
 		"newAgentActionDeploymentLimitReached(hobby,1)":  newAgentActionDeploymentLimitReached("hobby", 1),
+		"newAgentActionBackupRateLimited(hobby,1)":       newAgentActionBackupRateLimited("hobby", 1),
 		"newAgentActionPromoteApprovalSent(prod,email)":  newAgentActionPromoteApprovalSent("production", "owner@example.com"),
 		"newAgentActionStorageLimitReached(hobby,500)":   newAgentActionStorageLimitReached("hobby", 500),
 		"newAgentActionVaultQuotaExceeded(hobby,50)":     newAgentActionVaultQuotaExceeded("hobby", 50),

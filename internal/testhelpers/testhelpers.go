@@ -363,6 +363,36 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			received_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_razorpay_webhook_events_received_at ON razorpay_webhook_events(received_at)`,
+		// 031_backups — customer-facing Postgres backup + restore tables.
+		`CREATE TABLE IF NOT EXISTS resource_backups (
+			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			resource_id     UUID NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+			status          TEXT NOT NULL CHECK (status IN ('pending','running','ok','failed')) DEFAULT 'pending',
+			backup_kind     TEXT NOT NULL CHECK (backup_kind IN ('scheduled','manual')),
+			started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+			finished_at     TIMESTAMPTZ,
+			s3_key          TEXT,
+			size_bytes      BIGINT,
+			tier_at_backup  TEXT,
+			error_summary   TEXT,
+			triggered_by    UUID REFERENCES users(id),
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_backups_resource ON resource_backups(resource_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_backups_pending  ON resource_backups(status) WHERE status IN ('pending','running')`,
+		`CREATE TABLE IF NOT EXISTS resource_restores (
+			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			resource_id     UUID NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+			backup_id       UUID NOT NULL REFERENCES resource_backups(id),
+			status          TEXT NOT NULL CHECK (status IN ('pending','running','ok','failed')) DEFAULT 'pending',
+			started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+			finished_at     TIMESTAMPTZ,
+			error_summary   TEXT,
+			triggered_by    UUID NOT NULL REFERENCES users(id),
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_restores_resource ON resource_restores(resource_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_restores_pending  ON resource_restores(status) WHERE status IN ('pending','running')`,
 	}
 
 	for _, s := range stmts {
@@ -569,6 +599,14 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	bulkTwinH := handlers.NewBulkTwinHandler(db, dbH, cacheH, nosqlH, planReg)
 	api.Post("/families/bulk-twin", bulkTwinH.BulkTwin)
 	lastBulkTwinHandler = bulkTwinH
+	// Customer backups + restore (migration 031). Wired here so the
+	// handler tests in backup_test.go exercise the full route stack
+	// (auth middleware + JSON handler + ownership check) end-to-end.
+	backupH := handlers.NewBackupHandler(db, rdb, planReg)
+	api.Post("/resources/:id/backup", backupH.CreateBackup)
+	api.Get("/resources/:id/backups", backupH.ListBackups)
+	api.Post("/resources/:id/restore", backupH.CreateRestore)
+	api.Get("/resources/:id/restores", backupH.ListRestores)
 	api.Get("/webhooks/:token/requests", webhookH.ListRequests)
 	api.Get("/deployments", deployH.List)
 	api.Get("/deployments/:id", deployH.Get)
