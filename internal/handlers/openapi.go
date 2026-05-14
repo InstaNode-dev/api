@@ -1046,9 +1046,9 @@ const openAPISpec = `{
     "/api/v1/billing/checkout": {
       "post": {
         "summary": "Create a Razorpay subscription and return its hosted-page URL",
-        "description": "Mints a Razorpay subscription for the requested plan (hobby or pro) tied to the authenticated team. The dashboard redirects the user to the returned short_url to complete payment; on success Razorpay fires subscription.activated to /razorpay/webhook and the team's plan_tier is elevated atomically. The Team tier currently returns 400 tier_unavailable — only ops can set it via /internal/set-tier. plan_frequency selects monthly (default) vs yearly billing — yearly returns 503 billing_not_configured until the operator creates the yearly Razorpay plan and sets RAZORPAY_PLAN_ID_*_YEARLY.",
+        "description": "Mints a Razorpay subscription for the requested plan (hobby, hobby_plus, or pro) tied to the authenticated team. The dashboard redirects the user to the returned short_url to complete payment; on success Razorpay fires subscription.activated to /razorpay/webhook and the team's plan_tier is elevated atomically. The Team tier currently returns 400 tier_unavailable — only ops can set it via /internal/set-tier. plan_frequency selects monthly (default) vs yearly billing — yearly returns 503 billing_not_configured until the operator creates the yearly Razorpay plan and sets RAZORPAY_PLAN_ID_*_YEARLY.",
         "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "pro"] }, "plan_frequency": { "type": "string", "enum": ["monthly", "yearly"], "default": "monthly", "description": "Billing cycle. Empty = monthly. Yearly variants follow the same canonical-tier mapping on the webhook side — teams.plan_tier still stores the bare tier name." } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] }, "plan_frequency": { "type": "string", "enum": ["monthly", "yearly"], "default": "monthly", "description": "Billing cycle. Empty = monthly. Yearly variants follow the same canonical-tier mapping on the webhook side — teams.plan_tier still stores the bare tier name." } } } } } },
         "responses": {
           "200": { "description": "Subscription created — redirect user to short_url", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "short_url": { "type": "string", "format": "uri" }, "subscription_id": { "type": "string" } } } } } },
           "400": { "description": "Invalid plan, invalid plan_frequency, or tier_unavailable" },
@@ -1085,9 +1085,9 @@ const openAPISpec = `{
     "/api/v1/billing/change-plan": {
       "post": {
         "summary": "Switch the team's subscription to a different tier",
-        "description": "Hobby↔Pro on the same Razorpay subscription. Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. Team tier is currently not customer-changeable — returns 400 tier_unavailable.",
+        "description": "Hobby ↔ Hobby Plus ↔ Pro on the same Razorpay subscription. Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. Team tier is currently not customer-changeable — returns 400 tier_unavailable.",
         "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "pro"] } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] } } } } } },
         "responses": {
           "200": { "description": "Plan change accepted by Razorpay" },
           "400": { "description": "Invalid plan or tier_unavailable" },
@@ -1111,7 +1111,7 @@ const openAPISpec = `{
                 "required": ["code", "plan"],
                 "properties": {
                   "code": { "type": "string", "description": "Promotion code (case-insensitive)", "example": "LAUNCH50" },
-                  "plan": { "type": "string", "enum": ["hobby", "pro", "team"], "description": "Plan tier the discount must apply to" }
+                  "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro", "team"], "description": "Plan tier the discount must apply to" }
                 }
               }
             }
@@ -1379,7 +1379,7 @@ const openAPISpec = `{
         "summary": "Legacy alias for POST /api/v1/billing/checkout",
         "description": "Kept for backward compatibility with older dashboard/SDK clients. Identical contract to POST /api/v1/billing/checkout. New callers should use the /api/v1 path.",
         "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "pro"] } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] } } } } } },
         "responses": {
           "200": { "description": "Subscription created — redirect user to short_url", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "short_url": { "type": "string", "format": "uri" }, "subscription_id": { "type": "string" } } } } } },
           "400": { "description": "Invalid plan or tier_unavailable" },
@@ -2310,7 +2310,7 @@ const openAPISpec = `{
           "user_id": { "type": "string", "format": "uuid" },
           "team_id": { "type": "string", "format": "uuid" },
           "email": { "type": "string" },
-          "tier": { "type": "string", "enum": ["hobby", "pro", "team"] }
+          "tier": { "type": "string", "enum": ["hobby", "hobby_plus", "pro", "team", "growth"] }
         }
       },
       "StackRequest": {
@@ -2354,7 +2354,7 @@ const openAPISpec = `{
           "user_id": { "type": "string", "format": "uuid" },
           "team_id": { "type": "string", "format": "uuid" },
           "team_name": { "type": "string", "description": "Present only when the team has a non-empty name" },
-          "plan_tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "pro", "team"], "description": "Best-effort enrichment from the teams table; absent on DB lookup failure" }
+          "plan_tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "hobby_plus", "pro", "team", "growth"], "description": "Best-effort enrichment from the teams table; absent on DB lookup failure" }
         },
         "required": ["ok", "user_id", "team_id"]
       },
@@ -2494,7 +2494,7 @@ const openAPISpec = `{
         "description": "Aggregated billing state served by GET /api/v1/billing.",
         "properties": {
           "ok": { "type": "boolean" },
-          "tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "pro", "team"], "description": "Current plan tier from the team record" },
+          "tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "hobby_plus", "pro", "team", "growth"], "description": "Current plan tier from the team record" },
           "subscription_status": { "type": "string", "enum": ["none", "active", "cancelled"], "description": "'none' when no Razorpay subscription exists; 'cancelled' when Razorpay reports cancelled / completed / expired or cancel_at_cycle_end=true; 'active' otherwise. The platform has no trial period (see policy memory project_no_trial_pay_day_one.md); hobby/pro/team are paid from day one" },
           "next_renewal_at": { "type": ["string", "null"], "format": "date-time", "description": "ISO timestamp for next renewal (Razorpay current_end). null when no active subscription" },
           "amount_inr": { "type": ["integer", "null"], "description": "Monthly subscription amount in INR rupees (not paise). Sourced from the most recent paid invoice when available; falls back to the tier-derived price for brand-new subscriptions. null when no subscription on file" },
@@ -2545,7 +2545,7 @@ const openAPISpec = `{
           "ok":                { "type": "boolean", "enum": [true] },
           "freshness_seconds": { "type": "integer", "description": "Cache TTL window in seconds. Today 300 — matches the server-side const and the Cache-Control max-age." },
           "as_of":             { "type": "string", "format": "date-time", "description": "When the aggregation was computed." },
-          "tier":              { "type": "string", "description": "Current plan tier from the team record. Mirrored here so the sidebar doesn't need a second /billing fetch just to render the upgrade card.", "enum": ["anonymous", "free", "hobby", "pro", "team"] },
+          "tier":              { "type": "string", "description": "Current plan tier from the team record. Mirrored here so the sidebar doesn't need a second /billing fetch just to render the upgrade card.", "enum": ["anonymous", "free", "hobby", "hobby_plus", "pro", "team", "growth"] },
           "counts": {
             "type": "object",
             "description": "Per-area counts. resources.total is the sum of every typed bucket plus 'other' — saves the dashboard from re-adding.",
