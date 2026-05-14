@@ -26,6 +26,14 @@ const auditMaxLimit = 200
 // AuditEvent is one row in the audit_log table. Metadata is stored as
 // raw JSONB bytes so callers can serialize arbitrary k/v without the
 // model needing to know the shape.
+//
+// TeamID is the team that owns the event. Callers MAY pass uuid.Nil when
+// the event fires before a team exists — e.g. an `auth.login` failure
+// during signup, or an anonymous-tier action. uuid.Nil is translated to
+// SQL NULL by InsertAuditEvent (the column is nullable as of migration
+// 028). Dashboard reads filter by team_id = $1 which excludes NULLs in
+// Postgres equality semantics, so legitimate per-team reads never see
+// these admin-only rows.
 type AuditEvent struct {
 	ID           uuid.UUID
 	TeamID       uuid.UUID
@@ -42,6 +50,10 @@ type AuditEvent struct {
 // InsertAuditEvent inserts a row best-effort. Callers should run this in
 // a goroutine and ignore the error; an audit failure must never surface
 // to the user. Defaults: Actor → "agent" when empty.
+//
+// TeamID semantics: uuid.Nil is treated as SQL NULL (migration 028 made
+// the column nullable). This lets pre-team events like a failed signup
+// audit-trail land without inventing a fake team id.
 func InsertAuditEvent(ctx context.Context, db *sql.DB, ev AuditEvent) error {
 	if ev.Actor == "" {
 		ev.Actor = "agent"
@@ -55,10 +67,15 @@ func InsertAuditEvent(ctx context.Context, db *sql.DB, ev AuditEvent) error {
 	if len(ev.Metadata) > 0 {
 		metadata = ev.Metadata
 	}
+	// team_id is NULL when uuid.Nil — for pre-team events.
+	var teamID interface{}
+	if ev.TeamID != uuid.Nil {
+		teamID = ev.TeamID
+	}
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO audit_log (team_id, user_id, actor, kind, resource_type, resource_id, summary, metadata)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`, ev.TeamID, ev.UserID, ev.Actor, ev.Kind, resourceType, ev.ResourceID, ev.Summary, metadata)
+	`, teamID, ev.UserID, ev.Actor, ev.Kind, resourceType, ev.ResourceID, ev.Summary, metadata)
 	if err != nil {
 		return fmt.Errorf("models.InsertAuditEvent: %w", err)
 	}

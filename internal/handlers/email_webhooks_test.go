@@ -304,6 +304,11 @@ func TestEmailWebhook_SES_PermanentBounce_InsertsRow(t *testing.T) {
 
 	cfg := &config.Config{SESSNSTopicARN: testSESTopicArn}
 	h := handlers.NewEmailWebhookHandler(db, cfg)
+	// Legacy fixtures don't include a valid SNS RSA signature; disable
+	// verification here so these tests keep asserting the TopicArn /
+	// notificationType branches. The full RSA signature path has its
+	// own dedicated tests in sns_verify_test.go.
+	h.DisableSNSVerifierForTest()
 	app := emailWebhookApp(t, h)
 
 	payload := buildSESEnvelope(t, testSESTopicArn, "Bounce", "ses-bounce@example.com")
@@ -337,6 +342,11 @@ func TestEmailWebhook_SES_Complaint_InsertsAsSpamComplaint(t *testing.T) {
 
 	cfg := &config.Config{SESSNSTopicARN: testSESTopicArn}
 	h := handlers.NewEmailWebhookHandler(db, cfg)
+	// Legacy fixtures don't include a valid SNS RSA signature; disable
+	// verification here so these tests keep asserting the TopicArn /
+	// notificationType branches. The full RSA signature path has its
+	// own dedicated tests in sns_verify_test.go.
+	h.DisableSNSVerifierForTest()
 	app := emailWebhookApp(t, h)
 
 	payload := buildSESEnvelope(t, testSESTopicArn, "Complaint", "angry@example.com")
@@ -367,6 +377,11 @@ func TestEmailWebhook_SES_WrongTopicArn_Returns401(t *testing.T) {
 
 	cfg := &config.Config{SESSNSTopicARN: testSESTopicArn}
 	h := handlers.NewEmailWebhookHandler(db, cfg)
+	// Legacy fixtures don't include a valid SNS RSA signature; disable
+	// verification here so these tests keep asserting the TopicArn /
+	// notificationType branches. The full RSA signature path has its
+	// own dedicated tests in sns_verify_test.go.
+	h.DisableSNSVerifierForTest()
 	app := emailWebhookApp(t, h)
 
 	payload := buildSESEnvelope(t, "arn:aws:sns:us-east-1:000:attacker", "Bounce", "x@x.com")
@@ -398,6 +413,11 @@ func TestEmailWebhook_SES_SubscriptionConfirmation_NoInsert(t *testing.T) {
 
 	cfg := &config.Config{SESSNSTopicARN: testSESTopicArn}
 	h := handlers.NewEmailWebhookHandler(db, cfg)
+	// Legacy fixtures don't include a valid SNS RSA signature; disable
+	// verification here so these tests keep asserting the TopicArn /
+	// notificationType branches. The full RSA signature path has its
+	// own dedicated tests in sns_verify_test.go.
+	h.DisableSNSVerifierForTest()
 	app := emailWebhookApp(t, h)
 
 	payload, _ := json.Marshal(map[string]any{
@@ -437,6 +457,11 @@ func TestEmailWebhook_SES_DeliveryNotification_SkippedNoInsert(t *testing.T) {
 
 	cfg := &config.Config{SESSNSTopicARN: testSESTopicArn}
 	h := handlers.NewEmailWebhookHandler(db, cfg)
+	// Legacy fixtures don't include a valid SNS RSA signature; disable
+	// verification here so these tests keep asserting the TopicArn /
+	// notificationType branches. The full RSA signature path has its
+	// own dedicated tests in sns_verify_test.go.
+	h.DisableSNSVerifierForTest()
 	app := emailWebhookApp(t, h)
 
 	inner, _ := json.Marshal(map[string]any{

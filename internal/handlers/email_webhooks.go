@@ -41,6 +41,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/x509"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -56,16 +57,61 @@ import (
 )
 
 // EmailWebhookHandler holds the deps for both provider endpoints. db is
-// the platform Postgres; cfg surfaces BrevoWebhookSecret + SESSNSTopicARN.
+// the platform Postgres; cfg surfaces BrevoWebhookSecret + SESSNSTopicARN;
+// snsVerifier handles AWS SNS RSA signature verification (cert fetch +
+// canonical string + RSA-PKCS1v15-verify).
 type EmailWebhookHandler struct {
-	db  *sql.DB
-	cfg *config.Config
+	db          *sql.DB
+	cfg         *config.Config
+	snsVerifier *snsVerifier
 }
 
 // NewEmailWebhookHandler is the canonical constructor. Both endpoints are
-// methods on this handler so the route registration stays compact.
+// methods on this handler so the route registration stays compact. The
+// SNS verifier is constructed with production defaults (5s HTTP timeout,
+// 24h cert cache).
 func NewEmailWebhookHandler(db *sql.DB, cfg *config.Config) *EmailWebhookHandler {
-	return &EmailWebhookHandler{db: db, cfg: cfg}
+	return &EmailWebhookHandler{
+		db:          db,
+		cfg:         cfg,
+		snsVerifier: newSNSVerifier(),
+	}
+}
+
+// SetSNSVerifierForTest swaps in a test-only SNS verifier. Returns a
+// restore func so a test can defer the original verifier back. Used by
+// email_webhooks_test.go to swap in a verifier with an injected
+// fetchCert that returns an in-memory test cert. Production callers
+// must not invoke this — the field is otherwise unexported.
+func (h *EmailWebhookHandler) SetSNSVerifierForTest(v *snsVerifier) func() {
+	prev := h.snsVerifier
+	h.snsVerifier = v
+	return func() { h.snsVerifier = prev }
+}
+
+// NewSNSVerifierForTest returns a verifier whose fetchCert is overridden
+// to return the supplied PEM cert bytes. Hostname validation still runs,
+// so callers must use a SigningCertURL with a host like
+// "sns.us-east-1.amazonaws.com" — the verifier doesn't actually hit the
+// network. Public so tests in this package can construct one.
+func NewSNSVerifierForTest(pemBytes []byte) (*snsVerifier, error) {
+	cert, err := parseSNSCertPEM(pemBytes)
+	if err != nil {
+		return nil, err
+	}
+	v := newSNSVerifier()
+	v.fetchCert = func(_, _ string) (*x509.Certificate, error) {
+		return cert, nil
+	}
+	return v, nil
+}
+
+// DisableSNSVerifierForTest clears the verifier so a test that wants
+// the legacy TopicArn-only path can keep working. Lets the existing
+// email_webhooks_test.go fixtures stay valid without re-signing every
+// test payload. Production callers must not invoke this.
+func (h *EmailWebhookHandler) DisableSNSVerifierForTest() {
+	h.snsVerifier = nil
 }
 
 // ── Brevo ────────────────────────────────────────────────────────────────────
@@ -199,21 +245,25 @@ func verifyBrevoSignature(body []byte, signature, secret string) bool {
 // ── SES via SNS ──────────────────────────────────────────────────────────────
 
 // snsEnvelope is the SNS notification wrapper that fronts every SES bounce/
-// complaint message. AWS posts JSON with these top-level fields:
-//
-//   Type:           "Notification" | "SubscriptionConfirmation"
-//   TopicArn:       the topic that produced this notification
-//   Message:        a string containing the SES bounce/complaint JSON
-//   SubscribeURL:   only present on SubscriptionConfirmation
+// complaint message. AWS posts JSON with these top-level fields; the ones
+// below cover both Notification and SubscriptionConfirmation envelopes plus
+// every field needed for SNS RSA signature verification (sns_verify.go).
 //
 // We accept Notification only — operators handle the one-time subscription
 // confirmation out-of-band via the AWS console. A SubscriptionConfirmation
 // arriving here returns 200 with a hint logged at INFO so it's visible.
 type snsEnvelope struct {
-	Type         string `json:"Type"`
-	TopicArn     string `json:"TopicArn"`
-	Message      string `json:"Message"`
-	SubscribeURL string `json:"SubscribeURL"`
+	Type             string `json:"Type"`
+	MessageID        string `json:"MessageId"`
+	Token            string `json:"Token"`            // SubscriptionConfirmation only
+	TopicArn         string `json:"TopicArn"`
+	Subject          string `json:"Subject"`          // optional
+	Message          string `json:"Message"`
+	Timestamp        string `json:"Timestamp"`
+	SignatureVersion string `json:"SignatureVersion"`
+	Signature        string `json:"Signature"`
+	SigningCertURL   string `json:"SigningCertURL"`
+	SubscribeURL     string `json:"SubscribeURL"` // SubscriptionConfirmation only
 }
 
 // sesMessage is the SES bounce/complaint payload that arrives nested inside
@@ -267,6 +317,37 @@ func (h *EmailWebhookHandler) SES(c *fiber.Ctx) error {
 			"ok":    false,
 			"error": "invalid_signature",
 		})
+	}
+
+	// Full SNS RSA signature verification. The TopicArn check above is
+	// the cheap fast-path reject for drive-by traffic; this is the gate
+	// that stops a determined attacker who knows the ARN. Skipped only
+	// when the test path injects a nil verifier (handlers built via
+	// NewEmailWebhookHandler always have one).
+	if h.snsVerifier != nil {
+		if err := h.snsVerifier.verify(snsMessage{
+			Type:             env.Type,
+			MessageID:        env.MessageID,
+			Token:            env.Token,
+			TopicArn:         env.TopicArn,
+			Subject:          env.Subject,
+			Message:          env.Message,
+			Timestamp:        env.Timestamp,
+			SignatureVersion: env.SignatureVersion,
+			Signature:        env.Signature,
+			SigningCertURL:   env.SigningCertURL,
+			SubscribeURL:     env.SubscribeURL,
+		}); err != nil {
+			slog.Warn("email.webhook.ses.sns_signature_failed",
+				"error", err,
+				"signing_cert_url", env.SigningCertURL,
+				"signature_version", env.SignatureVersion,
+			)
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"ok":    false,
+				"error": "invalid_signature",
+			})
+		}
 	}
 
 	if env.Type == "SubscriptionConfirmation" {
