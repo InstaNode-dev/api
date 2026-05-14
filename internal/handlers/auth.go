@@ -107,6 +107,39 @@ type AuthHandler struct {
 	cfg *config.Config
 }
 
+// emitAuthLoginAudit writes the auth.login audit row best-effort. Provider is
+// one of "email" (magic-link), "github", "google", or "impersonation".
+// Failures only log — a stale audit_log row must never prevent the user from
+// completing their sign-in. Called in a goroutine so the writer never blocks
+// the HTTP response.
+func emitAuthLoginAudit(db *sql.DB, teamID, userID uuid.UUID, email, provider, ip, userAgent string) {
+	go func() {
+		meta := map[string]string{
+			"provider":   provider,
+			"ip":         ip,
+			"user_agent": userAgent,
+		}
+		metaBlob, _ := json.Marshal(meta)
+		summary := "user signed in via " + provider
+		ev := models.AuditEvent{
+			TeamID:   teamID,
+			UserID:   uuid.NullUUID{UUID: userID, Valid: userID != uuid.Nil},
+			Actor:    "user",
+			Kind:     models.AuditKindAuthLogin,
+			Summary:  summary,
+			Metadata: metaBlob,
+		}
+		if err := models.InsertAuditEvent(context.Background(), db, ev); err != nil {
+			slog.Warn("audit.emit.failed",
+				"kind", models.AuditKindAuthLogin,
+				"team_id", teamID,
+				"provider", provider,
+				"error", err,
+			)
+		}
+	}()
+}
+
 // NewAuthHandler constructs an AuthHandler.
 func NewAuthHandler(db *sql.DB, cfg *config.Config) *AuthHandler {
 	return &AuthHandler{db: db, cfg: cfg}
@@ -176,6 +209,8 @@ func (h *AuthHandler) GitHub(c *fiber.Ctx) error {
 		"request_id", requestID,
 	)
 
+	emitAuthLoginAudit(h.db, team.ID, user.ID, user.Email, "github", c.IP(), c.Get("User-Agent"))
+
 	return c.JSON(fiber.Map{
 		"ok":      true,
 		"token":   sessionToken,
@@ -224,6 +259,8 @@ func (h *AuthHandler) Google(c *fiber.Ctx) error {
 		"team_id", team.ID,
 		"request_id", requestID,
 	)
+
+	emitAuthLoginAudit(h.db, team.ID, user.ID, user.Email, "google", c.IP(), c.Get("User-Agent"))
 
 	return c.JSON(fiber.Map{
 		"ok":      true,
@@ -282,6 +319,8 @@ func (h *AuthHandler) GoogleCallback(c *fiber.Ctx) error {
 		"team_id", team.ID,
 		"request_id", requestID,
 	)
+
+	emitAuthLoginAudit(h.db, team.ID, user.ID, user.Email, "google", c.IP(), c.Get("User-Agent"))
 
 	return c.JSON(fiber.Map{
 		"ok":      true,
@@ -786,6 +825,8 @@ func (h *AuthHandler) GitHubCallback(c *fiber.Ctx) error {
 		"user_id", user.ID, "team_id", team.ID, "request_id", requestID,
 	)
 
+	emitAuthLoginAudit(h.db, team.ID, user.ID, user.Email, "github", c.IP(), c.Get("User-Agent"))
+
 	return c.Redirect(appendSessionToken(returnTo, sessionToken), fiber.StatusFound)
 }
 
@@ -868,6 +909,8 @@ func (h *AuthHandler) GoogleCallbackBrowser(c *fiber.Ctx) error {
 	slog.Info("auth.google.start_callback.success",
 		"user_id", user.ID, "team_id", team.ID, "request_id", requestID,
 	)
+
+	emitAuthLoginAudit(h.db, team.ID, user.ID, user.Email, "google", c.IP(), c.Get("User-Agent"))
 
 	return c.Redirect(appendSessionToken(returnTo, sessionToken), fiber.StatusFound)
 }

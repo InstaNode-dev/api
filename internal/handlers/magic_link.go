@@ -150,6 +150,8 @@ func (h *MagicLinkHandler) Callback(c *fiber.Ctx) error {
 		"user_id", user.ID, "team_id", team.ID, "request_id", requestID,
 	)
 
+	emitAuthLoginAudit(h.db, team.ID, user.ID, user.Email, "email", c.IP(), c.Get("User-Agent"))
+
 	return c.Redirect(appendSessionToken(returnTo, sessionToken), fiber.StatusFound)
 }
 

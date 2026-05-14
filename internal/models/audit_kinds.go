@@ -63,4 +63,47 @@ const (
 	// path_suffix MUST be the suffix only — the unguessable
 	// ADMIN_PATH_PREFIX is stripped before persistence.
 	AuditKindAdminAccess = "admin.access"
+
+	// AuditKindAuthLogin fires on every successful authentication that mints
+	// a session JWT — OAuth (GitHub / Google, both POST and browser
+	// callback variants), magic-link callback, and any other flow that
+	// terminates by handing the caller a session token. Drives the
+	// "new sign-in" Brevo notification + powers NR per-provider login
+	// dashboards. Metadata carries `provider` (email | github | google |
+	// impersonation), `ip`, and `user_agent`.
+	AuditKindAuthLogin = "auth.login"
+
+	// AuditKindVaultRead fires once per successful GET
+	// /api/v1/vault/:env/:key that returned 200. Misses (404, validation
+	// failures, tier rejections) do NOT emit — the audit row is signal that
+	// a real plaintext was returned to the caller. Metadata: `env`,
+	// `key_name`, `team_id`.
+	AuditKindVaultRead = "vault.read"
+
+	// AuditKindVaultWrite fires on every successful vault mutation:
+	// PUT (create or new-version), rotate (alias for PUT), and DELETE.
+	// Metadata: `env`, `key_name`, `team_id`, and `operation`
+	// (create | update | delete) so the downstream forwarder can branch on
+	// the action without re-parsing the kind.
+	AuditKindVaultWrite = "vault.write"
+
+	// AuditKindDeployCreated fires immediately after POST /deploy/new
+	// inserts the deployments row — BEFORE the async build runs. This is
+	// the "user clicked deploy" signal; reaching healthy or failed is
+	// reported separately via deploy.healthy / deploy.failed. Metadata:
+	// `deploy_id`, `team_id`, `env`, `app_name`.
+	AuditKindDeployCreated = "deploy.created"
+
+	// AuditKindDeployHealthy fires when the async deploy reconciliation
+	// observes the new pod's readinessProbe pass (or, in the current
+	// architecture, when the synchronous compute.Deploy + status update
+	// chain completes without error). Metadata: `deploy_id`, `team_id`,
+	// `time_to_healthy_seconds`.
+	AuditKindDeployHealthy = "deploy.healthy"
+
+	// AuditKindDeployFailed fires when the deploy fails terminally — build
+	// step OR rollout step. Metadata: `deploy_id`, `team_id`,
+	// `failure_stage` (build | rollout), `error_summary` (truncated error
+	// message — full error stays in the deployments.error_message column).
+	AuditKindDeployFailed = "deploy.failed"
 )
