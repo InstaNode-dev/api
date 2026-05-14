@@ -109,10 +109,22 @@ func CreateUser(ctx context.Context, db *sql.DB, teamID uuid.UUID, email, github
 		role = "member"
 	}
 
+	// is_primary: the first user we INSERT for a team becomes its
+	// primary. Migration 029's uq_users_one_primary_per_team partial
+	// unique index guarantees at most one true value per team, so the
+	// inline NOT EXISTS check is the canonical owner-detection point.
+	// Subsequent inserts get false even if they're owners — primary
+	// transfer is a separate operation (todo: AdminTransferPrimary).
 	u := &User{}
 	err := db.QueryRowContext(ctx, `
-		INSERT INTO users (team_id, email, github_id, google_id, role)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO users (team_id, email, github_id, google_id, role, is_primary)
+		VALUES (
+			$1, $2, $3, $4, $5,
+			NOT EXISTS (
+				SELECT 1 FROM users
+				 WHERE team_id = $1 AND is_primary = true
+			)
+		)
 		RETURNING id, team_id, email, role, github_id, google_id, created_at
 	`, teamID, email, ghID, gID, role).Scan(
 		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.CreatedAt,

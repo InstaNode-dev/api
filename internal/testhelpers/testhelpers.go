@@ -148,6 +148,15 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`UPDATE users u SET role = 'owner' FROM (
 			SELECT DISTINCT ON (team_id) id FROM users WHERE team_id IS NOT NULL ORDER BY team_id, created_at ASC
 		) AS first_user WHERE u.id = first_user.id AND u.role = 'member'`,
+		// 029_users_is_primary — explicit boolean for the "primary"
+		// user of a team. Backfill marks the earliest-created user per
+		// team as primary; the partial unique index enforces at most
+		// one primary per team.
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT false`,
+		`UPDATE users u SET is_primary = true FROM (
+			SELECT DISTINCT ON (team_id) id FROM users WHERE team_id IS NOT NULL ORDER BY team_id, created_at ASC
+		) AS first_primary WHERE u.id = first_primary.id AND u.is_primary = false`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_users_one_primary_per_team ON users(team_id) WHERE is_primary`,
 		`CREATE TABLE IF NOT EXISTS team_invitations (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
@@ -208,6 +217,11 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_team_at ON audit_log (team_id, created_at DESC)`,
+		// 028_audit_log_team_id_nullable — drop NOT NULL on team_id so the
+		// emit path can record events that fire BEFORE a team exists.
+		// Mirrored here so handler tests pick it up without running the
+		// SQL migrations separately.
+		`ALTER TABLE audit_log ALTER COLUMN team_id DROP NOT NULL`,
 		// 003_deployments — Phase 6 container deployments
 		`CREATE TABLE IF NOT EXISTS deployments (
 			id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -265,6 +279,9 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_team_at ON audit_log (team_id, created_at DESC)`,
+		// 028_audit_log_team_id_nullable — second mirror (the CREATE TABLE
+		// above uses IF NOT EXISTS so this ALTER fires once per fresh DB).
+		`ALTER TABLE audit_log ALTER COLUMN team_id DROP NOT NULL`,
 		// 021_admin_promo_codes — single-use admin-issued promo codes.
 		`CREATE TABLE IF NOT EXISTS admin_promo_codes (
 			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
