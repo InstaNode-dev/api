@@ -44,8 +44,8 @@ func expectUsageQueries(mock sqlmock.Sqlmock, teamID uuid.UUID) {
 	mock.ExpectQuery(`SELECT.*FROM teams WHERE id`).
 		WithArgs(teamID).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "name", "plan_tier", "stripe_customer_id", "trial_ends_at", "created_at",
-		}).AddRow(teamID, sql.NullString{}, "hobby", sql.NullString{}, nil, time.Now()))
+			"id", "name", "plan_tier", "stripe_customer_id", "created_at",
+		}).AddRow(teamID, sql.NullString{}, "hobby", sql.NullString{}, time.Now()))
 
 	// 2-4) storage sums for postgres, redis, mongodb. Each returns 0 bytes
 	// — we only care that the query fires.

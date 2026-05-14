@@ -406,6 +406,9 @@ type CustomerDetailAuditItem struct {
 }
 
 // CustomerDetail is the full response for GET /admin/customers/:team_id.
+//
+// Historical note: TrialEndsAt was a field on this struct until 2026-05-14;
+// removed per policy memory project_no_trial_pay_day_one.md.
 type CustomerDetail struct {
 	TeamID                 string                          `json:"team_id"`
 	Name                   string                          `json:"name"`
@@ -413,7 +416,6 @@ type CustomerDetail struct {
 	MRRMonthlyCents        int                             `json:"mrr_monthly"`
 	CreatedAt              time.Time                       `json:"created_at"`
 	RazorpaySubscriptionID string                          `json:"razorpay_subscription_id,omitempty"`
-	TrialEndsAt            *time.Time                      `json:"trial_ends_at,omitempty"`
 	Users                  []CustomerDetailUser            `json:"users"`
 	Resources              []CustomerDetailResourceSummary `json:"resources"`
 	DeploymentsActive      int                             `json:"deployments_active"`
@@ -451,10 +453,7 @@ func (h *AdminCustomersHandler) Detail(c *fiber.Ctx) error {
 	if team.RazorpaySubscriptionID.Valid {
 		out.RazorpaySubscriptionID = team.RazorpaySubscriptionID.String
 	}
-	if team.TrialEndsAt.Valid {
-		ts := team.TrialEndsAt.Time
-		out.TrialEndsAt = &ts
-	}
+	// trial removed — see project_no_trial_pay_day_one.md.
 
 	// Users.
 	userRows, err := h.db.QueryContext(c.Context(), `

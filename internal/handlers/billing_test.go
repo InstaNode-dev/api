@@ -848,16 +848,16 @@ func TestGetBillingState_ProSubscription_ReturnsRenewalAndPayment(t *testing.T) 
 	assert.Nil(t, pm["vpa"])
 }
 
-// TestGetBillingState_TrialTeam_SurfacesTrialStatus exercises the trial branch:
-// a team with trial_ends_at in the future returns "trial" + the trial-end as
-// next_renewal_at, even with no subscription on file.
-func TestGetBillingState_TrialTeam_SurfacesTrialStatus(t *testing.T) {
+// TestGetBillingState_NoTrialStatus is a regression guard against
+// reintroducing a trial concept. Per policy memory
+// project_no_trial_pay_day_one.md the platform has no trial period:
+// /api/v1/billing must never return subscription_status="trial". Migration
+// 034 dropped the underlying trial_ends_at column.
+func TestGetBillingState_NoTrialStatus(t *testing.T) {
 	db, cleanup := billingStateNeedsDB(t)
 	defer cleanup()
 
 	teamID := testhelpers.MustCreateTeamDB(t, db, "hobby")
-	teamUUID := uuid.MustParse(teamID)
-	require.NoError(t, models.StartTrial(context.Background(), db, teamUUID))
 
 	app := billingStateApp(t, db, teamID, nil)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/billing", nil)
@@ -869,8 +869,9 @@ func TestGetBillingState_TrialTeam_SurfacesTrialStatus(t *testing.T) {
 	var body map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 
-	assert.Equal(t, "trial", body["subscription_status"])
-	assert.NotEmpty(t, body["next_renewal_at"], "trial status must surface trial_ends_at as next_renewal_at")
+	status, _ := body["subscription_status"].(string)
+	assert.NotEqual(t, "trial", status, "subscription_status must never be 'trial' — no trial period exists on the platform")
+	assert.Equal(t, "none", status, "hobby team with no subscription must report 'none'")
 }
 
 // ─── CreateCheckoutAPI plan_frequency (P2 annual pricing) ────────────────
