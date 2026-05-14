@@ -109,6 +109,90 @@ plans:
       custom_domains: false
       sla: false
 
+  # hobby_plus — $19/mo mid-step between Hobby ($9) and Pro ($49). W11
+  # mid-tier insertion (2026-05-13). Research-backed pricing decoy: a
+  # triple-tier $9/$19/$49 lifts conversion ~22% vs $9/$49 by anchoring
+  # against the middle price. The headline differentiators vs hobby:
+  #   - 2 deployment apps (vs hobby's 1) — agents that ship two services
+  #     (frontend + worker) no longer need to skip-upgrade to Pro for
+  #     deployment headroom alone.
+  #   - custom_domains: true — first paid tier where the custom-domain
+  #     flow unlocks. The $10 step-up from hobby buys you a vanity URL.
+  #   - 5 GB object storage (vs hobby's 512 MB) — meaningful headroom
+  #     for content-heavy side projects without leaping to pro's 10 GB.
+  #   - 50 vault entries with multi-env (dev/staging/prod) vs hobby's
+  #     20 production-only — first tier with the multi-env workflow.
+  # Razorpay plan IDs are placeholders (RAZORPAY_PLAN_ID_HOBBY_PLUS,
+  # RAZORPAY_PLAN_ID_HOBBY_PLUS_ANNUAL) — operator must create the
+  # Razorpay subscription plans before checkout will work for this tier.
+  hobby_plus:
+    display_name: "Hobby Plus"
+    price_monthly_cents: 1900
+    limits:
+      provisions_per_day: -1
+      postgres_storage_mb: 1024
+      postgres_connections: 8
+      vector_storage_mb: 1024
+      vector_connections: 8
+      redis_memory_mb: 50
+      redis_commands_per_day: 10000
+      mongodb_storage_mb: 1024
+      mongodb_connections: 5
+      mongodb_ops_per_minute: 1000
+      queue_storage_mb: 5120
+      storage_storage_mb: 5120
+      webhook_requests_stored: 5000
+      team_members: 1
+      vault_max_entries: 50
+      vault_envs_allowed: ["development", "staging", "production"]
+      deployments_apps: 2
+      # Backups: 14-day retention sits between hobby's 7 and pro's 30.
+      # Restore is enabled — hobby_plus is the cheapest tier with
+      # self-serve restore. This makes "Restore your data" the second
+      # most concrete reason to upgrade from hobby (after custom domains).
+      backup_retention_days: 14
+      backup_restore_enabled: true
+      manual_backups_per_day: 5
+    features:
+      alerts: true
+      custom_domains: true
+      sla: false
+
+  # hobby_plus_yearly — $199/yr ≈ $16.58/mo (about 1.5 months free).
+  # Sits between hobby's "save 1 month" (~8%) and pro/team's
+  # "2 months free" (~17%) so the savings ladder reads:
+  #   Hobby $9 → save 1 month / Hobby Plus $19 → save ~1.5 months /
+  #   Pro $49 → save 2 months.
+  hobby_plus_yearly:
+    display_name: "Hobby Plus (yearly)"
+    price_monthly_cents: 19900
+    billing_period: "yearly"
+    limits:
+      provisions_per_day: -1
+      postgres_storage_mb: 1024
+      postgres_connections: 8
+      vector_storage_mb: 1024
+      vector_connections: 8
+      redis_memory_mb: 50
+      redis_commands_per_day: 10000
+      mongodb_storage_mb: 1024
+      mongodb_connections: 5
+      mongodb_ops_per_minute: 1000
+      queue_storage_mb: 5120
+      storage_storage_mb: 5120
+      webhook_requests_stored: 5000
+      team_members: 1
+      vault_max_entries: 50
+      vault_envs_allowed: ["development", "staging", "production"]
+      deployments_apps: 2
+      backup_retention_days: 14
+      backup_restore_enabled: true
+      manual_backups_per_day: 5
+    features:
+      alerts: true
+      custom_domains: true
+      sla: false
+
   # hobby_yearly — same limits + features as hobby. Annual billing only,
   # ~17% cheaper than 12x monthly ($90/yr vs $108). The Razorpay webhook
   # maps this plan_id back to the canonical "hobby" tier (CanonicalTier),

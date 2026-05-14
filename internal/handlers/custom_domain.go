@@ -307,10 +307,13 @@ func (h *CustomDomainHandler) Create(c *fiber.Ctx) error {
 		return err
 	}
 
-	// Tier gate — Pro+ only. Hobby / anonymous get a 402-style upgrade hint.
+	// Tier gate — Hobby Plus and above. Hobby / anonymous / free get a
+	// 402-style upgrade hint. W11 (2026-05-13): Hobby Plus is now the
+	// cheapest tier with custom_domains: true — the upgrade copy points
+	// at Hobby Plus rather than Pro so hobby users see the closer step.
 	if !h.plans.CustomDomainsAllowed(team.PlanTier) {
 		return respondError(c, fiber.StatusPaymentRequired, "upgrade_required",
-			"Custom domains require the Pro plan or higher. Upgrade at https://instanode.dev/pricing")
+			"Custom domains require the Hobby Plus plan or higher. Upgrade at https://instanode.dev/pricing")
 	}
 
 	stack, err := h.requireOwnedStack(c, team, c.Params("slug"))
