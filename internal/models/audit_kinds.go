@@ -208,4 +208,12 @@ const (
 	// operator can investigate and re-run. Metadata: {error,
 	// failed_at_step, resource_id (when applicable)}.
 	AuditKindTeamDeletionFailed = "team.deletion_failed"
+
+	// AuditKindResourceMetricsQueried fires when a caller successfully fetches
+	// GET /api/v1/resources/:id/metrics. The audit row's metadata records the
+	// resolved window_seconds + samples_count so the Loops forwarder /
+	// downstream consumers can distinguish "the customer is actively watching
+	// p95" from a one-off page load. NOT emitted on tier-gated 402 or
+	// ownership 403/404 paths — pre-auth queries shouldn't pollute the feed.
+	AuditKindResourceMetricsQueried = "resource.metrics_queried"
 )
