@@ -9,7 +9,8 @@
 //	  → /claim (with email)
 //	  → session_token returned in body
 //	  → /api/v1/whoami    (auth probe; tier=hobby)
-//	  → /api/v1/billing   (subscription_status=trial)
+//	  → /api/v1/billing   (subscription_status=none; hobby is paid from day one
+//	                       per project_no_trial_pay_day_one.md — no trial)
 //	  → /api/v1/resources (resource visible at tier=hobby)
 //	  → /razorpay/webhook subscription.charged → tier=pro
 //	  → /api/v1/billing reflects pro/active
@@ -170,7 +171,10 @@ func TestE2E_FullCustomerFlow_AnonymousToProToCancelled(t *testing.T) {
 		t.Errorf("step 3: /whoami team_id: want %q (from claim response), got %q", claim.TeamID, got)
 	}
 
-	// ── Step 4: /api/v1/billing — trial state ───────────────────────────────
+	// ── Step 4: /api/v1/billing — claimed hobby, no subscription yet ────────
+	// Per policy memory project_no_trial_pay_day_one.md the platform has no
+	// trial period. A freshly-claimed hobby team with no Razorpay subscription
+	// reports subscription_status="none" — NOT "trial".
 	billingResp := get(t, "/api/v1/billing", "Authorization", auth)
 	if billingResp.StatusCode != http.StatusOK {
 		t.Fatalf("step 4: GET /api/v1/billing: want 200, got %d\n%s", billingResp.StatusCode, readBody(t, billingResp))
@@ -180,8 +184,12 @@ func TestE2E_FullCustomerFlow_AnonymousToProToCancelled(t *testing.T) {
 	if tier, _ := billing["tier"].(string); tier != "hobby" {
 		t.Errorf("step 4: /billing tier: want hobby, got %q", tier)
 	}
-	if status, _ := billing["subscription_status"].(string); status != "trial" {
-		t.Errorf("step 4: /billing subscription_status: want trial, got %q", status)
+	status, _ := billing["subscription_status"].(string)
+	if status == "trial" {
+		t.Errorf("step 4: /billing subscription_status must never be 'trial' — no trial period exists on the platform")
+	}
+	if status != "none" {
+		t.Errorf("step 4: /billing subscription_status: want none, got %q", status)
 	}
 
 	// ── Step 5: /api/v1/resources — claimed resource visible at tier=hobby ─

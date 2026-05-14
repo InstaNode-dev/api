@@ -635,14 +635,12 @@ func fetchGoogleUserInfoOAuth2V2(ctx context.Context, accessToken string) (*goog
 // keep their own helpers because they have an external ID to match on first.
 //
 // Tier behaviour: a fresh team gets the default tier set by the DB
-// (`teams.plan_tier` defaults to 'anonymous' per migration 001 and is
-// overridden to 'hobby' by StartTrial only when the user goes through
-// /claim). For a brand-new magic-link user with nothing to claim, we leave
-// them on the default; an explicit upgrade path (Razorpay or /internal/set-tier)
-// will move them off it. We do NOT auto-start a 14-day trial here because
-// the magic-link flow is just an authentication mechanism, not an
-// onboarding event — auto-starting would silently start the trial clock for
-// anyone who clicked a link, including users who only wanted to peek.
+// (`teams.plan_tier` defaults to 'anonymous' per migration 001). For a
+// brand-new magic-link user with nothing to claim, we leave them on the
+// default; an explicit upgrade path (Razorpay or /internal/set-tier) will
+// move them off it. There is no trial — see policy memory
+// project_no_trial_pay_day_one.md. Hobby/pro/team are paid from day one;
+// anonymous (24h TTL) is the only free tier.
 func (h *AuthHandler) FindOrCreateUserByEmail(ctx context.Context, email string) (*models.User, *models.Team, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	if email == "" {

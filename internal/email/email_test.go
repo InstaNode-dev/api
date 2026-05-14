@@ -61,31 +61,6 @@ func TestSendPaymentFailed_WithNextAttemptDate(t *testing.T) {
 	}
 }
 
-// TestSendTrialWarning_NoopClient_ReturnsNil verifies the noop client returns nil.
-func TestSendTrialWarning_NoopClient_ReturnsNil(t *testing.T) {
-	c := noopClient()
-	trialEnd := time.Now().Add(48 * time.Hour)
-	err := c.SendTrialWarning(context.Background(), "user@example.com", 3, trialEnd)
-	if err != nil {
-		t.Fatalf("SendTrialWarning: expected nil, got: %v", err)
-	}
-}
-
-// TestSendTrialExpired_NoopClient_ReturnsNil verifies the noop client returns nil.
-func TestSendTrialExpired_NoopClient_ReturnsNil(t *testing.T) {
-	c := noopClient()
-	err := c.SendTrialExpired(context.Background(), "user@example.com")
-	if err != nil {
-		t.Fatalf("SendTrialExpired: expected nil, got: %v", err)
-	}
-}
-
-// TestSendTrialStarted_NoopClient_ReturnsNil verifies the noop client returns nil.
-func TestSendTrialStarted_NoopClient_ReturnsNil(t *testing.T) {
-	c := noopClient()
-	trialEnd := time.Now().Add(14 * 24 * time.Hour)
-	err := c.SendTrialStarted(context.Background(), "user@example.com", "Acme Corp", trialEnd)
-	if err != nil {
-		t.Fatalf("SendTrialStarted: expected nil, got: %v", err)
-	}
-}
+// Trial email tests removed on 2026-05-14 per policy memory
+// project_no_trial_pay_day_one.md — the SendTrialStarted, SendTrialWarning,
+// and SendTrialExpired functions no longer exist.

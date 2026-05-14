@@ -950,12 +950,10 @@ func (h *BillingHandler) GetBillingState(c *fiber.Ctx) error {
 		"razorpay_customer_id":     nil,
 	}
 
-	// Surface an in-flight trial as its own status — useful for the UI to
-	// distinguish "you're in a 14-day trial" from "you're on Hobby paid".
-	if team.TrialEndsAt.Valid && team.TrialEndsAt.Time.After(time.Now()) {
-		resp["subscription_status"] = "trial"
-		resp["next_renewal_at"] = team.TrialEndsAt.Time.UTC().Format(time.RFC3339Nano)
-	}
+	// Trial state used to short-circuit here. The platform no longer has a
+	// trial period (see policy memory project_no_trial_pay_day_one.md);
+	// hobby/pro/team are paid from day one. Anonymous (24h TTL) is the only
+	// free tier and is never billed at this endpoint.
 
 	subID := ""
 	if team.RazorpaySubscriptionID.Valid {

@@ -253,15 +253,21 @@ func TestE2E_PlanUpgrade_ResourceList_PreviousResourcesStillPresent(t *testing.T
 	}
 }
 
-// ── B4: trial_ends_at is cleared after paid subscription.charged ─────────────
+// ── B4: regression guard — trial_ends_at must never appear on /auth/me ───────
+//
+// The platform has no trial period (see policy memory
+// project_no_trial_pay_day_one.md). This test, previously named
+// TestE2E_PlanUpgrade_TrialEndsAt_ClearedAfterUpgrade, now asserts that the
+// field is absent both before and after a paid subscription.charged webhook.
+// Reintroducing the field would silently bring back the trial concept.
 
-func TestE2E_PlanUpgrade_TrialEndsAt_ClearedAfterUpgrade(t *testing.T) {
+func TestE2E_PlanUpgrade_TrialEndsAt_NeverAppearsOnAuthMe(t *testing.T) {
 	secret := razorpayWebhookSecret(t)
 	teamID, sessionJWT, _ := claimAndGetSession(t)
 
 	before := getAuthMe(t, sessionJWT)
-	if before["trial_ends_at"] == nil {
-		t.Log("note: trial_ends_at not set before upgrade (OK if trial already nil)")
+	if _, present := before["trial_ends_at"]; present {
+		t.Errorf("trial_ends_at must NOT appear on /auth/me before upgrade — no trial period exists; got %v", before["trial_ends_at"])
 	}
 
 	subID := "sub_test_" + uuid.NewString()[:12]
@@ -269,8 +275,8 @@ func TestE2E_PlanUpgrade_TrialEndsAt_ClearedAfterUpgrade(t *testing.T) {
 	readBody(t, resp)
 
 	after := getAuthMe(t, sessionJWT)
-	if after["trial_ends_at"] != nil {
-		t.Errorf("trial_ends_at must be cleared after subscription.charged; got %v", after["trial_ends_at"])
+	if _, present := after["trial_ends_at"]; present {
+		t.Errorf("trial_ends_at must NOT appear on /auth/me after upgrade — no trial period exists; got %v", after["trial_ends_at"])
 	}
 }
 
