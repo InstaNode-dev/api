@@ -11,10 +11,22 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
+	"instant.dev/internal/circuit"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
 	commonv1 "instant.dev/proto/common/v1"
 	provisionerv1 "instant.dev/proto/provisioner/v1"
+)
+
+// Circuit-breaker tuning for the api → provisioner gRPC boundary.
+// See README in internal/circuit for the state machine. Constants are
+// package-private (not env-tunable) because a misconfigured breaker is
+// worse than no breaker — operators who want to disable it can deploy
+// without the wrapped Client.
+const (
+	provisionerCircuitName      = "provisioner"
+	provisionerCircuitThreshold = 5
+	provisionerCircuitCooldown  = 30 * time.Second
 )
 
 // Credentials matches the shape returned by local providers.
@@ -26,14 +38,20 @@ type Credentials struct {
 	KeyPrefix          string
 }
 
-// Client wraps the gRPC ProvisionerServiceClient with convenience methods.
+// Client wraps the gRPC ProvisionerServiceClient with convenience methods
+// and a process-shared circuit breaker.
 type Client struct {
-	grpc   provisionerv1.ProvisionerServiceClient
-	secret string
+	grpc    provisionerv1.ProvisionerServiceClient
+	secret  string
+	breaker *circuit.Breaker // nil-safe; tests that construct {grpc, secret} still work
 }
 
 // NewClient dials the provisioner gRPC server and returns a Client.
 // The caller is responsible for calling conn.Close() on shutdown.
+//
+// The Client is constructed with a shared circuit breaker named
+// "provisioner" that trips on 5 consecutive RPC errors and stays open
+// for 30s. Inspect via `instant_circuit_breaker_state{name="provisioner"}`.
 func NewClient(addr, secret string) (*Client, *grpc.ClientConn, error) {
 	conn, err := grpc.NewClient(
 		addr,
@@ -48,11 +66,45 @@ func NewClient(addr, secret string) (*Client, *grpc.ClientConn, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("provisioner.NewClient: %w", err)
 	}
+	br := circuit.NewBreaker(
+		provisionerCircuitName,
+		provisionerCircuitThreshold,
+		provisionerCircuitCooldown,
+	).WithOnOpen(func() {
+		slog.Error("provisioner.circuit.opened",
+			"name", provisionerCircuitName,
+			"threshold", provisionerCircuitThreshold,
+			"cooldown_seconds", int(provisionerCircuitCooldown.Seconds()),
+			"impact", "all /db/new /cache/new /nosql/new /queue/new will 503 until provisioner recovers",
+			"runbook", "https://instanode.dev/status",
+		)
+	})
 	return &Client{
-		grpc:   provisionerv1.NewProvisionerServiceClient(conn),
-		secret: secret,
+		grpc:    provisionerv1.NewProvisionerServiceClient(conn),
+		secret:  secret,
+		breaker: br,
 	}, conn, nil
 }
+
+// callWithBreaker wraps a single RPC under the shared breaker. Returns
+// circuit.ErrOpen WITHOUT issuing the RPC when the breaker is open.
+// A nil breaker is treated as closed (test paths that build the Client
+// as a struct literal don't need the breaker wired).
+func callWithBreaker[T any](b *circuit.Breaker, fn func() (T, error)) (T, error) {
+	if b == nil {
+		return fn()
+	}
+	var zero T
+	if !b.Allow() {
+		return zero, circuit.ErrOpen
+	}
+	out, err := fn()
+	b.Record(err)
+	return out, err
+}
+
+// Breaker exposes the underlying breaker for tests and /healthz.
+func (c *Client) Breaker() *circuit.Breaker { return c.breaker }
 
 // ctxWithAuth attaches the provisioner auth token and, if present, the
 // X-Request-ID from the calling HTTP request so the provisioner's logs
@@ -78,128 +130,149 @@ func provisionTimeout(tier string) time.Duration {
 	return 4 * time.Minute
 }
 
-// ProvisionPostgres provisions a new Postgres database.
+// ProvisionPostgres provisions a new Postgres database. Wrapped by the
+// shared circuit breaker — when open, returns circuit.ErrOpen in <1ms
+// instead of waiting on the gRPC timeout. Handlers branch on
+// errors.Is(err, circuit.ErrOpen).
 func (c *Client) ProvisionPostgres(ctx context.Context, token, tier string) (*Credentials, error) {
-	start := time.Now()
-	ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), provisionTimeout(tier))
-	defer cancel()
-	resp, err := c.grpc.ProvisionResource(ctx, &provisionerv1.ProvisionRequest{
-		Token:        token,
-		Tier:         tier,
-		ResourceType: commonv1.ResourceType_RESOURCE_TYPE_POSTGRES,
+	return callWithBreaker(c.breaker, func() (*Credentials, error) {
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), provisionTimeout(tier))
+		defer cancel()
+		resp, err := c.grpc.ProvisionResource(ctx, &provisionerv1.ProvisionRequest{
+			Token:        token,
+			Tier:         tier,
+			ResourceType: commonv1.ResourceType_RESOURCE_TYPE_POSTGRES,
+		})
+		status := "ok"
+		if err != nil {
+			status = "error"
+		}
+		metrics.GRPCDuration.WithLabelValues("ProvisionPostgres", status).Observe(time.Since(start).Seconds())
+		if err != nil {
+			return nil, fmt.Errorf("provisioner.ProvisionPostgres: %w", err)
+		}
+		return &Credentials{
+			URL: resp.ConnectionUrl, DatabaseName: resp.DatabaseName,
+			Username: resp.Username, ProviderResourceID: resp.ProviderResourceId,
+		}, nil
 	})
-	status := "ok"
-	if err != nil {
-		status = "error"
-	}
-	metrics.GRPCDuration.WithLabelValues("ProvisionPostgres", status).Observe(time.Since(start).Seconds())
-	if err != nil {
-		return nil, fmt.Errorf("provisioner.ProvisionPostgres: %w", err)
-	}
-	return &Credentials{
-		URL: resp.ConnectionUrl, DatabaseName: resp.DatabaseName,
-		Username: resp.Username, ProviderResourceID: resp.ProviderResourceId,
-	}, nil
 }
 
-// ProvisionCache provisions a new Redis cache.
+// ProvisionCache provisions a new Redis cache. Wrapped by the shared
+// circuit breaker (see ProvisionPostgres).
 func (c *Client) ProvisionCache(ctx context.Context, token, tier string) (*Credentials, error) {
-	start := time.Now()
-	ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), provisionTimeout(tier))
-	defer cancel()
-	resp, err := c.grpc.ProvisionResource(ctx, &provisionerv1.ProvisionRequest{
-		Token:        token,
-		Tier:         tier,
-		ResourceType: commonv1.ResourceType_RESOURCE_TYPE_REDIS,
+	return callWithBreaker(c.breaker, func() (*Credentials, error) {
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), provisionTimeout(tier))
+		defer cancel()
+		resp, err := c.grpc.ProvisionResource(ctx, &provisionerv1.ProvisionRequest{
+			Token:        token,
+			Tier:         tier,
+			ResourceType: commonv1.ResourceType_RESOURCE_TYPE_REDIS,
+		})
+		status := "ok"
+		if err != nil {
+			status = "error"
+		}
+		metrics.GRPCDuration.WithLabelValues("ProvisionCache", status).Observe(time.Since(start).Seconds())
+		if err != nil {
+			return nil, fmt.Errorf("provisioner.ProvisionCache: %w", err)
+		}
+		return &Credentials{
+			URL: resp.ConnectionUrl, KeyPrefix: resp.KeyPrefix, ProviderResourceID: resp.ProviderResourceId,
+		}, nil
 	})
-	status := "ok"
-	if err != nil {
-		status = "error"
-	}
-	metrics.GRPCDuration.WithLabelValues("ProvisionCache", status).Observe(time.Since(start).Seconds())
-	if err != nil {
-		return nil, fmt.Errorf("provisioner.ProvisionCache: %w", err)
-	}
-	return &Credentials{
-		URL: resp.ConnectionUrl, KeyPrefix: resp.KeyPrefix, ProviderResourceID: resp.ProviderResourceId,
-	}, nil
 }
 
-// ProvisionNoSQL provisions a new MongoDB database.
+// ProvisionNoSQL provisions a new MongoDB database. Wrapped by the
+// shared circuit breaker (see ProvisionPostgres).
 func (c *Client) ProvisionNoSQL(ctx context.Context, token, tier string) (*Credentials, error) {
-	start := time.Now()
-	ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), provisionTimeout(tier))
-	defer cancel()
-	resp, err := c.grpc.ProvisionResource(ctx, &provisionerv1.ProvisionRequest{
-		Token:        token,
-		Tier:         tier,
-		ResourceType: commonv1.ResourceType_RESOURCE_TYPE_MONGODB,
+	return callWithBreaker(c.breaker, func() (*Credentials, error) {
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), provisionTimeout(tier))
+		defer cancel()
+		resp, err := c.grpc.ProvisionResource(ctx, &provisionerv1.ProvisionRequest{
+			Token:        token,
+			Tier:         tier,
+			ResourceType: commonv1.ResourceType_RESOURCE_TYPE_MONGODB,
+		})
+		status := "ok"
+		if err != nil {
+			status = "error"
+		}
+		metrics.GRPCDuration.WithLabelValues("ProvisionNoSQL", status).Observe(time.Since(start).Seconds())
+		if err != nil {
+			return nil, fmt.Errorf("provisioner.ProvisionNoSQL: %w", err)
+		}
+		return &Credentials{
+			URL: resp.ConnectionUrl, DatabaseName: resp.DatabaseName,
+			Username: resp.Username, ProviderResourceID: resp.ProviderResourceId,
+		}, nil
 	})
-	status := "ok"
-	if err != nil {
-		status = "error"
-	}
-	metrics.GRPCDuration.WithLabelValues("ProvisionNoSQL", status).Observe(time.Since(start).Seconds())
-	if err != nil {
-		return nil, fmt.Errorf("provisioner.ProvisionNoSQL: %w", err)
-	}
-	return &Credentials{
-		URL: resp.ConnectionUrl, DatabaseName: resp.DatabaseName,
-		Username: resp.Username, ProviderResourceID: resp.ProviderResourceId,
-	}, nil
 }
 
 // ProvisionQueue provisions a new NATS JetStream queue.
 // For pro/team tiers this creates a dedicated NATS pod; for others it uses the shared cluster.
+// Wrapped by the shared circuit breaker.
 func (c *Client) ProvisionQueue(ctx context.Context, token, tier string) (*Credentials, error) {
-	start := time.Now()
-	ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), provisionTimeout(tier))
-	defer cancel()
-	resp, err := c.grpc.ProvisionResource(ctx, &provisionerv1.ProvisionRequest{
-		Token:        token,
-		Tier:         tier,
-		ResourceType: commonv1.ResourceType_RESOURCE_TYPE_QUEUE,
+	return callWithBreaker(c.breaker, func() (*Credentials, error) {
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), provisionTimeout(tier))
+		defer cancel()
+		resp, err := c.grpc.ProvisionResource(ctx, &provisionerv1.ProvisionRequest{
+			Token:        token,
+			Tier:         tier,
+			ResourceType: commonv1.ResourceType_RESOURCE_TYPE_QUEUE,
+		})
+		status := "ok"
+		if err != nil {
+			status = "error"
+		}
+		metrics.GRPCDuration.WithLabelValues("ProvisionQueue", status).Observe(time.Since(start).Seconds())
+		if err != nil {
+			return nil, fmt.Errorf("provisioner.ProvisionQueue: %w", err)
+		}
+		return &Credentials{
+			URL: resp.ConnectionUrl, KeyPrefix: resp.KeyPrefix, ProviderResourceID: resp.ProviderResourceId,
+		}, nil
 	})
-	status := "ok"
-	if err != nil {
-		status = "error"
-	}
-	metrics.GRPCDuration.WithLabelValues("ProvisionQueue", status).Observe(time.Since(start).Seconds())
-	if err != nil {
-		return nil, fmt.Errorf("provisioner.ProvisionQueue: %w", err)
-	}
-	return &Credentials{
-		URL: resp.ConnectionUrl, KeyPrefix: resp.KeyPrefix, ProviderResourceID: resp.ProviderResourceId,
-	}, nil
 }
 
-// StorageBytes fetches current storage usage for a resource.
+// StorageBytes fetches current storage usage for a resource. Wrapped
+// by the shared breaker.
 func (c *Client) StorageBytes(ctx context.Context, token, providerResourceID string, resType commonv1.ResourceType) (int64, error) {
-	ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), 30*time.Second)
-	defer cancel()
-	resp, err := c.grpc.GetStorageBytes(ctx, &provisionerv1.StorageRequest{
-		Token:              token,
-		ProviderResourceId: providerResourceID,
-		ResourceType:       resType,
+	return callWithBreaker(c.breaker, func() (int64, error) {
+		ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), 30*time.Second)
+		defer cancel()
+		resp, err := c.grpc.GetStorageBytes(ctx, &provisionerv1.StorageRequest{
+			Token:              token,
+			ProviderResourceId: providerResourceID,
+			ResourceType:       resType,
+		})
+		if err != nil {
+			return 0, fmt.Errorf("provisioner.StorageBytes: %w", err)
+		}
+		return resp.StorageBytes, nil
 	})
-	if err != nil {
-		return 0, fmt.Errorf("provisioner.StorageBytes: %w", err)
-	}
-	return resp.StorageBytes, nil
 }
 
-// DeprovisionResource removes a provisioned resource.
+// DeprovisionResource removes a provisioned resource. Wrapped by the
+// shared breaker.
 func (c *Client) DeprovisionResource(ctx context.Context, token, providerResourceID string, resType commonv1.ResourceType) error {
-	ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), 30*time.Second)
-	defer cancel()
-	_, err := c.grpc.DeprovisionResource(ctx, &provisionerv1.DeprovisionRequest{
-		Token:              token,
-		ProviderResourceId: providerResourceID,
-		ResourceType:       resType,
+	_, err := callWithBreaker(c.breaker, func() (struct{}, error) {
+		ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), 30*time.Second)
+		defer cancel()
+		_, err := c.grpc.DeprovisionResource(ctx, &provisionerv1.DeprovisionRequest{
+			Token:              token,
+			ProviderResourceId: providerResourceID,
+			ResourceType:       resType,
+		})
+		if err != nil {
+			slog.Error("provisioner.DeprovisionResource failed", "error", err, "token", token)
+			return struct{}{}, fmt.Errorf("provisioner.DeprovisionResource: %w", err)
+		}
+		return struct{}{}, nil
 	})
-	if err != nil {
-		slog.Error("provisioner.DeprovisionResource failed", "error", err, "token", token)
-		return fmt.Errorf("provisioner.DeprovisionResource: %w", err)
-	}
-	return nil
+	return err
 }

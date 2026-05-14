@@ -332,7 +332,7 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("vector.new.soft_delete_failed", "error", delErr, "resource_id", resource.ID)
 		}
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision vector database")
+		return respondProvisionFailed(c, err, "Failed to provision vector database")
 	}
 
 	// Encrypt and persist the connection URL. Same pattern as db.go.
@@ -484,7 +484,7 @@ func (h *VectorHandler) newVectorAuthenticated(
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("vector.new.soft_delete_failed_auth", "error", delErr, "resource_id", resource.ID)
 		}
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision vector database")
+		return respondProvisionFailed(c, err, "Failed to provision vector database")
 	}
 
 	aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey)

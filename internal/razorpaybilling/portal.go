@@ -5,15 +5,84 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	razorpay "github.com/razorpay/razorpay-go"
+	"instant.dev/internal/circuit"
 	"instant.dev/internal/config"
 	"instant.dev/internal/models"
 )
+
+// Circuit-breaker tuning for the api → Razorpay HTTP boundary.
+//
+// Razorpay's outbound API is slower than the provisioner (p99 1-2s) and
+// the failure mode is a 5xx burst when their infra hiccups. 5 consecutive
+// failures opens the breaker; 60s cooldown matches the observed Razorpay
+// recovery window (too-short floods them with retries that re-trip).
+//
+// One process-wide breaker shared by ALL Razorpay calls — the failure
+// mode is "Razorpay is down", not "Subscription endpoint is down".
+const (
+	razorpayCircuitName      = "razorpay"
+	razorpayCircuitThreshold = 5
+	razorpayCircuitCooldown  = 60 * time.Second
+)
+
+// sharedBreaker is the package-level Razorpay breaker. Lazy-init so
+// the package can be imported without registering Prometheus metrics
+// in tests that never reach a Razorpay call.
+var (
+	sharedBreakerOnce sync.Once
+	sharedBreaker     *circuit.Breaker
+)
+
+func breaker() *circuit.Breaker {
+	sharedBreakerOnce.Do(func() {
+		sharedBreaker = circuit.NewBreaker(
+			razorpayCircuitName,
+			razorpayCircuitThreshold,
+			razorpayCircuitCooldown,
+		).WithOnOpen(func() {
+			slog.Error("razorpay.circuit.opened",
+				"name", razorpayCircuitName,
+				"threshold", razorpayCircuitThreshold,
+				"cooldown_seconds", int(razorpayCircuitCooldown.Seconds()),
+				"impact", "/billing/checkout and /billing/change-plan will 503 until Razorpay recovers",
+				"runbook", "https://instanode.dev/status",
+			)
+		})
+	})
+	return sharedBreaker
+}
+
+// Breaker exposes the package singleton breaker for /healthz consumers
+// and tests. Read-only — do NOT call Allow / Record on it directly.
+func Breaker() *circuit.Breaker { return breaker() }
+
+// callWithBreaker is the package-level wrapper for outbound Razorpay
+// calls. Returns circuit.ErrOpen when the breaker rejects.
+func callWithBreaker[T any](fn func() (T, error)) (T, error) {
+	b := breaker()
+	var zero T
+	if !b.Allow() {
+		return zero, circuit.ErrOpen
+	}
+	out, err := fn()
+	b.Record(err)
+	return out, err
+}
+
+// CallWithBreaker is the exported sibling of callWithBreaker, used by
+// the billing handler (which constructs its Razorpay client inline via
+// razorpay.NewClient instead of going through Portal). Same semantics.
+func CallWithBreaker[T any](fn func() (T, error)) (T, error) {
+	return callWithBreaker(fn)
+}
 
 // Portal exposes Razorpay subscription operations for dashboard billing.
 type Portal struct {
@@ -47,14 +116,17 @@ func (p *Portal) SubscriptionID(ctx context.Context, teamID uuid.UUID) (string, 
 }
 
 // CancelAtCycleEnd calls POST /subscriptions/{id}/cancel with cancel_at_cycle_end.
+// Wrapped by the package-level circuit breaker.
 func (p *Portal) CancelAtCycleEnd(subscriptionID string) error {
 	c, err := p.client()
 	if err != nil {
 		return err
 	}
-	_, err = c.Subscription.Cancel(subscriptionID, map[string]interface{}{
-		"cancel_at_cycle_end": true,
-	}, nil)
+	_, err = callWithBreaker(func() (map[string]any, error) {
+		return c.Subscription.Cancel(subscriptionID, map[string]interface{}{
+			"cancel_at_cycle_end": true,
+		}, nil)
+	})
 	return err
 }
 
@@ -74,9 +146,11 @@ func (p *Portal) CancelImmediately(subscriptionID string) error {
 	if err != nil {
 		return err
 	}
-	_, err = c.Subscription.Cancel(subscriptionID, map[string]interface{}{
-		"cancel_at_cycle_end": false,
-	}, nil)
+	_, err = callWithBreaker(func() (map[string]any, error) {
+		return c.Subscription.Cancel(subscriptionID, map[string]interface{}{
+			"cancel_at_cycle_end": false,
+		}, nil)
+	})
 	return err
 }
 
@@ -91,15 +165,18 @@ type Invoice struct {
 }
 
 // ListSubscriptionInvoices lists invoices for a subscription.
+// Wrapped by the package-level circuit breaker.
 func (p *Portal) ListSubscriptionInvoices(subscriptionID string) ([]Invoice, error) {
 	c, err := p.client()
 	if err != nil {
 		return nil, err
 	}
-	raw, err := c.Invoice.All(map[string]interface{}{
-		"subscription_id": subscriptionID,
-		"count":           100,
-	}, nil)
+	raw, err := callWithBreaker(func() (map[string]any, error) {
+		return c.Invoice.All(map[string]interface{}{
+			"subscription_id": subscriptionID,
+			"count":           100,
+		}, nil)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -161,12 +238,15 @@ func toInt64(v interface{}) int64 {
 }
 
 // PaymentUpdateURL returns a hosted URL the customer can use to authenticate or update payment.
+// Wrapped by the package-level circuit breaker.
 func (p *Portal) PaymentUpdateURL(subscriptionID string) (string, error) {
 	c, err := p.client()
 	if err != nil {
 		return "", err
 	}
-	sub, err := c.Subscription.Fetch(subscriptionID, nil, nil)
+	sub, err := callWithBreaker(func() (map[string]any, error) {
+		return c.Subscription.Fetch(subscriptionID, nil, nil)
+	})
 	if err != nil {
 		return "", err
 	}
@@ -211,7 +291,9 @@ func (p *Portal) ChangePlan(ctx context.Context, teamID uuid.UUID, targetPlan st
 			"plan":    strings.ToLower(strings.TrimSpace(targetPlan)),
 		},
 	}
-	sub, err := c.Subscription.Create(subBody, nil)
+	sub, err := callWithBreaker(func() (map[string]any, error) {
+		return c.Subscription.Create(subBody, nil)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("create subscription: %w", err)
 	}
@@ -222,7 +304,9 @@ func (p *Portal) ChangePlan(ctx context.Context, teamID uuid.UUID, targetPlan st
 			return nil, fmt.Errorf("persist subscription id: %w", updateErr)
 		}
 	}
-	cur, err := c.Subscription.Fetch(subID, nil, nil)
+	cur, err := callWithBreaker(func() (map[string]any, error) {
+		return c.Subscription.Fetch(subID, nil, nil)
+	})
 	effective := time.Now().UTC()
 	if err == nil {
 		if end := toInt64(cur["current_end"]); end > 0 {
@@ -265,12 +349,15 @@ type SubscriptionDetails struct {
 }
 
 // FetchSubscriptionDetails loads subscription from Razorpay and enriches payment method from latest paid invoice.
+// Wrapped by the package-level circuit breaker.
 func (p *Portal) FetchSubscriptionDetails(subscriptionID string) (*SubscriptionDetails, error) {
 	c, err := p.client()
 	if err != nil {
 		return nil, err
 	}
-	sub, err := c.Subscription.Fetch(subscriptionID, nil, nil)
+	sub, err := callWithBreaker(func() (map[string]any, error) {
+		return c.Subscription.Fetch(subscriptionID, nil, nil)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -289,10 +376,12 @@ func (p *Portal) FetchSubscriptionDetails(subscriptionID string) (*SubscriptionD
 	} else if v, ok := sub["cancel_at_cycle_end"].(float64); ok && v != 0 {
 		d.CancelAtPeriodEnd = true
 	}
-	raw, err := c.Invoice.All(map[string]interface{}{
-		"subscription_id": subscriptionID,
-		"count":           50,
-	}, nil)
+	raw, err := callWithBreaker(func() (map[string]any, error) {
+		return c.Invoice.All(map[string]interface{}{
+			"subscription_id": subscriptionID,
+			"count":           50,
+		}, nil)
+	})
 	if err != nil {
 		return d, nil
 	}
@@ -333,7 +422,9 @@ func (p *Portal) FetchSubscriptionDetails(subscriptionID string) (*SubscriptionD
 	if paymentID == "" {
 		return d, nil
 	}
-	pay, err := c.Payment.Fetch(paymentID, nil, nil)
+	pay, err := callWithBreaker(func() (map[string]any, error) {
+		return c.Payment.Fetch(paymentID, nil, nil)
+	})
 	if err != nil {
 		return d, nil
 	}
