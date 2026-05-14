@@ -144,4 +144,36 @@ const (
 	// "scheduled backup ran" — a restore is a much higher-signal event
 	// (user is recovering, may need support).
 	AuditKindRestoreRequested = "restore.requested"
+
+	// Data-access audit kinds (W7-C — customer-facing audit export).
+	// Compliance buyers (Team tier) need a complete trail of who read
+	// what + when. These fire on every successful customer-facing read
+	// of resource state (NOT internal scans/probes, which would flood
+	// the table — see resource.go for the "only on explicit reveal"
+	// rule applied to AuditKindConnectionURLDecrypted).
+	//
+	// Best-effort: emit-site failures must NEVER block the underlying
+	// read. See resource.go for the goroutine pattern. The new GET
+	// /api/v1/audit endpoint surfaces these to the customer along with
+	// the existing onboarding.* / subscription.* / promote.* kinds.
+
+	// AuditKindResourceRead fires on every successful GET
+	// /api/v1/resources/:id. Metadata: {resource_id, resource_type,
+	// accessed_by_user_id}. Per-resource resolution — one row per call.
+	AuditKindResourceRead = "resource.read"
+
+	// AuditKindConnectionURLDecrypted fires when a connection_url is
+	// decrypted server-side for return to the customer (the explicit
+	// "show connection string" reveal in the dashboard, or the
+	// /credentials endpoint). Does NOT fire on internal scans, the
+	// rotation flow's intermediate decrypt, or pause/resume — those
+	// are operational reads, not data-access reveals.
+	// Metadata: {resource_id, purpose: "customer_reveal"}.
+	AuditKindConnectionURLDecrypted = "connection_url.decrypted"
+
+	// AuditKindResourceListByTeam fires once per GET /api/v1/resources
+	// call (lower-resolution than per-resource — compliance-useful but
+	// must not generate a row per result). Metadata:
+	// {count_returned, env_filter}.
+	AuditKindResourceListByTeam = "resource.list_by_team"
 )

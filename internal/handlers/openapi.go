@@ -1754,16 +1754,40 @@ const openAPISpec = `{
     },
     "/api/v1/audit": {
       "get": {
-        "summary": "Per-team audit log (feeds the dashboard's Recent Activity panel)",
-        "description": "Returns up to ?limit (default 20, max 200) recent audit events for the caller's team, newest first. Optional ?kind filter (e.g. 'provision', 'delete', 'tier_change'). Each item has id, actor, kind, resource_type, resource_id (nullable), summary (HTML-safe), metadata (arbitrary JSON), at.",
+        "summary": "Customer-facing audit log export (W7-C compliance)",
+        "description": "Returns audit events scoped to the caller's team for compliance review. Includes rows where team_id = caller_team OR metadata.resource_id resolves to a resource the caller owns. Rows whose kind starts with 'admin.' are NEVER returned regardless of tier — those are reserved for the internal operator audit feed (compliance traceability for operator activity is handled through a separate channel). Pagination is cursor-style via ?before=<created_at>. The response body echoes the resolved lookback_days so the caller knows the tier window. Actor emails are partially redacted on the wire ('m***@example.com') to balance traceability against PII exposure; user_id stays in full so the buyer can correlate against their own team-membership records. Emit sites include the existing onboarding.claimed, subscription.*, promote.*, payment.grace_* kinds plus W7-C-added data-access kinds resource.read, resource.list_by_team, connection_url.decrypted. Tier gate: anonymous/free → 402, hobby = 30d lookback, pro = 90d, growth/team = unlimited.",
         "security": [{ "bearerAuth": [] }],
         "parameters": [
-          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 20, "minimum": 1, "maximum": 200 } },
-          { "name": "kind", "in": "query", "required": false, "schema": { "type": "string" } }
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50, "minimum": 1, "maximum": 200 }, "description": "Page size. Default 50, max 200. The endpoint returns at most this many rows per call; use ?before=<next_cursor> to fetch older rows." },
+          { "name": "before", "in": "query", "required": false, "schema": { "type": "string", "format": "date-time" }, "description": "Cursor — only return rows with created_at strictly older than this RFC3339 timestamp. Pass the previous response's next_cursor field here." },
+          { "name": "kind", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Exact kind match (e.g. 'resource.read', 'subscription.upgraded'). Admin.* kinds always return zero rows even when explicitly requested." },
+          { "name": "since", "in": "query", "required": false, "schema": { "type": "string", "format": "date-time" }, "description": "Inclusive lower bound (RFC3339). The tier lookback floor still wins — if you ask for a wider window than your plan allows you only see your plan's window." },
+          { "name": "until", "in": "query", "required": false, "schema": { "type": "string", "format": "date-time" }, "description": "Exclusive upper bound (RFC3339)." }
         ],
         "responses": {
-          "200": { "description": "Audit event list", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "items": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string", "format": "uuid" }, "actor": { "type": "string" }, "kind": { "type": "string" }, "resource_type": { "type": "string" }, "resource_id": { "type": ["string", "null"], "format": "uuid" }, "summary": { "type": "string", "description": "HTML-safe summary; rendered via dangerouslySetInnerHTML in the dashboard" }, "metadata": { "type": ["object", "null"], "additionalProperties": true }, "at": { "type": "string", "format": "date-time" } } } } } } } } },
-          "401": { "description": "Unauthorized" }
+          "200": { "description": "Audit event list", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "items": { "type": "array", "items": { "$ref": "#/components/schemas/AuditExportItem" } }, "total_returned": { "type": "integer", "description": "Number of items in this page." }, "next_cursor": { "type": ["string", "null"], "format": "date-time", "description": "Pass to ?before= on the next call. Null when this is the last page (the page wasn't full)." }, "lookback_days": { "type": "integer", "description": "Plan-derived hard floor. -1 means unlimited (growth/team)." }, "tier": { "type": "string", "description": "The caller's resolved plan tier at request time." } } } } } },
+          "401": { "description": "Unauthorized" },
+          "402": { "description": "Plan does not include audit export. Anonymous/free → upgrade required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "400": { "description": "Invalid query parameter (e.g. malformed ?before / ?since / ?until — must be RFC3339)." }
+        }
+      }
+    },
+    "/api/v1/audit.csv": {
+      "get": {
+        "summary": "Customer-facing audit log export — CSV stream (W7-C compliance)",
+        "description": "Same filter/scope/redaction rules as GET /api/v1/audit, but the response is streamed text/csv suitable for piping into a customer's own SIEM. Columns: id, kind, created_at, actor, actor_user_id, actor_email_masked, resource_id, resource_type, summary, metadata. Streaming guarantees: rows are encoded + flushed one at a time so a Team-tier customer with months of history does not OOM the api pod. The same admin.* exclusion and tier lookback floor apply.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 200, "minimum": 1, "maximum": 200 }, "description": "Per-call cap. CSV defaults to the max (200) because there is no client-friendly cursor in CSV — pass ?before/?since/?until for additional chunks." },
+          { "name": "before", "in": "query", "required": false, "schema": { "type": "string", "format": "date-time" } },
+          { "name": "kind", "in": "query", "required": false, "schema": { "type": "string" } },
+          { "name": "since", "in": "query", "required": false, "schema": { "type": "string", "format": "date-time" } },
+          { "name": "until", "in": "query", "required": false, "schema": { "type": "string", "format": "date-time" } }
+        ],
+        "responses": {
+          "200": { "description": "Audit event CSV. Header row is always emitted. Content-Disposition: attachment; filename=\"audit.csv\".", "content": { "text/csv": { "schema": { "type": "string" } } } },
+          "401": { "description": "Unauthorized" },
+          "402": { "description": "Plan does not include audit export. Anonymous/free → upgrade required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
@@ -2239,6 +2263,19 @@ const openAPISpec = `{
           "upgrade_url": { "type": "string", "format": "uri", "description": "Optional. Where the user can resolve the error — typically the pricing/upgrade page for quota walls and the login page for token errors. Present whenever following the URL would clear the error." }
         },
         "required": ["ok", "error", "message"]
+      },
+      "AuditExportItem": {
+        "type": "object",
+        "description": "One row of the customer-facing audit export. The same shape underlies the JSON list endpoint and (one column per field) the CSV stream endpoint. actor_email_masked redacts to first-char + domain ('m***@example.com'); actor_user_id stays in full so the buyer can correlate against their own team-membership records. Internal-only rows (kind starts with 'admin.') are never returned.",
+        "properties": {
+          "id":                 { "type": "string", "format": "uuid" },
+          "kind":               { "type": "string", "description": "Stable event kind. See internal/models/audit_kinds.go for the canonical list. W7-C added: resource.read, resource.list_by_team, connection_url.decrypted." },
+          "created_at":         { "type": "string", "format": "date-time" },
+          "metadata":           { "type": ["object", "null"], "additionalProperties": true, "description": "Arbitrary k/v stamped at emit time. Per-kind shape — see individual emit sites." },
+          "actor_user_id":      { "type": ["string", "null"], "format": "uuid", "description": "Null when the row came from a system actor (worker, billing webhook, dunning job)." },
+          "actor_email_masked": { "type": ["string", "null"], "description": "Partial-redacted email of the acting user. Format: first character of local-part + '***' + '@' + full domain (e.g. 'm***@example.com'). Null when actor_user_id is null or the user row has been deleted." }
+        },
+        "required": ["id", "kind", "created_at"]
       }
     }
   }

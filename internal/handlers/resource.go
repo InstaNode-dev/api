@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -81,6 +82,13 @@ func (h *ResourceHandler) List(c *fiber.Ctx) error {
 		items = append(items, resourceToMap(r))
 	}
 
+	// W7-C: emit a single lower-resolution audit row per list call. The
+	// per-row resolution lives on GET /api/v1/resources/:id; emitting one
+	// row per *member* of the list would flood the audit_log on teams with
+	// hundreds of resources, without giving compliance-buyers materially
+	// more signal. Best-effort: a failure here MUST NOT shape the response.
+	go emitResourceListByTeamAudit(h.db, teamID, middleware.GetUserID(c), len(items), envFilter)
+
 	return c.JSON(fiber.Map{
 		"ok":    true,
 		"items": items,
@@ -126,6 +134,11 @@ func (h *ResourceHandler) Get(c *fiber.Ctx) error {
 
 	item := resourceToMap(resource)
 	item["storage_exceeded"] = storageExceeded
+
+	// W7-C: per-resource read audit row. Best-effort goroutine — failures
+	// MUST NOT block the response (matches the A3 emit pattern in
+	// auth.go / onboarding.go).
+	go emitResourceReadAudit(h.db, teamID, middleware.GetUserID(c), resource.ID, resource.ResourceType)
 
 	return c.JSON(fiber.Map{
 		"ok":   true,
@@ -295,6 +308,13 @@ func (h *ResourceHandler) GetCredentials(c *fiber.Ctx) error {
 			"error", err, "resource_id", resource.ID, "request_id", requestID)
 		return respondError(c, fiber.StatusInternalServerError, "internal_error", "Failed to decrypt connection URL")
 	}
+
+	// W7-C: connection_url decrypted for customer reveal — emit one
+	// audit row per call. This endpoint is the "show connection string"
+	// path; the rotation handler also fires the same kind because it
+	// returns plaintext too. Internal decrypts (pause/resume's
+	// extractURLUsername, scan/probe paths) do NOT fire.
+	go emitConnectionURLDecryptedAudit(h.db, teamID, middleware.GetUserID(c), resource.ID, "customer_reveal")
 
 	return c.JSON(fiber.Map{
 		"ok":             true,
@@ -1100,6 +1120,117 @@ func rotateMongoPassword(ctx context.Context, adminURI, username, newPassword st
 		return fmt.Errorf("rotateMongoPassword: updateUser: %w", result.Err())
 	}
 	return nil
+}
+
+// emitResourceReadAudit writes a best-effort resource.read audit row.
+// Failure is logged but never bubbled — audit must not block the caller's
+// read. Wrapped in its own goroutine by the caller; do not invoke
+// synchronously from a request handler.
+//
+// W7-C compliance: the row's metadata carries the resource_id,
+// resource_type, and the actor's user_id so a Team-tier customer
+// reviewing the export can answer "which operator/agent read this row?"
+func emitResourceReadAudit(db *sql.DB, teamID uuid.UUID, userID string, resourceID uuid.UUID, resourceType string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	meta := map[string]string{
+		"resource_id":         resourceID.String(),
+		"resource_type":       resourceType,
+		"accessed_by_user_id": userID,
+	}
+	metaBlob, _ := json.Marshal(meta)
+
+	ev := models.AuditEvent{
+		TeamID:       teamID,
+		Kind:         models.AuditKindResourceRead,
+		ResourceType: resourceType,
+		ResourceID:   uuid.NullUUID{UUID: resourceID, Valid: true},
+		Summary:      "read <strong>" + resourceType + "</strong> <code>" + resourceID.String()[:8] + "</code>",
+		Metadata:     metaBlob,
+	}
+	if parsed, err := uuid.Parse(userID); err == nil {
+		ev.UserID = uuid.NullUUID{UUID: parsed, Valid: true}
+		ev.Actor = "user"
+	}
+	if err := models.InsertAuditEvent(ctx, db, ev); err != nil {
+		slog.Warn("audit.emit.failed",
+			"kind", models.AuditKindResourceRead,
+			"team_id", teamID,
+			"resource_id", resourceID,
+			"error", err,
+		)
+	}
+}
+
+// emitResourceListByTeamAudit writes a best-effort resource.list_by_team
+// row. ONE row per list call (not N) — the resolution is "the team
+// enumerated their resources at $time"; per-row reads are captured by
+// emitResourceReadAudit.
+func emitResourceListByTeamAudit(db *sql.DB, teamID uuid.UUID, userID string, countReturned int, envFilter string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	meta := map[string]interface{}{
+		"count_returned": countReturned,
+		"env_filter":     envFilter,
+	}
+	metaBlob, _ := json.Marshal(meta)
+
+	ev := models.AuditEvent{
+		TeamID:   teamID,
+		Kind:     models.AuditKindResourceListByTeam,
+		Summary:  fmt.Sprintf("listed %d resources", countReturned),
+		Metadata: metaBlob,
+	}
+	if parsed, err := uuid.Parse(userID); err == nil {
+		ev.UserID = uuid.NullUUID{UUID: parsed, Valid: true}
+		ev.Actor = "user"
+	}
+	if err := models.InsertAuditEvent(ctx, db, ev); err != nil {
+		slog.Warn("audit.emit.failed",
+			"kind", models.AuditKindResourceListByTeam,
+			"team_id", teamID,
+			"error", err,
+		)
+	}
+}
+
+// emitConnectionURLDecryptedAudit writes a best-effort
+// connection_url.decrypted row. Purpose is always "customer_reveal" today
+// (the only call site is GetCredentials); accepted as a parameter so
+// future call sites — e.g. an SDK-driven "decrypt and re-emit to .env"
+// flow — can stamp their own purpose without changing the function
+// signature again.
+func emitConnectionURLDecryptedAudit(db *sql.DB, teamID uuid.UUID, userID string, resourceID uuid.UUID, purpose string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	meta := map[string]string{
+		"resource_id": resourceID.String(),
+		"purpose":     purpose,
+	}
+	metaBlob, _ := json.Marshal(meta)
+
+	ev := models.AuditEvent{
+		TeamID:     teamID,
+		Kind:       models.AuditKindConnectionURLDecrypted,
+		ResourceID: uuid.NullUUID{UUID: resourceID, Valid: true},
+		Summary:    "decrypted connection_url for <code>" + resourceID.String()[:8] + "</code>",
+		Metadata:   metaBlob,
+	}
+	if parsed, err := uuid.Parse(userID); err == nil {
+		ev.UserID = uuid.NullUUID{UUID: parsed, Valid: true}
+		ev.Actor = "user"
+	}
+	if err := models.InsertAuditEvent(ctx, db, ev); err != nil {
+		slog.Warn("audit.emit.failed",
+			"kind", models.AuditKindConnectionURLDecrypted,
+			"team_id", teamID,
+			"resource_id", resourceID,
+			"error", err,
+		)
+	}
 }
 
 // resourceTypeToProto maps a resource_type string to the corresponding protobuf enum.
