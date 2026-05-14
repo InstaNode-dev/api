@@ -267,13 +267,14 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 			connectionURL := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
 			if connectionURL != "" {
 				metrics.FingerprintAbuseBlocked.Inc()
-				return c.JSON(fiber.Map{
+				// internal_url omitted on the anonymous dedup path — see
+				// internal_url.go (W11 scrub).
+				dedupResp := fiber.Map{
 					"ok":             true,
 					"id":             existing.ID.String(),
 					"token":          existing.Token.String(),
 					"name":           existing.Name.String,
 					"connection_url": connectionURL,
-					"internal_url":   proxiedInternalURL(connectionURL, "postgres"),
 					"tier":           existing.Tier,
 					"env":            existing.Env,
 					"extension":      "pgvector",
@@ -282,7 +283,9 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
-				})
+				}
+				setInternalURL(dedupResp, existing.Tier, connectionURL, "postgres")
+				return c.JSON(dedupResp)
 			}
 			slog.Warn("vector.new.dedup_empty_url — provisioning fresh",
 				"token", existing.Token, "request_id", requestID)
@@ -390,13 +393,13 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 	storageLimitMB := h.plans.StorageLimitMB("anonymous", models.ResourceTypeVector)
 	_, storageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
 
+	// internal_url omitted on the anonymous path — see internal_url.go.
 	resp := fiber.Map{
 		"ok":             true,
 		"id":             resource.ID.String(),
 		"token":          tokenStr,
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
-		"internal_url":   proxiedInternalURL(creds.URL, "postgres"),
 		"tier":           "anonymous",
 		"env":            resource.Env,
 		"extension":      "pgvector",
@@ -523,7 +526,6 @@ func (h *VectorHandler) newVectorAuthenticated(
 		"token":          tokenStr,
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
-		"internal_url":   proxiedInternalURL(creds.URL, "postgres"),
 		"tier":           tier,
 		"env":            resource.Env,
 		"dedicated":      dedicated,
@@ -534,6 +536,7 @@ func (h *VectorHandler) newVectorAuthenticated(
 			"connections": h.plans.ConnectionsLimit(tier, models.ResourceTypeVector),
 		},
 	}
+	setInternalURL(authResp, tier, creds.URL, "postgres")
 	if authStorageExceeded {
 		authResp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")

@@ -143,20 +143,24 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 			connectionURL := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
 			if connectionURL != "" {
 				metrics.FingerprintAbuseBlocked.Inc()
-				return c.JSON(fiber.Map{
+				// internal_url omitted via setInternalURL: existing.Tier is
+				// "anonymous" on the fingerprint-dedup path (never crosses into
+				// authenticated territory — that's a separate code branch).
+				dedupResp := fiber.Map{
 					"ok":             true,
 					"id":             existing.ID.String(),
 					"token":          existing.Token.String(),
 					"name":           existing.Name.String,
 					"connection_url": connectionURL,
-					"internal_url":   proxiedInternalURL(connectionURL, "postgres"),
 					"tier":           existing.Tier,
 					"env":            existing.Env,
 					"limits":         dbAnonymousLimits(),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
-				})
+				}
+				setInternalURL(dedupResp, existing.Tier, connectionURL, "postgres")
+				return c.JSON(dedupResp)
 			}
 			// Empty connection_url means provisioning failed mid-flight on the existing
 			// resource. Fall through to provision a fresh one rather than returning
@@ -276,13 +280,16 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 	storageLimitMB := h.plans.StorageLimitMB("anonymous", "postgres")
 	_, storageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
 
+	// internal_url intentionally omitted on the anonymous path — see
+	// setInternalURL doc comment in internal_url.go. Anon callers can't run
+	// in-cluster workloads (POST /deploy/new requires a claimed team), so
+	// internal_url has zero utility for them and leaks infra topology.
 	resp := fiber.Map{
 		"ok":             true,
 		"id":             resource.ID.String(),
 		"token":          tokenStr,
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
-		"internal_url":   proxiedInternalURL(creds.URL, "postgres"),
 		"tier":           "anonymous",
 		"env":            resource.Env,
 		"limits":         dbAnonymousLimits(),
@@ -412,7 +419,6 @@ func (h *DBHandler) newDBAuthenticated(
 		"token":          tokenStr,
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
-		"internal_url":   proxiedInternalURL(creds.URL, "postgres"),
 		"tier":           tier,
 		"env":            resource.Env,
 		"dedicated":      dedicated,
@@ -421,6 +427,7 @@ func (h *DBHandler) newDBAuthenticated(
 			"connections": h.plans.ConnectionsLimit(tier, "postgres"),
 		},
 	}
+	setInternalURL(authResp, tier, creds.URL, "postgres")
 	if authStorageExceeded {
 		authResp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
@@ -484,7 +491,6 @@ func (h *DBHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) err
 		"token":          res.Token,
 		"name":           res.Name,
 		"connection_url": res.ConnectionURL,
-		"internal_url":   res.InternalURL,
 		"tier":           res.Tier,
 		"env":            res.Env,
 		"family_root_id": res.FamilyRootID,
@@ -492,6 +498,15 @@ func (h *DBHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) err
 			"storage_mb":  res.Limits.StorageMB,
 			"connections": res.Limits.Connections,
 		},
+	}
+	// Twin requires an authenticated team (see TwinHandler.ProvisionTwin)
+	// so res.Tier is never "anonymous" in practice. Defensive guard
+	// preserves the W11 anon-internal_url-scrub invariant if a future
+	// callpath ever invokes the twin pipeline against an anon resource.
+	// res.InternalURL is already pre-computed (proxiedInternalURL ran
+	// upstream in ProvisionForTwinCore), so don't re-transform.
+	if res.Tier != tierAnonymous && res.InternalURL != "" {
+		resp[internalURLResponseKey] = res.InternalURL
 	}
 	if res.StorageExceeded {
 		resp["warning"] = "Storage limit reached. Upgrade to continue."
