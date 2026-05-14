@@ -386,6 +386,11 @@ func TestOpenAPI_CoversAllRegisteredRoutes(t *testing.T) {
 		"POST /api/v1/email/webhook/brevo":   true,
 		"POST /api/v1/email/webhook/ses":     true,
 		"POST /internal/teams/{id}/terminate": true,
+		// Worker-only resend driver. Auth is the shared
+		// WORKER_INTERNAL_JWT_SECRET HS256 token; agents must never call
+		// this directly. Exposing it in the public OpenAPI would
+		// mislead agents into thinking it's a customer-facing surface.
+		"POST /internal/email/resend-magic-link": true,
 		"GET /api/v1/usage/wall":              true,
 		"POST /api/v1/experiments/converted":  true,
 	}
