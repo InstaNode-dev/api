@@ -3,13 +3,15 @@ package storage
 // Package storage handles S3-compatible object storage provisioning.
 //
 // Two backends share the same Provider type and customer-facing contract,
-// chosen via `mode` at construction time:
+// chosen via OBJECT_STORE_MODE (alias OBJECT_STORE_BACKEND) at startup:
 //
-//   "minio-admin"  — historical default. The provider talks to MinIO's
-//     admin API (`madmin-go/v3`) to mint a dedicated IAM user per token
-//     with a prefix-scoped policy. Hard isolation: each customer's
-//     access key can only read/write under their own prefix. Used for
-//     self-hosted MinIO in the cluster.
+//   "minio-admin"  — DEFAULT in non-dev environments. The provider talks
+//     to MinIO's admin API (`madmin-go/v3`) to mint a dedicated IAM user
+//     per token with a prefix-scoped policy. Hard isolation: each
+//     customer's access key can only read/write under their own prefix.
+//     Required for any Team-tier / compliance-bound customer. Closes
+//     the shared-key loophole where every /storage/new caller used to
+//     receive the same master access key.
 //
 //   "shared-key"   — provider-agnostic. The provider holds ONE master
 //     access key (sourced from OBJECT_STORE_ACCESS_KEY /
@@ -20,8 +22,10 @@ package storage
 //     trusted because customers are authenticated to the platform
 //     before they ever see the key. Used for DO Spaces / AWS S3 / GCS /
 //     R2 / Backblaze B2 / Wasabi / any other S3-compatible service that
-//     doesn't expose a portable per-user IAM API. This is the path that
-//     lets us swap object-storage providers without code changes.
+//     doesn't expose a portable per-user IAM API. Local-dev only in
+//     production builds — the router refuses to start with shared-key
+//     when ENVIRONMENT=production unless OBJECT_STORE_ALLOW_SHARED_KEY=1
+//     is set as an explicit operator escape hatch.
 //
 // Credential format (both backends):
 //   - AccessKeyID:     key_{token_prefix8} in admin mode, master key in shared mode
@@ -35,11 +39,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 
 	madmin "github.com/minio/madmin-go/v3"
+	"instant.dev/internal/metrics"
 )
 
 // Backend selects the credential-issuance strategy.
@@ -49,14 +55,40 @@ const (
 	// BackendMinIOAdmin uses MinIO's admin API to mint per-customer IAM users.
 	// Hard prefix isolation. Requires the backend to be MinIO (other S3-
 	// compatible services don't expose a portable per-user IAM API).
+	// This is the secure default — see package doc.
 	BackendMinIOAdmin Backend = "minio-admin"
 
 	// BackendSharedKey returns the platform's master credentials to every
 	// customer along with their assigned prefix. Trust-based isolation;
 	// works against any S3-compatible service (DO Spaces, AWS S3, GCS,
-	// R2, B2, Wasabi).
+	// R2, B2, Wasabi). Local-dev only in production builds.
 	BackendSharedKey Backend = "shared-key"
 )
+
+// ErrAdminUnavailable is returned when an admin-mode operation is invoked
+// but the admin client could not be constructed (missing credentials or
+// the configured backend is shared-key). Callers should surface this as a
+// 503 to the customer rather than silently falling back to shared-key.
+var ErrAdminUnavailable = errors.New("storage: admin-mode unavailable (missing OBJECT_STORE_ACCESS_KEY/OBJECT_STORE_SECRET_KEY or backend not minio-admin)")
+
+// ResolveBackend normalises the operator-facing mode string into a Backend
+// value. Accepts the historical aliases ("admin", "minio", "iam") for
+// minio-admin and ("shared", "master") for shared-key. Empty string and
+// unknown values both resolve to BackendMinIOAdmin — the secure default.
+//
+// The router uses this so OBJECT_STORE_MODE=admin (the documented default)
+// always lands on the per-customer IAM-user path, even on operators who
+// haven't migrated from the legacy OBJECT_STORE_BACKEND=minio-admin env.
+func ResolveBackend(mode string) Backend {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "shared-key", "shared", "master", "shared_key":
+		return BackendSharedKey
+	case "minio-admin", "admin", "minio", "iam", "":
+		return BackendMinIOAdmin
+	default:
+		return BackendMinIOAdmin
+	}
+}
 
 // Credentials holds the S3-compatible storage access details.
 type Credentials struct {
@@ -96,6 +128,26 @@ type Provider struct {
 	endpoint       string // internal host:port for admin/bucket ops, e.g. "minio.instant-data.svc.cluster.local:9000"
 	publicEndpoint string // host:port returned to customers (falls back to endpoint when empty)
 	bucketName     string // e.g. "instant-shared"
+}
+
+// Backend reports the credential-issuance strategy this provider was
+// constructed with. Callers (router, /healthz, audit emitters) use this
+// to log which isolation mode is in effect at runtime.
+func (p *Provider) Backend() Backend {
+	if p == nil {
+		return ""
+	}
+	return p.backend
+}
+
+// BucketName reports the configured shared-bucket name. Exposed so
+// operator-facing endpoints (e.g. /internal/storage-self-check) can
+// display the bucket without reaching into config.
+func (p *Provider) BucketName() string {
+	if p == nil {
+		return ""
+	}
+	return p.bucketName
 }
 
 // New creates a Provider in MinIO admin mode (current behavior — kept for
@@ -229,8 +281,13 @@ func (p *Provider) Provision(ctx context.Context, token, tier string) (*Credenti
 		}
 		secretAccessKey := hex.EncodeToString(secretBytes)
 
+		if p.madmClient == nil {
+			return nil, ErrAdminUnavailable
+		}
+
 		// Create the MinIO IAM user.
 		if err := p.madmClient.AddUser(ctx, accessKeyID, secretAccessKey); err != nil {
+			metrics.StorageIAMUsersFailed.WithLabelValues("create", "add_user").Inc()
 			return nil, fmt.Errorf("storage.Provision: AddUser %q: %w", accessKeyID, err)
 		}
 
@@ -238,10 +295,12 @@ func (p *Provider) Provision(ctx context.Context, token, tier string) (*Credenti
 		policyJSON, err := json.Marshal(p.buildPolicy(objectPrefix))
 		if err != nil {
 			_ = p.madmClient.RemoveUser(ctx, accessKeyID)
+			metrics.StorageIAMUsersFailed.WithLabelValues("create", "marshal_policy").Inc()
 			return nil, fmt.Errorf("storage.Provision: marshal policy: %w", err)
 		}
 		if err := p.madmClient.AddCannedPolicy(ctx, policyName, policyJSON); err != nil {
 			_ = p.madmClient.RemoveUser(ctx, accessKeyID)
+			metrics.StorageIAMUsersFailed.WithLabelValues("create", "add_policy").Inc()
 			return nil, fmt.Errorf("storage.Provision: AddCannedPolicy %q: %w", policyName, err)
 		}
 
@@ -249,9 +308,11 @@ func (p *Provider) Provision(ctx context.Context, token, tier string) (*Credenti
 		if err := p.madmClient.SetPolicy(ctx, policyName, accessKeyID, false); err != nil {
 			_ = p.madmClient.RemoveUser(ctx, accessKeyID)
 			_ = p.madmClient.RemoveCannedPolicy(ctx, policyName)
+			metrics.StorageIAMUsersFailed.WithLabelValues("create", "set_policy").Inc()
 			return nil, fmt.Errorf("storage.Provision: SetPolicy %q → %q: %w", policyName, accessKeyID, err)
 		}
 
+		metrics.StorageIAMUsersCreated.Inc()
 		slog.Info("storage.Provision: MinIO user created",
 			"backend", p.backend,
 			"token", token,
@@ -300,13 +361,25 @@ func (p *Provider) Deprovision(ctx context.Context, token string) error {
 	accessKeyID := "key_" + prefix
 	policyName := "pol_" + prefix
 
+	if p.madmClient == nil {
+		return ErrAdminUnavailable
+	}
+
+	var failed bool
 	if err := p.madmClient.RemoveUser(ctx, accessKeyID); err != nil {
+		failed = true
+		metrics.StorageIAMUsersFailed.WithLabelValues("delete", "remove_user").Inc()
 		slog.Warn("storage.Deprovision: RemoveUser failed",
 			"access_key_id", accessKeyID, "error", err)
 	}
 	if err := p.madmClient.RemoveCannedPolicy(ctx, policyName); err != nil {
+		failed = true
+		metrics.StorageIAMUsersFailed.WithLabelValues("delete", "remove_policy").Inc()
 		slog.Warn("storage.Deprovision: RemoveCannedPolicy failed",
 			"policy_name", policyName, "error", err)
+	}
+	if !failed {
+		metrics.StorageIAMUsersDeleted.Inc()
 	}
 
 	slog.Info("storage.Deprovision: MinIO user and policy removed",
@@ -321,14 +394,32 @@ type iamPolicy struct {
 }
 
 type iamStatement struct {
-	Effect   string   `json:"Effect"`
-	Action   []string `json:"Action"`
-	Resource []string `json:"Resource"`
+	Effect    string             `json:"Effect"`
+	Action    []string           `json:"Action"`
+	Resource  []string           `json:"Resource"`
+	Condition map[string]condMap `json:"Condition,omitempty"`
 }
 
-// buildPolicy returns an IAM policy that allows s3:* only on the given prefix
-// within the shared bucket, plus ListBucket on the bucket itself (required for
-// prefix-scoped listings). Only used in minio-admin mode.
+// condMap is the inner map of an IAM Condition block, e.g.
+//
+//	{"StringLike": {"s3:prefix": ["a1b2c3d4/*"]}}
+//
+// The outer key is the operator ("StringLike"); the inner map carries the
+// per-key value list.
+type condMap map[string][]string
+
+// buildPolicy returns an IAM policy that allows the minimum read+write+
+// list surface the customer needs against their own prefix:
+//
+//   - s3:GetObject + s3:PutObject + s3:DeleteObject on
+//     arn:aws:s3:::{bucket}/{prefix}/*
+//   - s3:ListBucket on arn:aws:s3:::{bucket} BUT scoped by an
+//     s3:prefix StringLike condition so the customer can only list
+//     keys under their prefix — never enumerate sibling tenants.
+//
+// Only used in minio-admin mode. This is the policy that closes the
+// shared-key loophole: even if the customer somehow obtains the IAM
+// user's secret, they cannot read another tenant's objects.
 func (p *Provider) buildPolicy(objectPrefix string) iamPolicy {
 	pfx := strings.TrimSuffix(objectPrefix, "/")
 	return iamPolicy{
@@ -336,13 +427,18 @@ func (p *Provider) buildPolicy(objectPrefix string) iamPolicy {
 		Statement: []iamStatement{
 			{
 				Effect:   "Allow",
-				Action:   []string{"s3:*"},
+				Action:   []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject"},
 				Resource: []string{fmt.Sprintf("arn:aws:s3:::%s/%s/*", p.bucketName, pfx)},
 			},
 			{
 				Effect:   "Allow",
 				Action:   []string{"s3:ListBucket"},
 				Resource: []string{fmt.Sprintf("arn:aws:s3:::%s", p.bucketName)},
+				Condition: map[string]condMap{
+					"StringLike": {
+						"s3:prefix": []string{pfx + "/*"},
+					},
+				},
 			},
 		},
 	}
