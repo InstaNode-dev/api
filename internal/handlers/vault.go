@@ -26,8 +26,10 @@ package handlers
 // log preserves the action durably.
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -193,6 +195,50 @@ func (h *VaultHandler) audit(c *fiber.Ctx, teamID uuid.UUID, userID uuid.NullUUI
 	}
 }
 
+// emitAuditEvent writes a row to the cross-team audit_log table best-effort
+// (separate from the dedicated vault_audit_log). The vault_audit_log table
+// is the security-focused record; this one feeds the dashboard recent-activity
+// feed + the Brevo forwarder. Runs in a goroutine so a slow audit insert
+// never blocks the vault read/write request returning.
+//
+// kind is one of models.AuditKindVaultRead / AuditKindVaultWrite. operation
+// is one of "create" | "update" | "delete" | "" — empty for reads.
+func (h *VaultHandler) emitAuditEvent(teamID uuid.UUID, userID uuid.NullUUID, kind, env, key, operation string) {
+	go func() {
+		meta := map[string]string{
+			"env":      env,
+			"key_name": key,
+			"team_id":  teamID.String(),
+		}
+		if operation != "" {
+			meta["operation"] = operation
+		}
+		metaBlob, _ := json.Marshal(meta)
+
+		summary := "vault read " + env + "/" + key
+		if kind == models.AuditKindVaultWrite {
+			summary = "vault " + operation + " " + env + "/" + key
+		}
+
+		ev := models.AuditEvent{
+			TeamID:   teamID,
+			UserID:   userID,
+			Actor:    "user",
+			Kind:     kind,
+			Summary:  summary,
+			Metadata: metaBlob,
+		}
+		if err := models.InsertAuditEvent(context.Background(), h.db, ev); err != nil {
+			slog.Warn("audit.emit.failed",
+				"kind", kind,
+				"team_id", teamID,
+				"env", env,
+				"error", err,
+			)
+		}
+	}()
+}
+
 // PutSecret handles PUT /api/v1/vault/:env/:key.
 // Always creates a new version. Returns 201 with {key,version}.
 func (h *VaultHandler) PutSecret(c *fiber.Ctx) error {
@@ -315,6 +361,15 @@ func (h *VaultHandler) upsertSecret(c *fiber.Ctx, action string) error {
 
 	h.audit(c, teamID, userID, action, env, key, ip)
 
+	// audit_log emit: every successful vault mutation. Operation is derived
+	// from the returned version — v1 is a fresh create, v2+ is an update.
+	// "rotate" is functionally an update (it produces v2+ by definition).
+	operation := "create"
+	if secret.Version > 1 || action == "rotate" {
+		operation = "update"
+	}
+	h.emitAuditEvent(teamID, userID, models.AuditKindVaultWrite, env, key, operation)
+
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"ok":      true,
 		"key":     secret.Key,
@@ -373,6 +428,10 @@ func (h *VaultHandler) GetSecret(c *fiber.Ctx) error {
 	}
 
 	h.audit(c, teamID, userID, "get", env, key, ip)
+
+	// audit_log emit: only on a successful read that returned plaintext.
+	// 404s (cross-team / missing) and tier rejections must NOT emit.
+	h.emitAuditEvent(teamID, userID, models.AuditKindVaultRead, env, key, "")
 
 	return c.JSON(fiber.Map{
 		"ok":      true,
@@ -671,5 +730,10 @@ func (h *VaultHandler) DeleteSecret(c *fiber.Ctx) error {
 	}
 
 	h.audit(c, teamID, userID, "delete", env, key, ip)
+
+	// audit_log emit: successful delete only. 404 paths (no rows removed)
+	// already short-circuited above so we never see a no-op delete here.
+	h.emitAuditEvent(teamID, userID, models.AuditKindVaultWrite, env, key, "delete")
+
 	return c.SendStatus(fiber.StatusNoContent)
 }
