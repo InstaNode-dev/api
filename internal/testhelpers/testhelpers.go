@@ -660,6 +660,11 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 
 	// Phase 6: deploy
 	deployH := handlers.NewDeployHandler(db, rdb, cfg, planReg)
+	// Wave FIX-I — wire the noop email client so the two-step deletion
+	// branch is exercised in tests. The noop provider records the
+	// SendDeletionConfirmation call without an HTTP roundtrip, so the
+	// handler returns 202 with the pending_deletions row in place.
+	deployH.SetEmailClient(email.NewNoop())
 	deployGroup := app.Group("/deploy", middleware.RequireAuth(cfg))
 	deployGroup.Post("/new", middleware.Idempotency(rdb, "deploy.new"), deployH.New)
 	deployGroup.Get("/:id", deployH.Get)
@@ -724,6 +729,9 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	api.Get("/deployments/:id", deployH.Get)
 	api.Delete("/deployments/:id", deployH.Delete)
 	api.Patch("/deployments/:id", deployH.Patch)
+	// Wave FIX-I — two-step email-confirmed deletion endpoints.
+	api.Post("/deployments/:id/confirm-deletion", deployH.ConfirmDelete)
+	api.Delete("/deployments/:id/confirm-deletion", deployH.CancelDelete)
 
 	// GitHub auto-deploy (migration 035) — wired into the test app so the
 	// happy-path / idempotency / signature-mismatch tests in

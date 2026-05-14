@@ -30,8 +30,10 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"instant.dev/internal/config"
+	"instant.dev/internal/email"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/urls"
 	"instant.dev/internal/models"
@@ -63,6 +65,11 @@ type DeployHandler struct {
 	cfg          *config.Config
 	compute      compute.Provider
 	planRegistry *plans.Registry
+	// emailClient is wired by SetEmailClient so router construction can
+	// share the singleton with auth / billing / onboarding handlers.
+	// Left nil = email-confirmed deletion falls back to immediate
+	// destruction (back-compat for pre-FIX-I deploys + local dev).
+	emailClient *email.Client
 }
 
 // NewDeployHandler initialises the handler and selects the compute backend based on
@@ -85,6 +92,15 @@ func NewDeployHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, planReg
 		cp = noop.New()
 	}
 	return &DeployHandler{db: db, rdb: rdb, cfg: cfg, compute: cp, planRegistry: planRegistry}
+}
+
+// SetEmailClient wires the email client used by the two-step deletion
+// flow. Separate setter (rather than a constructor arg) to keep the
+// NewDeployHandler signature stable — every existing test would have
+// otherwise needed updating with a noop email client. Router calls this
+// after construction with the shared singleton.
+func (h *DeployHandler) SetEmailClient(c *email.Client) {
+	h.emailClient = c
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -717,7 +733,15 @@ func (h *DeployHandler) UpdateEnv(c *fiber.Ctx) error {
 // ── DELETE /deploy/:id ────────────────────────────────────────────────────────
 
 // Delete handles DELETE /deploy/:id.
-// Calls Teardown on the compute provider (best-effort), then hard-deletes the DB row.
+//
+// Wave FIX-I flow:
+//   - Paid tier (hobby/pro/team/growth) AND email client wired AND
+//     X-Skip-Email-Confirmation header NOT set → queue a pending_deletions
+//     row, email the owner, return 202 with `deletion_status:
+//     "pending_confirmation"`. Quota stays consumed until confirmed.
+//   - Anonymous / free tier, OR header bypass, OR no email client →
+//     immediate destruction (back-compat path below). Calls Teardown on
+//     the compute provider (best-effort), then hard-deletes the DB row.
 func (h *DeployHandler) Delete(c *fiber.Ctx) error {
 	team, err := h.requireTeam(c)
 	if err != nil {
@@ -740,6 +764,31 @@ func (h *DeployHandler) Delete(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
 	}
 
+	// Two-step deletion gate. Three conditions must hold to enter:
+	// paid tier, email client wired, header not bypassed. Otherwise
+	// fall through to immediate destruction (current behaviour).
+	if teamIsPaid(team) && h.emailClient != nil && !shouldSkipEmailConfirmation(c) {
+		deps := requestDeletionDeps{
+			DB:               h.db,
+			Email:            h.emailClient,
+			APIPublicURL:     h.cfg.APIPublicURL,
+			DashboardBaseURL: h.cfg.DashboardBaseURL,
+			TTLMinutes:       h.cfg.DeletionConfirmationTTLMinutes,
+		}
+		return requestEmailConfirmedDeletion(c, deps, team, d.ID,
+			models.PendingDeletionResourceDeploy,
+			"deployment "+appID)
+	}
+
+	// Immediate-destruction path (anonymous/free, or explicit header
+	// bypass). Same shape as pre-FIX-I.
+	return h.doImmediateDelete(c, d, appID, team.ID)
+}
+
+// doImmediateDelete is the back-compat synchronous destruction path.
+// Extracted to a method so the two-step confirmation flow can call into
+// the same teardown logic without duplicating the audit + log lines.
+func (h *DeployHandler) doImmediateDelete(c *fiber.Ctx, d *models.Deployment, appID string, teamID uuid.UUID) error {
 	// Teardown compute resources (best-effort — don't block delete on provider errors).
 	if d.ProviderID != "" {
 		if teardownErr := h.compute.Teardown(c.Context(), d.ProviderID); teardownErr != nil {
@@ -758,13 +807,90 @@ func (h *DeployHandler) Delete(c *fiber.Ctx) error {
 	}
 
 	slog.Info("deploy.deleted",
-		"app_id", appID, "team_id", team.ID,
+		"app_id", appID, "team_id", teamID,
 		"request_id", middleware.GetRequestID(c))
 
 	return c.JSON(fiber.Map{
 		"ok":      true,
 		"message": "Deployment deleted",
 	})
+}
+
+// ConfirmDelete handles POST /api/v1/deployments/:id/confirm-deletion?token=<tok>.
+// Step 2 of the email-confirmed flow — see deletion_confirm.go for the
+// shared resolver. The token validation gates on hash + 'pending'
+// status + future expires_at; a winning CAS flips the row and runs the
+// actual deprovision.
+func (h *DeployHandler) ConfirmDelete(c *fiber.Ctx) error {
+	team, err := h.requireTeam(c)
+	if err != nil {
+		return err
+	}
+
+	if h.emailClient == nil {
+		return respondError(c, fiber.StatusServiceUnavailable,
+			"deletion_email_disabled",
+			"Email confirmation is not enabled on this deployment")
+	}
+
+	deps := requestDeletionDeps{
+		DB:               h.db,
+		Email:            h.emailClient,
+		APIPublicURL:     h.cfg.APIPublicURL,
+		DashboardBaseURL: h.cfg.DashboardBaseURL,
+		TTLMinutes:       h.cfg.DeletionConfirmationTTLMinutes,
+	}
+
+	token := c.Query("token")
+	// Per the contract, the deprovision callback receives the pending
+	// row — we look up the deployment, call Teardown best-effort, then
+	// hard-delete the DB row.
+	deprovisionFn := func(ctx context.Context, p *models.PendingDeletion) error {
+		d, derr := models.GetDeploymentByID(ctx, h.db, p.ResourceID)
+		if derr != nil {
+			return fmt.Errorf("confirm-delete: lookup deployment: %w", derr)
+		}
+		if d.ProviderID != "" {
+			if teardownErr := h.compute.Teardown(ctx, d.ProviderID); teardownErr != nil {
+				slog.Warn("deploy.confirm_delete.teardown_failed",
+					"app_id", d.AppID, "provider_id", d.ProviderID, "error", teardownErr)
+			}
+		}
+		return models.DeleteDeployment(ctx, h.db, d.ID)
+	}
+
+	return resolveEmailConfirmedDeletion(c, deps, team, token, deprovisionFn)
+}
+
+// CancelDelete handles DELETE /api/v1/deployments/:id/confirm-deletion.
+// Cancels a pending row without requiring the plaintext token —
+// the caller is authenticated against the team and owns the resource.
+func (h *DeployHandler) CancelDelete(c *fiber.Ctx) error {
+	team, err := h.requireTeam(c)
+	if err != nil {
+		return err
+	}
+
+	appID := c.Params("id")
+	d, err := models.GetDeploymentByAppID(c.Context(), h.db, appID)
+	if err != nil {
+		var notFound *models.ErrDeploymentNotFound
+		if errors.As(err, &notFound) {
+			return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
+		}
+		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch deployment")
+	}
+	if d.TeamID != team.ID {
+		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this deployment")
+	}
+
+	deps := requestDeletionDeps{
+		DB:               h.db,
+		APIPublicURL:     h.cfg.APIPublicURL,
+		DashboardBaseURL: h.cfg.DashboardBaseURL,
+		TTLMinutes:       h.cfg.DeletionConfirmationTTLMinutes,
+	}
+	return cancelEmailConfirmedDeletion(c, deps, team, d.ID, models.PendingDeletionResourceDeploy)
 }
 
 // ── POST /deploy/:id/redeploy ─────────────────────────────────────────────────
