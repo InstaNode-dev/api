@@ -858,6 +858,152 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/resources/{id}/backup": {
+      "post": {
+        "summary": "Trigger an ad-hoc Postgres backup",
+        "description": "Queues a manual backup of the referenced postgres resource. Tier-gated: anonymous/free callers get 402 + agent_action telling them to claim and upgrade; hobby callers are capped at 1 manual backup per UTC day (Redis-backed counter manual_backup:<team_id>:<YYYY-MM-DD>); pro/growth get 100/day; team gets 1000/day. Only postgres resources are supported today — other types return 400 unsupported_resource_type. The API inserts a pending row in resource_backups and returns immediately; the worker picks it up within 30s, runs pg_dump → S3, and writes the terminal status, size_bytes, and s3_key. Poll GET /api/v1/resources/{id}/backups to watch the row transition pending → running → ok|failed. Audit event: backup.requested with metadata {resource_id, triggered_by, backup_kind}. Retention follows plans.yaml.backup_retention_days (hobby=7, pro/growth=30, team=90). Hobby cannot restore from these — see /restore.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" }, "description": "Resource token UUID — must be a postgres resource owned by the authenticated team." }],
+        "responses": {
+          "200": { "description": "Backup queued", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "backup_id": { "type": "string", "format": "uuid" }, "status": { "type": "string", "enum": ["pending"] }, "started_at": { "type": "string", "format": "date-time" }, "message": { "type": "string" } } } } } },
+          "400": { "description": "invalid_id (resource UUID malformed) or unsupported_resource_type (resource is not postgres)" },
+          "401": { "description": "Unauthorized — session token required" },
+          "402": { "description": "upgrade_required — anonymous/free tier cannot back up; response carries agent_action + upgrade_url", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "403": { "description": "Forbidden — caller doesn't own the resource" },
+          "404": { "description": "not_found — resource doesn't exist" },
+          "429": { "description": "rate_limited — team has hit its manual_backups_per_day cap for the current UTC day; response carries agent_action pointing at the Pro upgrade", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "503": { "description": "backup_create_failed — transient DB error; retry with backoff" }
+        }
+      }
+    },
+    "/api/v1/resources/{id}/backups": {
+      "get": {
+        "summary": "List backups for a resource",
+        "description": "Returns the team's backups for this resource, newest first. Cursor-style pagination via ?before=<RFC3339> — pass the oldest row's created_at to fetch the next page. ?limit caps at 200 (default 50). Each item carries status (pending|running|ok|failed), backup_kind (scheduled|manual), tier_at_backup (the tier in effect when the backup was taken, used by the retention prune job in the worker), size_bytes (NULL until the worker writes the terminal row), and error_summary (only set on failed). 403 on cross-team access. No tier gate on read — even hobby callers can list to verify backups exist, which is part of the Pro-upgrade trust path.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }, "description": "Max rows to return. Capped at 200." },
+          { "name": "before", "in": "query", "schema": { "type": "string", "format": "date-time" }, "description": "Cursor — only rows with created_at < before are returned. Pass the oldest item's created_at to paginate backwards." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Backup list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok":    { "type": "boolean" },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "backup_id":      { "type": "string", "format": "uuid" },
+                          "status":         { "type": "string", "enum": ["pending","running","ok","failed"] },
+                          "backup_kind":    { "type": "string", "enum": ["scheduled","manual"] },
+                          "started_at":     { "type": "string", "format": "date-time" },
+                          "finished_at":    { "type": "string", "format": "date-time", "nullable": true },
+                          "size_bytes":     { "type": "integer", "nullable": true, "description": "Size of the pg_dump artifact in bytes. NULL until the worker writes the terminal row." },
+                          "tier_at_backup": { "type": "string", "nullable": true, "description": "Snapshot of team.plan_tier when the backup was taken. Used by the retention prune job — a backup taken on Pro stays for 30 days even after the team downgrades." },
+                          "error_summary":  { "type": "string", "nullable": true, "description": "Short human-readable failure reason. Only set when status='failed'." },
+                          "created_at":     { "type": "string", "format": "date-time" }
+                        }
+                      }
+                    },
+                    "total": { "type": "integer", "description": "Total backups for this resource (not just the current page). Used by the dashboard to render pagination affordances." }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "invalid_id or invalid_cursor (?before is not RFC3339)" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Forbidden — caller doesn't own the resource" },
+          "404": { "description": "not_found — resource doesn't exist" }
+        }
+      }
+    },
+    "/api/v1/resources/{id}/restore": {
+      "post": {
+        "summary": "Restore a Postgres resource from a backup (Pro+)",
+        "description": "Queues a restore from a previously-completed backup. Tier-gated to Pro/Growth/Team via plans.yaml.backup_restore_enabled — hobby/free callers get 402 + agent_action telling them to upgrade ('Pro can restore, Hobby cannot' is the wedge). backup_id must (a) exist, (b) belong to the same resource named in the URL, (c) be in status='ok'. Mismatches return 400/404/409 with distinct error codes so a dashboard can show the right copy. The API writes a pending row in resource_restores; the worker picks it up within 30s and runs pg_restore from S3. Audit event: restore.requested with metadata {resource_id, backup_id, triggered_by} — distinct from backup.requested so a Loops subscriber can filter to 'user clicked Restore' (a high-signal event). The DB column resource_restores.triggered_by is NOT NULL; PAT-only sessions without a user identity get 401.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" }, "description": "Resource token UUID — target of the restore. Must be owned by the authenticated team." }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["backup_id"],
+                "properties": {
+                  "backup_id": { "type": "string", "format": "uuid", "description": "Id of the resource_backups row to restore from. Must be in status='ok' and belong to the same resource as the URL :id." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Restore queued", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "restore_id": { "type": "string", "format": "uuid" }, "status": { "type": "string", "enum": ["pending"] }, "started_at": { "type": "string", "format": "date-time" }, "message": { "type": "string" } } } } } },
+          "400": { "description": "invalid_id, invalid_body, missing_backup_id, invalid_backup_id, or backup_resource_mismatch (backup_id belongs to a different resource than the one in the URL)" },
+          "401": { "description": "Unauthorized — session token required AND must carry a user identity (PAT-only sessions are rejected)" },
+          "402": { "description": "upgrade_required — restore is Pro+. Response carries agent_action + upgrade_url to https://instanode.dev/pricing.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "403": { "description": "Forbidden — caller doesn't own the resource" },
+          "404": { "description": "not_found (resource doesn't exist) OR backup_not_found (backup_id doesn't exist)" },
+          "409": { "description": "backup_not_ready — backup_id is in status pending/running/failed and cannot be restored from. Response carries agent_action telling the user to wait or pick another backup.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "503": { "description": "restore_create_failed or backup_lookup_failed — transient DB error; retry" }
+        }
+      }
+    },
+    "/api/v1/resources/{id}/restores": {
+      "get": {
+        "summary": "List restore attempts for a resource",
+        "description": "Same shape and pagination as /backups. Items carry status (pending|running|ok|failed), backup_id (the source backup), and error_summary (only on failed). No tier gate — visible to every tier so the dashboard can show 'restore in progress / restore complete' state even on tiers that can't initiate new restores. 403 on cross-team access.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 } },
+          { "name": "before", "in": "query", "schema": { "type": "string", "format": "date-time" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Restore list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok":    { "type": "boolean" },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "restore_id":    { "type": "string", "format": "uuid" },
+                          "backup_id":     { "type": "string", "format": "uuid", "description": "Source backup the restore was taken from." },
+                          "status":        { "type": "string", "enum": ["pending","running","ok","failed"] },
+                          "started_at":    { "type": "string", "format": "date-time" },
+                          "finished_at":   { "type": "string", "format": "date-time", "nullable": true },
+                          "error_summary": { "type": "string", "nullable": true },
+                          "created_at":    { "type": "string", "format": "date-time" }
+                        }
+                      }
+                    },
+                    "total": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "invalid_id or invalid_cursor" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Forbidden — caller doesn't own the resource" },
+          "404": { "description": "not_found" }
+        }
+      }
+    },
     "/api/v1/webhooks/{token}/requests": {
       "get": {
         "summary": "List received webhook payloads",
