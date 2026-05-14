@@ -32,7 +32,7 @@ func billingTestAppWithRealDB(t *testing.T) (*fiber.App, func()) {
 		JWTSecret:             "test-secret-that-is-at-least-32-bytes-long!!",
 		RazorpayWebhookSecret: testWebhookSecret,
 	}
-	emailClient := email.New("")
+	emailClient := email.NewNoop()
 	billing := handlers.NewBillingHandler(db, cfg, emailClient)
 
 	app := fiber.New()
