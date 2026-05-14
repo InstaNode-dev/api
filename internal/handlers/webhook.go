@@ -20,11 +20,16 @@ package handlers
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/textproto"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -45,7 +50,61 @@ const (
 
 	// webhookAuthTTL is the Redis TTL for authenticated webhook payloads.
 	webhookAuthTTL = 7 * 24 * time.Hour
+
+	// webhookMaxBodyBytes is the hard ceiling on stored body size for
+	// /webhook/receive/:token. Set explicitly so the receiver enforces
+	// 1 MiB even when the ambient Fiber config or ingress raises it.
+	// Bodies larger than this return 413 payload_too_large.
+	//
+	// Reconciles BugBash Q30: ingress allowed 100MB, docs claimed 1MB,
+	// Fiber default was 4MB — the actual stored cap was effectively
+	// "whatever made it through ingress minus our slice." Now uniform.
+	webhookMaxBodyBytes = 1 << 20
+
+	// webhookRedactedValue is what every sensitive header value is
+	// rewritten to before storage. Keeping the KEY visible lets a debugging
+	// agent see "yes an Authorization header WAS attached" without the
+	// secret itself reaching Redis or the GET /requests response.
+	webhookRedactedValue = "[REDACTED]"
+
+	// webhookHMACHeader is the header an HMAC-locked webhook expects.
+	// Standard "sha256=<hex>" GitHub-style value.
+	webhookHMACHeader = "X-Hub-Signature-256"
+
+	// webhookRotationHeader is set on the receive response when the
+	// 101st (i.e. cap+1) payload arrived and the ring buffer evicted
+	// the oldest entry. Real webhook senders (Stripe, GitHub, Twilio)
+	// ignore extra response headers, but a human or AI agent watching
+	// the receiver during development sees rotation explicitly instead
+	// of silently losing the earliest payload.
+	webhookRotationHeader = "X-Webhook-Rotated"
+
+	// webhookIdempotencyHeader is the per-receive idempotency key.
+	// Distinct from the generic Idempotency middleware's header because
+	// the receive path is signed by senders like Stripe that already
+	// emit their own X-Idempotency-Key for retries — we honour theirs
+	// directly instead of forcing them to pick a different name.
+	webhookIdempotencyHeader = "X-Idempotency-Key"
 )
+
+// sensitiveHeaders names the lower-case header keys whose values must be
+// rewritten to [REDACTED] before the captured request is persisted. Keys
+// are kept in canonical (textproto.CanonicalMIMEHeaderKey) form so the
+// match is case-insensitive against caller input. This denylist is the
+// fix for BugBash #119 / #S7 — every value in this set was previously
+// stored verbatim in Redis and returned by GET /api/v1/webhooks/:token/requests,
+// so anyone holding the receive URL could exfiltrate the sender's
+// credentials. The key is preserved (only the value is overwritten) so a
+// developer debugging "did my sender attach Authorization?" still sees
+// the answer.
+var sensitiveHeaders = map[string]bool{
+	"Authorization":       true,
+	"Proxy-Authorization": true,
+	"Cookie":              true,
+	"Set-Cookie":          true,
+	"X-Api-Key":           true,
+	"X-Auth-Token":        true,
+}
 
 // webhookMaxStored returns the request cap for a given tier from plans.yaml.
 // Returns 100 as a safe floor when the Registry returns 0 or a negative value
@@ -343,8 +402,34 @@ func (h *WebhookHandler) newWebhookAuthenticated(
 	})
 }
 
-// Receive handles POST /webhook/receive/:token — stores the incoming request in Redis.
-// This endpoint requires no authentication.
+// Receive handles ANY HTTP method against /webhook/receive/:token — stores
+// the incoming request in Redis. This endpoint requires no platform
+// authentication; the resource token in the URL is itself the address.
+//
+// Registered with app.All so verification-challenge flows (Slack URL
+// verify uses GET, some senders use PUT/DELETE) reach the handler instead
+// of bouncing off a 405 (BugBash #Q29).
+//
+// Security posture (BugBash Wave FIX-C):
+//   - Sensitive header values are rewritten to [REDACTED] before storage
+//     so GET /api/v1/webhooks/:token/requests cannot leak the sender's
+//     Authorization / Cookie / API key (#119 / #S7).
+//   - Optional HMAC verification (X-Hub-Signature-256) when the resource
+//     has a non-NULL hmac_secret. Unset secret = back-compat open
+//     receiver (existing tokens keep working).
+//   - Body size capped at webhookMaxBodyBytes (1 MiB) explicitly; over
+//     limit returns 413 instead of silently truncating (#Q30).
+//   - Query string captured (RFC 3986: everything after '?', excluding
+//     fragment) so flows that encode shop/event ids in the URL no longer
+//     lose that signal (#123 / #Q33).
+//   - All duplicate headers preserved (map[string][]string) instead of
+//     collapsing to the last value (#Q32).
+//   - X-Idempotency-Key honoured: replays return the cached request
+//     payload without writing a new ring-buffer entry (#Q28).
+//   - X-Webhook-Rotated header emitted on the response when this payload
+//     evicted the oldest stored request (#Q34).
+//   - Per-request Redis Set/Get write removed — was a dead write never
+//     read by ListRequests (#Q31).
 func (h *WebhookHandler) Receive(c *fiber.Ctx) error {
 	if !h.cfg.IsServiceEnabled("webhook") {
 		return respondError(c, fiber.StatusServiceUnavailable, "service_disabled",
@@ -376,19 +461,64 @@ func (h *WebhookHandler) Receive(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusGone, "webhook_inactive", "This webhook token is no longer active")
 	}
 
-	// Read the body using Fiber's buffered accessor (safe after middleware).
-	const maxBodyBytes = 1 << 20 // 1 MB
+	// ── Body size enforcement ───────────────────────────────────────────────
+	// c.Body() returns the buffered body from fasthttp. We check length BEFORE
+	// reading further so a 1.5MiB body is rejected with 413 instead of being
+	// silently truncated (BugBash #Q30: ingress allows 100MB, fiber default
+	// allowed 4MB, docs claimed 1MB — none of those agreed with reality).
 	rawBody := c.Body()
-	if len(rawBody) > maxBodyBytes {
-		rawBody = rawBody[:maxBodyBytes]
+	if len(rawBody) > webhookMaxBodyBytes {
+		return respondError(c, fiber.StatusRequestEntityTooLarge, "payload_too_large",
+			fmt.Sprintf("Webhook payload exceeds the %d byte limit", webhookMaxBodyBytes))
 	}
 
-	// Collect headers, excluding sensitive ones.
-	headers := make(map[string]string)
-	c.Request().Header.VisitAll(func(key, value []byte) {
-		k := string(key)
-		headers[k] = string(value)
-	})
+	// ── Optional HMAC verification (BugBash #122) ──────────────────────────
+	// When the resource has a non-NULL hmac_secret, every incoming request
+	// MUST carry an X-Hub-Signature-256 header whose hex digest matches
+	// HMAC-SHA256(secret, body). NULL secret = back-compat (every existing
+	// token keeps working without re-provisioning).
+	hmacSecret, hmacErr := models.GetWebhookHMACSecret(ctx, h.db, resource.ID)
+	if hmacErr != nil {
+		slog.Error("webhook.receive.hmac_lookup_failed",
+			"error", hmacErr, "token", tokenStr, "request_id", requestID)
+		// Fail open on lookup errors — the column may not exist yet on a
+		// stale schema, and blocking a real webhook because we couldn't
+		// SELECT the secret column is the wrong default.
+		hmacSecret = ""
+	}
+	if hmacSecret != "" {
+		sig := c.Get(webhookHMACHeader)
+		if !verifyWebhookHMAC(hmacSecret, rawBody, sig) {
+			slog.Warn("webhook.receive.hmac_mismatch",
+				"token", tokenStr,
+				"has_signature", sig != "",
+				"request_id", requestID,
+			)
+			metrics.RedisErrors.WithLabelValues("webhook_hmac_mismatch").Inc()
+			return respondError(c, fiber.StatusUnauthorized, "invalid_signature",
+				"Webhook signature does not match the configured HMAC secret")
+		}
+	}
+
+	// ── Idempotency replay (BugBash #Q28) ──────────────────────────────────
+	// If the caller sent X-Idempotency-Key, dedup on (token, key). A cached
+	// response is returned verbatim — we never write a second ring-buffer
+	// entry for the same (token, key) tuple within the TTL. Redis errors
+	// fail open — an outage must not block the sender.
+	idemKey := strings.TrimSpace(c.Get(webhookIdempotencyHeader))
+	if idemKey != "" {
+		if cached, ok := h.lookupIdempotentReceive(ctx, tokenStr, idemKey); ok {
+			return c.JSON(cached)
+		}
+	}
+
+	// ── Capture request envelope ───────────────────────────────────────────
+	// Build a method/path/query/headers/body record. Headers map to
+	// []string so a sender that sends two of the same key (e.g.
+	// two `Set-Cookie` headers, or `Forwarded` chained through a proxy)
+	// no longer collapses to "the last one wins" (BugBash #Q32).
+	headers := captureHeaders(c)
+	queryString := string(c.Request().URI().QueryString())
 
 	reqID := uuid.New().String()
 	receivedAt := time.Now().UTC()
@@ -396,6 +526,8 @@ func (h *WebhookHandler) Receive(c *fiber.Ctx) error {
 	payload := map[string]any{
 		"id":          reqID,
 		"method":      string(c.Request().Header.Method()),
+		"path":        string(c.Request().URI().Path()),
+		"query":       queryString,
 		"headers":     headers,
 		"body":        string(rawBody),
 		"received_at": receivedAt.Format(time.RFC3339),
@@ -417,18 +549,23 @@ func (h *WebhookHandler) Receive(c *fiber.Ctx) error {
 		ttl = webhookAuthTTL
 	}
 
-	// Store the individual payload with a TTL.
-	redisKey := webhookRedisKey(tokenStr, reqID)
 	listKey := webhookListKey(tokenStr)
+	maxStored := h.webhookMaxStored(resource.Tier)
+
+	// Snapshot the pre-push length so we can detect ring-buffer rotation
+	// (BugBash #Q34). LPush then LLen would race against concurrent
+	// receives, but the length check is best-effort observability —
+	// occasional miscounts here just mean a rotation event is missed in
+	// the response header, not a correctness bug.
+	preLen, lenErr := h.rdb.LLen(ctx, listKey).Result()
+	if lenErr != nil {
+		preLen = -1 // unknown
+	}
 
 	pipe := h.rdb.Pipeline()
-	pipe.Set(ctx, redisKey, payloadBytes, ttl)
-	// Push to the list and cap at the tier's limit.
-	maxStored := h.webhookMaxStored(resource.Tier)
 	pipe.LPush(ctx, listKey, string(payloadBytes))
 	pipe.LTrim(ctx, listKey, 0, maxStored-1)
 	pipe.Expire(ctx, listKey, ttl)
-
 	if _, pipeErr := pipe.Exec(ctx); pipeErr != nil {
 		slog.Error("webhook.receive.redis_store_failed",
 			"error", pipeErr, "token", tokenStr, "request_id", requestID)
@@ -436,16 +573,116 @@ func (h *WebhookHandler) Receive(c *fiber.Ctx) error {
 		// Fail open — don't block the sender even if Redis is down.
 	}
 
+	// Cache the response for idempotency replay (best-effort).
+	respPayload := fiber.Map{"ok": true, "id": reqID}
+	if idemKey != "" {
+		h.storeIdempotentReceive(ctx, tokenStr, idemKey, respPayload, ttl)
+	}
+
+	// Set rotation header when this push evicted an entry. Pre-len == cap
+	// means LPush + LTrim dropped one off the tail. Bump the metric so NR
+	// can chart "tokens hitting their ring-buffer cap" — typically signals
+	// the user needs to upgrade.
+	if preLen >= 0 && preLen >= maxStored {
+		c.Set(webhookRotationHeader, tokenStr)
+		slog.Info("webhook.receive.rotation",
+			"token", tokenStr,
+			"tier", resource.Tier,
+			"max_stored", maxStored,
+			"request_id", requestID,
+		)
+		metrics.RedisErrors.WithLabelValues("webhook_rotation").Inc()
+	}
+
 	slog.Info("webhook.receive.stored",
 		"token", tokenStr,
 		"request_id", reqID,
+		"method", string(c.Request().Header.Method()),
 		"tier", resource.Tier,
 	)
 
-	return c.JSON(fiber.Map{
-		"ok": true,
-		"id": reqID,
+	return c.JSON(respPayload)
+}
+
+// captureHeaders reads every header from the incoming request, redacts
+// sensitive values, and groups duplicate keys. Returns map[string][]string
+// so a payload that arrived with two `Set-Cookie` headers preserves both
+// (BugBash #Q32). Sensitive header values (Authorization, Cookie, ...) are
+// rewritten to [REDACTED] — the key stays so an agent can see "yes a
+// credential WAS attached" without the actual secret reaching storage.
+func captureHeaders(c *fiber.Ctx) map[string][]string {
+	headers := make(map[string][]string)
+	c.Request().Header.VisitAll(func(key, value []byte) {
+		canon := textproto.CanonicalMIMEHeaderKey(string(key))
+		v := string(value)
+		if sensitiveHeaders[canon] {
+			v = webhookRedactedValue
+		}
+		headers[canon] = append(headers[canon], v)
 	})
+	return headers
+}
+
+// verifyWebhookHMAC constant-time-compares the expected HMAC-SHA256(body)
+// against the X-Hub-Signature-256 header. Header format is
+// "sha256=<hex>" (GitHub convention). Returns false if the header is
+// missing, malformed, or its digest does not match.
+func verifyWebhookHMAC(secret string, body []byte, header string) bool {
+	if header == "" {
+		return false
+	}
+	const prefix = "sha256="
+	if !strings.HasPrefix(header, prefix) {
+		return false
+	}
+	got, decErr := hex.DecodeString(strings.TrimPrefix(header, prefix))
+	if decErr != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	want := mac.Sum(nil)
+	return hmac.Equal(got, want)
+}
+
+// webhookIdempotencyKey returns the Redis key used to cache a previous
+// receive response for replay. Scoped per (token, raw-idempotency-key)
+// so the same key sent to two different webhook tokens cannot collide.
+// The raw key is hashed so an attacker that compromises Redis cannot
+// reverse keys back to whatever opaque value the sender chose.
+func webhookIdempotencyKey(token, key string) string {
+	h := sha256.Sum256([]byte(key))
+	return fmt.Sprintf("wh:idem:%s:%s", token, hex.EncodeToString(h[:]))
+}
+
+// lookupIdempotentReceive checks for a cached response from a previous
+// receive with the same idempotency key. Fail-open on Redis errors
+// (treat as a miss) — an outage must not block real webhook traffic.
+func (h *WebhookHandler) lookupIdempotentReceive(ctx context.Context, token, key string) (fiber.Map, bool) {
+	raw, err := h.rdb.Get(ctx, webhookIdempotencyKey(token, key)).Result()
+	if err != nil {
+		return nil, false
+	}
+	var cached fiber.Map
+	if jsonErr := json.Unmarshal([]byte(raw), &cached); jsonErr != nil {
+		return nil, false
+	}
+	return cached, true
+}
+
+// storeIdempotentReceive persists the receive response so a retry with
+// the same X-Idempotency-Key replays instead of writing a fresh entry.
+// TTL matches the resource's stored-payload TTL — when the body it
+// refers to ages out, the idempotency cache ages out too, so an old
+// key cannot replay against a now-empty ring buffer.
+func (h *WebhookHandler) storeIdempotentReceive(ctx context.Context, token, key string, resp fiber.Map, ttl time.Duration) {
+	payload, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	if setErr := h.rdb.Set(ctx, webhookIdempotencyKey(token, key), payload, ttl).Err(); setErr != nil {
+		metrics.RedisErrors.WithLabelValues("webhook_idem_store").Inc()
+	}
 }
 
 // ListRequests handles GET /api/v1/webhooks/:token/requests.

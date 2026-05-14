@@ -148,11 +148,19 @@ const openAPISpec = `{
     "/webhook/receive/{token}": {
       "post": {
         "summary": "Receive a webhook payload",
-        "description": "Accepts any HTTP method. Stores headers + body in Redis with a 24h TTL. Returns the stored request ID.",
-        "parameters": [{ "name": "token", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "description": "Accepts ANY HTTP method (GET/POST/PUT/DELETE) so verification-challenge flows like Slack URL verify reach the handler. Stores method, path, query string, all duplicate headers (sensitive ones — Authorization, Cookie, X-Api-Key, X-Auth-Token, Proxy-Authorization, Set-Cookie — are redacted to '[REDACTED]'), and the raw body (capped at 1 MiB) in Redis with a tier-based TTL. The ring buffer per token is capped at the tier's webhook_requests_stored limit; the 101st payload evicts the oldest and sets response header X-Webhook-Rotated: <token>. If the resource has an HMAC secret set, every request must carry a valid X-Hub-Signature-256 header (sha256=<hex of HMAC-SHA256(secret, body)>) or returns 401. Senders may pass X-Idempotency-Key for safe retries — the same key replays the original response without writing a duplicate entry.",
+        "parameters": [
+          { "name": "token", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "X-Hub-Signature-256", "in": "header", "required": false, "schema": { "type": "string" }, "description": "sha256=<hex> — required only when the webhook resource has hmac_secret configured." },
+          { "name": "X-Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string" }, "description": "Opaque key (e.g. from Stripe's Idempotency-Key); two requests with the same key replay the original response." }
+        ],
         "requestBody": { "content": { "application/json": {}, "application/x-www-form-urlencoded": {}, "text/plain": {} } },
         "responses": {
-          "200": { "description": "Payload stored", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string" } } } } } }
+          "200": { "description": "Payload stored", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string" } } } } } },
+          "401": { "description": "HMAC signature missing or invalid (when hmac_secret is set on the resource).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "404": { "description": "Token not found.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "410": { "description": "Token exists but resource status != 'active'.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "413": { "description": "Request body exceeds the 1 MiB cap.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
