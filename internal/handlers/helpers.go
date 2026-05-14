@@ -6,7 +6,25 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"instant.dev/internal/circuit"
+	"instant.dev/internal/middleware"
 )
+
+// init wires the Idempotency middleware's ErrResponseWritten check.
+//
+// BB2-D5 (2026-05-14): the middleware needs to recognise the sentinel
+// respondError* returns so it can CACHE the 4xx response body it just
+// wrote (e.g. 402 quota_exceeded) instead of bailing as if a plumbing
+// error had aborted the request. We register via init() instead of a
+// direct import in middleware because handlers already imports middleware
+// (webhook.go, deploy.go, etc.) — a back-edge would deadlock the package
+// graph at compile time. The Idempotency middleware's default is a
+// no-op false-returner, so test packages that don't import handlers
+// keep the pre-fix behaviour.
+func init() {
+	middleware.IsResponseWrittenErr = func(err error) bool {
+		return errors.Is(err, ErrResponseWritten)
+	}
+}
 
 // ErrResponseWritten is the sentinel respondError returns to signal "I
 // already wrote the response body — propagate me up but DO NOT let Fiber's
