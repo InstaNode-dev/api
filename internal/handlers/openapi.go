@@ -63,6 +63,19 @@ const openAPISpec = `{
         }
       }
     },
+    "/vector/new": {
+      "post": {
+        "summary": "Provision a pgvector-enabled Postgres database",
+        "description": "Returns a real postgres:// connection string with the pgvector extension pre-installed. Use for embedding stores (OpenAI ada-002 = 1536 dims, text-embedding-3-small = 1536, text-embedding-3-large = 3072). The optional dimensions field is a documentation hint — pgvector lets you pick per-column dimensions at table-create time, so the server stores the declared default but does not enforce it. Tier limits mirror Postgres exactly because the underlying storage IS Postgres. Anonymous tier: 10MB, 2 connections, 24h TTL.",
+        "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VectorProvisionRequest" } } } },
+        "responses": {
+          "201": { "description": "Vector database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VectorProvisionResponse" } } } },
+          "400": { "description": "Invalid dimensions (must be 1..16000) or invalid env.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      }
+    },
     "/cache/new": {
       "post": {
         "summary": "Provision a Redis cache",
@@ -1652,6 +1665,31 @@ const openAPISpec = `{
           "connection_url": { "type": "string", "description": "postgres:// connection string with pgvector pre-installed. Use this from external callers." },
           "internal_url": { "type": "string", "description": "Cluster-internal postgres:// URL routed via instant-pg-proxy. Use this when calling from a workload deployed inside the instanode cluster (e.g. an app started by /deploy/new) — the public hostname does not hairpin reliably." },
           "tier": { "type": "string" },
+          "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
+          "note": { "type": "string" }
+        }
+      },
+      "VectorProvisionRequest": {
+        "type": "object",
+        "description": "Request body for POST /vector/new. Identical to ProvisionRequest plus the optional dimensions hint.",
+        "properties": {
+          "name": { "type": "string", "description": "Optional human-readable label (max 120 chars)" },
+          "env": { "type": "string", "description": "Optional environment scope. Defaults to 'development'.", "default": "development" },
+          "parent_resource_id": { "type": "string", "format": "uuid", "description": "Optional family-link parent (authenticated callers only). See ProvisionRequest." },
+          "dimensions": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 1536, "description": "Default embedding dimension for documentation. pgvector lets you pick per-column dimensions at table-create time, so this is purely informational. Defaults to 1536 (OpenAI text-embedding-ada-002 / text-embedding-3-small). Use 3072 for text-embedding-3-large." }
+        }
+      },
+      "VectorProvisionResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "token": { "type": "string", "format": "uuid" },
+          "connection_url": { "type": "string", "description": "postgres:// connection string with the pgvector extension already installed (CREATE EXTENSION vector ran during provisioning). Use this from external callers." },
+          "internal_url": { "type": "string", "description": "Cluster-internal postgres:// URL routed via instant-pg-proxy. Use this when calling from a workload deployed inside the instanode cluster." },
+          "tier": { "type": "string" },
+          "env": { "type": "string" },
+          "extension": { "type": "string", "enum": ["pgvector"], "description": "Always 'pgvector' for /vector/new. Declared so clients can confirm the extension is present without querying pg_extension." },
+          "dimensions": { "type": "integer", "description": "Echo of the requested dimensions hint (defaults to 1536). Informational only — pgvector enforces dimensions per column, not per database." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "note": { "type": "string" }
         }

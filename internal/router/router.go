@@ -152,6 +152,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	teamMembersH := handlers.NewTeamMembersHandler(db, cfg, planRegistry, emailClient)
 	envPolicyH := handlers.NewEnvPolicyHandler(db)
 	dbH := handlers.NewDBHandler(db, rdb, cfg, provClient, planRegistry)
+	vectorH := handlers.NewVectorHandler(db, rdb, cfg, provClient, planRegistry)
 	cacheH := handlers.NewCacheHandler(db, rdb, cfg, provClient, planRegistry)
 	nosqlH := handlers.NewNoSQLHandler(db, rdb, cfg, provClient, planRegistry)
 	// twinH composes the three above so POST /api/v1/resources/:id/provision-twin
@@ -266,6 +267,10 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// internal/middleware/idempotency.go. See that file for the full
 	// rationale on the rate-budget vs quota-budget split.
 	app.Post("/db/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "db.new"), dbH.NewDB)
+	// /vector/new — pgvector-enabled Postgres. Same OptionalAuth +
+	// RequireWritable chain as /db/new so anonymous callers can wedge into
+	// the AI-app-builder flow and impersonated sessions still 403.
+	app.Post("/vector/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "vector.new"), vectorH.NewVector)
 	app.Post("/cache/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "cache.new"), cacheH.NewCache)
 	app.Post("/nosql/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "nosql.new"), nosqlH.NewNoSQL)
 	app.Post("/queue/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "queue.new"), queueH.NewQueue)
