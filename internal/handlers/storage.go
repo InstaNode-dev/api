@@ -92,8 +92,14 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
 	var body provisionRequestBody
-	_ = c.BodyParser(&body)
-	body.Name = sanitizeName(body.Name)
+	if err := parseProvisionBody(c, &body); err != nil {
+		return err
+	}
+	cleanName, sanErr := sanitizeNameForRequest(c, body.Name)
+	if sanErr != nil {
+		return sanErr
+	}
+	body.Name = cleanName
 
 	env, envErr := resolveEnv(c, body.Env)
 	if envErr != nil {
@@ -240,7 +246,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 		metrics.RedisErrors.WithLabelValues("recycle_mark").Inc()
 	}
 
-	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+	return respondCreated(c, fiber.Map{
 		"ok":                true,
 		"id":                resource.ID.String(),
 		"token":             tokenStr,
@@ -385,7 +391,7 @@ func (h *StorageHandler) newStorageAuthenticated(
 		}(resource.ID, creds.AccessKeyID)
 	}
 
-	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+	return respondCreated(c, fiber.Map{
 		"ok":                true,
 		"id":                resource.ID.String(),
 		"token":             resource.Token.String(),
