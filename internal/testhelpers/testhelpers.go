@@ -355,6 +355,14 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_promote_approvals_token ON promote_approvals(token) WHERE status = 'pending'`,
 		`CREATE INDEX IF NOT EXISTS idx_promote_approvals_pending_exec ON promote_approvals(status) WHERE status = 'approved' AND executed_at IS NULL`,
+		// 033_razorpay_webhook_events — replay protection for the Razorpay
+		// webhook handler. Mirror so handler tests can hit InsertOnConflict.
+		`CREATE TABLE IF NOT EXISTS razorpay_webhook_events (
+			event_id     TEXT PRIMARY KEY,
+			event_type   TEXT NOT NULL,
+			received_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_razorpay_webhook_events_received_at ON razorpay_webhook_events(received_at)`,
 	}
 
 	for _, s := range stmts {
