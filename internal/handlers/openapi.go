@@ -1392,6 +1392,56 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/resources/{id}/metrics": {
+      "get": {
+        "summary": "Per-resource time-series metrics (p50/p95/p99 latency, connections, storage, error rate)",
+        "description": "Returns aggregated metrics for the resource over the requested window. Default window is 1h; max window is tier-gated: hobby=1h, pro=24h, growth/team=7d. Anonymous/free callers get 402 upgrade_required — resource observability is a Pro+ differentiator. Buckets are fixed at 60s; samples_count = window_seconds / 60. The response carries data_source=stub while the W5-A heartbeat prober's per-probe row writer is unshipped — the API SHAPE matches the eventual real-data response so dashboard code does not change when the stub is replaced. Future swap-in is documented in resource_metrics.go (Option A: NerdGraph NRQL; Option C: server-side bucketing of resource_metrics rows).",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "window", "in": "query", "required": false, "schema": { "type": "string", "default": "1h", "example": "24h" }, "description": "Duration string (1h, 30m, 24h). Bare integers are interpreted as seconds (3600 == 1h). Capped per tier; over-cap returns 402 with agent_action naming the ceiling instead of silently clamping." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Metrics fetched",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok":                       { "type": "boolean" },
+                    "resource_id":              { "type": "string", "format": "uuid" },
+                    "resource_type":            { "type": "string", "description": "postgres | redis | mongodb | webhook | queue | storage" },
+                    "window_seconds":           { "type": "integer", "format": "int64", "description": "Resolved window in seconds (post-default, post-cap-rejection)." },
+                    "samples_count":            { "type": "integer", "description": "Equals window_seconds / sample_interval_seconds. Capped at 10080 (7d @ 1min)." },
+                    "sample_interval_seconds": { "type": "integer", "description": "Fixed at 60. Tier ceilings change window, not bucket width." },
+                    "metrics": {
+                      "type": "object",
+                      "description": "All arrays have length samples_count. Empty during the stub window means awaiting-first-probe-sample, not backend-down.",
+                      "properties": {
+                        "latency_p50_ms":     { "type": "array", "items": { "type": "number" } },
+                        "latency_p95_ms":     { "type": "array", "items": { "type": "number" } },
+                        "latency_p99_ms":     { "type": "array", "items": { "type": "number" } },
+                        "connections_active": { "type": "array", "items": { "type": "number" } },
+                        "storage_bytes":      { "type": "array", "items": { "type": "number" } },
+                        "error_rate_pct":     { "type": "array", "items": { "type": "number" } }
+                      }
+                    },
+                    "data_source": { "type": "string", "enum": ["stub", "newrelic", "resource_metrics"], "description": "stub while the W5-A prober is unshipped. resource_metrics once Option C lands, newrelic once Option A lands. Dashboard renders a yellow banner only on stub." }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "invalid_id — :id is not a valid UUID — OR invalid_window — window param unparseable, non-positive, or > 7d hard maximum" },
+          "401": { "description": "Unauthorized — session token required" },
+          "402": { "description": "upgrade_required — anonymous/free tier hit the wall OR ?window= exceeds tier cap. Body carries agent_action explaining the current ceiling (e.g. Hobby caps metrics windows at 1h; longer windows require Pro) + upgrade_url." },
+          "403": { "description": "Forbidden — caller's team doesn't own the resource" },
+          "404": { "description": "not_found — resource doesn't exist" },
+          "503": { "description": "fetch_failed — DB lookup failed (transient infra error)" }
+        }
+      }
+    },
     "/api/v1/resources/{id}/credentials": {
       "get": {
         "summary": "Read the decrypted connection_url for a resource",
