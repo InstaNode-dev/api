@@ -452,9 +452,13 @@ func (h *BackupHandler) ListRestores(c *fiber.Ctx) error {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// requireOwnedResource looks up the resource by token and 403's if the
+// requireOwnedResource looks up the resource by token and 404's if the
 // authenticated team does not own it. Writes the error response and returns
 // a non-nil error in every failure path so the caller can just early-return.
+//
+// 404 (not 403) on cross-team mismatch: returning 403 would confirm the
+// resource exists in another tenant. 404 keeps cross-team existence opaque,
+// matching GetCredentials/Get/Delete/RotateCredentials/Pause/Resume.
 func (h *BackupHandler) requireOwnedResource(ctx context.Context, c *fiber.Ctx, teamID uuid.UUID, token uuid.UUID, op string) (*models.Resource, error) {
 	requestID := middleware.GetRequestID(c)
 	resource, err := models.GetResourceByToken(ctx, h.db, token)
@@ -468,7 +472,7 @@ func (h *BackupHandler) requireOwnedResource(ctx context.Context, c *fiber.Ctx, 
 		return nil, respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch resource")
 	}
 	if !resource.TeamID.Valid || resource.TeamID.UUID != teamID {
-		return nil, respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this resource")
+		return nil, respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
 	}
 	return resource, nil
 }

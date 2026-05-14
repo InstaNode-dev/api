@@ -198,7 +198,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("cache.new.soft_delete_failed", "error", delErr, "resource_id", resource.ID)
 		}
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision Redis namespace")
+		return respondProvisionFailed(c, err, "Failed to provision Redis namespace")
 	}
 
 	// Persist the key_prefix so the dedup path can return the correct ACL namespace.
@@ -361,7 +361,7 @@ func (h *CacheHandler) newCacheAuthenticated(
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("cache.new.soft_delete_failed_auth", "error", delErr, "resource_id", resource.ID)
 		}
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision Redis namespace")
+		return respondProvisionFailed(c, err, "Failed to provision Redis namespace")
 	}
 
 	// Persist the key_prefix so the dedup path can return the correct ACL namespace.
@@ -468,7 +468,7 @@ func (h *CacheHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) 
 	ctx := c.UserContext()
 	res, err := h.ProvisionForTwinCore(ctx, in)
 	if err != nil {
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", err.Error())
+		return respondProvisionFailed(c, err, err.Error())
 	}
 
 	resp := fiber.Map{

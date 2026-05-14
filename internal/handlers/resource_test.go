@@ -70,9 +70,10 @@ func TestRotateCredentials_InvalidUUID_Returns400(t *testing.T) {
 	assert.Equal(t, "invalid_id", body["error"])
 }
 
-// TestRotateCredentials_WrongTeam_Returns403 verifies that a team that does not
-// own the resource gets 403 Forbidden.
-func TestRotateCredentials_WrongTeam_Returns403(t *testing.T) {
+// TestRotateCredentials_WrongTeam_Returns404 verifies that a team that does not
+// own the resource gets 404 (not 403) — cross-team access must not leak
+// existence of resources owned by other teams.
+func TestRotateCredentials_WrongTeam_Returns404(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -115,10 +116,10 @@ func TestRotateCredentials_WrongTeam_Returns403(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 	var body map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-	assert.Equal(t, "forbidden", body["error"])
+	assert.Equal(t, "not_found", body["error"])
 }
 
 // TestRotateCredentials_ResourceHasNoURL_Returns400 verifies that rotating credentials

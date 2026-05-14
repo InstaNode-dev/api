@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"instant.dev/internal/circuit"
 	"instant.dev/internal/config"
 	"instant.dev/internal/email"
 	"instant.dev/internal/metrics"
@@ -318,8 +319,23 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 		"notes":           notes,
 	}
 
-	sub, err := client.Subscription.Create(subBody, nil)
+	// Wrap the outbound Subscription.Create with the package-level
+	// Razorpay circuit breaker. When Razorpay is hosed, return 503
+	// billing_provider_unavailable instead of waiting on the HTTP
+	// timeout — agents see a clear "retry in 60s" signal.
+	sub, err := razorpaybilling.CallWithBreaker(func() (map[string]any, error) {
+		return client.Subscription.Create(subBody, nil)
+	})
 	if err != nil {
+		if errors.Is(err, circuit.ErrOpen) {
+			slog.Error("billing.checkout.razorpay_circuit_open",
+				"team_id", teamID,
+				"plan", plan,
+				"request_id", requestID,
+			)
+			return respondError(c, fiber.StatusServiceUnavailable, "billing_provider_unavailable",
+				"The billing provider is temporarily unavailable. Retry in 60 seconds — see https://instanode.dev/status for live status.")
+		}
 		slog.Error("billing.checkout.subscription_create_failed",
 			"error", err,
 			"team_id", teamID,
@@ -1112,6 +1128,11 @@ func (h *BillingHandler) ListInvoicesAPI(c *fiber.Ctx) error {
 	}
 	rows, err := portal.ListSubscriptionInvoices(subID)
 	if err != nil {
+		if errors.Is(err, circuit.ErrOpen) {
+			slog.Error("billing.invoices.razorpay_circuit_open", "team_id", teamID)
+			return respondError(c, fiber.StatusServiceUnavailable, "billing_provider_unavailable",
+				"The billing provider is temporarily unavailable. Retry in 60 seconds — see https://instanode.dev/status.")
+		}
 		slog.Error("billing.invoices.list_failed", "error", err, "team_id", teamID)
 		return respondError(c, fiber.StatusBadGateway, "razorpay_error", "Failed to list invoices")
 	}
@@ -1146,6 +1167,11 @@ func (h *BillingHandler) UpdatePaymentMethodAPI(c *fiber.Ctx) error {
 	}
 	shortURL, err := portal.PaymentUpdateURL(subID)
 	if err != nil {
+		if errors.Is(err, circuit.ErrOpen) {
+			slog.Error("billing.payment_update.razorpay_circuit_open", "team_id", teamID)
+			return respondError(c, fiber.StatusServiceUnavailable, "billing_provider_unavailable",
+				"The billing provider is temporarily unavailable. Retry in 60 seconds — see https://instanode.dev/status.")
+		}
 		return respondError(c, fiber.StatusUnprocessableEntity, "no_update_url", err.Error())
 	}
 	return c.JSON(fiber.Map{"ok": true, "short_url": shortURL})
@@ -1200,6 +1226,11 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 	}
 	res, err := portal.ChangePlan(c.Context(), teamID, target, planIDs)
 	if err != nil {
+		if errors.Is(err, circuit.ErrOpen) {
+			slog.Error("billing.change_plan.razorpay_circuit_open", "team_id", teamID)
+			return respondError(c, fiber.StatusServiceUnavailable, "billing_provider_unavailable",
+				"The billing provider is temporarily unavailable. Retry in 60 seconds — see https://instanode.dev/status.")
+		}
 		slog.Error("billing.change_plan.failed", "error", err, "team_id", teamID)
 		return respondError(c, fiber.StatusBadGateway, "razorpay_error", err.Error())
 	}

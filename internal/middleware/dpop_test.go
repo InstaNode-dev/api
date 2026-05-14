@@ -161,6 +161,7 @@ func runRequest(t *testing.T, app *fiber.App, method, target, bearer, dpop strin
 
 // TestDPoP_Valid verifies a well-formed proof passes through.
 func TestDPoP_Valid(t *testing.T) {
+	middleware.ResetDPoPRedisBreakerForTest()
 	t.Setenv("API_PUBLIC_URL", "https://api.instanode.dev")
 
 	mr, err := miniredis.Run()
@@ -213,6 +214,7 @@ func TestDPoP_BadSig(t *testing.T) {
 
 // TestDPoP_Replay verifies that the same jti reused returns 401.
 func TestDPoP_Replay(t *testing.T) {
+	middleware.ResetDPoPRedisBreakerForTest()
 	t.Setenv("API_PUBLIC_URL", "https://api.instanode.dev")
 
 	mr, err := miniredis.Run()
