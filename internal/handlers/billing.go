@@ -92,6 +92,9 @@ func (h *BillingHandler) razorpayPlanIDs() map[string]string {
 	if h.cfg.RazorpayPlanIDHobby != "" {
 		m["hobby"] = h.cfg.RazorpayPlanIDHobby
 	}
+	if h.cfg.RazorpayPlanIDHobbyPlus != "" {
+		m["hobby_plus"] = h.cfg.RazorpayPlanIDHobbyPlus
+	}
 	if h.cfg.RazorpayPlanIDPro != "" {
 		m["pro"] = h.cfg.RazorpayPlanIDPro
 	}
@@ -112,6 +115,15 @@ func (h *BillingHandler) razorpayPlanIDFor(tier, frequency string) string {
 			return h.cfg.RazorpayPlanIDHobbyYearly
 		}
 		return h.cfg.RazorpayPlanIDHobby
+	case "hobby_plus":
+		// W11 mid-tier. Plan IDs default to "" until the operator
+		// creates the RAZORPAY_PLAN_ID_HOBBY_PLUS / _ANNUAL plans in
+		// the Razorpay dashboard — callers see 503 billing_not_configured
+		// when the corresponding env var is unset.
+		if frequency == "yearly" {
+			return h.cfg.RazorpayPlanIDHobbyPlusYearly
+		}
+		return h.cfg.RazorpayPlanIDHobbyPlus
 	case "pro":
 		if frequency == "yearly" {
 			return h.cfg.RazorpayPlanIDProYearly
@@ -153,6 +165,12 @@ func (h *BillingHandler) planIDToTier(planID string) string {
 	}
 	if h.cfg.RazorpayPlanIDProYearly != "" && planID == h.cfg.RazorpayPlanIDProYearly {
 		return "pro"
+	}
+	if h.cfg.RazorpayPlanIDHobbyPlus != "" && planID == h.cfg.RazorpayPlanIDHobbyPlus {
+		return "hobby_plus"
+	}
+	if h.cfg.RazorpayPlanIDHobbyPlusYearly != "" && planID == h.cfg.RazorpayPlanIDHobbyPlusYearly {
+		return "hobby_plus"
 	}
 	if h.cfg.RazorpayPlanIDHobby != "" && planID == h.cfg.RazorpayPlanIDHobby {
 		return "hobby"
@@ -206,7 +224,7 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	}
 
 	switch plan {
-	case "hobby", "pro":
+	case "hobby", "hobby_plus", "pro":
 		// fall through — plan_id is resolved by razorpayPlanIDFor below.
 	case "team":
 		// Team tier is under development — block customer-initiated
@@ -216,7 +234,7 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "tier_unavailable",
 			"Team tier is under active development. Email support@instanode.dev to join the early access list.")
 	default:
-		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "plan must be 'hobby' or 'pro'")
+		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "plan must be 'hobby', 'hobby_plus', or 'pro'")
 	}
 	planID := h.razorpayPlanIDFor(plan, frequency)
 
@@ -892,6 +910,10 @@ func monthlyAmountINRForTier(tier string) int64 {
 	switch strings.ToLower(strings.TrimSpace(tier)) {
 	case "hobby":
 		return 750
+	case "hobby_plus":
+		// $19/mo ≈ ₹1583 at typical USD→INR. Sits between hobby (₹750)
+		// and pro (₹4100). Mirrors the price_monthly_cents ladder.
+		return 1583
 	case "pro":
 		return 4100
 	case "team":
@@ -1163,7 +1185,7 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 	}
 	planIDs := h.razorpayPlanIDs()
 	if _, ok := planIDs[target]; !ok {
-		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "target_plan must be hobby, pro, or team")
+		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "target_plan must be hobby, hobby_plus, pro, or team")
 	}
 	// Team tier is under development — block customer-initiated upgrades to
 	// team via the public API. The internal /internal/set-tier endpoint

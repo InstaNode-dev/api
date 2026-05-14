@@ -73,6 +73,12 @@ func tierLookbackSeconds(planTier string) (int64, bool) {
 		return 0, false
 	case "hobby":
 		return 30 * 24 * 3600, true
+	case "hobby_plus":
+		// W11: 60-day lookback sits between hobby's 30 and pro's 90,
+		// matching the mid-tier positioning. Hobby Plus subscribers
+		// get a meaningfully larger audit window without unlocking
+		// pro's full 90-day enterprise floor.
+		return 60 * 24 * 3600, true
 	case "pro":
 		return 90 * 24 * 3600, true
 	case "growth", "team":

@@ -100,11 +100,13 @@ func TestLoad_InvalidYAML_ReturnsError(t *testing.T) {
 func TestAll_ReturnsAllPlans(t *testing.T) {
 	r := plans.Default()
 	all := r.All()
-	// 6 base tiers + 3 yearly variants (hobby_yearly, pro_yearly, team_yearly).
-	assert.Len(t, all, 9, "default registry must have 9 plans (6 base + 3 yearly variants)")
+	// 7 base tiers + 4 yearly variants (hobby_yearly, hobby_plus_yearly,
+	// pro_yearly, team_yearly) = 11. W11 (2026-05-13) added hobby_plus
+	// + hobby_plus_yearly as the $19/mo mid-step between hobby and pro.
+	assert.Len(t, all, 11, "default registry must have 11 plans (7 base + 4 yearly variants)")
 	for _, name := range []string{
-		"anonymous", "free", "hobby", "pro", "team", "growth",
-		"hobby_yearly", "pro_yearly", "team_yearly",
+		"anonymous", "free", "hobby", "hobby_plus", "pro", "team", "growth",
+		"hobby_yearly", "hobby_plus_yearly", "pro_yearly", "team_yearly",
 	} {
 		assert.Contains(t, all, name)
 	}
@@ -115,7 +117,7 @@ func TestAll_ReturnsAllPlans(t *testing.T) {
 // counterparts. The only allowed divergence is price and billing_period.
 func TestYearlyVariants_MirrorMonthly(t *testing.T) {
 	r := plans.Default()
-	for _, base := range []string{"hobby", "pro", "team"} {
+	for _, base := range []string{"hobby", "hobby_plus", "pro", "team"} {
 		yearly := r.Get(base + "_yearly")
 		monthly := r.Get(base)
 		assert.Equal(t, monthly.Limits, yearly.Limits,
@@ -131,10 +133,57 @@ func TestYearlyVariants_MirrorMonthly(t *testing.T) {
 func TestCanonicalTier_StripsYearlySuffix(t *testing.T) {
 	assert.Equal(t, "pro", plans.CanonicalTier("pro_yearly"))
 	assert.Equal(t, "hobby", plans.CanonicalTier("hobby_yearly"))
+	assert.Equal(t, "hobby_plus", plans.CanonicalTier("hobby_plus_yearly"))
 	assert.Equal(t, "team", plans.CanonicalTier("team_yearly"))
 	assert.Equal(t, "pro", plans.CanonicalTier("pro"))
+	assert.Equal(t, "hobby_plus", plans.CanonicalTier("hobby_plus"))
 	assert.Equal(t, "anonymous", plans.CanonicalTier("anonymous"))
 	assert.Equal(t, "", plans.CanonicalTier(""))
+}
+
+// TestHobbyPlus_TierMatrix is the W11 lock-in test for the api-level
+// wrapper: hobby_plus exists with the expected limits + features.
+// Mirrors the common-package test of the same name; this one exercises
+// the api re-export path so a future drift between the two packages
+// is caught at the api layer too.
+func TestHobbyPlus_TierMatrix(t *testing.T) {
+	r := plans.Default()
+	require.NotNil(t, r)
+	// PriceMonthly: $19 = 1900 cents.
+	assert.Equal(t, 1900, r.PriceMonthly("hobby_plus"),
+		"hobby_plus must be priced at $19/mo (1900 cents)")
+	// Display name surfaces in dashboard + invoices.
+	assert.Equal(t, "Hobby Plus", r.DisplayName("hobby_plus"))
+	// Headline feature: 2 deployment apps + custom domains.
+	assert.Equal(t, 2, r.DeploymentsAppsLimit("hobby_plus"),
+		"hobby_plus must allow 2 deployment apps")
+	assert.True(t, r.CustomDomainsAllowed("hobby_plus"),
+		"hobby_plus must enable custom_domains (the W11 headline feature)")
+	// Multi-env vault.
+	assert.Equal(t, 50, r.VaultMaxEntries("hobby_plus"))
+	assert.Equal(t, []string{"development", "staging", "production"},
+		r.VaultEnvsAllowed("hobby_plus"))
+	// Storage / connection limits — mirror hobby on cheap services, bump
+	// mongodb + object storage to mid-tier values.
+	assert.Equal(t, 1024, r.StorageLimitMB("hobby_plus", "postgres"))
+	assert.Equal(t, 50, r.StorageLimitMB("hobby_plus", "redis"))
+	assert.Equal(t, 1024, r.StorageLimitMB("hobby_plus", "mongodb"))
+	assert.Equal(t, 5120, r.StorageLimitMB("hobby_plus", "storage"))
+	assert.Equal(t, 5000, r.StorageLimitMB("hobby_plus", "webhook"))
+	assert.Equal(t, 8, r.ConnectionsLimit("hobby_plus", "postgres"))
+	assert.Equal(t, 5, r.ConnectionsLimit("hobby_plus", "mongodb"))
+	// Backup posture: 14-day retention, restore enabled (mid-tier
+	// between hobby's 7-day-no-restore and pro's 30-day-with-restore).
+	assert.Equal(t, 14, r.BackupRetentionDays("hobby_plus"))
+	assert.True(t, r.BackupRestoreEnabled("hobby_plus"),
+		"hobby_plus is the cheapest tier with self-serve restore")
+	assert.Equal(t, 5, r.ManualBackupsPerDay("hobby_plus"))
+	// Yearly variant exists and is cheaper than monthly x12.
+	yearly := r.Get("hobby_plus_yearly")
+	require.NotNil(t, yearly)
+	assert.Equal(t, 19900, yearly.PriceMonthly, "hobby_plus_yearly = $199/yr (19900 cents)")
+	assert.Less(t, yearly.PriceMonthly, 1900*12,
+		"hobby_plus_yearly must be cheaper than 12x monthly so the savings claim is honest")
 }
 
 // TestFreeTier_MirrorsAnonymous verifies the api-level plans wrapper exposes
