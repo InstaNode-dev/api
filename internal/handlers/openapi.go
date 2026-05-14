@@ -1692,6 +1692,133 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/deployments/{id}/github": {
+      "post": {
+        "summary": "Connect a deployment to a GitHub repository for auto-deploy",
+        "description": "Wires the deployment to a GitHub repo + branch. On every push to the tracked branch, GitHub POSTs to /webhooks/github/{webhook_id}, the API verifies the X-Hub-Signature-256 HMAC, and enqueues a fresh deploy via the worker. The response carries the webhook_url (paste into GitHub → Settings → Webhooks) and the webhook_secret (paste into the same form; this is the ONLY time the plaintext secret is returned — it is AES-256-GCM encrypted at rest). Tier-gated: Hobby and above. Anonymous / free are rejected with 402 because they cannot deploy at all. Hobby teams can have one deployment total (plans.yaml deployments_apps=1); that single deployment may have one GitHub connection. A deployment can have at most one connection at a time — a second POST returns 409 with agent_action telling the caller to DELETE first.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Deployment app_id (short slug, e.g. '6fffcc21')." }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["repo"],
+                "properties": {
+                  "repo": { "type": "string", "description": "GitHub repository in 'owner/repo' form, e.g. 'octocat/hello-world'.", "example": "octocat/hello-world" },
+                  "branch": { "type": "string", "description": "Branch to watch. Defaults to 'main'. Pushes to other branches are ignored at receive time.", "example": "main" },
+                  "installation_id": { "type": "integer", "format": "int64", "description": "Optional GitHub App installation id. Reserved for a future private-repo flow; today plain webhooks are used and this field can be omitted." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Connection created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "type": "boolean" },
+                    "connection": { "$ref": "#/components/schemas/GitHubConnection" },
+                    "webhook_url": { "type": "string", "format": "uri", "description": "Paste into GitHub → Settings → Webhooks → Payload URL." },
+                    "webhook_secret": { "type": "string", "description": "Plaintext HMAC signing key. Paste into GitHub → Settings → Webhooks → Secret. Returned ONCE — not surfaced again." },
+                    "note": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Bad request — invalid_repo (not owner/repo form), invalid_branch (>250 chars), or invalid_body" },
+          "401": { "description": "Unauthorized" },
+          "402": { "description": "github_requires_paid_tier — anonymous / free trying to connect. agent_action points to https://instanode.dev/pricing." },
+          "403": { "description": "Not your deployment" },
+          "404": { "description": "Deployment not found" },
+          "409": { "description": "already_connected — deployment already has a GitHub connection. DELETE first to reconnect." },
+          "503": { "description": "encryption_unavailable / encryption_failed / create_failed" }
+        }
+      },
+      "get": {
+        "summary": "Get the current GitHub connection for a deployment",
+        "description": "Returns the current connection (without the webhook secret — that is returned exactly once on POST). Useful for the dashboard's 'connected to <repo>' tile + last-deploy timestamp. When no connection exists, returns connected=false with connection=null.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": {
+            "description": "Connection status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok":          { "type": "boolean" },
+                    "connected":   { "type": "boolean" },
+                    "connection":  { "oneOf": [ { "$ref": "#/components/schemas/GitHubConnection" }, { "type": "null" } ] },
+                    "webhook_url": { "type": "string", "format": "uri", "description": "Present only when connected=true." }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Not your deployment" },
+          "404": { "description": "Deployment not found" }
+        }
+      },
+      "delete": {
+        "summary": "Disconnect a deployment from GitHub auto-deploy",
+        "description": "Removes the GitHub connection. The deployment itself stays — only the auto-deploy wiring is removed. Idempotent: calling DELETE when no connection exists returns 200 with deleted=false.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Connection removed (or no-op when none existed)" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Not your deployment" },
+          "404": { "description": "Deployment not found" },
+          "503": { "description": "delete_failed" }
+        }
+      }
+    },
+    "/webhooks/github/{webhook_id}": {
+      "post": {
+        "summary": "Receive a GitHub push event (PUBLIC, signed)",
+        "description": "GitHub POSTs here on every push to the customer's connected repo. Authentication is HMAC-SHA256 over the request body using the per-connection secret — the signature arrives in the X-Hub-Signature-256 header as 'sha256=<hex>'. This endpoint is PUBLIC (no Authorization header — GitHub presents none). Behaviour: ping events return 200 with pong=true; non-push events are accepted as no-ops; push events to a branch other than the tracked branch are accepted as no-ops; pushes to the tracked branch enqueue a pending_github_deploys row that the worker drains within 30s. Idempotency: a duplicate push.event with the same after commit SHA is a no-op (duplicate=true in response). Rate-limit: 10 deploys/hour/repo — exceeding returns 429 with Retry-After=3600. Branch-delete pushes (after=all-zeros) are ignored.",
+        "parameters": [
+          { "name": "webhook_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" }, "description": "Connection id returned by POST /api/v1/deployments/{id}/github." },
+          { "name": "X-Hub-Signature-256", "in": "header", "required": true, "schema": { "type": "string" }, "description": "GitHub-formatted signature: 'sha256=<hex>' where hex is HMAC-SHA256(secret, body)." },
+          { "name": "X-GitHub-Event", "in": "header", "required": true, "schema": { "type": "string", "enum": ["push", "ping"] }, "description": "GitHub event type. Only 'push' triggers a deploy; 'ping' acknowledges." }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "GitHub push event payload (subset). See https://docs.github.com/en/webhooks/webhook-events-and-payloads#push.",
+                "properties": {
+                  "ref":   { "type": "string", "example": "refs/heads/main" },
+                  "after": { "type": "string", "description": "Commit SHA after the push (becomes the deploy revision)." },
+                  "pusher": { "type": "object", "properties": { "name": { "type": "string" } } },
+                  "repository": { "type": "object", "properties": { "full_name": { "type": "string" } } }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Event accepted (ping / no-op for non-push event / branch_mismatch / duplicate)" },
+          "202": { "description": "Deploy enqueued — worker will drain shortly" },
+          "400": { "description": "invalid_payload — body is not valid JSON" },
+          "401": { "description": "signature_invalid — X-Hub-Signature-256 did not verify" },
+          "404": { "description": "Webhook not found" },
+          "429": { "description": "rate_limited — connection exceeded 10 deploys/hour" },
+          "503": { "description": "encryption_unavailable / decrypt_failed / enqueue_failed" }
+        }
+      }
+    },
     "/api/v1/stacks": {
       "get": {
         "summary": "List all stacks owned by the caller's team",
@@ -2236,6 +2363,21 @@ const openAPISpec = `{
           },
           "note": { "type": "string" }
         }
+      },
+      "GitHubConnection": {
+        "type": "object",
+        "description": "One link between a deployment and a GitHub repository. Surfaced by POST/GET /api/v1/deployments/{id}/github. The plaintext webhook_secret is NEVER part of this shape — it is returned exactly once on POST as a sibling field of the connection object.",
+        "properties": {
+          "id":              { "type": "string", "format": "uuid", "description": "Connection id. Doubles as the webhook_id segment of the public receive URL." },
+          "app_id":          { "type": "string", "description": "Deployment short slug (e.g. '6fffcc21')." },
+          "github_repo":     { "type": "string", "description": "GitHub repository in 'owner/repo' form." },
+          "branch":          { "type": "string", "description": "Tracked branch. Pushes to other branches are ignored at receive time." },
+          "created_at":      { "type": "string", "format": "date-time" },
+          "last_deploy_at":  { "type": "string", "format": "date-time", "description": "Most recent push that triggered a deploy. Absent when no push has arrived yet." },
+          "last_commit_sha": { "type": "string", "description": "Most recent commit SHA we enqueued. Powers idempotency — a duplicate push.event with the same SHA is a no-op." },
+          "installation_id": { "type": "integer", "format": "int64", "description": "Optional GitHub App installation id. Absent when plain-webhook flow was used." }
+        },
+        "required": ["id", "app_id", "github_repo", "branch", "created_at"]
       },
       "InvitationResponse": {
         "type": "object",

@@ -328,6 +328,14 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Post("/webhook/receive/:token", webhookH.Receive)
 	app.Get("/resources/:token/logs", logsH.ResourceLogs)
 
+	// GitHub auto-deploy receiver (migration 035) — PUBLIC, signed.
+	// GitHub itself POSTs here on every push. Auth = HMAC-SHA256
+	// verification against the per-connection secret (X-Hub-Signature-256
+	// header). NOT placed under any RequireAuth middleware because GitHub
+	// presents no session token; signature is the boundary.
+	githubReceiveH := handlers.NewGitHubDeployHandler(db, cfg, planRegistry)
+	app.Post("/webhooks/github/:webhook_id", githubReceiveH.Receive)
+
 	// Deploy — Phase 6 (auth required on all endpoints).
 	// POST /deploy/new is gated by RequireEnvAccess(ActionDeploy) — the
 	// env scope arrives as a multipart form field (not JSON or query), so
@@ -627,6 +635,18 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// validatePrivateDeployFields with POST /deploy/new so the rule-set is
 	// audited in one place.
 	api.Patch("/deployments/:id", deployH.Patch)
+
+	// GitHub auto-deploy (migration 035). Customers wire a deployment to
+	// a GitHub repo; pushes to the tracked branch trigger a fresh deploy.
+	// All three /api/v1 routes are auth-required (inherited from the
+	// `api` group middleware) and Pro+ tier-gated inside the handler.
+	// The public receive endpoint is registered separately below — it
+	// must NOT inherit RequireAuth because GitHub itself does not present
+	// a session token; signature verification is the auth boundary.
+	githubDeployH := handlers.NewGitHubDeployHandler(db, cfg, planRegistry)
+	api.Post("/deployments/:id/github", middleware.RequireWritable(), githubDeployH.Connect)
+	api.Get("/deployments/:id/github", githubDeployH.Get)
+	api.Delete("/deployments/:id/github", middleware.RequireWritable(), githubDeployH.Disconnect)
 
 	// Stack management endpoints — Phase 6 (under /api/v1)
 	api.Get("/stacks", stackH.List)
