@@ -49,7 +49,6 @@ plans:
   anonymous:
     display_name: "Anon"
     price_monthly_cents: 0
-    trial_days: 0
     limits:
       provisions_per_day: 3
       postgres_storage_mb: 10
@@ -77,7 +76,6 @@ plans:
   pro:
     display_name: "Pro"
     price_monthly_cents: 4900
-    trial_days: 0
     limits:
       provisions_per_day: -1
       postgres_storage_mb: 5120
@@ -170,13 +168,11 @@ plans:
   anonymous:
     display_name: "Anon"
     price_monthly_cents: 0
-    trial_days: 0
     limits: {provisions_per_day: 5, postgres_storage_mb: 10, redis_memory_mb: 5}
     features: {alerts: false, custom_domains: false, sla: false}
   pro:
     display_name: "Pro"
     price_monthly_cents: 4900
-    trial_days: 0
     limits: {provisions_per_day: -1, postgres_storage_mb: 5120, redis_memory_mb: 256}
     features: {alerts: true, custom_domains: false, sla: false}
 promotions:
@@ -202,13 +198,11 @@ plans:
   anonymous:
     display_name: "Anon"
     price_monthly_cents: 0
-    trial_days: 0
     limits: {provisions_per_day: 5, postgres_storage_mb: 10, redis_memory_mb: 5}
     features: {alerts: false, custom_domains: false, sla: false}
   pro:
     display_name: "Pro"
     price_monthly_cents: 4900
-    trial_days: 0
     limits: {provisions_per_day: -1, postgres_storage_mb: 5120, redis_memory_mb: 256}
     features: {alerts: true, custom_domains: false, sla: false}
 promotions:
@@ -239,13 +233,11 @@ plans:
   anonymous:
     display_name: "Anon"
     price_monthly_cents: 0
-    trial_days: 0
     limits: {provisions_per_day: 5, postgres_storage_mb: 10, redis_memory_mb: 5}
     features: {alerts: false, custom_domains: false, sla: false}
   pro:
     display_name: "Pro"
     price_monthly_cents: 4900
-    trial_days: 0
     limits: {provisions_per_day: -1, postgres_storage_mb: 5120, redis_memory_mb: 256}
     features: {alerts: true, custom_domains: false, sla: false}
 promotions:

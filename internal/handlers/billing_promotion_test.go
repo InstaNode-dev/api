@@ -50,25 +50,21 @@ plans:
   anonymous:
     display_name: "Anonymous"
     price_monthly_cents: 0
-    trial_days: 0
     limits: { provisions_per_day: 5 }
     features: {}
   hobby:
     display_name: "Hobby"
     price_monthly_cents: 900
-    trial_days: 0
     limits: { provisions_per_day: 50 }
     features: {}
   pro:
     display_name: "Pro"
     price_monthly_cents: 4900
-    trial_days: 0
     limits: { provisions_per_day: 500 }
     features: {}
   team:
     display_name: "Team"
     price_monthly_cents: 19900
-    trial_days: 0
     limits: { provisions_per_day: 5000 }
     features: {}
 
