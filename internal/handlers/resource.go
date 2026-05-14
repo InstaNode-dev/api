@@ -181,13 +181,29 @@ func (h *ResourceHandler) Delete(c *fiber.Ctx) error {
 	switch resource.ResourceType {
 	case "storage":
 		if h.storageProvider != nil {
-			if deprovErr := h.storageProvider.Deprovision(c.Context(), token.String()); deprovErr != nil {
+			deprovErr := h.storageProvider.Deprovision(c.Context(), token.String())
+			if deprovErr != nil {
 				slog.Warn("resource.delete.storage_deprovision_failed",
 					"error", deprovErr,
 					"resource_id", resource.ID,
 					"token", token.String(),
 					"request_id", requestID,
 				)
+			}
+			// Audit-emit the per-tenant IAM user removal so the create/delete
+			// pair brackets exactly how long the key existed. Only meaningful
+			// in admin mode — shared-key mode has no per-tenant key to remove.
+			if deprovErr == nil && h.storageProvider.Backend() == storageprovider.BackendMinIOAdmin {
+				go func(rid uuid.UUID, tid uuid.UUID, tok string) {
+					_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+						TeamID:       tid,
+						Actor:        "system",
+						Kind:         models.AuditKindStorageIAMUserDeleted,
+						ResourceType: "storage",
+						ResourceID:   uuid.NullUUID{UUID: rid, Valid: true},
+						Summary:      "removed per-tenant storage key <code>key_" + tok[:8] + "</code>",
+					})
+				}(resource.ID, teamID, token.String())
 			}
 		}
 	default:

@@ -106,4 +106,18 @@ const (
 	// `failure_stage` (build | rollout), `error_summary` (truncated error
 	// message — full error stays in the deployments.error_message column).
 	AuditKindDeployFailed = "deploy.failed"
+
+	// AuditKindStorageIAMUserCreated fires when a successful /storage/new
+	// in MinIO admin mode mints a per-tenant IAM user. Surfaces the
+	// "tenant just got their own key" event so on-call / compliance can
+	// reconstruct who held which key when. Metadata carries the
+	// access_key_id (per-tenant prefix-scoped, NOT the master) and the
+	// resource_id; the secret is never persisted in the audit trail.
+	AuditKindStorageIAMUserCreated = "storage.iam_user_created"
+
+	// AuditKindStorageIAMUserDeleted fires when DELETE /api/v1/resources/:id
+	// (or the worker-driven expiry path) removes a per-tenant IAM user.
+	// Pair this with the corresponding "_created" event to bound how long
+	// a given key existed.
+	AuditKindStorageIAMUserDeleted = "storage.iam_user_deleted"
 )

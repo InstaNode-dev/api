@@ -364,6 +364,27 @@ func (h *StorageHandler) newStorageAuthenticated(
 	)
 	metrics.ProvisionsTotal.WithLabelValues("storage", team.PlanTier).Inc()
 
+	// In admin-mode the provider just minted a per-tenant IAM user. Surface
+	// that as a discrete audit row so compliance can answer "who held this
+	// access key at time T?" — distinct from the generic "provision" event
+	// already inserted above. Best-effort; an audit failure never blocks
+	// the provision. Only emitted when the provider is actually issuing
+	// per-tenant keys; shared-key mode reuses the master across all
+	// customers and the kind would be misleading.
+	if h.storageProvider != nil && h.storageProvider.Backend() == storageprovider.BackendMinIOAdmin {
+		go func(rid uuid.UUID, accessKey string) {
+			_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+				TeamID:       teamUUID,
+				Actor:        "system",
+				Kind:         models.AuditKindStorageIAMUserCreated,
+				ResourceType: "storage",
+				ResourceID:   uuid.NullUUID{UUID: rid, Valid: true},
+				Summary: "minted per-tenant storage key <code>" +
+					accessKey + "</code> for prefix <code>" + creds.Prefix + "</code>",
+			})
+		}(resource.ID, creds.AccessKeyID)
+	}
+
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"ok":                true,
 		"id":                resource.ID.String(),
