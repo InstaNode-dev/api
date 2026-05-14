@@ -564,7 +564,9 @@ func (h *DeployHandler) Get(c *fiber.Ctx) error {
 	}
 
 	if d.TeamID != team.ID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this deployment")
+		// 404 not 403: never confirm the existence of deployments owned
+		// by other teams.
+		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
 	}
 
 	return c.JSON(fiber.Map{
@@ -593,7 +595,9 @@ func (h *DeployHandler) Logs(c *fiber.Ctx) error {
 	}
 
 	if d.TeamID != team.ID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this deployment")
+		// 404 not 403: never confirm the existence of deployments owned
+		// by other teams.
+		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
 	}
 
 	if d.ProviderID == "" {
@@ -664,7 +668,9 @@ func (h *DeployHandler) UpdateEnv(c *fiber.Ctx) error {
 	}
 
 	if d.TeamID != team.ID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this deployment")
+		// 404 not 403: never confirm the existence of deployments owned
+		// by other teams.
+		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
 	}
 
 	var body updateEnvBody
@@ -725,7 +731,9 @@ func (h *DeployHandler) Delete(c *fiber.Ctx) error {
 	}
 
 	if d.TeamID != team.ID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this deployment")
+		// 404 not 403: never confirm the existence of deployments owned
+		// by other teams.
+		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
 	}
 
 	// Teardown compute resources (best-effort — don't block delete on provider errors).
@@ -777,7 +785,9 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 	}
 
 	if d.TeamID != team.ID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this deployment")
+		// 404 not 403: never confirm the existence of deployments owned
+		// by other teams.
+		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
 	}
 
 	if d.ProviderID == "" {

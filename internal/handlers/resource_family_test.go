@@ -197,9 +197,10 @@ func TestResourceFamily_Orphan_ReturnsSingleMember(t *testing.T) {
 	assert.True(t, body.Members[0].IsRoot)
 }
 
-// TestResourceFamily_CrossTeam_Returns403 mirrors the rotate-credentials
-// cross-team test — the response must NOT leak any family metadata.
-func TestResourceFamily_CrossTeam_Returns403(t *testing.T) {
+// TestResourceFamily_CrossTeam_Returns404 mirrors the rotate-credentials
+// cross-team test — the response must NOT leak any family metadata, and
+// must NOT confirm existence either (404 not 403).
+func TestResourceFamily_CrossTeam_Returns404(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -222,8 +223,8 @@ func TestResourceFamily_CrossTeam_Returns403(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode,
-		"cross-team /family must be 403 (not 404), per the slice 2 spec")
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"cross-team /family must be 404 — never confirm the resource's existence to a non-owner")
 }
 
 // TestResourceFamily_InvalidUUID_Returns400 covers the path-param parse error.
