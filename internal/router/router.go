@@ -459,6 +459,15 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	internalTerminateH := handlers.NewInternalTerminateHandler(db, cfg, internalTermPortal.CancelAtCycleEnd)
 	app.Post("/internal/teams/:id/terminate", internalTerminateH.Terminate)
 
+	// Internal worker-driven resend for magic_links that failed their first
+	// send attempt. The worker's magic_link_reconciler periodic job (every
+	// 60s) sweeps rows stuck at email_send_status IN ('pending', 'send_failed')
+	// inside the 15-minute TTL window and POSTs the row id here.
+	// Same fail-closed posture as /internal/teams/:id/terminate: when
+	// WORKER_INTERNAL_JWT_SECRET is unset, every call 401s.
+	internalResendH := handlers.NewInternalResendMagicLinkHandler(db, cfg, emailClient)
+	app.Post("/internal/email/resend-magic-link", internalResendH.Resend)
+
 	// §10.20 cached-aggregation endpoints. Separate handlers from BillingHandler
 	// so the caching contract (Redis + singleflight + Cache-Control headers)
 	// is visible at the route + handler boundary, not buried inside the billing
