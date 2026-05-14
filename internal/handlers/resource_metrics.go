@@ -193,7 +193,9 @@ func (h *ResourceHandler) Metrics(c *fiber.Ctx) error {
 	}
 
 	if !resource.TeamID.Valid || resource.TeamID.UUID != teamID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this resource")
+		// 404 not 403: never confirm the existence of resources owned by
+		// other teams (or unclaimed anonymous resources).
+		return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
 	}
 
 	// Tier-gate is read from the team's plan_tier — NOT resource.Tier — so a

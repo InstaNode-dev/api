@@ -38,7 +38,7 @@ const openAPISpec = `{
     "version": "1.0.0",
     "description": "Zero-friction developer infrastructure. Provision real databases, caches, and queues with a single HTTP call — no account, no Docker, no setup."
   },
-  "servers": [{ "url": "https://instant.dev", "description": "Production" }],
+  "servers": [{ "url": "https://api.instanode.dev", "description": "Production" }],
   "paths": {
     "/livez": {
       "get": {
@@ -148,11 +148,19 @@ const openAPISpec = `{
     "/webhook/receive/{token}": {
       "post": {
         "summary": "Receive a webhook payload",
-        "description": "Accepts any HTTP method. Stores headers + body in Redis with a 24h TTL. Returns the stored request ID.",
-        "parameters": [{ "name": "token", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "description": "Accepts ANY HTTP method (GET/POST/PUT/DELETE) so verification-challenge flows like Slack URL verify reach the handler. Stores method, path, query string, all duplicate headers (sensitive ones — Authorization, Cookie, X-Api-Key, X-Auth-Token, Proxy-Authorization, Set-Cookie — are redacted to '[REDACTED]'), and the raw body (capped at 1 MiB) in Redis with a tier-based TTL. The ring buffer per token is capped at the tier's webhook_requests_stored limit; the 101st payload evicts the oldest and sets response header X-Webhook-Rotated: <token>. If the resource has an HMAC secret set, every request must carry a valid X-Hub-Signature-256 header (sha256=<hex of HMAC-SHA256(secret, body)>) or returns 401. Senders may pass X-Idempotency-Key for safe retries — the same key replays the original response without writing a duplicate entry.",
+        "parameters": [
+          { "name": "token", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "X-Hub-Signature-256", "in": "header", "required": false, "schema": { "type": "string" }, "description": "sha256=<hex> — required only when the webhook resource has hmac_secret configured." },
+          { "name": "X-Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string" }, "description": "Opaque key (e.g. from Stripe's Idempotency-Key); two requests with the same key replay the original response." }
+        ],
         "requestBody": { "content": { "application/json": {}, "application/x-www-form-urlencoded": {}, "text/plain": {} } },
         "responses": {
-          "200": { "description": "Payload stored", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string" } } } } } }
+          "200": { "description": "Payload stored", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string" } } } } } },
+          "401": { "description": "HMAC signature missing or invalid (when hmac_secret is set on the resource).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "404": { "description": "Token not found.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "410": { "description": "Token exists but resource status != 'active'.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "413": { "description": "Request body exceeds the 1 MiB cap.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
@@ -537,9 +545,18 @@ const openAPISpec = `{
     },
     "/start": {
       "get": {
-        "summary": "Pre-filled upgrade landing page",
-        "parameters": [{ "name": "t", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Signed onboarding JWT from the note field" }],
-        "responses": { "200": { "description": "HTML landing page with resource context" } }
+        "summary": "Onboarding bounce — 302 redirect to the dashboard claim page",
+        "description": "Public bounce endpoint baked into the upgrade_url returned by every anonymous provisioning response. Issues a 302 Location redirect to the dashboard's claim page (DASHBOARD_BASE_URL + '/claim?t=<jwt>') — the dashboard then drives the email-claim flow against POST /claim. Agents that already hold the upgrade_jwt should POST /claim directly instead of following this redirect.",
+        "parameters": [{ "name": "t", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Signed onboarding JWT (the upgrade_jwt field from any anonymous provisioning response, or extracted from the upgrade URL)." }],
+        "responses": {
+          "302": {
+            "description": "Redirect to the dashboard claim page (e.g. https://instanode.dev/claim?t=<jwt>). Follow the Location header for the human flow, or POST /claim directly with the JWT to skip the dashboard step.",
+            "headers": {
+              "Location": { "schema": { "type": "string", "format": "uri" }, "description": "Dashboard claim URL with the JWT echoed in the t= query param" }
+            }
+          },
+          "400": { "description": "Missing or malformed t= JWT", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
       }
     },
     "/auth/me": {
@@ -1038,9 +1055,9 @@ const openAPISpec = `{
     "/api/v1/billing/checkout": {
       "post": {
         "summary": "Create a Razorpay subscription and return its hosted-page URL",
-        "description": "Mints a Razorpay subscription for the requested plan (hobby or pro) tied to the authenticated team. The dashboard redirects the user to the returned short_url to complete payment; on success Razorpay fires subscription.activated to /razorpay/webhook and the team's plan_tier is elevated atomically. The Team tier currently returns 400 tier_unavailable — only ops can set it via /internal/set-tier. plan_frequency selects monthly (default) vs yearly billing — yearly returns 503 billing_not_configured until the operator creates the yearly Razorpay plan and sets RAZORPAY_PLAN_ID_*_YEARLY.",
+        "description": "Mints a Razorpay subscription for the requested plan (hobby, hobby_plus, or pro) tied to the authenticated team. The dashboard redirects the user to the returned short_url to complete payment; on success Razorpay fires subscription.activated to /razorpay/webhook and the team's plan_tier is elevated atomically. The Team tier currently returns 400 tier_unavailable — only ops can set it via /internal/set-tier. plan_frequency selects monthly (default) vs yearly billing — yearly returns 503 billing_not_configured until the operator creates the yearly Razorpay plan and sets RAZORPAY_PLAN_ID_*_YEARLY.",
         "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "pro"] }, "plan_frequency": { "type": "string", "enum": ["monthly", "yearly"], "default": "monthly", "description": "Billing cycle. Empty = monthly. Yearly variants follow the same canonical-tier mapping on the webhook side — teams.plan_tier still stores the bare tier name." } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] }, "plan_frequency": { "type": "string", "enum": ["monthly", "yearly"], "default": "monthly", "description": "Billing cycle. Empty = monthly. Yearly variants follow the same canonical-tier mapping on the webhook side — teams.plan_tier still stores the bare tier name." } } } } } },
         "responses": {
           "200": { "description": "Subscription created — redirect user to short_url", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "short_url": { "type": "string", "format": "uri" }, "subscription_id": { "type": "string" } } } } } },
           "400": { "description": "Invalid plan, invalid plan_frequency, or tier_unavailable" },
@@ -1077,9 +1094,9 @@ const openAPISpec = `{
     "/api/v1/billing/change-plan": {
       "post": {
         "summary": "Switch the team's subscription to a different tier",
-        "description": "Hobby↔Pro on the same Razorpay subscription. Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. Team tier is currently not customer-changeable — returns 400 tier_unavailable.",
+        "description": "Hobby ↔ Hobby Plus ↔ Pro on the same Razorpay subscription. Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. Team tier is currently not customer-changeable — returns 400 tier_unavailable.",
         "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "pro"] } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] } } } } } },
         "responses": {
           "200": { "description": "Plan change accepted by Razorpay" },
           "400": { "description": "Invalid plan or tier_unavailable" },
@@ -1103,7 +1120,7 @@ const openAPISpec = `{
                 "required": ["code", "plan"],
                 "properties": {
                   "code": { "type": "string", "description": "Promotion code (case-insensitive)", "example": "LAUNCH50" },
-                  "plan": { "type": "string", "enum": ["hobby", "pro", "team"], "description": "Plan tier the discount must apply to" }
+                  "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro", "team"], "description": "Plan tier the discount must apply to" }
                 }
               }
             }
@@ -1371,7 +1388,7 @@ const openAPISpec = `{
         "summary": "Legacy alias for POST /api/v1/billing/checkout",
         "description": "Kept for backward compatibility with older dashboard/SDK clients. Identical contract to POST /api/v1/billing/checkout. New callers should use the /api/v1 path.",
         "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "pro"] } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] } } } } } },
         "responses": {
           "200": { "description": "Subscription created — redirect user to short_url", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "short_url": { "type": "string", "format": "uri" }, "subscription_id": { "type": "string" } } } } } },
           "400": { "description": "Invalid plan or tier_unavailable" },
@@ -1577,15 +1594,19 @@ const openAPISpec = `{
     "/api/v1/team/members/invite": {
       "post": {
         "summary": "Invite a user to the team (owner or admin)",
-        "description": "Two flows under the same endpoint: role='member' uses the legacy owner-controlled seat flow (owner-only, enforces tier seat limit); role='admin'/'developer'/'viewer' uses the RBAC token flow (single-use token emailed out, accepted at POST /api/v1/invitations/{token}/accept).",
+        "description": "Two flows under the same endpoint: role='member' uses the legacy owner-controlled seat flow (owner-only); role='admin'/'developer'/'viewer' uses the RBAC token flow (single-use token emailed out, accepted at POST /api/v1/invitations/{token}/accept). BOTH flows enforce the per-tier seat limit. Rate-limited to 10 invites/hour/team via Redis sliding counter; over-cap returns 429. Idempotency-Key header is honored (24h cache, replays carry X-Idempotent-Replay: true).",
         "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string" }, "description": "Optional opaque key (≤255 chars). When present the response is cached for 24h scoped to (team_id, key); subsequent calls with the same key replay the cached response verbatim and set X-Idempotent-Replay: true." }
+        ],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["email"], "properties": { "email": { "type": "string", "format": "email" }, "role": { "type": "string", "enum": ["admin", "developer", "viewer", "member"], "default": "member" } } } } } },
         "responses": {
           "201": { "description": "Invitation created" },
           "400": { "description": "Body invalid, missing email, or invalid role" },
           "401": { "description": "Unauthorized" },
           "403": { "description": "Owner/admin role required" },
-          "409": { "description": "Member limit reached / duplicate / already-a-member" }
+          "409": { "description": "Member limit reached / duplicate / already-a-member" },
+          "429": { "description": "Rate limit exceeded (10 invites/hour/team)" }
         }
       }
     },
@@ -1604,15 +1625,45 @@ const openAPISpec = `{
     "/api/v1/team/members/{user_id}": {
       "delete": {
         "summary": "Remove a member from the team (owner only)",
+        "description": "Refuses when the target is the team's primary user — every team needs a primary. Promote another member via POST .../promote-to-primary first. On success the removed user is reassigned to a freshly-created personal team; that team's UUID is returned in orphan_team_id so the caller can audit it.",
         "security": [{ "bearerAuth": [] }],
         "parameters": [{ "name": "user_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
         "responses": {
-          "200": { "description": "Member removed" },
-          "400": { "description": "Invalid user id" },
+          "200": { "description": "Member removed; response includes orphan_team_id", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "orphan_team_id": { "type": "string", "format": "uuid", "description": "UUID of the freshly-created personal team the removed user was reassigned to." } } } } } },
+          "400": { "description": "Invalid user id, or target is the team's primary user (error code cannot_remove_primary)" },
           "401": { "description": "Unauthorized" },
           "403": { "description": "Owner only" },
           "404": { "description": "User not in team" },
           "409": { "description": "Cannot remove the owner" }
+        }
+      },
+      "patch": {
+        "summary": "Change a member's role (owner only)",
+        "description": "Updates users.role for the target. Allowed roles: admin, developer, viewer, member (legacy alias of developer). Owner role is NOT assignable here — use POST .../promote-to-primary for an atomic ownership transfer.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "user_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["role"], "properties": { "role": { "type": "string", "enum": ["admin", "developer", "viewer", "member"] } } } } } },
+        "responses": {
+          "200": { "description": "Role updated", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "user_id": { "type": "string", "format": "uuid" }, "role": { "type": "string" } } } } } },
+          "400": { "description": "Invalid user id, invalid role, or attempt to assign owner (error code cannot_assign_owner_role)" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Owner only" },
+          "404": { "description": "User not on this team" }
+        }
+      }
+    },
+    "/api/v1/team/members/{user_id}/promote-to-primary": {
+      "post": {
+        "summary": "Atomically transfer team primary + owner to the target user (owner only)",
+        "description": "Owner-only. Demotes the current primary (is_primary=false, role=admin) and promotes the target (is_primary=true, role=owner) inside one transaction so the partial unique index uq_users_one_primary_per_team can never observe a two-primary state. Idempotent: promoting the existing primary is a no-op.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "user_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Primary transferred", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "team_id": { "type": "string", "format": "uuid" }, "primary_user_id": { "type": "string", "format": "uuid" } } } } } },
+          "400": { "description": "Invalid user id" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Owner only" },
+          "404": { "description": "Target user not on this team" }
         }
       }
     },
@@ -1643,11 +1694,11 @@ const openAPISpec = `{
     "/api/v1/team/invitations/{id}/accept": {
       "post": {
         "summary": "Accept an invitation by its row id (authenticated user)",
-        "description": "Authenticated counterpart to POST /api/v1/invitations/{token}/accept — this one accepts by the invitation row id (UUID) and trusts the caller's session for identity. Use the token-based public endpoint when accepting from a link in an email.",
+        "description": "Authenticated counterpart to POST /api/v1/invitations/{token}/accept — this one accepts by the invitation row id (UUID) and trusts the caller's session for identity. Use the token-based public endpoint when accepting from a link in an email. If the invitation requested role=owner but the team already has an owner, the user is silently downgraded to member and the response carries a warning field explaining the demote — use POST /api/v1/team/members/{user_id}/promote-to-primary for an atomic ownership transfer.",
         "security": [{ "bearerAuth": [] }],
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
         "responses": {
-          "200": { "description": "Accepted" },
+          "200": { "description": "Accepted; response includes the granted role and an optional warning when an owner request was silently downgraded.", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "role": { "type": "string" }, "warning": { "type": "string", "description": "Present iff the invitation requested role=owner but a silent downgrade to member occurred." } } } } } },
           "401": { "description": "Unauthorized" },
           "404": { "description": "Invitation not found" },
           "409": { "description": "Expired, already used, or member-limit reached" }
@@ -2146,7 +2197,9 @@ const openAPISpec = `{
           "internal_url": { "type": "string", "description": "Cluster-internal postgres:// URL routed via instant-pg-proxy. Use this when calling from a workload deployed inside the instanode cluster (e.g. an app started by /deploy/new) — the public hostname does not hairpin reliably." },
           "tier": { "type": "string" },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
-          "note": { "type": "string" }
+          "note": { "type": "string" },
+          "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email to convert the anonymous resource into a claimed (authenticated) one — no need to string-parse the upgrade URL. Absent on authenticated provisions." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL the agent can hand to the user to drive the dashboard claim flow." }
         }
       },
       "VectorProvisionRequest": {
@@ -2171,7 +2224,9 @@ const openAPISpec = `{
           "extension": { "type": "string", "enum": ["pgvector"], "description": "Always 'pgvector' for /vector/new. Declared so clients can confirm the extension is present without querying pg_extension." },
           "dimensions": { "type": "integer", "description": "Echo of the requested dimensions hint (defaults to 1536). Informational only — pgvector enforces dimensions per column, not per database." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
-          "note": { "type": "string" }
+          "note": { "type": "string" },
+          "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "CacheProvisionResponse": {
@@ -2184,7 +2239,9 @@ const openAPISpec = `{
           "key_prefix": { "type": "string", "description": "All keys must use this prefix for namespace isolation" },
           "tier": { "type": "string" },
           "limits": { "type": "object", "properties": { "memory_mb": { "type": "integer" }, "expires_in": { "type": "string" } } },
-          "note": { "type": "string" }
+          "note": { "type": "string" },
+          "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "NoSQLProvisionResponse": {
@@ -2196,7 +2253,9 @@ const openAPISpec = `{
           "internal_url": { "type": "string", "description": "Cluster-internal mongodb:// URL routed via instant-mongo-proxy. Use this when calling from a workload deployed inside the instanode cluster." },
           "tier": { "type": "string" },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
-          "note": { "type": "string" }
+          "note": { "type": "string" },
+          "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "QueueProvisionResponse": {
@@ -2208,7 +2267,9 @@ const openAPISpec = `{
           "internal_url": { "type": "string", "description": "Cluster-internal nats:// URL routed via instant-nats-proxy. Use this when calling from a workload deployed inside the instanode cluster." },
           "tier": { "type": "string" },
           "limits": { "type": "object" },
-          "note": { "type": "string" }
+          "note": { "type": "string" },
+          "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "WebhookProvisionResponse": {
@@ -2219,7 +2280,9 @@ const openAPISpec = `{
           "receive_url": { "type": "string", "description": "Public URL that accepts any HTTP method and stores the payload" },
           "tier": { "type": "string" },
           "expires_at": { "type": "string", "format": "date-time" },
-          "note": { "type": "string" }
+          "note": { "type": "string" },
+          "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "StorageProvisionResponse": {
@@ -2236,7 +2299,9 @@ const openAPISpec = `{
           "prefix": { "type": "string", "description": "Object-key prefix all writes must use for isolation" },
           "tier": { "type": "string" },
           "env": { "type": "string" },
-          "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "expires_in": { "type": "string", "description": "Anonymous-only" } } }
+          "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "expires_in": { "type": "string", "description": "Anonymous-only" } } },
+          "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "DeployItem": {
@@ -2246,7 +2311,7 @@ const openAPISpec = `{
           "id": { "type": "string", "format": "uuid" },
           "app_id": { "type": "string", "description": "8-char public identifier used in the URL" },
           "url": { "type": "string" },
-          "status": { "type": "string", "enum": ["building", "healthy", "failed", "stopped"] },
+          "status": { "type": "string", "enum": ["building", "deploying", "healthy", "failed", "stopped"] },
           "tier": { "type": "string" },
           "environment": { "type": "string" },
           "env": { "type": "object", "additionalProperties": { "type": "string" } },
@@ -2281,17 +2346,7 @@ const openAPISpec = `{
           "resources": {
             "type": "array",
             "description": "All anonymous resources that this JWT would attach to the new team if /claim were posted.",
-            "items": {
-              "type": "object",
-              "properties": {
-                "id": { "type": "string", "format": "uuid" },
-                "token": { "type": "string", "format": "uuid" },
-                "resource_type": { "type": "string", "enum": ["postgres", "redis", "mongodb", "nats", "webhook", "storage"] },
-                "tier": { "type": "string" },
-                "status": { "type": "string" },
-                "created_at": { "type": "string", "format": "date-time" }
-              }
-            }
+            "items": { "$ref": "#/components/schemas/ResourceItem" }
           }
         }
       },
@@ -2302,7 +2357,7 @@ const openAPISpec = `{
           "user_id": { "type": "string", "format": "uuid" },
           "team_id": { "type": "string", "format": "uuid" },
           "email": { "type": "string" },
-          "tier": { "type": "string", "enum": ["hobby", "pro", "team"] }
+          "tier": { "type": "string", "enum": ["hobby", "hobby_plus", "pro", "team", "growth"] }
         }
       },
       "StackRequest": {
@@ -2346,7 +2401,7 @@ const openAPISpec = `{
           "user_id": { "type": "string", "format": "uuid" },
           "team_id": { "type": "string", "format": "uuid" },
           "team_name": { "type": "string", "description": "Present only when the team has a non-empty name" },
-          "plan_tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "pro", "team"], "description": "Best-effort enrichment from the teams table; absent on DB lookup failure" }
+          "plan_tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "hobby_plus", "pro", "team", "growth"], "description": "Best-effort enrichment from the teams table; absent on DB lookup failure" }
         },
         "required": ["ok", "user_id", "team_id"]
       },
@@ -2363,7 +2418,7 @@ const openAPISpec = `{
         "properties": {
           "id": { "type": "string", "format": "uuid" },
           "token": { "type": "string", "format": "uuid" },
-          "resource_type": { "type": "string", "enum": ["postgres", "redis", "mongodb", "nats", "webhook", "storage"] },
+          "resource_type": { "type": "string", "enum": ["postgres", "redis", "mongodb", "queue", "storage", "webhook", "vector"] },
           "name": { "type": "string" },
           "env": { "type": "string", "description": "Environment scope (production / staging / dev / ...)" },
           "tier": { "type": "string" },
@@ -2427,7 +2482,7 @@ const openAPISpec = `{
               "id": { "type": "string", "format": "uuid" },
               "app_id": { "type": "string", "description": "8-char public identifier used in the URL" },
               "url": { "type": "string", "description": "Live HTTPS URL (set once status=healthy)" },
-              "status": { "type": "string", "enum": ["building", "healthy", "failed", "stopped"] },
+              "status": { "type": "string", "enum": ["building", "deploying", "healthy", "failed", "stopped"] },
               "tier": { "type": "string" },
               "environment": { "type": "string", "description": "Env scope (production/staging/dev). Note: 'env' on this object is the env_vars map, not the scope." },
               "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Env vars map — vault://KEY references resolve at deploy time" },
@@ -2486,7 +2541,7 @@ const openAPISpec = `{
         "description": "Aggregated billing state served by GET /api/v1/billing.",
         "properties": {
           "ok": { "type": "boolean" },
-          "tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "pro", "team"], "description": "Current plan tier from the team record" },
+          "tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "hobby_plus", "pro", "team", "growth"], "description": "Current plan tier from the team record" },
           "subscription_status": { "type": "string", "enum": ["none", "active", "cancelled"], "description": "'none' when no Razorpay subscription exists; 'cancelled' when Razorpay reports cancelled / completed / expired or cancel_at_cycle_end=true; 'active' otherwise. The platform has no trial period (see policy memory project_no_trial_pay_day_one.md); hobby/pro/team are paid from day one" },
           "next_renewal_at": { "type": ["string", "null"], "format": "date-time", "description": "ISO timestamp for next renewal (Razorpay current_end). null when no active subscription" },
           "amount_inr": { "type": ["integer", "null"], "description": "Monthly subscription amount in INR rupees (not paise). Sourced from the most recent paid invoice when available; falls back to the tier-derived price for brand-new subscriptions. null when no subscription on file" },
@@ -2537,7 +2592,7 @@ const openAPISpec = `{
           "ok":                { "type": "boolean", "enum": [true] },
           "freshness_seconds": { "type": "integer", "description": "Cache TTL window in seconds. Today 300 — matches the server-side const and the Cache-Control max-age." },
           "as_of":             { "type": "string", "format": "date-time", "description": "When the aggregation was computed." },
-          "tier":              { "type": "string", "description": "Current plan tier from the team record. Mirrored here so the sidebar doesn't need a second /billing fetch just to render the upgrade card.", "enum": ["anonymous", "free", "hobby", "pro", "team"] },
+          "tier":              { "type": "string", "description": "Current plan tier from the team record. Mirrored here so the sidebar doesn't need a second /billing fetch just to render the upgrade card. Values mirror teams.plan_tier — includes monthly canonical names and their *_yearly variants.", "enum": ["anonymous", "free", "hobby", "hobby_plus", "growth", "pro", "team", "hobby_yearly", "hobby_plus_yearly", "growth_yearly", "pro_yearly", "team_yearly"] },
           "counts": {
             "type": "object",
             "description": "Per-area counts. resources.total is the sum of every typed bucket plus 'other' — saves the dashboard from re-adding.",
@@ -2577,7 +2632,8 @@ const openAPISpec = `{
           "request_id": { "type": "string", "description": "Echo of the X-Request-ID header for this request. Stable correlator agents can quote when emailing support@instanode.dev — saves the user from copy/pasting headers." },
           "retry_after_seconds": { "type": ["integer", "null"], "description": "Seconds the agent should wait before retrying. null on 4xx (no retry — fix the request). int on transient 5xx: 30 for 503, 60 for 429, 10 for 502/504. For 429/502/503/504 the same value is also set in the Retry-After HTTP header." },
           "agent_action": { "type": "string", "description": "Optional. A sentence the calling agent should surface verbatim to the human user — e.g. 'Tell the user they've hit the hobby tier storage limit (500MB). Have them upgrade at https://instanode.dev/pricing to provision more storage.' Present on quota walls, invalid-token errors, permission-denied errors, expired-resource errors, tier-gate errors, AND on plumbing 5xx (where it falls back to a generic 'email support with this request_id' sentence)." },
-          "upgrade_url": { "type": "string", "format": "uri", "description": "Optional. Where the user can resolve the error — typically the pricing/upgrade page for quota walls and the login page for token errors. Present whenever following the URL would clear the error." }
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Optional. Where the user can resolve the error — typically the pricing/upgrade page for quota walls and the login page for token errors. Present whenever following the URL would clear the error." },
+          "claim_url": { "type": "string", "format": "uri", "description": "Optional. Present specifically on error='free_tier_recycle_requires_claim' (402 from /db/new, /cache/new, /nosql/new, /queue/new, /storage/new, /webhook/new): the URL the anonymous caller should visit to claim their existing resources with email before they can provision again. Distinct from upgrade_url — claim_url is about identity (anonymous → claimed), upgrade_url is about tier (claimed → paid). Both may be present on the same envelope." }
         },
         "required": ["ok", "error", "message", "retry_after_seconds"]
       },

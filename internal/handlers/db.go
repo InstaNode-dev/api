@@ -90,8 +90,14 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
 	var body provisionRequestBody
-	_ = c.BodyParser(&body)
-	body.Name = sanitizeName(body.Name)
+	if err := parseProvisionBody(c, &body); err != nil {
+		return err
+	}
+	cleanName, sanErr := sanitizeNameForRequest(c, body.Name)
+	if sanErr != nil {
+		return sanErr
+	}
+	body.Name = cleanName
 
 	env, envErr := resolveEnv(c, body.Env)
 	if envErr != nil {
@@ -160,7 +166,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 					"upgrade_jwt":    jwtToken,
 				}
 				setInternalURL(dedupResp, existing.Tier, connectionURL, "postgres")
-				return c.JSON(dedupResp)
+				return respondOK(c, dedupResp)
 			}
 			// Empty connection_url means provisioning failed mid-flight on the existing
 			// resource. Fall through to provision a fresh one rather than returning
@@ -301,7 +307,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 		resp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
 	}
-	return c.Status(fiber.StatusCreated).JSON(resp)
+	return respondCreated(c, resp)
 }
 
 func (h *DBHandler) newDBAuthenticated(
@@ -432,7 +438,7 @@ func (h *DBHandler) newDBAuthenticated(
 		authResp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
 	}
-	return c.Status(fiber.StatusCreated).JSON(authResp)
+	return respondCreated(c, authResp)
 }
 
 // decryptConnectionURL decrypts an AES-encrypted connection URL stored in the DB.
@@ -512,7 +518,7 @@ func (h *DBHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) err
 		resp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
 	}
-	return c.Status(fiber.StatusCreated).JSON(resp)
+	return respondCreated(c, resp)
 }
 
 // ProvisionForTwinCore is the fiber-free implementation of ProvisionForTwin.

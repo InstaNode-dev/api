@@ -177,7 +177,9 @@ func (h *BulkTwinHandler) BulkTwin(c *fiber.Ctx) error {
 	}
 
 	var body bulkTwinRequest
-	_ = c.BodyParser(&body)
+	if err := parseProvisionBody(c, &body); err != nil {
+		return err
+	}
 
 	// Normalise + validate env strings. Empty source/target are both errors
 	// here — bulk-twin is an explicit "I want every prod resource in staging"

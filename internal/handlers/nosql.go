@@ -78,8 +78,14 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
 	var body provisionRequestBody
-	_ = c.BodyParser(&body)
-	body.Name = sanitizeName(body.Name)
+	if err := parseProvisionBody(c, &body); err != nil {
+		return err
+	}
+	cleanName, sanErr := sanitizeNameForRequest(c, body.Name)
+	if sanErr != nil {
+		return sanErr
+	}
+	body.Name = cleanName
 
 	env, envErr := resolveEnv(c, body.Env)
 	if envErr != nil {
@@ -145,7 +151,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 					"upgrade_jwt":    jwtToken,
 				}
 				setInternalURL(dedupResp, existing.Tier, connectionURL, "mongodb")
-				return c.JSON(dedupResp)
+				return respondOK(c, dedupResp)
 			}
 			// Empty connection_url means provisioning failed mid-flight on the existing
 			// resource. Fall through to provision a fresh one rather than returning
@@ -275,7 +281,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 		nosqlResp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
 	}
-	return c.Status(fiber.StatusCreated).JSON(nosqlResp)
+	return respondCreated(c, nosqlResp)
 }
 
 func (h *NoSQLHandler) newNoSQLAuthenticated(
@@ -403,7 +409,7 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 		nosqlAuthResp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
 	}
-	return c.Status(fiber.StatusCreated).JSON(nosqlAuthResp)
+	return respondCreated(c, nosqlAuthResp)
 }
 
 // decryptConnectionURL decrypts an AES-encrypted connection URL stored in the DB.
@@ -429,7 +435,16 @@ func nosqlAnonymousLimits() fiber.Map {
 	return fiber.Map{
 		"storage_mb":  5,
 		"connections": 2,
-		"expires_in":  "24h",
+		// FIX-G (2026-05-14, #167): per-token cap is 2, but the underlying
+		// MongoDB pod is shared-tenant and admits up to 20 simultaneous
+		// connections across all anonymous tokens (`--maxConns 20` on the
+		// statefulset). Surfacing the shared cap lets an agent reading
+		// this response avoid the "I asked for 2 and got refused under
+		// burst" footgun — under load, your effective per-token ceiling
+		// is your share of 20, not the nominal 2.
+		"connections_shared_cap_pod": 20,
+		"connections_note":           "shared cap up to 20 across all anonymous tokens",
+		"expires_in":                 "24h",
 	}
 }
 
@@ -470,7 +485,7 @@ func (h *NoSQLHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) 
 		resp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
 	}
-	return c.Status(fiber.StatusCreated).JSON(resp)
+	return respondCreated(c, resp)
 }
 
 // ProvisionForTwinCore is the fiber-free implementation of ProvisionForTwin.

@@ -62,15 +62,25 @@ package handlers
 // a contract violation. The audit runs `grep "agent_action" internal/handlers`
 // on every PR — new strings must land in this file or extend codeToAgentAction.
 
-import "fmt"
+import (
+	"fmt"
+
+	"instant.dev/internal/plans"
+)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Multi-env / stack tier walls
 // ─────────────────────────────────────────────────────────────────────────────
 
 // AgentActionMultiEnvUpgradeRequired is returned when a hobby/free team
-// tries to use a multi-env workflow (stack family read, stack promote).
-const AgentActionMultiEnvUpgradeRequired = "Tell the user multi-env workflows (staging/production promote, env families) require the Pro plan. Have them upgrade at https://instanode.dev/pricing — takes 30 seconds."
+// tries to use a multi-env workflow (stack family read, stack promote,
+// vault copy, twin, family bulk-twin, pause/resume).
+//
+// W11 (2026-05-13) update: Hobby Plus ($19/mo) is the cheapest tier that
+// unlocks multi-env (vault_envs_allowed: [development, staging, production]),
+// so the upgrade copy points there rather than Pro — the agent surfaces
+// the closer step to the user.
+const AgentActionMultiEnvUpgradeRequired = "Tell the user multi-env workflows (staging/prod promote, env families, vault copy) need Hobby Plus or higher. Have them upgrade at https://instanode.dev/pricing — $19/mo, 30 seconds."
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Resource pause/resume walls (POST /api/v1/resources/:id/pause | /resume)
@@ -103,12 +113,30 @@ const AgentActionStackPromoteMissingImageRef = "Tell the user this stack predate
 
 // newAgentActionDeploymentLimitReached builds the 402 copy returned when a
 // team hits its deployments_apps cap (plans.yaml). Names the tier and the
-// exact cap, points the user at the upgrade URL.
+// exact cap, points the user at the next-tier upgrade URL.
+//
+// W11 (2026-05-13) routing: hobby's 1-deploy cap is solved by hobby_plus's
+// 2-deploy cap ($19/mo) — the closer upgrade step. Pro is only the right
+// nudge once the caller is already past the hobby_plus cap (or on a higher
+// tier that ran into a higher cap, which today means growth → team).
 func newAgentActionDeploymentLimitReached(tier string, limit int) string {
-	return fmt.Sprintf(
-		"Tell the user they've hit the %s tier deployment cap (%d apps). Upgrade to Pro for 10 deployments at https://instanode.dev/pricing — takes 30 seconds, no card for upgrade preview.",
-		tier, limit,
-	)
+	switch plans.CanonicalTier(tier) {
+	case "anonymous", "free", "hobby":
+		return fmt.Sprintf(
+			"Tell the user they've hit the %s tier deployment cap (%d app). Upgrade to Hobby Plus for 2 deployments at https://instanode.dev/pricing — $19/mo, 30 seconds.",
+			tier, limit,
+		)
+	case "hobby_plus":
+		return fmt.Sprintf(
+			"Tell the user they've hit the %s tier deployment cap (%d apps). Upgrade to Pro for 10 deployments at https://instanode.dev/pricing — takes 30 seconds, no card for upgrade preview.",
+			tier, limit,
+		)
+	default:
+		return fmt.Sprintf(
+			"Tell the user they've hit the %s tier deployment cap (%d apps). Upgrade to Pro for 10 deployments at https://instanode.dev/pricing — takes 30 seconds, no card for upgrade preview.",
+			tier, limit,
+		)
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

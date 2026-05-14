@@ -551,7 +551,11 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 	// Optional human-readable name.
 	name := ""
 	if names := form.Value["name"]; len(names) > 0 {
-		name = sanitizeName(names[0])
+		clean, sanErr := sanitizeNameForRequest(c, names[0])
+		if sanErr != nil {
+			return sanErr
+		}
+		name = clean
 	}
 
 	// Anonymous stacks: nil TeamID + 24h TTL + fingerprint (same model as /db/new).
@@ -1307,17 +1311,26 @@ const auditActorSystem = "system"
 const auditResourceTypeVault = "vault"
 
 // multiEnvTierAllowed reports whether the given tier may use the env-promotion
-// endpoints. Pro / Team / Growth only. The spec (RETRO-2026-05-12 §10.17) calls
-// this out as a Pro-tier differentiator — the hobby tier explicitly does NOT
-// get multi-env workflows.
+// endpoints. Hobby Plus / Pro / Team / Growth (and their *_yearly variants).
 //
-// Held inline rather than added to common/plans/Registry because the plan YAML
-// does not yet have a `features.multi_env` flag and we don't want to widen the
-// shared schema for a feature that's still bedding in. If the policy grows
-// teeth (e.g. variant per-tier env count caps), promote this into plans.yaml.
+// W11 (2026-05-13) extended this to hobby_plus: plans.yaml now lists
+// vault_envs_allowed: [development, staging, production] for hobby_plus, so
+// the env-aware surface (promote, families/bulk-twin, vault/copy, twin,
+// pause/resume) must accept it too — otherwise FIX-A6/Q23 leaves Hobby Plus
+// structurally broken.
+//
+// The *_yearly suffixes are belt-and-braces: webhooks canonicalize plan_tier
+// to the bare name before writing teams.plan_tier (see planIDToTier →
+// CanonicalTier), so in practice this function only ever sees bare tiers.
+// We pass them through CanonicalTier defensively so a caller that hands us a
+// raw yearly variant (an ops script, a future direct setter) still resolves.
+//
+// Held inline rather than as a Registry method because the policy is still
+// boolean-only — no per-env caps, no role thresholds. If the policy grows
+// teeth, promote this into plans.yaml as a `features.multi_env` flag.
 func multiEnvTierAllowed(tier string) bool {
-	switch tier {
-	case "pro", "team", "growth":
+	switch plans.CanonicalTier(tier) {
+	case "hobby_plus", "pro", "team", "growth":
 		return true
 	default:
 		return false
@@ -1332,7 +1345,7 @@ func respondMultiEnvUpgradeRequired(c *fiber.Ctx, currentTier string) error {
 	_ = c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
 		"ok":           false,
 		"error":        "upgrade_required",
-		"message":      "Multi-env workflows require the Pro plan or higher. Your team is on the " + currentTier + " plan.",
+		"message":      "Multi-env workflows require the Hobby Plus plan or higher. Your team is on the " + currentTier + " plan.",
 		"upgrade_url":  "https://instanode.dev/pricing",
 		"agent_action": AgentActionMultiEnvUpgradeRequired,
 	})
@@ -1695,7 +1708,10 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 			return respondError(c, fiber.StatusInternalServerError, "internal_error",
 				"Failed to generate stack ID")
 		}
-		name := sanitizeName(body.Name)
+		name, sanErr := sanitizeNameForRequest(c, body.Name)
+		if sanErr != nil {
+			return sanErr
+		}
 		if name == "" {
 			name = source.Name
 		}

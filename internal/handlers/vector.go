@@ -214,8 +214,14 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
 	var body provisionRequestBody
-	_ = c.BodyParser(&body)
-	body.Name = sanitizeName(body.Name)
+	if err := parseProvisionBody(c, &body); err != nil {
+		return err
+	}
+	cleanName, sanErr := sanitizeNameForRequest(c, body.Name)
+	if sanErr != nil {
+		return sanErr
+	}
+	body.Name = cleanName
 
 	env, envErr := resolveEnv(c, body.Env)
 	if envErr != nil {
@@ -285,7 +291,7 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 					"upgrade_jwt":    jwtToken,
 				}
 				setInternalURL(dedupResp, existing.Tier, connectionURL, "postgres")
-				return c.JSON(dedupResp)
+				return respondOK(c, dedupResp)
 			}
 			slog.Warn("vector.new.dedup_empty_url — provisioning fresh",
 				"token", existing.Token, "request_id", requestID)
@@ -413,7 +419,7 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 		resp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
 	}
-	return c.Status(fiber.StatusCreated).JSON(resp)
+	return respondCreated(c, resp)
 }
 
 func (h *VectorHandler) newVectorAuthenticated(
@@ -541,7 +547,7 @@ func (h *VectorHandler) newVectorAuthenticated(
 		authResp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
 	}
-	return c.Status(fiber.StatusCreated).JSON(authResp)
+	return respondCreated(c, authResp)
 }
 
 // decryptConnectionURL is shared with DBHandler but kept separately on the

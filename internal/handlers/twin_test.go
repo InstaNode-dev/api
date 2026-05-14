@@ -147,10 +147,11 @@ func TestProvisionTwin_HobbyTier_Returns402(t *testing.T) {
 	assert.NotEmpty(t, body.UpgradeURL, "402 must carry upgrade_url")
 }
 
-//  2. Cross-team source → 403. The caller is authenticated, but the source
-//     belongs to a different team. The response must NOT leak whether the
-//     resource exists (no 404).
-func TestProvisionTwin_CrossTeam_Returns403(t *testing.T) {
+//  2. Cross-team source → 404. The caller is authenticated, but the source
+//     belongs to a different team. The response must NOT confirm that the
+//     resource exists in another tenant — 404 keeps it indistinguishable
+//     from a non-existent id.
+func TestProvisionTwin_CrossTeam_Returns404(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -168,11 +169,11 @@ func TestProvisionTwin_CrossTeam_Returns403(t *testing.T) {
 
 	resp := postTwin(t, app, sourceToken, jwtB, map[string]any{"env": "staging"})
 	defer resp.Body.Close()
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode,
-		"cross-team source must be 403 (not 404) — same posture as /family")
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"cross-team source must be 404 — never confirm the resource's existence to a non-owner")
 
 	body := decodeErr(t, resp)
-	assert.Equal(t, "forbidden", body.Error)
+	assert.Equal(t, "not_found", body.Error)
 }
 
 //  3. Source not found → 404. Caller passes a syntactically-valid UUID

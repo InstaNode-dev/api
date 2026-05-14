@@ -383,6 +383,10 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS degraded BOOLEAN NOT NULL DEFAULT false`,
 		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS degraded_reason TEXT`,
 		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS last_reconciled_at TIMESTAMPTZ`,
+		// 042_webhook_hmac_secret — optional shared secret for HMAC-locked
+		// /webhook/receive/:token. Mirrored here so a fresh SetupTestDB has
+		// the column the receive handler reads at request time.
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS hmac_secret TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_degraded ON resources(degraded) WHERE degraded`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_pending_sweep ON resources(status, created_at) WHERE status = 'pending'`,
 		// 031_backups — customer-facing Postgres backup + restore tables.
@@ -641,7 +645,18 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	webhookH := handlers.NewWebhookHandler(db, rdb, cfg, planReg)
 	app.Post("/storage/new", middleware.OptionalAuth(cfg), middleware.Idempotency(rdb, "storage.new"), storageH.NewStorage)
 	app.Post("/webhook/new", middleware.OptionalAuth(cfg), middleware.Idempotency(rdb, "webhook.new"), webhookH.NewWebhook)
-	app.Post("/webhook/receive/:token", webhookH.Receive)
+	// Mirror the production router: app.All so GET/PUT/DELETE verification
+	// flows reach the handler instead of 405-ing. See router.go for the
+	// full rationale (BugBash #Q29).
+	app.All("/webhook/receive/:token", webhookH.Receive)
+
+	// /queue/new and /auth/cli are wired so handler-level tests can hit
+	// every body-parsing surface Wave FIX-D introduced. Both endpoints
+	// existed in production already (internal/router/router.go) but were
+	// previously absent from the test app.
+	queueH := handlers.NewQueueHandler(db, rdb, cfg, nil, planReg)
+	app.Post("/queue/new", middleware.OptionalAuth(cfg), middleware.Idempotency(rdb, "queue.new"), queueH.NewQueue)
+	app.Post("/auth/cli", cliAuthH.CreateCLISession)
 
 	// Phase 6: deploy
 	deployH := handlers.NewDeployHandler(db, rdb, cfg, planReg)
