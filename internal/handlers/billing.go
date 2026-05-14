@@ -16,6 +16,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	razorpay "github.com/razorpay/razorpay-go"
+	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -36,11 +37,32 @@ import (
 // the checkout side and the webhook side cannot drift.
 const checkoutNoteAdminPromoCodeID = "admin_promo_code_id"
 
+// checkoutInflightTTL bounds the server-side dedup window for a team's
+// concurrent /api/v1/billing/checkout calls. ~60s is well within the
+// time it takes a user to read the Razorpay hosted-checkout response,
+// realise it loaded, and (mistakenly) double-tap or re-submit. The TTL
+// also caps the worst case where the first caller crashes mid-flight —
+// after 60s a retry is allowed without operator intervention.
+const checkoutInflightTTL = 60 * time.Second
+
+// checkoutInflightKeyPrefix is the Redis key prefix for the per-team
+// SETNX dedup guard. Scoped by team_id (not user) so a second user on
+// the same team also bounces — the subscription belongs to the team.
+const checkoutInflightKeyPrefix = "team_checkout_inflight:"
+
 // BillingHandler handles billing and Razorpay webhook endpoints.
 type BillingHandler struct {
 	db    *sql.DB
 	cfg   *config.Config
 	email *email.Client
+
+	// rdb is the Redis client used by the BB2-D5 server-side dedup guard
+	// on CreateCheckoutAPI (the SETNX `team_checkout_inflight:<team_id>`
+	// belt). Nil-safe: if unset, the guard fails open and the call
+	// proceeds — Redis outages must never block paid upgrades. The
+	// router wires this via WithRedis() at handler construction time;
+	// tests that don't exercise the guard can leave it nil.
+	rdb *redis.Client
 
 	// FetchSubscriptionDetails fetches a Razorpay subscription + its latest
 	// paid invoice for billing-state aggregation. Set in tests to substitute
@@ -58,6 +80,16 @@ func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient *email.Client
 		portal := &razorpaybilling.Portal{DB: h.db, Cfg: h.cfg}
 		return portal.FetchSubscriptionDetails(subID)
 	}
+	return h
+}
+
+// WithRedis wires a Redis client onto the handler for the BB2-D5 checkout
+// dedup guard. Returns the receiver for fluent construction at the router
+// boundary. Calling this is OPTIONAL — when the field is nil the guard
+// fails open (proceeds without dedup) which preserves backwards-compatible
+// behaviour for tests that construct the handler without Redis.
+func (h *BillingHandler) WithRedis(rdb *redis.Client) *BillingHandler {
+	h.rdb = rdb
 	return h
 }
 
@@ -203,6 +235,78 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	teamID, err := uuid.Parse(teamIDStr)
 	if err != nil {
 		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Valid session token required")
+	}
+
+	// BB2-D5 server-side dedup belt. Two rapid concurrent POSTs (cross-tab
+	// click, mobile double-tap, retried form submit) each call Razorpay
+	// independently today and create TWO subscriptions — a real revenue
+	// loss path because the user is charged for whichever short_url they
+	// actually open. The dashboard's single-tab `checkoutLoading` guard is
+	// client-only and bypassed by any of the above; this Redis SETNX is
+	// the load-bearing fix.
+	//
+	// Contract:
+	//   - Atomic SETNX (`team_checkout_inflight:<team_id>`, TTL 60s).
+	//   - SETNX=1 (key created) → proceed. We hold the key for the entire
+	//     Razorpay call duration; the TTL auto-clears so a crashed/timed-
+	//     out first caller never wedges a team's checkout indefinitely.
+	//   - SETNX=0 (key already held) → return 409 checkout_in_flight with
+	//     a structured agent_action so the caller knows to wait + refresh.
+	//   - Redis error → fail OPEN with a WARN log. A Redis outage must
+	//     NEVER block a paid upgrade; the cost of an extremely rare
+	//     duplicate during a Redis brownout is far below the cost of
+	//     blocking every paying customer. The Idempotency-Key middleware
+	//     on this route is the braces — when present it dedupes
+	//     regardless of Redis health.
+	guardCtx := c.Context()
+	guardKey := checkoutInflightKeyPrefix + teamID.String()
+	if h.rdb != nil {
+		ok, setErr := h.rdb.SetNX(guardCtx, guardKey, requestID, checkoutInflightTTL).Result()
+		if setErr != nil {
+			// Fail open — a Redis brownout must not block paying customers.
+			// The Idempotency-Key braces and the dashboard single-tab guard
+			// still apply on this path.
+			slog.Warn("billing.checkout.dedup_setnx_failed_open",
+				"error", setErr,
+				"team_id", teamID,
+				"request_id", requestID,
+			)
+		} else if !ok {
+			// Another caller is already creating a checkout for this team.
+			// Surface retry_after_seconds = 60 directly (the helper's default
+			// is nil on 409s — see defaultRetryAfterSeconds — but agents
+			// branching on this status DO want a wait hint). Emit the
+			// envelope inline rather than threading a fourth helper.
+			slog.Info("billing.checkout.dedup_blocked",
+				"team_id", teamID,
+				"request_id", requestID,
+			)
+			retry := int(checkoutInflightTTL / time.Second)
+			_ = c.Status(fiber.StatusConflict).JSON(ErrorResponse{
+				OK:                false,
+				Error:             "checkout_in_flight",
+				Message:           "A checkout is already being created for this team. Wait ~60s and retry, or visit /dashboard to find the existing pending subscription.",
+				RequestID:         requestID,
+				RetryAfterSeconds: &retry,
+				AgentAction:       "Tell the user a checkout is already being created. They should wait ~60 seconds and refresh — the existing checkout link will appear in the dashboard.",
+			})
+			return ErrResponseWritten
+		} else {
+			defer func() {
+				// Release the guard on the way out so a retry after a
+				// 4xx (e.g. invalid plan) doesn't have to wait the full
+				// 60s. The TTL is the safety net for crashed callers; the
+				// defer is the fast-path for normal completion. Use a
+				// background context so a cancelled request still clears.
+				if delErr := h.rdb.Del(context.Background(), guardKey).Err(); delErr != nil {
+					slog.Warn("billing.checkout.dedup_release_failed",
+						"error", delErr,
+						"team_id", teamID,
+						"request_id", requestID,
+					)
+				}
+			}()
+		}
 	}
 
 	var body checkoutRequest
