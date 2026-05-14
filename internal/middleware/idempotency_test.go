@@ -19,6 +19,7 @@ package middleware_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,6 +33,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"instant.dev/internal/handlers"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/testhelpers"
 )
@@ -328,18 +330,38 @@ func TestIdempotency_TTLExpiration_24h(t *testing.T) {
 // the wall on every reconnect; the cached 402 lets the upstream agent
 // loop see the same error and stop. This is the rationale for the
 // "5xx not cached / 4xx cached" rule.
+//
+// IMPORTANT (BB2-D5, 2026-05-14): this test exercises the REAL production
+// error path — handlers.WriteFiberError (which delegates to respondError)
+// returns the handlers.ErrResponseWritten sentinel after committing the
+// 4xx body to the wire. Pre-BB2-D5 the test used c.Status().JSON() which
+// returns nil and bypassed the middleware's bail clause — so the test
+// passed for the wrong reason while production silently skipped caching
+// every 4xx error a handler produced via respondError. The Fiber
+// ErrorHandler mirrors the production short-circuit on ErrResponseWritten.
 func TestIdempotency_4xxIsCached(t *testing.T) {
 	rdb, cleanR := testhelpers.SetupTestRedis(t)
 	defer cleanR()
 
 	hits := &idemCounter{}
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			// Production behaviour: respondError already wrote the body —
+			// short-circuit so we don't overwrite. Matches router/router.go.
+			if errors.Is(err, handlers.ErrResponseWritten) {
+				return nil
+			}
+			return fiber.DefaultErrorHandler(c, err)
+		},
+	})
 	app.Use(middleware.Fingerprint())
 	app.Post("/test", middleware.Idempotency(rdb, "test.fourxx"), func(c *fiber.Ctx) error {
 		hits.inc()
-		return c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
-			"error": "quota_exceeded",
-		})
+		// Real production error path: respondError writes status+body and
+		// returns ErrResponseWritten as a sentinel. This is what every
+		// handler emits for /db/new, /cache/new, /deploy/new etc.
+		return handlers.WriteFiberError(c, fiber.StatusPaymentRequired,
+			"quota_exceeded", "Tier cap reached — upgrade or wait for reset.")
 	})
 
 	ip := uniqueTestIP("fourxx")
@@ -357,7 +379,159 @@ func TestIdempotency_4xxIsCached(t *testing.T) {
 	assert.Contains(t, body2, "quota_exceeded",
 		"replayed body must match the cached one")
 	assert.Equal(t, 1, hits.get(),
-		"handler must NOT re-run when a cached 4xx is available")
+		"handler must NOT re-run when a cached 4xx is available — BB2-D5 root case")
+}
+
+// TestIdempotency_RealHandlerErrorPathCaches — BB2-D5 regression test.
+//
+// Drives the EXACT production failure: an agent hits /deploy/new over its
+// tier cap, the server returns 402 cap-blocked via respondError (which
+// writes the body and returns ErrResponseWritten), and the agent retries
+// with the same Idempotency-Key. Before BB2-D5 the second call ran the
+// handler again — re-billing, re-side-effecting. After the fix the second
+// call short-circuits to the cached 402.
+//
+// This test FAILS before the fix (handler hit count = 2) and PASSES after
+// (handler hit count = 1).
+func TestIdempotency_RealHandlerErrorPathCaches(t *testing.T) {
+	rdb, cleanR := testhelpers.SetupTestRedis(t)
+	defer cleanR()
+
+	hits := &idemCounter{}
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			if errors.Is(err, handlers.ErrResponseWritten) {
+				return nil
+			}
+			return fiber.DefaultErrorHandler(c, err)
+		},
+	})
+	app.Use(middleware.Fingerprint())
+	app.Post("/deploy/new", middleware.Idempotency(rdb, "deploy.new"),
+		func(c *fiber.Ctx) error {
+			hits.inc()
+			return handlers.WriteFiberError(c, fiber.StatusPaymentRequired,
+				"quota_exceeded",
+				"deployments_apps cap reached for hobby tier. Upgrade or delete an existing deploy.")
+		})
+
+	ip := uniqueTestIP("bb2d5-real-path")
+	key := "deploy-retry-key-" + ip
+	body := `{"tarball":"redacted","env":"production"}`
+
+	resp1 := postWithIdem(t, app, "/deploy/new", ip, key, body)
+	body1 := readBody(t, resp1)
+	require.Equal(t, http.StatusPaymentRequired, resp1.StatusCode,
+		"first call must surface the 402 from respondError")
+	require.Empty(t, resp1.Header.Get("X-Idempotent-Replay"),
+		"first call must NOT be marked as a replay")
+	require.Contains(t, body1, "quota_exceeded")
+
+	// Agent retries with the same Idempotency-Key. Production behaviour
+	// before the fix: handler runs again, side effects repeat. After the
+	// fix: cached 402 replays, handler never invoked.
+	resp2 := postWithIdem(t, app, "/deploy/new", ip, key, body)
+	body2 := readBody(t, resp2)
+	assert.Equal(t, http.StatusPaymentRequired, resp2.StatusCode,
+		"replay must surface the cached 402")
+	assert.Equal(t, "true", resp2.Header.Get("X-Idempotent-Replay"),
+		"replay header must be set so the agent knows this is a cached error")
+	assert.Equal(t, body1, body2,
+		"replayed body must equal the original 402 envelope verbatim")
+	assert.Equal(t, 1, hits.get(),
+		"handler must run EXACTLY ONCE across two identical Idempotency-Key calls — "+
+			"this is the BB2-D5 contract that was silently broken in production")
+}
+
+// TestIdempotency_5xxFromRespondError_NotCached — guardrail that the BB2-D5
+// fix does NOT over-correct. A handler that calls respondError with a 5xx
+// status (e.g. provision_failed) still returns ErrResponseWritten, but the
+// status >= 500 branch must still bypass caching so retries can complete
+// the work once the upstream recovers. Without this guardrail a transient
+// provisioner outage would freeze every retry behind a cached 503 for 24h.
+func TestIdempotency_5xxFromRespondError_NotCached(t *testing.T) {
+	rdb, cleanR := testhelpers.SetupTestRedis(t)
+	defer cleanR()
+
+	hits := &idemCounter{}
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			if errors.Is(err, handlers.ErrResponseWritten) {
+				return nil
+			}
+			return fiber.DefaultErrorHandler(c, err)
+		},
+	})
+	app.Use(middleware.Fingerprint())
+	app.Post("/test", middleware.Idempotency(rdb, "test.fivexx-real"),
+		func(c *fiber.Ctx) error {
+			hits.inc()
+			return handlers.WriteFiberError(c, fiber.StatusServiceUnavailable,
+				"provision_failed", "Upstream provisioner unavailable.")
+		})
+
+	ip := uniqueTestIP("bb2d5-5xx-real")
+	key := "test-key-5xx-real-" + ip
+	body := `{"x":1}`
+
+	resp1 := postWithIdem(t, app, "/test", ip, key, body)
+	readBody(t, resp1)
+	resp2 := postWithIdem(t, app, "/test", ip, key, body)
+	readBody(t, resp2)
+
+	assert.Equal(t, http.StatusServiceUnavailable, resp1.StatusCode)
+	assert.Equal(t, http.StatusServiceUnavailable, resp2.StatusCode)
+	assert.Empty(t, resp2.Header.Get("X-Idempotent-Replay"),
+		"5xx must NOT replay even when reached via respondError — "+
+			"the agent's retry must reach the handler so the work eventually completes")
+	assert.Equal(t, 2, hits.get(),
+		"handler must re-run on every retry while the upstream stays 5xx")
+}
+
+// TestIdempotency_NonSentinelErrorNotCached — guardrail that a plumbing
+// error (e.g. a fiber.NewError returned by deeper middleware, a panic
+// recovered by Fiber's default recover) is NOT cached. Only the
+// ErrResponseWritten sentinel — which means "I committed a real 4xx/5xx
+// body to the wire on purpose" — triggers the cache write. Anything else
+// is a bug we don't want to memoise for 24h.
+func TestIdempotency_NonSentinelErrorNotCached(t *testing.T) {
+	rdb, cleanR := testhelpers.SetupTestRedis(t)
+	defer cleanR()
+
+	hits := &idemCounter{}
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			// Default Fiber behaviour: write 500 + plain message.
+			return fiber.DefaultErrorHandler(c, err)
+		},
+	})
+	app.Use(middleware.Fingerprint())
+	app.Post("/test", middleware.Idempotency(rdb, "test.bare-error"),
+		func(c *fiber.Ctx) error {
+			hits.inc()
+			// A bare error — NO body written. Production would hit the
+			// Fiber ErrorHandler which writes a 500. Idempotency middleware
+			// must NOT cache this — the response body wasn't intentionally
+			// shaped by respondError.
+			return errors.New("bare plumbing error")
+		})
+
+	ip := uniqueTestIP("bb2d5-bare")
+	key := "test-bare-" + ip
+	body := `{"x":1}`
+
+	resp1 := postWithIdem(t, app, "/test", ip, key, body)
+	readBody(t, resp1)
+	resp2 := postWithIdem(t, app, "/test", ip, key, body)
+	readBody(t, resp2)
+
+	// Both calls fall through Fiber's default 500 handler.
+	assert.Equal(t, http.StatusInternalServerError, resp1.StatusCode)
+	assert.Equal(t, http.StatusInternalServerError, resp2.StatusCode)
+	assert.Empty(t, resp2.Header.Get("X-Idempotent-Replay"),
+		"non-sentinel errors must NOT be cached — only ErrResponseWritten triggers caching")
+	assert.Equal(t, 2, hits.get(),
+		"handler must re-run when the error is a plumbing bug, not an intentional respondError")
 }
 
 // TestIdempotency_WhitespaceOnlyKey_BackwardsCompat — Go's net/http
