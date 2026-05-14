@@ -466,9 +466,49 @@ func dbAnonymousLimits() fiber.Map {
 //
 // Response shape on 201 mirrors newDBAuthenticated so the dashboard +
 // MCP can consume twin responses with zero branching against /db/new.
+//
+// This method delegates to ProvisionForTwinCore (the fiber-free core) and
+// renders the result as JSON — bulk-twin reuses the Core path directly so
+// it can aggregate many results into one Multi-Status response without
+// fiber writes-per-row.
 func (h *DBHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) error {
 	ctx := c.UserContext()
+	res, err := h.ProvisionForTwinCore(ctx, in)
+	if err != nil {
+		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", err.Error())
+	}
 
+	resp := fiber.Map{
+		"ok":             true,
+		"id":             res.ID,
+		"token":          res.Token,
+		"name":           res.Name,
+		"connection_url": res.ConnectionURL,
+		"internal_url":   res.InternalURL,
+		"tier":           res.Tier,
+		"env":            res.Env,
+		"family_root_id": res.FamilyRootID,
+		"limits": fiber.Map{
+			"storage_mb":  res.Limits.StorageMB,
+			"connections": res.Limits.Connections,
+		},
+	}
+	if res.StorageExceeded {
+		resp["warning"] = "Storage limit reached. Upgrade to continue."
+		c.Set("X-Instant-Notice", "storage_limit_reached")
+	}
+	return c.Status(fiber.StatusCreated).JSON(resp)
+}
+
+// ProvisionForTwinCore is the fiber-free implementation of ProvisionForTwin.
+// Returns a TwinProvisionResult on success, or an error string suitable for
+// surfacing to the caller. Used by both the single-twin handler (which renders
+// the result as JSON) and the bulk-twin handler (which aggregates results).
+//
+// Errors are returned with a human-friendly message — the bulk handler
+// records them verbatim in the failures array. Side-effects (audit row,
+// soft-delete on provision failure) are identical to the original path.
+func (h *DBHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionForTwinInput) (TwinProvisionResult, error) {
 	resource, err := models.CreateResource(ctx, h.db, models.CreateResourceParams{
 		TeamID:           &in.TeamID,
 		ResourceType:     models.ResourceTypePostgres,
@@ -485,12 +525,9 @@ func (h *DBHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) err
 	if err != nil {
 		slog.Error("twin.db.create_resource_failed",
 			"error", err, "team_id", in.TeamID, "env", in.Env, "request_id", in.RequestID)
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to record twin resource")
+		return TwinProvisionResult{}, twinCoreErr("Failed to record twin resource")
 	}
 
-	// Best-effort audit event; failures never block the provision. Matches
-	// the `provision` kind used by /db/new so the Activity feed renders
-	// twin events alongside normal provisions.
 	go func() {
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:       in.TeamID,
@@ -517,7 +554,7 @@ func (h *DBHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) err
 			slog.Error("twin.db.soft_delete_failed",
 				"error", delErr, "resource_id", resource.ID, "request_id", in.RequestID)
 		}
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision Postgres twin")
+		return TwinProvisionResult{}, twinCoreErr("Failed to provision Postgres twin")
 	}
 
 	if aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey); keyErr != nil {
@@ -547,24 +584,20 @@ func (h *DBHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) err
 	storageLimitMB := h.plans.StorageLimitMB(in.Tier, models.ResourceTypePostgres)
 	_, storageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
 
-	resp := fiber.Map{
-		"ok":             true,
-		"id":             resource.ID.String(),
-		"token":          tokenStr,
-		"name":           resource.Name.String,
-		"connection_url": creds.URL,
-		"internal_url":   proxiedInternalURL(creds.URL, models.ResourceTypePostgres),
-		"tier":           in.Tier,
-		"env":            resource.Env,
-		"family_root_id": derefUUID(in.ParentRootID),
-		"limits": fiber.Map{
-			"storage_mb":  storageLimitMB,
-			"connections": h.plans.ConnectionsLimit(in.Tier, models.ResourceTypePostgres),
+	return TwinProvisionResult{
+		ID:            resource.ID.String(),
+		Token:         tokenStr,
+		Name:          resource.Name.String,
+		ResourceType:  models.ResourceTypePostgres,
+		ConnectionURL: creds.URL,
+		InternalURL:   proxiedInternalURL(creds.URL, models.ResourceTypePostgres),
+		Tier:          in.Tier,
+		Env:           resource.Env,
+		FamilyRootID:  derefUUID(in.ParentRootID),
+		Limits: TwinResultLimits{
+			StorageMB:   storageLimitMB,
+			Connections: h.plans.ConnectionsLimit(in.Tier, models.ResourceTypePostgres),
 		},
-	}
-	if storageExceeded {
-		resp["warning"] = "Storage limit reached. Upgrade to continue."
-		c.Set("X-Instant-Notice", "storage_limit_reached")
-	}
-	return c.Status(fiber.StatusCreated).JSON(resp)
+		StorageExceeded: storageExceeded,
+	}, nil
 }

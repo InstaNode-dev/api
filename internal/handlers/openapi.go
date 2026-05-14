@@ -810,6 +810,41 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/families/bulk-twin": {
+      "post": {
+        "summary": "Bulk env-twin every parent resource in source_env (Pro+)",
+        "description": "One-shot endpoint to twin every family-root resource a team owns in source_env into target_env. Replaces N sequential per-resource /provision-twin calls — the agentic-founder use case for setting up staging in one step.\n\nReturns 200 on full success, 207 Multi-Status when at least one twin failed (the successful rows are NOT rolled back — caller retries just the failed parents). Parents already twinned in target_env count as skipped_already_existed (NOT failures) so retries are idempotent. Tier-gated to Pro/Team/Growth.\n\nConcurrency: per-call semaphore caps in-flight provisions (5 by default) so a team with 30 resources doesn't wait 30× serial provision time. Provisions are NOT rolled back on partial failure — the customer can retry just the failed rows.\n\nQuota gate: if a team's resource-count headroom is exhausted, the remaining parents return failures[] entries with error=quota_exceeded + the upgrade URL in agent_action.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["source_env", "target_env"],
+                "properties": {
+                  "source_env":     { "type": "string", "description": "Env to copy FROM (e.g. \"production\"). Must match ^[a-z0-9-]{1,32}$. Only resources where parent_resource_id IS NULL — the family roots — are considered." },
+                  "target_env":     { "type": "string", "description": "Env to copy TO (e.g. \"staging\"). Must differ from source_env. Same charset rule as source_env." },
+                  "resource_types": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["postgres", "redis", "mongodb"] },
+                    "description": "Optional whitelist. Empty = all twin-supported types. Unknown types in the filter are silently dropped so old callers don't break when a new supported type lands."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "All selected parents twinned (or already had a twin). Body: { ok:true, twinned, skipped_already_existed, items[], failures:[] }. Items carry parent_token + twin_token + resource_type + env + (optional) skipped:true for the already-existed rows." },
+          "207": { "description": "Multi-Status — at least one parent failed (provision error, quota_exceeded, etc.). Body shape identical to 200 but failures[] is non-empty. Each failure carries parent_token + error code + message + (for quota_exceeded) agent_action + upgrade_url." },
+          "400": { "description": "missing_source_env / missing_target_env / invalid_source_env / invalid_target_env / same_env (source and target are identical)." },
+          "401": { "description": "Unauthorized — Bearer token required." },
+          "402": { "description": "upgrade_required — team is on hobby/free; response carries agent_action + upgrade_url. Multi-env workflows are a Pro+ differentiator." },
+          "503": { "description": "team_lookup_failed / list_failed — transient DB error; retry with backoff." }
+        }
+      }
+    },
     "/api/v1/webhooks/{token}/requests": {
       "get": {
         "summary": "List received webhook payloads",
