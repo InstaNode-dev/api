@@ -262,6 +262,17 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// OpenAPI spec — machine-readable description of the agent-facing API
 	app.Get("/openapi.json", handlers.ServeOpenAPI)
 
+	// /llms.txt — agent discovery doc, 302 to marketing where it's the
+	// source of truth. Agents that hit api.instanode.dev first land here
+	// and follow the redirect to instanode.dev/llms.txt (and its companion
+	// /llms-full.txt) without a 404 dead-end. P1 persona finding 2026-05-14.
+	app.Get("/llms.txt", func(c *fiber.Ctx) error {
+		return c.Redirect("https://instanode.dev/llms.txt", fiber.StatusFound)
+	})
+	app.Get("/llms-full.txt", func(c *fiber.Ctx) error {
+		return c.Redirect("https://instanode.dev/llms-full.txt", fiber.StatusFound)
+	})
+
 	// Public capability + incident discovery for AI agents — no auth.
 	// /capabilities answers "what can I do at which tier?" without
 	// provisioning-to-discover-limits. /incidents returns [] today and
