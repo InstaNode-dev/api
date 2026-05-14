@@ -582,12 +582,18 @@ func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
 		"request_id", requestID,
 	)
 
+	// W10 fix #81: dashboards (W8 + W9 PauseResumeButton) expect a structured
+	// `resource` field so the click-handler can swap local React state in
+	// place rather than re-fetch. Keep the legacy top-level fields for any
+	// agent/CLI client that consumed the flat shape (additive change).
+	resource.Status = "paused"
 	return c.JSON(fiber.Map{
-		"ok":      true,
-		"id":      resource.ID,
-		"token":   resource.Token,
-		"status":  "paused",
-		"message": "Resource paused. Storage is preserved and the connection URL is unchanged; new connections are refused until resume.",
+		"ok":       true,
+		"id":       resource.ID,
+		"token":    resource.Token,
+		"status":   "paused",
+		"message":  "Resource paused. Storage is preserved and the connection URL is unchanged; new connections are refused until resume.",
+		"item":     resourceToMap(resource),
 	})
 }
 
@@ -693,12 +699,16 @@ func (h *ResourceHandler) Resume(c *fiber.Ctx) error {
 		"request_id", requestID,
 	)
 
+	// W10 fix #81: parallel to Pause — surface the full Resource so the
+	// dashboard adapter can swap state without refetching.
+	resource.Status = "active"
 	return c.JSON(fiber.Map{
-		"ok":      true,
-		"id":      resource.ID,
-		"token":   resource.Token,
-		"status":  "active",
-		"message": "Resource resumed. The connection URL is unchanged — your existing config still works.",
+		"ok":       true,
+		"id":       resource.ID,
+		"token":    resource.Token,
+		"status":   "active",
+		"message":  "Resource resumed. The connection URL is unchanged — your existing config still works.",
+		"item":     resourceToMap(resource),
 	})
 }
 
