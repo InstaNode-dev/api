@@ -355,6 +355,11 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 // ── Razorpay webhook payload structs ─────────────────────────────────────────
 
 type rzpWebhookEvent struct {
+	// ID is the canonical event identifier Razorpay assigns to every
+	// webhook (sent in both the `X-Razorpay-Event-Id` header and the body
+	// `id` field). Used for replay protection — see razorpay_webhook_events
+	// table + processedRazorpayEvent helper below.
+	ID      string          `json:"id"`
 	Event   string          `json:"event"`
 	Payload rzpEventPayload `json:"payload"`
 }
@@ -411,6 +416,39 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 	ctx, span := otel.Tracer("instant.dev/handlers").Start(c.UserContext(), "billing.razorpay_webhook",
 		trace.WithAttributes(attribute.String("rzp.event", event.Event)))
 	defer span.End()
+
+	// Replay protection: Razorpay sends a unique event_id in the
+	// `X-Razorpay-Event-Id` header (canonical) and in the body `id` field
+	// (fallback). The signature check above proves the payload came from
+	// Razorpay, but signed payloads can be re-POSTed N times — each replay
+	// would re-fire the state machine. Atomic INSERT into the dedup table
+	// returns 0-rows-affected on conflict; treat that as "already
+	// processed" and return 200 OK without further side-effects.
+	eventID := c.Get("X-Razorpay-Event-Id")
+	if eventID == "" {
+		eventID = event.ID
+	}
+	if eventID != "" && h.db != nil {
+		res, err := h.db.ExecContext(ctx,
+			`INSERT INTO razorpay_webhook_events (event_id, event_type) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING`,
+			eventID, event.Event,
+		)
+		if err != nil {
+			// Fail open — log and continue. A dedup write failure is far
+			// less bad than swallowing a real subscription state change.
+			slog.Warn("billing.webhook.dedup_insert_failed", "error", err, "event_id", eventID)
+		} else if n, _ := res.RowsAffected(); n == 0 {
+			span.SetAttributes(attribute.Bool("rzp.replay_blocked", true))
+			slog.Info("billing.webhook.replay_blocked", "event_id", eventID, "event_type", event.Event)
+			return c.Status(fiber.StatusOK).JSON(fiber.Map{"ok": true, "deduped": true})
+		}
+	} else if eventID == "" {
+		// No event_id available — log and proceed. Razorpay always sends
+		// one in current API versions; absence indicates either a test
+		// fixture or a non-Razorpay forged payload (signature would have
+		// already failed in that case).
+		slog.Warn("billing.webhook.no_event_id", "event_type", event.Event)
+	}
 
 	switch event.Event {
 	case "subscription.charged":
