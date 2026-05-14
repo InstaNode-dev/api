@@ -139,20 +139,23 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 			connectionURL := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
 			if connectionURL != "" {
 				metrics.FingerprintAbuseBlocked.Inc()
-				return c.JSON(fiber.Map{
+				// internal_url omitted on the anonymous dedup path — see
+				// internal_url.go (W11 scrub).
+				dedupResp := fiber.Map{
 					"ok":             true,
 					"id":             existing.ID.String(),
 					"token":          existing.Token.String(),
 					"name":           existing.Name.String,
 					"connection_url": connectionURL,
-					"internal_url":   proxiedInternalURL(connectionURL, "queue"),
 					"tier":           existing.Tier,
 					"env":            existing.Env,
 					"limits":         queueAnonymousLimits(),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
-				})
+				}
+				setInternalURL(dedupResp, existing.Tier, connectionURL, "queue")
+				return c.JSON(dedupResp)
 			}
 			// Empty connection_url means provisioning failed mid-flight on the existing
 			// resource. Fall through to provision a fresh one rather than returning
@@ -254,13 +257,13 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		metrics.RedisErrors.WithLabelValues("recycle_mark").Inc()
 	}
 
+	// internal_url omitted on the anonymous path — see internal_url.go.
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"ok":             true,
 		"id":             resource.ID.String(),
 		"token":          tokenStr,
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
-		"internal_url":   proxiedInternalURL(creds.URL, "queue"),
 		"subject_prefix": creds.SubjectPrefix,
 		"tier":           "anonymous",
 		"env":            resource.Env,
@@ -376,7 +379,6 @@ func (h *QueueHandler) newQueueAuthenticated(
 		"token":          resource.Token.String(),
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
-		"internal_url":   proxiedInternalURL(creds.URL, "queue"),
 		"subject_prefix": creds.SubjectPrefix,
 		"tier":           tier,
 		"env":            resource.Env,
@@ -385,6 +387,7 @@ func (h *QueueHandler) newQueueAuthenticated(
 			"storage_mb": h.plans.StorageLimitMB(tier, "queue"),
 		},
 	}
+	setInternalURL(resp, tier, creds.URL, "queue")
 	return c.Status(fiber.StatusCreated).JSON(resp)
 }
 
