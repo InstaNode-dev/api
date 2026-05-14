@@ -519,15 +519,17 @@ const openAPISpec = `{
     "/api/v1/vault/{env}/{key}/rotate": {
       "post": {
         "summary": "Rotate a secret (new value, version + 1)",
-        "description": "Convenience for PUT — preserves history but bumps the version visibly. Existing deployments continue to read v(N-1) until they redeploy.",
+        "description": "Convenience for PUT — preserves history but bumps the version visibly. Existing deployments continue to read v(N-1) until they redeploy.\n\nIdempotent: each call inserts a new versioned row in vault_secrets, so double-clicks were producing duplicate versions (BB2-CHROME-3). The Idempotency middleware now dedups retries via either an explicit Idempotency-Key header (24h TTL) or the body-fingerprint fallback (120s TTL). See the top-level Idempotency section in info.description.",
         "security": [{ "bearerAuth": [] }],
         "parameters": [
           { "name": "env", "in": "path", "required": true, "schema": { "type": "string" } },
-          { "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }
+          { "name": "key", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars). First response cached for 24h; replays return the cached body with X-Idempotent-Replay: true. Reusing the key with a different body returns 409." }
         ],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["value"], "properties": { "value": { "type": "string" } } } } } },
         "responses": {
-          "200": { "description": "Rotated", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VaultPutResponse" } } } }
+          "200": { "description": "Rotated", "headers": { "X-Idempotent-Replay": { "description": "Set to 'true' when the response was served from the idempotency cache instead of running the handler.", "schema": { "type": "string", "enum": ["true"] } }, "X-Idempotency-Source": { "description": "Which dedup path matched: explicit (Idempotency-Key header), fingerprint (body-fingerprint fallback), or miss (handler ran fresh).", "schema": { "type": "string", "enum": ["explicit", "fingerprint", "miss"] } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VaultPutResponse" } } } },
+          "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
