@@ -10,6 +10,14 @@ import (
 )
 
 // Team represents a billing/organizational unit.
+//
+// TODO(no-trial-policy 2026-05-13): TrialEndsAt + the trial_ends_at column +
+// the StartTrial / SendTrialStarted / SendTrialWarning code paths predate the
+// "no trial — pay from day one" policy (see plans_policy_test.go). The
+// trial_days config has been removed; the column itself is left in place so
+// existing rows aren't corrupted, but new writes should not populate it. A
+// follow-up migration should NULL out trial_ends_at across all teams and then
+// drop the column.
 type Team struct {
 	ID                     uuid.UUID
 	Name                   sql.NullString
