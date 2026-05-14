@@ -43,7 +43,7 @@ func teamsApp(t *testing.T, db *sql.DB, actorUserID, actorTeamID, actorRole stri
 		JWTSecret:        testhelpers.TestJWTSecret,
 		DashboardBaseURL: "http://localhost:5173",
 	}
-	mail := email.New("") // noop client — never actually sends
+	mail := email.NewNoop() // noop client — never actually sends
 
 	app := fiber.New(fiber.Config{
 		// respondError already wrote the body — short-circuit so the

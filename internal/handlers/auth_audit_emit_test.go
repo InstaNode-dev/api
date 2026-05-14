@@ -69,7 +69,7 @@ func magicLinkTestApp(t *testing.T, db *sql.DB) *fiber.App {
 	})
 	app.Use(middleware.RequestID())
 	authH := handlers.NewAuthHandler(db, cfg)
-	mlH := handlers.NewMagicLinkHandler(db, cfg, email.New(""), authH)
+	mlH := handlers.NewMagicLinkHandler(db, cfg, email.NewNoop(), authH)
 	app.Get("/auth/email/callback", mlH.Callback)
 	return app
 }

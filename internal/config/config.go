@@ -37,6 +37,15 @@ type Config struct {
 	RazorpayPlanIDProYearly       string // RAZORPAY_PLAN_ID_PRO_YEARLY — plan_id for pro tier (yearly)
 	RazorpayPlanIDTeamYearly      string // RAZORPAY_PLAN_ID_TEAM_YEARLY — plan_id for team tier (yearly)
 	ResendAPIKey             string
+	// EmailProvider explicitly selects the outbound email backend. Accepted
+	// values: "brevo" | "resend" | "noop". When empty, internal/email
+	// auto-detects: BREVO_API_KEY > RESEND_API_KEY (≠ "CHANGE_ME") > noop.
+	// Added 2026-05-14 to recover from the live RESEND_API_KEY="CHANGE_ME"
+	// outage by routing through the already-provisioned BREVO_API_KEY.
+	EmailProvider    string
+	BrevoAPIKey      string // BREVO_API_KEY — Brevo Transactional Email API key
+	EmailFromName    string // EMAIL_FROM_NAME — verified-sender display name (default "InstaNode")
+	EmailFromAddress string // EMAIL_FROM_ADDRESS — verified-sender email (default "noreply@instanode.dev")
 	GitHubClientID           string
 	GitHubClientSecret       string
 	GoogleClientID           string
@@ -211,6 +220,10 @@ func Load() *Config {
 		RazorpayPlanIDProYearly:       os.Getenv("RAZORPAY_PLAN_ID_PRO_YEARLY"),
 		RazorpayPlanIDTeamYearly:      os.Getenv("RAZORPAY_PLAN_ID_TEAM_YEARLY"),
 		ResendAPIKey:             os.Getenv("RESEND_API_KEY"),
+		EmailProvider:            os.Getenv("EMAIL_PROVIDER"),
+		BrevoAPIKey:              os.Getenv("BREVO_API_KEY"),
+		EmailFromName:            os.Getenv("EMAIL_FROM_NAME"),
+		EmailFromAddress:         os.Getenv("EMAIL_FROM_ADDRESS"),
 		GitHubClientID:           os.Getenv("GITHUB_CLIENT_ID"),
 		GitHubClientSecret:       os.Getenv("GITHUB_CLIENT_SECRET"),
 		GoogleClientID:           os.Getenv("GOOGLE_CLIENT_ID"),
@@ -405,7 +418,10 @@ func logStartupConfig(cfg *Config) {
 		"jwt_secret", maskSecret(cfg.JWTSecret),
 		"aes_key", maskSecret(cfg.AESKey),
 		"razorpay_key_set", cfg.RazorpayKeyID != "",
-		"resend_key_set", cfg.ResendAPIKey != "",
+		"resend_key_set", cfg.ResendAPIKey != "" && cfg.ResendAPIKey != "CHANGE_ME",
+		"brevo_key_set", cfg.BrevoAPIKey != "",
+		"email_provider", cfg.EmailProvider,
+		"email_from_address_set", cfg.EmailFromAddress != "",
 		"github_oauth_set", cfg.GitHubClientID != "",
 		"google_oauth_set", cfg.GoogleClientID != "",
 		"google_redirect_uri_set", cfg.GoogleRedirectURI != "",

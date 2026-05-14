@@ -1,61 +1,322 @@
 package email
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/resend/resend-go/v2"
 )
 
-// Client wraps the Resend API client.
+// ProviderName identifies a backend implementation. Stable strings; safe to use
+// as metric/log labels.
+type ProviderName string
+
+const (
+	ProviderBrevo  ProviderName = "brevo"
+	ProviderResend ProviderName = "resend"
+	ProviderNoop   ProviderName = "noop"
+)
+
+// resendSentinelUnset is the placeholder value live deployments use to indicate
+// "Resend is not configured". Treating it as "unset" prevents the magic-link
+// flow from breaking when an operator forgets to fill in the secret.
+const resendSentinelUnset = "CHANGE_ME"
+
+// brevoEndpoint is the Brevo Transactional Email API. It accepts a JSON body
+// and returns 201 on success.
+const brevoEndpoint = "https://api.brevo.com/v3/smtp/email"
+
+// defaultFromName / defaultFromAddress are the fallbacks used when the
+// EMAIL_FROM_NAME / EMAIL_FROM_ADDRESS env vars are not configured. They match
+// the verified sender currently registered with Brevo for instanode.dev.
+const (
+	defaultFromName    = "InstaNode"
+	defaultFromAddress = "noreply@instanode.dev"
+)
+
+// Config carries the email-backend configuration. All fields are optional;
+// New() resolves sensible defaults so calling New(Config{}) yields a noop
+// client that never blocks development.
+type Config struct {
+	// Provider, when non-empty, forces a specific backend regardless of which
+	// API keys are present. Accepted values: "brevo", "resend", "noop".
+	// Anything else falls back to auto-detection (Brevo > Resend > Noop).
+	Provider string
+
+	// BrevoAPIKey is the value of BREVO_API_KEY. When non-empty and Provider
+	// is unset or "brevo", the Brevo backend is used.
+	BrevoAPIKey string
+
+	// ResendAPIKey is the value of RESEND_API_KEY. Treated as unset when empty
+	// or equal to "CHANGE_ME" (the placeholder in infra/k8s/secrets.yaml that
+	// caused the live magic-link outage on 2026-05-14).
+	ResendAPIKey string
+
+	// FromName / FromAddress override the verified-sender pair. Empty values
+	// fall back to "InstaNode" / "noreply@instanode.dev".
+	FromName    string
+	FromAddress string
+
+	// HTTPClient, when non-nil, replaces the default net/http.Client used by
+	// the Brevo backend. Set in tests to swap in a httptest.Server.
+	HTTPClient *http.Client
+}
+
+// provider is the internal seam: one method, no provider-specific types leak
+// out. All public Send* helpers on Client funnel through provider.Send.
+type provider interface {
+	Send(ctx context.Context, to, subject, plainText, htmlBody string) error
+	Name() ProviderName
+}
+
+// Client is the public façade. Handlers depend on *Client; they never see the
+// provider type, so swapping backends does not ripple into call sites.
 type Client struct {
-	client *resend.Client
-	from   string // e.g. "Instant Dev <noreply@instant.dev>"
-	noop   bool   // true when apiKey is empty (dev mode)
+	provider provider
+	fromName string
+	fromAddr string
 }
 
-// New creates an email client. Returns a no-op client if apiKey is empty (dev mode).
-func New(apiKey string) *Client {
-	if apiKey == "" {
-		slog.Info("email.client.noop", "reason", "no RESEND_API_KEY set — emails will be logged only")
-		return &Client{noop: true, from: "Instant Dev <noreply@instant.dev>"}
+// New constructs an email Client. Provider selection precedence:
+//
+//  1. Config.Provider, if explicitly set to "brevo" | "resend" | "noop".
+//  2. BREVO_API_KEY set and non-empty → brevo.
+//  3. RESEND_API_KEY set, non-empty, and not equal to "CHANGE_ME" → resend.
+//  4. Otherwise → noop (logs, never sends).
+//
+// The chosen provider is logged once at construction via slog.Info under the
+// "email.client.init" event so operators can confirm which backend the api
+// pod boots with.
+func New(cfg Config) *Client {
+	fromName := cfg.FromName
+	if fromName == "" {
+		fromName = defaultFromName
 	}
-	return &Client{
-		client: resend.NewClient(apiKey),
-		from:   "Instant Dev <noreply@instant.dev>",
+	fromAddr := cfg.FromAddress
+	if fromAddr == "" {
+		fromAddr = defaultFromAddress
 	}
+
+	c := &Client{fromName: fromName, fromAddr: fromAddr}
+
+	chosen := resolveProvider(cfg)
+	switch chosen {
+	case ProviderBrevo:
+		httpClient := cfg.HTTPClient
+		if httpClient == nil {
+			httpClient = &http.Client{Timeout: 10 * time.Second}
+		}
+		c.provider = &brevoProvider{
+			apiKey:   cfg.BrevoAPIKey,
+			http:     httpClient,
+			fromName: fromName,
+			fromAddr: fromAddr,
+		}
+	case ProviderResend:
+		c.provider = &resendProvider{
+			client: resend.NewClient(cfg.ResendAPIKey),
+			from:   fmt.Sprintf("%s <%s>", fromName, fromAddr),
+		}
+	default:
+		c.provider = &noopProvider{}
+	}
+
+	slog.Info("email.client.init",
+		"provider", string(chosen),
+		"from_name", fromName,
+		"from_address", fromAddr,
+	)
+	return c
 }
 
-// send is the internal dispatcher. If noop, it logs and returns nil.
+// NewNoop returns a Client backed by the noop provider. Convenience helper
+// for tests and bootstrap paths where outbound email is undesired.
+func NewNoop() *Client {
+	return New(Config{Provider: string(ProviderNoop)})
+}
+
+// resolveProvider implements the precedence rules documented on New.
+func resolveProvider(cfg Config) ProviderName {
+	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
+	case string(ProviderBrevo):
+		return ProviderBrevo
+	case string(ProviderResend):
+		return ProviderResend
+	case string(ProviderNoop):
+		return ProviderNoop
+	}
+	if strings.TrimSpace(cfg.BrevoAPIKey) != "" {
+		return ProviderBrevo
+	}
+	if rk := strings.TrimSpace(cfg.ResendAPIKey); rk != "" && rk != resendSentinelUnset {
+		return ProviderResend
+	}
+	return ProviderNoop
+}
+
+// send is the internal dispatch wrapper. Every public Send* method funnels
+// through here so logging + provider routing stay in one place.
 func (c *Client) send(ctx context.Context, to, subject, plainText, htmlBody string) error {
-	if c.noop {
-		slog.Info("email.skipped",
-			"to", to,
-			"subject", subject,
-		)
+	if c.provider == nil {
+		// Defensive: a zero-value Client (never returned by New) would
+		// otherwise panic. Treat it as noop.
+		slog.Warn("email.client.no_provider", "to", to, "subject", subject)
 		return nil
 	}
+	return c.provider.Send(ctx, to, subject, plainText, htmlBody)
+}
 
+// ProviderName returns the active backend identifier. Useful for /healthz
+// payloads or operator-facing diagnostics that confirm which backend the
+// running pod chose.
+func (c *Client) ProviderName() ProviderName {
+	if c.provider == nil {
+		return ProviderNoop
+	}
+	return c.provider.Name()
+}
+
+// ---------------------------------------------------------------------------
+// resendProvider — wraps github.com/resend/resend-go/v2 (existing behaviour).
+// ---------------------------------------------------------------------------
+
+type resendProvider struct {
+	client *resend.Client
+	from   string
+}
+
+func (p *resendProvider) Name() ProviderName { return ProviderResend }
+
+func (p *resendProvider) Send(ctx context.Context, to, subject, plainText, htmlBody string) error {
 	params := &resend.SendEmailRequest{
-		From:    c.from,
+		From:    p.from,
 		To:      []string{to},
 		Subject: subject,
 		Text:    plainText,
 		Html:    htmlBody,
 	}
-
-	_, err := c.client.Emails.SendWithContext(ctx, params)
-	if err != nil {
+	if _, err := p.client.Emails.SendWithContext(ctx, params); err != nil {
 		slog.Error("email.send_failed",
+			"provider", string(ProviderResend),
 			"to", to,
 			"subject", subject,
 			"error", err,
 		)
 		return fmt.Errorf("email.send: %w", err)
 	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// brevoProvider — POSTs Transactional Email API; no SDK dependency added.
+// ---------------------------------------------------------------------------
+
+type brevoProvider struct {
+	apiKey   string
+	http     *http.Client
+	fromName string
+	fromAddr string
+}
+
+func (p *brevoProvider) Name() ProviderName { return ProviderBrevo }
+
+// brevoSender / brevoRecipient match the JSON shape documented at
+// https://developers.brevo.com/reference/sendtransacemail. Both are
+// internal — they never leak past Send.
+type brevoSender struct {
+	Name  string `json:"name,omitempty"`
+	Email string `json:"email"`
+}
+
+type brevoRecipient struct {
+	Email string `json:"email"`
+	Name  string `json:"name,omitempty"`
+}
+
+type brevoSendRequest struct {
+	Sender      brevoSender      `json:"sender"`
+	To          []brevoRecipient `json:"to"`
+	Subject     string           `json:"subject"`
+	TextContent string           `json:"textContent,omitempty"`
+	HTMLContent string           `json:"htmlContent,omitempty"`
+}
+
+func (p *brevoProvider) Send(ctx context.Context, to, subject, plainText, htmlBody string) error {
+	if strings.TrimSpace(to) == "" {
+		return fmt.Errorf("email.brevo: empty recipient")
+	}
+
+	body := brevoSendRequest{
+		Sender:      brevoSender{Name: p.fromName, Email: p.fromAddr},
+		To:          []brevoRecipient{{Email: to}},
+		Subject:     subject,
+		TextContent: plainText,
+		HTMLContent: htmlBody,
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("email.brevo.marshal: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, brevoEndpoint, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("email.brevo.new_request: %w", err)
+	}
+	req.Header.Set("api-key", p.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := p.http.Do(req)
+	if err != nil {
+		slog.Error("email.send_failed",
+			"provider", string(ProviderBrevo),
+			"to", to,
+			"subject", subject,
+			"error", err,
+		)
+		return fmt.Errorf("email.brevo.do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Brevo: 201 Created on success. 400 surfaces sender-not-verified, 401
+	// is bad api-key, 4xx generally are payload problems. Surface the
+	// response body so operators see the exact reason.
+	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusAccepted {
+		return nil
+	}
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	slog.Error("email.send_failed",
+		"provider", string(ProviderBrevo),
+		"to", to,
+		"subject", subject,
+		"status", resp.StatusCode,
+		"body", string(respBody),
+	)
+	return fmt.Errorf("email.brevo: unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+}
+
+// ---------------------------------------------------------------------------
+// noopProvider — logs and returns nil. Matches the historical empty-key path.
+// ---------------------------------------------------------------------------
+
+type noopProvider struct{}
+
+func (p *noopProvider) Name() ProviderName { return ProviderNoop }
+
+func (p *noopProvider) Send(_ context.Context, to, subject, _, _ string) error {
+	slog.Info("email.skipped",
+		"provider", string(ProviderNoop),
+		"to", to,
+		"subject", subject,
+	)
 	return nil
 }
 
