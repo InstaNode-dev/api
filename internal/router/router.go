@@ -64,6 +64,23 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		ProxyHeader: "X-Forwarded-For",
 	})
 
+	// ── Liveness probe (MUST be registered before any middleware) ────────────
+	// GET /livez — "the process is alive." NO database check, NO migration
+	// check, NO auth, NO rate-limit, NO logging context. Pure process-up
+	// signal so a k8s liveness probe can distinguish "process alive" from
+	// "process ready" (the readiness signal lives at /healthz, which checks
+	// DB + migration state).
+	//
+	// Wired here BEFORE the app.Use(...) chain so the kubelet's probe
+	// traffic (~6/min/pod from livenessProbe + readinessProbe split, per
+	// W5-D) never touches the rate limiter — rate-limiting your own
+	// kubelet is silly. Same path will be mirrored on the
+	// provisioner-sidecar (8092), worker-healthz (8091), and migrator
+	// (8090) in sibling-repo PRs.
+	app.Get("/livez", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{"alive": true})
+	})
+
 	// ── Middleware chain (order matters) ─────────────────────────────────────
 	app.Use(middleware.RequestID())
 	// LoggerContext copies request_id (and team_id once auth has run)
