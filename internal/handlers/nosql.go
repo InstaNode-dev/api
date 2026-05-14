@@ -194,7 +194,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("nosql.new.soft_delete_failed", "error", delErr, "resource_id", resource.ID)
 		}
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision MongoDB database")
+		return respondProvisionFailed(c, err, "Failed to provision MongoDB database")
 	}
 
 	// Encrypt and persist the connection URL.
@@ -347,7 +347,7 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("nosql.new.soft_delete_failed_auth", "error", delErr, "resource_id", resource.ID)
 		}
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision MongoDB database")
+		return respondProvisionFailed(c, err, "Failed to provision MongoDB database")
 	}
 
 	// Encrypt and persist the connection URL.
@@ -444,7 +444,7 @@ func (h *NoSQLHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) 
 	ctx := c.UserContext()
 	res, err := h.ProvisionForTwinCore(ctx, in)
 	if err != nil {
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", err.Error())
+		return respondProvisionFailed(c, err, err.Error())
 	}
 
 	resp := fiber.Map{

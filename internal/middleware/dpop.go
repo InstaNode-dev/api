@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -35,6 +36,7 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jws"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/redis/go-redis/v9"
+	"instant.dev/internal/circuit"
 )
 
 const (
@@ -55,7 +57,68 @@ const (
 	// dpopErrorInvalid is the WWW-Authenticate error keyword for malformed,
 	// expired, or replayed proofs (RFC 9449 §7.1).
 	dpopErrorInvalid = "invalid_dpop_proof"
+
+	// dpopRedisCircuitName / Threshold / Cooldown — circuit-breaker tuning
+	// for the Redis-backed DPoP replay-detection store. Converts the
+	// fail-CLOSED pathology ("Redis is down → every DPoP token locked out")
+	// into a bounded 30s blast radius.
+	//
+	// Threshold 3 — Redis is fast; consecutive failures imply real outage,
+	// not flap. Cooldown 30s — matches retry_after_seconds=30 for 503.
+	dpopRedisCircuitName      = "dpop_redis"
+	dpopRedisCircuitThreshold = 3
+	dpopRedisCircuitCooldown  = 30 * time.Second
 )
+
+// dpopRedisBreaker is the package-level breaker for the DPoP replay
+// Redis client. Lazy-init so test code that doesn't exercise the
+// middleware doesn't register Prometheus metrics.
+var (
+	dpopRedisBreakerOnce sync.Once
+	dpopRedisBreakerInst *circuit.Breaker
+)
+
+func dpopRedisBreaker() *circuit.Breaker {
+	dpopRedisBreakerOnce.Do(func() {
+		dpopRedisBreakerInst = circuit.NewBreaker(
+			dpopRedisCircuitName,
+			dpopRedisCircuitThreshold,
+			dpopRedisCircuitCooldown,
+		).WithOnOpen(func() {
+			slog.Error("dpop.redis.circuit.opened",
+				"name", dpopRedisCircuitName,
+				"threshold", dpopRedisCircuitThreshold,
+				"cooldown_seconds", int(dpopRedisCircuitCooldown.Seconds()),
+				"impact", "DPoP-tagged tokens see 503 dpop_replay_check_unavailable until Redis recovers",
+				"runbook", "https://instanode.dev/status",
+			)
+		})
+	})
+	return dpopRedisBreakerInst
+}
+
+// DPoPRedisBreaker exposes the singleton breaker for tests and /healthz.
+// Read-only — do NOT mutate.
+func DPoPRedisBreaker() *circuit.Breaker { return dpopRedisBreaker() }
+
+// ResetDPoPRedisBreakerForTest replaces the package-singleton with a
+// freshly-constructed breaker. Test-only — production MUST NOT call.
+// Used by tests that exercise circuit transitions; without this hook,
+// test ordering leaks open-state across runs.
+func ResetDPoPRedisBreakerForTest() {
+	dpopRedisBreakerInst = circuit.NewBreaker(
+		dpopRedisCircuitName,
+		dpopRedisCircuitThreshold,
+		dpopRedisCircuitCooldown,
+	)
+	dpopRedisBreakerOnce.Do(func() {})
+}
+
+// errDPoPReplayStoreDown is the internal sentinel signalling "couldn't
+// verify the jti was unique because Redis is broken". Converted to the
+// canonical 503 envelope by RequireDPoP. Using a sentinel (not the raw
+// Redis error) prevents the JSON body from leaking server addresses.
+var errDPoPReplayStoreDown = errors.New("dpop replay store unavailable")
 
 // base64URLNoPad encodes b as base64url with no padding (RFC 4648 §5).
 func base64URLNoPad(b []byte) string {
@@ -84,6 +147,22 @@ func RequireDPoP(rdb *redis.Client) fiber.Handler {
 		}
 
 		if err := verifyDPoPProof(c, proof, jkt, rdb); err != nil {
+			// Replay-store-down is operationally distinct from "the
+			// agent's proof is bad" — return 503 so the agent retries
+			// the SAME token, not re-mints one that'd also fail.
+			if errors.Is(err, errDPoPReplayStoreDown) {
+				slog.Error("middleware.dpop.replay_store_unavailable",
+					"jkt", jkt, "path", c.Path())
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+					"ok":                  false,
+					"error":               "dpop_replay_check_unavailable",
+					"message":             "DPoP replay-protection store is temporarily degraded. Retry in 30 seconds — your token is still valid.",
+					"request_id":          GetRequestID(c),
+					"retry_after_seconds": 30,
+					"agent_action":        "Tell the user the replay-protection store is temporarily degraded. Retry in 30 seconds — token is valid; see https://instanode.dev/status for live recovery info.",
+					"upgrade_url":         "https://instanode.dev/status",
+				})
+			}
 			slog.Info("middleware.dpop.rejected",
 				"error", err,
 				"jkt", jkt,
@@ -171,22 +250,40 @@ func verifyDPoPProof(c *fiber.Ctx, proof, expectedJKT string, rdb *redis.Client)
 	}
 
 	// Replay protection — track jti in Redis with TTL = freshness window.
-	// If Redis is unavailable, log and continue (fail-open mirrors the
-	// rate_limit middleware: a Redis outage must not block legitimate
-	// agent traffic).
-	if rdb != nil {
-		ctx, cancel := context.WithTimeout(c.Context(), 250*time.Millisecond)
-		defer cancel()
-		key := dpopReplayKeyPrefix + jti
-		setOK, err := rdb.SetNX(ctx, key, "1", dpopFreshnessWindow).Result()
-		if err != nil {
-			slog.Warn("middleware.dpop.replay_check_failed",
-				"error", err, "jti", jti)
-		} else if !setOK {
-			return errors.New("DPoP jti has been seen before (replay)")
-		}
-	} else {
-		slog.Warn("middleware.dpop.no_redis_replay_detection_disabled")
+	//
+	// W12 / B43 S12 — DPoP previously failed OPEN on Redis errors and
+	// when rdb==nil. That silently restored token replayability for
+	// every key-bound session during a Redis outage. Fixed here:
+	//
+	//   - rdb == nil:      respond 503 dpop_replay_check_unavailable.
+	//                      Silent fail-open is no longer a posture.
+	//   - rdb errors:      record against the dpop_redis breaker.
+	//                      After 3 consecutive failures the breaker
+	//                      opens and subsequent requests 503 in <1ms
+	//                      (no 250ms Redis timeout per request). An
+	//                      outage costs 30s of 503s, not permanent
+	//                      replayability. A successful half-open trial
+	//                      auto-closes the breaker on recovery.
+	//   - SetNX returns false (jti seen): replay — reject as before.
+	if rdb == nil {
+		return errDPoPReplayStoreDown
+	}
+	b := dpopRedisBreaker()
+	if !b.Allow() {
+		return errDPoPReplayStoreDown
+	}
+	ctx, cancel := context.WithTimeout(c.Context(), 250*time.Millisecond)
+	defer cancel()
+	key := dpopReplayKeyPrefix + jti
+	setOK, err := rdb.SetNX(ctx, key, "1", dpopFreshnessWindow).Result()
+	b.Record(err)
+	if err != nil {
+		slog.Warn("middleware.dpop.replay_check_failed",
+			"error", err, "jti", jti)
+		return errDPoPReplayStoreDown
+	}
+	if !setOK {
+		return errors.New("DPoP jti has been seen before (replay)")
 	}
 
 	return nil
