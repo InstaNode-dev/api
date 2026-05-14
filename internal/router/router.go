@@ -475,6 +475,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Get("/resources/:id/family", resourceH.Family)
 	api.Get("/resources/:id", resourceH.Get)
 	api.Get("/resources/:id/credentials", resourceH.GetCredentials)
+	// W7F — per-resource observability. Tier-gated to Pro+ inside the
+	// handler (anonymous/free → 402); hobby/pro/growth/team are bounded by
+	// per-tier window caps. Returns synthetic samples + data_source:"stub"
+	// until W5-A's prober.go starts writing real probe rows.
+	api.Get("/resources/:id/metrics", resourceH.Metrics)
 	// DELETE is env-policy gated: the env scope is the env recorded on the
 	// resource row itself (NOT a request param). The custom lookup reads
 	// the resource by URL :id and returns its env. Lookup errors fall
