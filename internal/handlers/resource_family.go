@@ -93,11 +93,11 @@ func (h *ResourceHandler) Family(c *fiber.Ctx) error {
 		anchor = r
 	}
 
-	// Ownership: 403 on cross-team. We use 403 rather than 404 here
-	// because the caller already knows the id exists (they passed it
-	// in); the meaningful failure mode is the authz miss.
+	// Ownership: 404 on cross-team. Returning 403 here would confirm
+	// the resource exists in another tenant; 404 keeps the existence
+	// of cross-team rows fully opaque (matches GetCredentials et al).
 	if !anchor.TeamID.Valid || anchor.TeamID.UUID != teamID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this resource")
+		return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
 	}
 
 	family, err := models.GetResourceFamily(c.Context(), h.db, anchor.ID)

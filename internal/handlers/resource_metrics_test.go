@@ -230,8 +230,9 @@ func TestMetrics_GrowthTier_7d_OK(t *testing.T) {
 	assert.Equal(t, float64(7*24*3600), body["window_seconds"])
 }
 
-// TestMetrics_CrossTeam_403 — Team B cannot read Team A's resource metrics.
-func TestMetrics_CrossTeam_403(t *testing.T) {
+// TestMetrics_CrossTeam_404 — Team B cannot read Team A's resource metrics.
+// Returns 404 (not 403) — cross-team access must not leak existence.
+func TestMetrics_CrossTeam_404(t *testing.T) {
 	db, _ := testhelpers.SetupTestDB(t)
 	t.Cleanup(func() { db.Close() })
 	rdb, _ := testhelpers.SetupTestRedis(t)
@@ -260,10 +261,10 @@ func TestMetrics_CrossTeam_403(t *testing.T) {
 	resp := doMetrics(t, app, jwtB, resourceToken, "")
 	defer resp.Body.Close()
 
-	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 	var body map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-	assert.Equal(t, "forbidden", body["error"])
+	assert.Equal(t, "not_found", body["error"])
 }
 
 // TestMetrics_InvalidUUID_400 — bad :id param.
