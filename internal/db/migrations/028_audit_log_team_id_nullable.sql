@@ -1,0 +1,23 @@
+-- Migration: 028_audit_log_team_id_nullable — drop NOT NULL on
+-- audit_log.team_id so the emit path can record events that occur
+-- BEFORE a team exists (failed session-token refreshes during signup,
+-- anonymous-tier events, and any future signup-related audit kinds).
+--
+-- Why this is safe:
+--   1. The column still has a FK to teams(id) with ON DELETE CASCADE.
+--      A NULL team_id row will never be cascaded by a team delete (since
+--      there's no team) but it's also never "leaked" because the
+--      dashboard's /api/v1/audit query filters by team_id = $1 and
+--      simply won't see NULL rows. NULL audit rows are admin-only by
+--      construction.
+--   2. The team-scoped read query (`WHERE team_id = $1`) naturally
+--      excludes NULLs in Postgres equality semantics, so existing
+--      dashboard readers see no behavior change.
+--   3. The existing index idx_audit_team_at on (team_id, created_at DESC)
+--      stays valid — Postgres b-tree indexes accept NULLs (they sort
+--      last by default) and the WHERE-team_id-= query won't traverse
+--      them anyway.
+--
+-- Operators who later want to audit "what bounced before claim?" can
+-- read the NULL-team rows directly off the admin connection.
+ALTER TABLE audit_log ALTER COLUMN team_id DROP NOT NULL;
