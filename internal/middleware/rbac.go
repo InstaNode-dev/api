@@ -4,6 +4,14 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
+// forbiddenAgentAction is the canonical agent_action sentence served on
+// every 403 from RequireRole (insufficient team role). Mirrors the
+// "forbidden" entry in handlers.codeToAgentAction so an agent inspecting
+// a middleware-emitted 403 (e.g. a viewer trying to call
+// /team/invitations) sees the same remediation prose as a
+// handler-emitted 403 (e.g. a non-owner trying to delete the team).
+const forbiddenAgentAction = "Tell the user they don't have permission for this action. Have them confirm they're logged in to the right team at https://instanode.dev/app/team."
+
 // LocalKeyTeamRole is the fiber.Locals key for the authenticated user's role
 // on their team (one of: owner, admin, developer, viewer, member).
 //
@@ -73,18 +81,21 @@ func RequireRole(min string) fiber.Handler {
 	required := roleRank(min)
 	return func(c *fiber.Ctx) error {
 		// auth_user_id must already be set (RequireAuth must run first).
+		// Route through respondUnauthorized so the envelope (message,
+		// request_id, retry_after_seconds, agent_action, upgrade_url) is
+		// identical to every other middleware-emitted 401 (W12).
 		if GetUserID(c) == "" {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"ok":    false,
-				"error": "unauthorized",
-			})
+			return respondUnauthorized(c)
 		}
 		actor := GetTeamRole(c)
 		if roleRank(actor) < required {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-				"ok":      false,
-				"error":   "forbidden",
-				"message": "Insufficient role: requires at least " + min,
+				"ok":                  false,
+				"error":               "forbidden",
+				"message":             "Insufficient role: requires at least " + min,
+				"request_id":          GetRequestID(c),
+				"retry_after_seconds": nil,
+				"agent_action":        forbiddenAgentAction,
 			})
 		}
 		return c.Next()

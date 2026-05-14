@@ -194,13 +194,25 @@ func verifyDPoPProof(c *fiber.Ctx, proof, expectedJKT string, rdb *redis.Client)
 
 // rejectDPoP writes an RFC 9449 §7.1 401 with WWW-Authenticate: DPoP and a
 // matching error keyword agents can branch on.
+//
+// W12: the body shape matches respondUnauthorized's canonical envelope —
+// message, request_id, retry_after_seconds, agent_action, upgrade_url are
+// all populated so an agent inspecting the response sees the same field
+// set as any other 401 from this API. error_description is retained
+// alongside `message` because RFC 9449 §7.1 names that field explicitly in
+// the WWW-Authenticate header companion.
 func rejectDPoP(c *fiber.Ctx, description string) error {
 	c.Set("WWW-Authenticate",
 		fmt.Sprintf(`DPoP error="%s", error_description="%s"`, dpopErrorInvalid, description))
 	return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-		"ok":                false,
-		"error":             dpopErrorInvalid,
-		"error_description": description,
+		"ok":                  false,
+		"error":               dpopErrorInvalid,
+		"error_description":   description,
+		"message":             "DPoP proof rejected: " + description + ". The agent must re-mint a fresh DPoP proof bound to the request method + URL.",
+		"request_id":          GetRequestID(c),
+		"retry_after_seconds": nil,
+		"agent_action":        unauthorizedAgentAction,
+		"upgrade_url":         AuthLoginURL,
 	})
 }
 
