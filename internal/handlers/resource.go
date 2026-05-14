@@ -613,7 +613,7 @@ func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
 		"token":    resource.Token,
 		"status":   "paused",
 		"message":  "Resource paused. Storage is preserved and the connection URL is unchanged; new connections are refused until resume.",
-		"item":     resourceToMap(resource),
+		"resource": resourceToMap(resource),
 	})
 }
 
@@ -728,7 +728,7 @@ func (h *ResourceHandler) Resume(c *fiber.Ctx) error {
 		"token":    resource.Token,
 		"status":   "active",
 		"message":  "Resource resumed. The connection URL is unchanged — your existing config still works.",
-		"item":     resourceToMap(resource),
+		"resource": resourceToMap(resource),
 	})
 }
 
