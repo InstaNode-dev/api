@@ -420,6 +420,40 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		// IF EXISTS so test setups bringing up a fresh DB don't trip on the
 		// missing column when other code paths drop the field.
 		`ALTER TABLE teams DROP COLUMN IF EXISTS trial_ends_at`,
+
+		// 035_app_github_connections — GitHub auto-deploy wiring. Mirrors
+		// migration 035 so handler unit tests reach into the same schema
+		// production runs against. The unique index on app_id enforces the
+		// "one connection per deployment" rule that the Connect handler
+		// returns 409 on.
+		`CREATE TABLE IF NOT EXISTS app_github_connections (
+			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			app_id          UUID NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+			team_id         UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			github_repo     TEXT NOT NULL,
+			branch          TEXT NOT NULL DEFAULT 'main',
+			webhook_secret  TEXT NOT NULL,
+			installation_id BIGINT,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+			last_deploy_at  TIMESTAMPTZ,
+			last_commit_sha TEXT
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_app_github_connection ON app_github_connections(app_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_app_github_connections_team ON app_github_connections(team_id)`,
+		`CREATE TABLE IF NOT EXISTS pending_github_deploys (
+			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			connection_id   UUID NOT NULL REFERENCES app_github_connections(id) ON DELETE CASCADE,
+			app_id          UUID NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+			commit_sha      TEXT NOT NULL,
+			pusher_login    TEXT,
+			status          TEXT NOT NULL DEFAULT 'queued',
+			attempts        INTEGER NOT NULL DEFAULT 0,
+			error_message   TEXT,
+			enqueued_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+			completed_at    TIMESTAMPTZ
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_github_deploys_queued ON pending_github_deploys(enqueued_at) WHERE status = 'queued'`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_github_deploys_commit ON pending_github_deploys(connection_id, commit_sha)`,
 	}
 
 	for _, s := range stmts {
@@ -671,6 +705,18 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	api.Get("/deployments/:id", deployH.Get)
 	api.Delete("/deployments/:id", deployH.Delete)
 	api.Patch("/deployments/:id", deployH.Patch)
+
+	// GitHub auto-deploy (migration 035) — wired into the test app so the
+	// happy-path / idempotency / signature-mismatch tests in
+	// github_deploy_test.go exercise the full route stack. The PUBLIC
+	// receive endpoint is registered at the app root, mirroring production
+	// (it must NOT live under /api/v1 — GitHub presents no Authorization
+	// header).
+	githubDeployH := handlers.NewGitHubDeployHandler(db, cfg, planReg)
+	api.Post("/deployments/:id/github", githubDeployH.Connect)
+	api.Get("/deployments/:id/github", githubDeployH.Get)
+	api.Delete("/deployments/:id/github", githubDeployH.Disconnect)
+	app.Post("/webhooks/github/:webhook_id", githubDeployH.Receive)
 
 	// A/B-experiment conversion sink — wired into the test app so
 	// handler tests can exercise the full route stack (router +

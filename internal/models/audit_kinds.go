@@ -221,4 +221,38 @@ const (
 	// metadata.new_value document what changed. Per-user-id is captured on
 	// the audit row.
 	AuditKindTeamUpdated = "team.updated"
+
+	// GitHub auto-deploy lifecycle (migration 035). Customers wire a
+	// deployment to a GitHub repo; pushes to the tracked branch trigger
+	// a fresh deploy via the worker. Each kind documents one inflection
+	// point so on-call + the Loops forwarder can see the full chain.
+	//
+	// AuditKindGitHubConnected fires on POST /api/v1/deployments/:id/github
+	// after the row lands in app_github_connections. Metadata: {app_id,
+	// github_repo, branch, connection_id}.
+	AuditKindGitHubConnected = "github.connected"
+
+	// AuditKindGitHubDisconnected fires on DELETE
+	// /api/v1/deployments/:id/github. Metadata: {app_id, connection_id}.
+	AuditKindGitHubDisconnected = "github.disconnected"
+
+	// AuditKindGitHubPushReceived fires on every accepted POST to
+	// /webhooks/github/:webhook_id — signature passed, push event parsed.
+	// Metadata: {connection_id, commit_sha, branch, pusher}. Does NOT
+	// fire on signature failures (those emit github.signature_failed
+	// instead).
+	AuditKindGitHubPushReceived = "github.push_received"
+
+	// AuditKindGitHubDeployTriggered fires once the pending_github_deploys
+	// row has been inserted (the worker will drain shortly). Distinct from
+	// push_received so a downstream consumer can tell "we accepted the
+	// signal" from "we will rebuild". Metadata: {connection_id, app_id,
+	// commit_sha, pending_id}.
+	AuditKindGitHubDeployTriggered = "github.deploy_triggered"
+
+	// AuditKindGitHubSignatureFailed fires when an inbound webhook fails
+	// HMAC verification. Metadata: {connection_id (best-effort, may be
+	// empty if the row lookup itself failed), ip, user_agent}. Surface
+	// to on-call so a leaked secret OR a misconfigured customer is loud.
+	AuditKindGitHubSignatureFailed = "github.signature_failed"
 )
