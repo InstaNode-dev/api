@@ -108,10 +108,26 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	cliAuthH := handlers.NewCLIAuthHandler(db, rdb, cfg, planRegistry)
 	// Build storage provider once and share it with both StorageHandler and ResourceHandler
 	// so that DELETE /api/v1/resources/:id can deprovision MinIO IAM users.
+	//
+	// Backend selection:
+	//   - OBJECT_STORE_MODE / OBJECT_STORE_BACKEND → minio-admin (default) or shared-key
+	//   - storage.ResolveBackend normalises aliases ("admin", "iam" → minio-admin;
+	//     "shared", "shared_key" → shared-key)
+	//
+	// Fail-closed rule: in ENVIRONMENT=production, shared-key mode requires
+	// the explicit OBJECT_STORE_ALLOW_SHARED_KEY=true escape hatch. Without
+	// it the provider stays nil, /storage/new returns 503, and the operator
+	// sees a startup error in the log — preferable to silently shipping a
+	// configuration where every customer holds the master access key.
 	var storageProv *storageprovider.Provider
 	if cfg.ObjectStoreEndpoint != "" {
-		backend := storageprovider.Backend(cfg.ObjectStoreBackend)
-		if sp, err := storageprovider.NewWithBackend(
+		backend := storageprovider.ResolveBackend(cfg.ObjectStoreMode)
+		if backend == storageprovider.BackendSharedKey && cfg.Environment == "production" && !cfg.ObjectStoreAllowSharedKey {
+			slog.Error("storage: refusing to start in shared-key mode in production",
+				"backend", backend,
+				"environment", cfg.Environment,
+				"hint", "set OBJECT_STORE_MODE=admin (with admin creds) or OBJECT_STORE_ALLOW_SHARED_KEY=true to override")
+		} else if sp, err := storageprovider.NewWithBackend(
 			backend,
 			cfg.ObjectStoreEndpoint,
 			cfg.ObjectStorePublicURL,
@@ -122,7 +138,12 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		); err != nil {
 			slog.Warn("storage: provider init failed", "backend", backend, "error", err)
 		} else {
-			slog.Info("storage: provider initialized", "backend", backend, "endpoint", cfg.ObjectStoreEndpoint)
+			slog.Info("storage: provider initialized",
+				"backend", backend,
+				"endpoint", cfg.ObjectStoreEndpoint,
+				"bucket", cfg.ObjectStoreBucket,
+				"isolation", isolationLabel(backend),
+			)
 			storageProv = sp
 		}
 	}
@@ -656,4 +677,19 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	}
 
 	return app
+}
+
+// isolationLabel maps the storage backend to a human-readable isolation
+// posture for the startup log. Used so on-call SREs can grep one line
+// to confirm prod is running per-tenant IAM users — not the shared-key
+// loophole that previously gave every customer the master access key.
+func isolationLabel(b storageprovider.Backend) string {
+	switch b {
+	case storageprovider.BackendMinIOAdmin:
+		return "per-tenant-iam-user"
+	case storageprovider.BackendSharedKey:
+		return "shared-master-key"
+	default:
+		return string(b)
+	}
 }

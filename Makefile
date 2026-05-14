@@ -3,7 +3,8 @@
         migrate migrate-platform migrate-customers \
         docker-build smoke-buildinfo \
         k8s-deploy k8s-delete k8s-status k8s-regen-migrations \
-        gen-secrets install-cli
+        gen-secrets install-cli \
+        storage-verify-isolation
 
 # Build-time metadata injected into instant.dev/common/buildinfo via -ldflags.
 # Override on the make line if needed. GIT_SHA falls back to "dev" when not
@@ -181,3 +182,44 @@ k8s-status:
 gen-secrets:
 	@echo "JWT_SECRET=$(shell openssl rand -hex 32)"
 	@echo "AES_KEY=$(shell openssl rand -hex 32)"
+
+# ── Storage isolation verification ────────────────────────────────────────────
+#
+# Provision two storage tokens, then prove customer A's IAM user can't read
+# customer B's prefix. With admin mode enabled, the cross-prefix GET MUST
+# return HTTP 403. With shared-key mode (the loophole this PR closes) it
+# would return HTTP 200 — that's the regression this target detects.
+#
+# Run against a live API + S3 endpoint:
+#   API_BASE_URL=http://localhost:8080 \
+#   S3_ENDPOINT=http://localhost:9000 \
+#   make storage-verify-isolation
+#
+# Requires: curl, aws-cli (or mc) in PATH. See e2e/storage_isolation_e2e_test.go
+# for an automated version that runs in CI.
+storage-verify-isolation:
+	@echo ""
+	@echo "Storage isolation verification"
+	@echo "──────────────────────────────"
+	@: $${API_BASE_URL:?API_BASE_URL is required, e.g. http://localhost:8080}
+	@: $${S3_ENDPOINT:?S3_ENDPOINT is required, e.g. http://localhost:9000}
+	@echo "1/4 provisioning customer A..."
+	@A=$$(curl -fsS -X POST $$API_BASE_URL/storage/new -H 'Content-Type: application/json' -d '{}'); \
+	  AK_A=$$(echo $$A | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["access_key_id"])'); \
+	  SK_A=$$(echo $$A | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["secret_access_key"])'); \
+	  PRE_A=$$(echo $$A | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["prefix"])'); \
+	  echo "2/4 provisioning customer B..."; \
+	  B=$$(curl -fsS -X POST $$API_BASE_URL/storage/new -H 'Content-Type: application/json' -d '{}'); \
+	  AK_B=$$(echo $$B | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["access_key_id"])'); \
+	  PRE_B=$$(echo $$B | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["prefix"])'); \
+	  echo "  A: ak=$$AK_A prefix=$$PRE_A"; \
+	  echo "  B: ak=$$AK_B prefix=$$PRE_B"; \
+	  echo "3/4 writing a test object as A under A's prefix..."; \
+	  echo "hello-from-A" > /tmp/.storage-iso-test.txt; \
+	  AWS_ACCESS_KEY_ID=$$AK_A AWS_SECRET_ACCESS_KEY=$$SK_A \
+	    aws --endpoint-url $$S3_ENDPOINT s3 cp /tmp/.storage-iso-test.txt s3://instant-shared/$${PRE_A}probe.txt; \
+	  echo "4/4 attempting cross-prefix read (B's key trying to read A's object)..."; \
+	  AWS_ACCESS_KEY_ID=$$AK_B AWS_SECRET_ACCESS_KEY=$$SK_A \
+	    aws --endpoint-url $$S3_ENDPOINT s3 cp s3://instant-shared/$${PRE_A}probe.txt /tmp/.steal.txt 2>&1 | grep -q 'AccessDenied\|403' \
+	    && echo "PASS isolation enforced — cross-prefix read returned 403" \
+	    || (echo "FAIL cross-prefix read succeeded — shared-key loophole is OPEN"; exit 1)
