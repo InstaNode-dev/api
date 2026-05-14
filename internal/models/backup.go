@@ -59,6 +59,13 @@ type ResourceBackup struct {
 	ErrorSummary  sql.NullString
 	TriggeredBy   uuid.NullUUID
 	CreatedAt     time.Time
+	// SHA256 is the hex-encoded SHA-256 digest of the gzipped pg_dump
+	// artifact stored at S3Key. Worker-populated during finalize. NULL
+	// on rows that pre-date migration 043 — the restore handler treats
+	// NULL as "unknown integrity, skip the check" and the digest
+	// mismatch path only triggers when both source row and re-read
+	// blob produce a digest.
+	SHA256 sql.NullString
 }
 
 // ResourceRestore is one row in resource_restores. Mirrors ResourceBackup
@@ -96,13 +103,13 @@ func CreateBackupRow(ctx context.Context, db *sql.DB, p CreateBackupParams) (*Re
 			(resource_id, status, backup_kind, tier_at_backup, triggered_by)
 		VALUES ($1, 'pending', $2, NULLIF($3,''), $4)
 		RETURNING id, resource_id, status, backup_kind, started_at, finished_at,
-		          s3_key, size_bytes, tier_at_backup, error_summary, triggered_by, created_at
+		          s3_key, size_bytes, tier_at_backup, error_summary, triggered_by, created_at, sha256
 	`, p.ResourceID, p.BackupKind, p.TierAtBackup, p.TriggeredBy)
 
 	b := &ResourceBackup{}
 	if err := row.Scan(
 		&b.ID, &b.ResourceID, &b.Status, &b.BackupKind, &b.StartedAt, &b.FinishedAt,
-		&b.S3Key, &b.SizeBytes, &b.TierAtBackup, &b.ErrorSummary, &b.TriggeredBy, &b.CreatedAt,
+		&b.S3Key, &b.SizeBytes, &b.TierAtBackup, &b.ErrorSummary, &b.TriggeredBy, &b.CreatedAt, &b.SHA256,
 	); err != nil {
 		return nil, fmt.Errorf("models.CreateBackupRow: %w", err)
 	}
@@ -115,18 +122,71 @@ func CreateBackupRow(ctx context.Context, db *sql.DB, p CreateBackupParams) (*Re
 func GetBackupByID(ctx context.Context, db *sql.DB, id uuid.UUID) (*ResourceBackup, error) {
 	row := db.QueryRowContext(ctx, `
 		SELECT id, resource_id, status, backup_kind, started_at, finished_at,
-		       s3_key, size_bytes, tier_at_backup, error_summary, triggered_by, created_at
+		       s3_key, size_bytes, tier_at_backup, error_summary, triggered_by, created_at, sha256
 		FROM resource_backups
 		WHERE id = $1
 	`, id)
 	b := &ResourceBackup{}
 	if err := row.Scan(
 		&b.ID, &b.ResourceID, &b.Status, &b.BackupKind, &b.StartedAt, &b.FinishedAt,
-		&b.S3Key, &b.SizeBytes, &b.TierAtBackup, &b.ErrorSummary, &b.TriggeredBy, &b.CreatedAt,
+		&b.S3Key, &b.SizeBytes, &b.TierAtBackup, &b.ErrorSummary, &b.TriggeredBy, &b.CreatedAt, &b.SHA256,
 	); err != nil {
 		return nil, err // includes sql.ErrNoRows for the handler to detect
 	}
 	return b, nil
+}
+
+// GetBackupByIDForTeam fetches a backup row but returns sql.ErrNoRows
+// when the backup belongs to a different team than the one supplied.
+// This makes a cross-tenant backup_id guess look exactly like a non-
+// existent id — handlers map both to 404, eliminating the 400-vs-404
+// signal that FIX-H #64/#Q46 flagged. Implemented with a single JOIN
+// against resources so we don't leak the existence of a backup whose
+// resource belongs to a different team.
+func GetBackupByIDForTeam(ctx context.Context, db *sql.DB, backupID, teamID uuid.UUID) (*ResourceBackup, error) {
+	row := db.QueryRowContext(ctx, `
+		SELECT b.id, b.resource_id, b.status, b.backup_kind, b.started_at, b.finished_at,
+		       b.s3_key, b.size_bytes, b.tier_at_backup, b.error_summary, b.triggered_by, b.created_at, b.sha256
+		FROM resource_backups b
+		JOIN resources r ON r.id = b.resource_id
+		WHERE b.id = $1 AND r.team_id = $2
+	`, backupID, teamID)
+	b := &ResourceBackup{}
+	if err := row.Scan(
+		&b.ID, &b.ResourceID, &b.Status, &b.BackupKind, &b.StartedAt, &b.FinishedAt,
+		&b.S3Key, &b.SizeBytes, &b.TierAtBackup, &b.ErrorSummary, &b.TriggeredBy, &b.CreatedAt, &b.SHA256,
+	); err != nil {
+		return nil, err // includes sql.ErrNoRows; the caller maps to 404
+	}
+	return b, nil
+}
+
+// HasInflightRestore reports whether the given team has a restore row
+// for the given resource currently in status='pending' or 'running'.
+// Used to short-circuit a concurrent POST /restore — letting two run
+// in parallel would replay the same pg_dump twice, racing pg_restore's
+// destructive --clean step against itself.
+//
+// Returns (true, nil) when an inflight row exists, (false, nil) when
+// not. DB errors are propagated to the caller; on error the caller
+// MUST fail-CLOSED (refuse the second restore) because the safer
+// default for a destructive replay is "don't" — opposite of the
+// fail-open posture we use for rate-limit Redis errors.
+func HasInflightRestore(ctx context.Context, db *sql.DB, teamID, resourceID uuid.UUID) (bool, error) {
+	var exists bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM resource_restores rr
+			JOIN resources r ON r.id = rr.resource_id
+			WHERE rr.resource_id = $1
+			  AND r.team_id = $2
+			  AND rr.status IN ('pending','running')
+		)
+	`, resourceID, teamID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("models.HasInflightRestore: %w", err)
+	}
+	return exists, nil
 }
 
 // ListBackupsByResource returns backups for a resource ordered newest-first.
@@ -150,7 +210,7 @@ func ListBackupsByResource(ctx context.Context, db *sql.DB, resourceID uuid.UUID
 	if before.IsZero() {
 		rows, err = db.QueryContext(ctx, `
 			SELECT id, resource_id, status, backup_kind, started_at, finished_at,
-			       s3_key, size_bytes, tier_at_backup, error_summary, triggered_by, created_at
+			       s3_key, size_bytes, tier_at_backup, error_summary, triggered_by, created_at, sha256
 			FROM resource_backups
 			WHERE resource_id = $1
 			ORDER BY created_at DESC
@@ -159,7 +219,7 @@ func ListBackupsByResource(ctx context.Context, db *sql.DB, resourceID uuid.UUID
 	} else {
 		rows, err = db.QueryContext(ctx, `
 			SELECT id, resource_id, status, backup_kind, started_at, finished_at,
-			       s3_key, size_bytes, tier_at_backup, error_summary, triggered_by, created_at
+			       s3_key, size_bytes, tier_at_backup, error_summary, triggered_by, created_at, sha256
 			FROM resource_backups
 			WHERE resource_id = $1 AND created_at < $2
 			ORDER BY created_at DESC
@@ -176,7 +236,7 @@ func ListBackupsByResource(ctx context.Context, db *sql.DB, resourceID uuid.UUID
 		b := &ResourceBackup{}
 		if err := rows.Scan(
 			&b.ID, &b.ResourceID, &b.Status, &b.BackupKind, &b.StartedAt, &b.FinishedAt,
-			&b.S3Key, &b.SizeBytes, &b.TierAtBackup, &b.ErrorSummary, &b.TriggeredBy, &b.CreatedAt,
+			&b.S3Key, &b.SizeBytes, &b.TierAtBackup, &b.ErrorSummary, &b.TriggeredBy, &b.CreatedAt, &b.SHA256,
 		); err != nil {
 			return nil, fmt.Errorf("models.ListBackupsByResource scan: %w", err)
 		}
