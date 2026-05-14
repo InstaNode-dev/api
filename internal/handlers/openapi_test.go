@@ -312,6 +312,230 @@ func TestOpenAPI_CachedAggregateEndpointsDocumented(t *testing.T) {
 	}
 }
 
+// TestOpenAPI_ServerURLIsCanonicalProduction guards Wave FIX-E #C1 — the
+// servers[0].url was set to https://instant.dev (dead-brand, returns 404).
+// An agent reading the OpenAPI to figure out where to send requests would
+// land on a parking page and give up. Must be https://api.instanode.dev.
+func TestOpenAPI_ServerURLIsCanonicalProduction(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	servers, ok := v["servers"].([]any)
+	if !ok || len(servers) == 0 {
+		t.Fatal("servers[] missing")
+	}
+	first, _ := servers[0].(map[string]any)
+	url, _ := first["url"].(string)
+	if url != "https://api.instanode.dev" {
+		t.Errorf("servers[0].url = %q; want https://api.instanode.dev (dead-brand https://instant.dev 404s)", url)
+	}
+}
+
+// TestOpenAPI_ResourceTypeEnumIsCanonical guards Wave FIX-E #C9 — the
+// resource_type enum on both ResourceItem AND ClaimPreviewResponse drifted
+// to ["postgres","redis","mongodb","nats","webhook","storage"]: the value
+// "nats" was never written to the resources.resource_type column (handlers
+// emit "queue"), and the column "vector" — shipped at /vector/new — was
+// missing entirely. Both schemas must reference the canonical 7-value set.
+func TestOpenAPI_ResourceTypeEnumIsCanonical(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	want := map[string]bool{
+		"postgres": true, "redis": true, "mongodb": true,
+		"queue": true, "storage": true, "webhook": true, "vector": true,
+	}
+
+	// ResourceItem
+	props, ok := digMap(v, "components", "schemas", "ResourceItem", "properties")
+	if !ok {
+		t.Fatal("ResourceItem.properties missing")
+	}
+	rt, _ := props["resource_type"].(map[string]any)
+	enumAny, _ := rt["enum"].([]any)
+	got := map[string]bool{}
+	for _, e := range enumAny {
+		if s, _ := e.(string); s != "" {
+			got[s] = true
+		}
+	}
+	for w := range want {
+		if !got[w] {
+			t.Errorf("ResourceItem.resource_type.enum missing %q", w)
+		}
+	}
+	if got["nats"] {
+		t.Error("ResourceItem.resource_type.enum still carries stale 'nats' — should be 'queue'")
+	}
+
+	// ClaimPreviewResponse.resources[] must $ref ResourceItem (hoist) so the
+	// two enums can't drift again.
+	cp, ok := digMap(v, "components", "schemas", "ClaimPreviewResponse", "properties")
+	if !ok {
+		t.Fatal("ClaimPreviewResponse.properties missing")
+	}
+	resources, _ := cp["resources"].(map[string]any)
+	items, _ := resources["items"].(map[string]any)
+	ref, _ := items["$ref"].(string)
+	if !strings.HasSuffix(ref, "/ResourceItem") {
+		t.Errorf("ClaimPreviewResponse.resources.items must $ref ResourceItem to prevent enum drift; got %q", ref)
+	}
+}
+
+// TestOpenAPI_DeployStatusEnumIncludesDeploying guards Wave FIX-E #C10 — the
+// DeployResponse.item.status (and the sibling DeployItem) enum was
+// ["building","healthy","failed","stopped"] but the live worker writes
+// "deploying" as an intermediate state. Agents that strictly validated
+// against the enum would reject perfectly-good poll responses.
+func TestOpenAPI_DeployStatusEnumIncludesDeploying(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	check := func(label string, enumAny []any) {
+		got := map[string]bool{}
+		for _, e := range enumAny {
+			if s, _ := e.(string); s != "" {
+				got[s] = true
+			}
+		}
+		for _, w := range []string{"building", "deploying", "healthy", "failed", "stopped"} {
+			if !got[w] {
+				t.Errorf("%s.status.enum missing %q", label, w)
+			}
+		}
+	}
+
+	// DeployResponse.item.status
+	props, ok := digMap(v, "components", "schemas", "DeployResponse", "properties")
+	if !ok {
+		t.Fatal("DeployResponse.properties missing")
+	}
+	item, _ := props["item"].(map[string]any)
+	itemProps, _ := item["properties"].(map[string]any)
+	st, _ := itemProps["status"].(map[string]any)
+	enumAny, _ := st["enum"].([]any)
+	check("DeployResponse.item", enumAny)
+
+	// DeployItem.status (parallel shape — list endpoint)
+	di, ok := digMap(v, "components", "schemas", "DeployItem", "properties")
+	if !ok {
+		t.Fatal("DeployItem.properties missing")
+	}
+	st2, _ := di["status"].(map[string]any)
+	enumAny2, _ := st2["enum"].([]any)
+	check("DeployItem", enumAny2)
+}
+
+// TestOpenAPI_TeamSummaryTierEnumCoversAllTiers guards Wave FIX-E #C11 — the
+// TeamSummaryResponse.tier enum was ["anonymous","free","hobby","pro","team"]
+// but the live teams.plan_tier column carries hobby_plus, growth, AND yearly
+// variants. A dashboard that validated against this enum would reject
+// summaries for any Plus / yearly customer.
+func TestOpenAPI_TeamSummaryTierEnumCoversAllTiers(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	props, ok := digMap(v, "components", "schemas", "TeamSummaryResponse", "properties")
+	if !ok {
+		t.Fatal("TeamSummaryResponse.properties missing")
+	}
+	tier, _ := props["tier"].(map[string]any)
+	enumAny, _ := tier["enum"].([]any)
+	got := map[string]bool{}
+	for _, e := range enumAny {
+		if s, _ := e.(string); s != "" {
+			got[s] = true
+		}
+	}
+	for _, w := range []string{"hobby_plus", "growth", "hobby_yearly", "pro_yearly"} {
+		if !got[w] {
+			t.Errorf("TeamSummaryResponse.tier.enum missing %q — Plus / yearly customers will fail strict validation", w)
+		}
+	}
+}
+
+// TestOpenAPI_ErrorResponseDocumentsClaimURL guards Wave FIX-E #C12 — the
+// provisioning 402 envelope on free_tier_recycle_requires_claim carries a
+// claim_url field on the wire, but the schema didn't declare it. Agents
+// that strict-parse against the schema would either drop the field or fail
+// to surface the claim flow back to the user.
+func TestOpenAPI_ErrorResponseDocumentsClaimURL(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	props, ok := digMap(v, "components", "schemas", "ErrorResponse", "properties")
+	if !ok {
+		t.Fatal("ErrorResponse.properties missing")
+	}
+	if _, ok := props["claim_url"]; !ok {
+		t.Error("ErrorResponse.properties.claim_url missing — free_tier_recycle_requires_claim envelope returns it on the wire but the schema is silent")
+	}
+}
+
+// TestOpenAPI_StartIs302NotHTML guards Wave FIX-E #C13 — GET /start used to be
+// documented as a 200 HTML response, but the actual handler issues a 302
+// Location redirect to the dashboard claim page. Agents following the spec
+// to "render HTML" would fail; agents following an HTTP client default of
+// "follow redirects" would work but be confused why their content-type
+// expectations don't match.
+func TestOpenAPI_StartIs302NotHTML(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	get, ok := digMap(v, "paths", "/start", "get")
+	if !ok {
+		t.Fatal("/start GET missing from spec")
+	}
+	responses, _ := get["responses"].(map[string]any)
+	if _, ok := responses["302"]; !ok {
+		t.Error("/start GET must document 302 — the handler issues a redirect, not an HTML page")
+	}
+	if r302, ok := responses["302"].(map[string]any); ok {
+		headers, _ := r302["headers"].(map[string]any)
+		if _, ok := headers["Location"]; !ok {
+			t.Error("/start 302 must document the Location header — agents need to know to follow it")
+		}
+	}
+}
+
+// TestOpenAPI_ProvisionResponsesDocumentUpgradeJWT guards Wave FIX-E #C17 —
+// every anonymous provision response writes upgrade_jwt to the wire (so
+// agents can POST /claim without string-parsing the URL), but the OpenAPI
+// schemas for those responses didn't declare the field. An agent reading
+// the spec alone would not know upgrade_jwt is on the wire and would fall
+// back to URL-stripping (which the policy memory says we explicitly do
+// not want).
+func TestOpenAPI_ProvisionResponsesDocumentUpgradeJWT(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	for _, schemaName := range []string{
+		"DBProvisionResponse",
+		"CacheProvisionResponse",
+		"NoSQLProvisionResponse",
+		"QueueProvisionResponse",
+		"StorageProvisionResponse",
+		"WebhookProvisionResponse",
+		"VectorProvisionResponse",
+	} {
+		props, ok := digMap(v, "components", "schemas", schemaName, "properties")
+		if !ok {
+			t.Errorf("%s missing", schemaName)
+			continue
+		}
+		if _, ok := props["upgrade_jwt"]; !ok {
+			t.Errorf("%s.properties.upgrade_jwt missing — agents must be able to discover the field from the spec alone", schemaName)
+		}
+	}
+}
+
 func digMap(root map[string]any, keys ...string) (map[string]any, bool) {
 	cur := root
 	for _, k := range keys {

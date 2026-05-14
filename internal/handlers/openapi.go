@@ -38,7 +38,7 @@ const openAPISpec = `{
     "version": "1.0.0",
     "description": "Zero-friction developer infrastructure. Provision real databases, caches, and queues with a single HTTP call — no account, no Docker, no setup."
   },
-  "servers": [{ "url": "https://instant.dev", "description": "Production" }],
+  "servers": [{ "url": "https://api.instanode.dev", "description": "Production" }],
   "paths": {
     "/livez": {
       "get": {
@@ -537,9 +537,18 @@ const openAPISpec = `{
     },
     "/start": {
       "get": {
-        "summary": "Pre-filled upgrade landing page",
-        "parameters": [{ "name": "t", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Signed onboarding JWT from the note field" }],
-        "responses": { "200": { "description": "HTML landing page with resource context" } }
+        "summary": "Onboarding bounce — 302 redirect to the dashboard claim page",
+        "description": "Public bounce endpoint baked into the upgrade_url returned by every anonymous provisioning response. Issues a 302 Location redirect to the dashboard's claim page (DASHBOARD_BASE_URL + '/claim?t=<jwt>') — the dashboard then drives the email-claim flow against POST /claim. Agents that already hold the upgrade_jwt should POST /claim directly instead of following this redirect.",
+        "parameters": [{ "name": "t", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Signed onboarding JWT (the upgrade_jwt field from any anonymous provisioning response, or extracted from the upgrade URL)." }],
+        "responses": {
+          "302": {
+            "description": "Redirect to the dashboard claim page (e.g. https://instanode.dev/claim?t=<jwt>). Follow the Location header for the human flow, or POST /claim directly with the JWT to skip the dashboard step.",
+            "headers": {
+              "Location": { "schema": { "type": "string", "format": "uri" }, "description": "Dashboard claim URL with the JWT echoed in the t= query param" }
+            }
+          },
+          "400": { "description": "Missing or malformed t= JWT", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
       }
     },
     "/auth/me": {
@@ -2146,7 +2155,9 @@ const openAPISpec = `{
           "internal_url": { "type": "string", "description": "Cluster-internal postgres:// URL routed via instant-pg-proxy. Use this when calling from a workload deployed inside the instanode cluster (e.g. an app started by /deploy/new) — the public hostname does not hairpin reliably." },
           "tier": { "type": "string" },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
-          "note": { "type": "string" }
+          "note": { "type": "string" },
+          "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email to convert the anonymous resource into a claimed (authenticated) one — no need to string-parse the upgrade URL. Absent on authenticated provisions." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL the agent can hand to the user to drive the dashboard claim flow." }
         }
       },
       "VectorProvisionRequest": {
@@ -2171,7 +2182,9 @@ const openAPISpec = `{
           "extension": { "type": "string", "enum": ["pgvector"], "description": "Always 'pgvector' for /vector/new. Declared so clients can confirm the extension is present without querying pg_extension." },
           "dimensions": { "type": "integer", "description": "Echo of the requested dimensions hint (defaults to 1536). Informational only — pgvector enforces dimensions per column, not per database." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
-          "note": { "type": "string" }
+          "note": { "type": "string" },
+          "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "CacheProvisionResponse": {
@@ -2184,7 +2197,9 @@ const openAPISpec = `{
           "key_prefix": { "type": "string", "description": "All keys must use this prefix for namespace isolation" },
           "tier": { "type": "string" },
           "limits": { "type": "object", "properties": { "memory_mb": { "type": "integer" }, "expires_in": { "type": "string" } } },
-          "note": { "type": "string" }
+          "note": { "type": "string" },
+          "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "NoSQLProvisionResponse": {
@@ -2196,7 +2211,9 @@ const openAPISpec = `{
           "internal_url": { "type": "string", "description": "Cluster-internal mongodb:// URL routed via instant-mongo-proxy. Use this when calling from a workload deployed inside the instanode cluster." },
           "tier": { "type": "string" },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
-          "note": { "type": "string" }
+          "note": { "type": "string" },
+          "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "QueueProvisionResponse": {
@@ -2208,7 +2225,9 @@ const openAPISpec = `{
           "internal_url": { "type": "string", "description": "Cluster-internal nats:// URL routed via instant-nats-proxy. Use this when calling from a workload deployed inside the instanode cluster." },
           "tier": { "type": "string" },
           "limits": { "type": "object" },
-          "note": { "type": "string" }
+          "note": { "type": "string" },
+          "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "WebhookProvisionResponse": {
@@ -2219,7 +2238,9 @@ const openAPISpec = `{
           "receive_url": { "type": "string", "description": "Public URL that accepts any HTTP method and stores the payload" },
           "tier": { "type": "string" },
           "expires_at": { "type": "string", "format": "date-time" },
-          "note": { "type": "string" }
+          "note": { "type": "string" },
+          "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "StorageProvisionResponse": {
@@ -2236,7 +2257,9 @@ const openAPISpec = `{
           "prefix": { "type": "string", "description": "Object-key prefix all writes must use for isolation" },
           "tier": { "type": "string" },
           "env": { "type": "string" },
-          "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "expires_in": { "type": "string", "description": "Anonymous-only" } } }
+          "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "expires_in": { "type": "string", "description": "Anonymous-only" } } },
+          "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "DeployItem": {
@@ -2246,7 +2269,7 @@ const openAPISpec = `{
           "id": { "type": "string", "format": "uuid" },
           "app_id": { "type": "string", "description": "8-char public identifier used in the URL" },
           "url": { "type": "string" },
-          "status": { "type": "string", "enum": ["building", "healthy", "failed", "stopped"] },
+          "status": { "type": "string", "enum": ["building", "deploying", "healthy", "failed", "stopped"] },
           "tier": { "type": "string" },
           "environment": { "type": "string" },
           "env": { "type": "object", "additionalProperties": { "type": "string" } },
@@ -2281,17 +2304,7 @@ const openAPISpec = `{
           "resources": {
             "type": "array",
             "description": "All anonymous resources that this JWT would attach to the new team if /claim were posted.",
-            "items": {
-              "type": "object",
-              "properties": {
-                "id": { "type": "string", "format": "uuid" },
-                "token": { "type": "string", "format": "uuid" },
-                "resource_type": { "type": "string", "enum": ["postgres", "redis", "mongodb", "nats", "webhook", "storage"] },
-                "tier": { "type": "string" },
-                "status": { "type": "string" },
-                "created_at": { "type": "string", "format": "date-time" }
-              }
-            }
+            "items": { "$ref": "#/components/schemas/ResourceItem" }
           }
         }
       },
@@ -2363,7 +2376,7 @@ const openAPISpec = `{
         "properties": {
           "id": { "type": "string", "format": "uuid" },
           "token": { "type": "string", "format": "uuid" },
-          "resource_type": { "type": "string", "enum": ["postgres", "redis", "mongodb", "nats", "webhook", "storage"] },
+          "resource_type": { "type": "string", "enum": ["postgres", "redis", "mongodb", "queue", "storage", "webhook", "vector"] },
           "name": { "type": "string" },
           "env": { "type": "string", "description": "Environment scope (production / staging / dev / ...)" },
           "tier": { "type": "string" },
@@ -2427,7 +2440,7 @@ const openAPISpec = `{
               "id": { "type": "string", "format": "uuid" },
               "app_id": { "type": "string", "description": "8-char public identifier used in the URL" },
               "url": { "type": "string", "description": "Live HTTPS URL (set once status=healthy)" },
-              "status": { "type": "string", "enum": ["building", "healthy", "failed", "stopped"] },
+              "status": { "type": "string", "enum": ["building", "deploying", "healthy", "failed", "stopped"] },
               "tier": { "type": "string" },
               "environment": { "type": "string", "description": "Env scope (production/staging/dev). Note: 'env' on this object is the env_vars map, not the scope." },
               "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Env vars map — vault://KEY references resolve at deploy time" },
@@ -2537,7 +2550,7 @@ const openAPISpec = `{
           "ok":                { "type": "boolean", "enum": [true] },
           "freshness_seconds": { "type": "integer", "description": "Cache TTL window in seconds. Today 300 — matches the server-side const and the Cache-Control max-age." },
           "as_of":             { "type": "string", "format": "date-time", "description": "When the aggregation was computed." },
-          "tier":              { "type": "string", "description": "Current plan tier from the team record. Mirrored here so the sidebar doesn't need a second /billing fetch just to render the upgrade card.", "enum": ["anonymous", "free", "hobby", "pro", "team"] },
+          "tier":              { "type": "string", "description": "Current plan tier from the team record. Mirrored here so the sidebar doesn't need a second /billing fetch just to render the upgrade card. Values mirror teams.plan_tier — includes monthly canonical names and their *_yearly variants.", "enum": ["anonymous", "free", "hobby", "hobby_plus", "growth", "pro", "team", "hobby_yearly", "hobby_plus_yearly", "growth_yearly", "pro_yearly", "team_yearly"] },
           "counts": {
             "type": "object",
             "description": "Per-area counts. resources.total is the sum of every typed bucket plus 'other' — saves the dashboard from re-adding.",
@@ -2577,7 +2590,8 @@ const openAPISpec = `{
           "request_id": { "type": "string", "description": "Echo of the X-Request-ID header for this request. Stable correlator agents can quote when emailing support@instanode.dev — saves the user from copy/pasting headers." },
           "retry_after_seconds": { "type": ["integer", "null"], "description": "Seconds the agent should wait before retrying. null on 4xx (no retry — fix the request). int on transient 5xx: 30 for 503, 60 for 429, 10 for 502/504. For 429/502/503/504 the same value is also set in the Retry-After HTTP header." },
           "agent_action": { "type": "string", "description": "Optional. A sentence the calling agent should surface verbatim to the human user — e.g. 'Tell the user they've hit the hobby tier storage limit (500MB). Have them upgrade at https://instanode.dev/pricing to provision more storage.' Present on quota walls, invalid-token errors, permission-denied errors, expired-resource errors, tier-gate errors, AND on plumbing 5xx (where it falls back to a generic 'email support with this request_id' sentence)." },
-          "upgrade_url": { "type": "string", "format": "uri", "description": "Optional. Where the user can resolve the error — typically the pricing/upgrade page for quota walls and the login page for token errors. Present whenever following the URL would clear the error." }
+          "upgrade_url": { "type": "string", "format": "uri", "description": "Optional. Where the user can resolve the error — typically the pricing/upgrade page for quota walls and the login page for token errors. Present whenever following the URL would clear the error." },
+          "claim_url": { "type": "string", "format": "uri", "description": "Optional. Present specifically on error='free_tier_recycle_requires_claim' (402 from /db/new, /cache/new, /nosql/new, /queue/new, /storage/new, /webhook/new): the URL the anonymous caller should visit to claim their existing resources with email before they can provision again. Distinct from upgrade_url — claim_url is about identity (anonymous → claimed), upgrade_url is about tier (claimed → paid). Both may be present on the same envelope." }
         },
         "required": ["ok", "error", "message", "retry_after_seconds"]
       },
