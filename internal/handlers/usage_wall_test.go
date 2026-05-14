@@ -61,8 +61,8 @@ func expectTeamLookup(mock sqlmock.Sqlmock, teamID uuid.UUID, tier string) {
 	mock.ExpectQuery(`SELECT.*FROM teams WHERE id`).
 		WithArgs(teamID).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "name", "plan_tier", "stripe_customer_id", "trial_ends_at", "created_at",
-		}).AddRow(teamID, sql.NullString{}, tier, sql.NullString{}, nil, time.Now()))
+			"id", "name", "plan_tier", "stripe_customer_id", "created_at",
+		}).AddRow(teamID, sql.NullString{}, tier, sql.NullString{}, time.Now()))
 }
 
 // TestUsageWall_ReturnsLatestRowWithMetadata is the headline test: an

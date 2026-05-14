@@ -2095,8 +2095,7 @@ const openAPISpec = `{
           "user_id": { "type": "string", "format": "uuid" },
           "team_id": { "type": "string", "format": "uuid" },
           "email": { "type": "string" },
-          "tier": { "type": "string", "enum": ["hobby", "pro", "team"] },
-          "trial_ends_at": { "type": "string", "format": "date-time", "nullable": true }
+          "tier": { "type": "string", "enum": ["hobby", "pro", "team"] }
         }
       },
       "StackRequest": {
@@ -2266,7 +2265,7 @@ const openAPISpec = `{
         "properties": {
           "ok": { "type": "boolean" },
           "tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "pro", "team"], "description": "Current plan tier from the team record" },
-          "subscription_status": { "type": "string", "enum": ["none", "active", "cancelled", "trial"], "description": "'none' when no Razorpay subscription exists; 'trial' when trial_ends_at is in the future; 'cancelled' when Razorpay reports cancelled / completed / expired or cancel_at_cycle_end=true; 'active' otherwise" },
+          "subscription_status": { "type": "string", "enum": ["none", "active", "cancelled"], "description": "'none' when no Razorpay subscription exists; 'cancelled' when Razorpay reports cancelled / completed / expired or cancel_at_cycle_end=true; 'active' otherwise. The platform has no trial period (see policy memory project_no_trial_pay_day_one.md); hobby/pro/team are paid from day one" },
           "next_renewal_at": { "type": ["string", "null"], "format": "date-time", "description": "ISO timestamp for next renewal (Razorpay current_end). null when no active subscription" },
           "amount_inr": { "type": ["integer", "null"], "description": "Monthly subscription amount in INR rupees (not paise). Sourced from the most recent paid invoice when available; falls back to the tier-derived price for brand-new subscriptions. null when no subscription on file" },
           "payment_method": { "oneOf": [{ "$ref": "#/components/schemas/BillingPaymentMethod" }, { "type": "null" }] },

@@ -77,12 +77,14 @@ func runMigrations(t *testing.T, db *sql.DB) {
 	t.Helper()
 
 	stmts := []string{
+		// trial_ends_at column intentionally not declared here — migration
+		// 034 dropped it (see project_no_trial_pay_day_one.md). The DROP COLUMN
+		// statement near the bottom of this list keeps reused test DBs in sync.
 		`CREATE TABLE IF NOT EXISTS teams (
 			id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			name              TEXT,
 			plan_tier         TEXT NOT NULL DEFAULT 'hobby',
 			stripe_customer_id TEXT UNIQUE,
-			trial_ends_at     TIMESTAMPTZ,
 			created_at        TIMESTAMPTZ DEFAULT now()
 		)`,
 		// Slice 6 (migration 019_env_policy.sql) — mirror the column here
@@ -413,6 +415,11 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_restores_resource ON resource_restores(resource_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_restores_pending  ON resource_restores(status) WHERE status IN ('pending','running')`,
+		// 034_drop_trial_ends_at — the platform has no trial period (see
+		// policy memory project_no_trial_pay_day_one.md). Idempotent with
+		// IF EXISTS so test setups bringing up a fresh DB don't trip on the
+		// missing column when other code paths drop the field.
+		`ALTER TABLE teams DROP COLUMN IF EXISTS trial_ends_at`,
 	}
 
 	for _, s := range stmts {
