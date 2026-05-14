@@ -537,6 +537,17 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Delete("/team/invitations/:id", teamMembersH.RevokeInvitation)
 	api.Post("/team/invitations/:id/accept", teamMembersH.AcceptInvitation)
 
+	// GDPR Article 17 — right-to-be-forgotten. Owner-only (RequireRole gates
+	// at the route boundary). The handler additionally enforces a
+	// confirm_team_slug body match before any state change. See
+	// handlers/team_deletion.go for the full lifecycle contract; the
+	// post-grace destruction happens in the worker's team_deletion_executor
+	// (see worker/internal/jobs/team_deletion_executor.go).
+	teamDelH := handlers.NewTeamDeletionHandler(db, cfg)
+	teamDelH.CancelSubscription = &handlers.PortalSubscriptionCanceler{DB: db, Cfg: cfg}
+	api.Delete("/team", middleware.RequireRole("owner"), teamDelH.Delete)
+	api.Post("/team/restore", middleware.RequireRole("owner"), teamDelH.Restore)
+
 	api.Get("/billing", billing.GetBillingState)
 	api.Post("/billing/checkout", billing.CreateCheckoutAPI)
 	// Self-serve POST /billing/cancel was removed per policy — see project
