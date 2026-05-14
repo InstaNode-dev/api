@@ -1,13 +1,16 @@
 package middleware
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,14 +21,27 @@ import (
 
 // idempotency.go — Stripe/AWS-style Idempotency-Key support for provisioning
 // endpoints (/db/new, /cache/new, /nosql/new, /queue/new, /storage/new,
-// /webhook/new, /deploy/new).
+// /webhook/new, /deploy/new) PLUS a body-fingerprint fallback that protects
+// every create endpoint against accidental double-creation even when the
+// caller didn't opt in via the header.
 //
 // Rationale: autonomous AI agents (Claude Code, Cursor, MCP) retry on
-// transient errors. Without idempotency, each retry creates a duplicate
-// resource — burning quota and creating cleanup work. The header is opaque
-// and client-supplied (agents generate a UUID per logical attempt). When
-// present, the first response is cached for 24h and replayed verbatim on
-// any subsequent call carrying the same key.
+// transient errors. Browsers double-tap on flaky mobile networks. Forms
+// resubmit on the back button. Without idempotency, each retry creates a
+// duplicate resource — burning quota and creating cleanup work. The header
+// is opaque and client-supplied (agents generate a UUID per logical
+// attempt). When present, the first response is cached for 24h and
+// replayed verbatim on any subsequent call carrying the same key.
+//
+// Fingerprint-fallback contract (2026-05-14, this file): when the header
+// is ABSENT, the middleware synthesises a fallback key from
+// sha256(scope || "|" || route_pattern || "|" || canonical_body) and
+// caches the response for 120s. Long enough to absorb double-clicks and
+// fast retry storms; short enough that an honest second creation 5
+// minutes later doesn't accidentally replay. Callers who want exactly-
+// once across longer windows must pass an explicit Idempotency-Key.
+// The response carries X-Idempotency-Source: explicit|fingerprint|miss
+// so debuggers can see which path matched.
 //
 // Middleware ordering (see internal/router/router.go for the per-route
 // wiring): RateLimit runs at app.Use scope (global, before OptionalAuth),
@@ -62,30 +78,69 @@ import (
 // against fingerprint dedup:
 //   - With Idempotency-Key + cached: replay the cached token (whatever it
 //     was on the first call), even if fingerprint dedup would now hand out
-//     a different existing resource. X-Idempotent-Replay: true.
+//     a different existing resource. X-Idempotent-Replay: true,
+//     X-Idempotency-Source: explicit.
 //   - With Idempotency-Key + no cache: handler runs; its fingerprint-dedup
 //     branch may apply on the first call. The response is then cached so
 //     subsequent same-key calls replay the same token.
-//   - Without Idempotency-Key: handler's fingerprint-dedup is the only
-//     dedup layer. X-Idempotent-Replay is NEVER set on this path — that
-//     header is reserved exclusively for the idempotency middleware so
-//     upstream agents can branch reliably on "this was a replay vs a
-//     fingerprint dedup hit vs a fresh provision".
-// E2E coverage: e2e/w11_hardening_e2e_test.go pins all three branches.
+//   - Without Idempotency-Key (fingerprint-fallback path, 2026-05-14):
+//     the middleware's own body-fingerprint cache may replay the previous
+//     response (X-Idempotent-Replay: true, X-Idempotency-Source:
+//     fingerprint). On a miss, the handler runs; its handler-internal
+//     fingerprint-dedup branch may still apply on the 6th+ provision.
+//     Handler-only dedup paths produce X-Idempotency-Source: miss (no
+//     replay header) so upstream agents can still distinguish "middleware
+//     replayed" from "handler returned existing token" from "fresh
+//     provision".
+// E2E coverage: e2e/w11_hardening_e2e_test.go pins the explicit branches;
+// e2e/idempotency_fingerprint_e2e_test.go pins the fallback path.
 //
 // 5xx responses are NOT cached so retries trigger fresh attempts; 2xx and
 // 4xx ARE cached (a 402 quota_exceeded should replay so the agent sees
 // the same upgrade prompt rather than retry-storming the wall).
+
+// IsResponseWrittenErr reports whether err is the handlers.ErrResponseWritten
+// sentinel — the marker respondError* returns after committing a structured
+// 4xx/5xx body to the wire. The handlers package registers the real check
+// via init() (see handlers/helpers.go) to avoid an import cycle: handlers
+// imports middleware, so middleware cannot import handlers directly.
+//
+// Default returns false so test packages that don't import handlers (none
+// of the middleware-package tests do today) get the pre-BB2-D5 behaviour
+// where any handler error bypasses caching. Production routes always
+// import handlers indirectly via router/router.go, so the init() fires.
+var IsResponseWrittenErr = func(err error) bool { return false }
 
 const (
 	// idempotencyHeader is the request header carrying the opaque key.
 	idempotencyHeader = "Idempotency-Key"
 	// idempotencyReplayHeader is set on replayed responses.
 	idempotencyReplayHeader = "X-Idempotent-Replay"
-	// idempotencyTTL is the cache lifetime — matches Stripe's 24h window.
+	// idempotencySourceHeader is set on every response that the middleware
+	// touches, signalling which dedup path matched: "explicit" when the
+	// caller passed an Idempotency-Key (whether cached or fresh),
+	// "fingerprint" when the body-fingerprint fallback matched a cached
+	// entry, "miss" when the fingerprint path ran the handler fresh.
+	idempotencySourceHeader = "X-Idempotency-Source"
+	// idempotencyTTL is the cache lifetime — matches Stripe's 24h window
+	// for explicit-key requests. The fingerprint fallback uses
+	// idempotencyFingerprintTTL instead (much shorter — see below).
 	idempotencyTTL = 24 * time.Hour
+	// idempotencyFingerprintTTL is the lifetime of an auto-synthesised
+	// fingerprint cache entry. 120s is the smallest window that absorbs
+	// double-clicks, mobile-network retries, and 5xx retry storms while
+	// staying short enough that a second honest creation a few minutes
+	// later doesn't accidentally replay. Callers who need true
+	// exactly-once over longer windows MUST pass an explicit
+	// Idempotency-Key (which gets the full 24h cache).
+	idempotencyFingerprintTTL = 120 * time.Second
 	// idempotencyKeyMaxLen caps the client-supplied key. Stripe uses 255.
 	idempotencyKeyMaxLen = 255
+
+	// X-Idempotency-Source values.
+	idempotencySourceExplicit    = "explicit"
+	idempotencySourceFingerprint = "fingerprint"
+	idempotencySourceMiss        = "miss"
 )
 
 // idemEntry is the JSON shape persisted in Redis. It captures everything
@@ -98,34 +153,34 @@ type idemEntry struct {
 	BodyHash    string `json:"h"` // sha256 hex of the original request body
 }
 
-// Idempotency returns a Fiber handler that caches successful responses
-// by an opaque Idempotency-Key header. When the header is absent the
-// middleware is a no-op (backwards-compat for all existing callers).
+// Idempotency returns a Fiber handler that dedups duplicate POSTs via two
+// layered mechanisms:
+//
+//  1. Explicit Idempotency-Key header (Stripe-shape, 24h TTL). When the
+//     caller passes a UUID-shaped key, the first response is cached and
+//     replayed verbatim on every subsequent call with the same key.
+//  2. Body-fingerprint fallback (120s TTL). When the header is absent the
+//     middleware synthesises a key from sha256(scope || route || body).
+//     Absorbs accidental double-clicks, mobile double-taps, agent retries
+//     on transient 5xx, and reverse-proxy retries on network blips.
+//
+// Both paths set X-Idempotency-Source: explicit|fingerprint|miss so the
+// caller (and any debugging tee) can see which path matched.
 //
 // endpoint is a short stable identifier (e.g. "db.new") used to namespace
 // the cache key — the same idempotency key sent to /db/new and /cache/new
-// MUST NOT collide.
+// MUST NOT collide. The fingerprint path additionally namespaces by the
+// route pattern (c.Route().Path) so /db/new and /cache/new with the same
+// empty body never share a cache slot.
 func Idempotency(rdb *redis.Client, endpoint string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		rawKey := c.Get(idempotencyHeader)
-		if rawKey == "" {
-			return c.Next()
-		}
 
-		key := strings.TrimSpace(rawKey)
-		if err := validateIdempotencyKey(key); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"ok":      false,
-				"error":   "invalid_idempotency_key",
-				"message": err.Error(),
-			})
-		}
-
-		// Scope: team_id when authenticated, fingerprint when anonymous.
-		// Falls back to "anon" if neither is populated (no fingerprint
-		// middleware ran, no auth) — still gives correct semantics, just
-		// in a degenerate shared keyspace. That can't happen in production
-		// since Fingerprint() runs at app.Use scope.
+		// Compute the scope used to namespace cache keys. team_id when
+		// authenticated, network fingerprint (sha256(/24-subnet + ASN)
+		// from middleware.Fingerprint) when anonymous, "anon" as a last
+		// resort if neither is populated — which can't happen in
+		// production since Fingerprint() runs at app.Use scope.
 		scope := GetTeamID(c)
 		if scope == "" {
 			scope = GetFingerprint(c)
@@ -134,107 +189,413 @@ func Idempotency(rdb *redis.Client, endpoint string) fiber.Handler {
 			scope = "anon"
 		}
 
-		keyHash := sha256Hex(key)
-		cacheKey := fmt.Sprintf("idem:%s:%s:%s", scope, endpoint, keyHash)
-
-		// Request body hash — used to detect "same key, different body" misuse.
-		// c.Body() returns []byte, may be empty for some endpoints (e.g.
-		// /webhook/new accepts an empty body). Empty body hashes to a stable
-		// constant, which is the correct behaviour for "two empty requests
-		// with the same key should be deduped".
-		reqBody := c.Body()
-		reqBodyHash := sha256Hex(string(reqBody))
-
-		ctx := c.Context()
-
-		// Check for an existing entry. Redis errors are fail-open — a
-		// Redis outage must not block provisioning (same fail-open posture
-		// as the rate-limit and quota middleware). When the lookup fails
-		// we proceed without idempotency for this request; the caller may
-		// see a duplicate resource if they retry, which is strictly less
-		// bad than blocking provisioning entirely.
-		raw, err := rdb.Get(ctx, cacheKey).Result()
-		if err != nil && !errors.Is(err, redis.Nil) {
-			slog.Warn("idempotency.redis_get_failed",
-				"error", err,
-				"endpoint", endpoint,
-				"request_id", GetRequestID(c),
-			)
-			metrics.RedisErrors.WithLabelValues("idempotency").Inc()
-			return c.Next()
+		// Branch 1: explicit Idempotency-Key path. The validation, scope,
+		// and cache mechanics here are unchanged from the pre-fingerprint
+		// implementation — DO NOT alter TTL or key shape; that's an
+		// existing contract that callers depend on. The only behaviour
+		// added in this branch is the X-Idempotency-Source: explicit
+		// header.
+		if rawKey != "" {
+			return idempotencyExplicit(c, rdb, endpoint, scope, rawKey)
 		}
 
-		if err == nil {
-			// Cache hit — replay or conflict.
-			var entry idemEntry
-			if jerr := json.Unmarshal([]byte(raw), &entry); jerr != nil {
-				// Corrupt cache entry — treat as miss and overwrite below.
-				slog.Warn("idempotency.cache_unmarshal_failed",
-					"error", jerr, "endpoint", endpoint)
-			} else {
-				if entry.BodyHash != reqBodyHash {
-					return c.Status(fiber.StatusConflict).JSON(fiber.Map{
-						"ok":      false,
-						"error":   "idempotency_key_conflict",
-						"message": "Idempotency-Key already used with a different body",
-					})
-				}
-				// Replay verbatim.
-				c.Set(idempotencyReplayHeader, "true")
-				if entry.ContentType != "" {
-					c.Set(fiber.HeaderContentType, entry.ContentType)
-				}
-				return c.Status(entry.StatusCode).Send(entry.Body)
+		// Branch 2: body-fingerprint fallback. The synthesised key is
+		// sha256(scope || "|" || route_pattern || "|" || canonical_body)
+		// with a 120s TTL. The route pattern (not the full URL) is the
+		// namespace so /db/new vs /cache/new vs /webhook/new can't collide
+		// even with the same empty body. Multipart endpoints (notably
+		// /deploy/new) get a special canonicaliser that hashes the
+		// tarball + sorted form fields instead of the raw multipart blob.
+		return idempotencyFingerprint(c, rdb, endpoint, scope)
+	}
+}
+
+// idempotencyExplicit handles the Stripe-shape Idempotency-Key path.
+// Extracted from the main Idempotency wrapper so the fingerprint-fallback
+// branch can live alongside it without nesting another layer of if-blocks.
+func idempotencyExplicit(c *fiber.Ctx, rdb *redis.Client, endpoint, scope, rawKey string) error {
+	key := strings.TrimSpace(rawKey)
+	if err := validateIdempotencyKey(key); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"ok":      false,
+			"error":   "invalid_idempotency_key",
+			"message": err.Error(),
+		})
+	}
+
+	keyHash := sha256Hex(key)
+	cacheKey := fmt.Sprintf("idem:%s:%s:%s", scope, endpoint, keyHash)
+
+	// Request body hash — used to detect "same key, different body" misuse.
+	// c.Body() returns []byte, may be empty for some endpoints (e.g.
+	// /webhook/new accepts an empty body). Empty body hashes to a stable
+	// constant, which is the correct behaviour for "two empty requests
+	// with the same key should be deduped".
+	reqBody := c.Body()
+	reqBodyHash := sha256Hex(string(reqBody))
+
+	// Mark every response on the explicit path so callers can branch on
+	// "did the middleware see my key?" (vs. a typo that fell through to
+	// the fingerprint fallback).
+	c.Set(idempotencySourceHeader, idempotencySourceExplicit)
+
+	ctx := c.Context()
+	raw, err := rdb.Get(ctx, cacheKey).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		slog.Warn("idempotency.redis_get_failed",
+			"error", err,
+			"endpoint", endpoint,
+			"request_id", GetRequestID(c),
+		)
+		metrics.RedisErrors.WithLabelValues("idempotency").Inc()
+		return c.Next()
+	}
+
+	if err == nil {
+		var entry idemEntry
+		if jerr := json.Unmarshal([]byte(raw), &entry); jerr != nil {
+			slog.Warn("idempotency.cache_unmarshal_failed",
+				"error", jerr, "endpoint", endpoint)
+		} else {
+			if entry.BodyHash != reqBodyHash {
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+					"ok":      false,
+					"error":   "idempotency_key_conflict",
+					"message": "Idempotency-Key already used with a different body",
+				})
+			}
+			c.Set(idempotencyReplayHeader, "true")
+			if entry.ContentType != "" {
+				c.Set(fiber.HeaderContentType, entry.ContentType)
+			}
+			return c.Status(entry.StatusCode).Send(entry.Body)
+		}
+	}
+
+	nextErr := c.Next()
+	if nextErr != nil && !IsResponseWrittenErr(nextErr) {
+		return nextErr
+	}
+
+	status := c.Response().StatusCode()
+	if status >= 500 {
+		return nextErr
+	}
+
+	body := append([]byte(nil), c.Response().Body()...)
+	ct := string(c.Response().Header.ContentType())
+
+	entry := idemEntry{
+		StatusCode:  status,
+		Body:        body,
+		ContentType: ct,
+		BodyHash:    reqBodyHash,
+	}
+	payload, jerr := json.Marshal(entry)
+	if jerr != nil {
+		slog.Warn("idempotency.marshal_failed",
+			"error", jerr, "endpoint", endpoint)
+		return nextErr
+	}
+
+	if serr := rdb.Set(context.Background(), cacheKey, payload, idempotencyTTL).Err(); serr != nil {
+		slog.Warn("idempotency.redis_set_failed",
+			"error", serr,
+			"endpoint", endpoint,
+			"request_id", GetRequestID(c),
+		)
+		metrics.RedisErrors.WithLabelValues("idempotency").Inc()
+	}
+	return nextErr
+}
+
+// idempotencyFingerprint handles the implicit-no-header path. The cache
+// key is sha256(scope || "|" || route_pattern || "|" || canonical_body)
+// with a 120s TTL. The route pattern is sourced from c.Route().Path so
+// "/db/new" and "/cache/new" can't collide on identical bodies.
+//
+// On a cache hit the middleware sets X-Idempotency-Source: fingerprint
+// and X-Idempotent-Replay: true, then replays the cached body verbatim.
+// On a miss it sets X-Idempotency-Source: miss, runs the handler, and
+// caches non-5xx responses.
+//
+// Fail-open posture: any Redis error short-circuits to c.Next() with a
+// WARN log — never block resource creation because Redis is unavailable.
+func idempotencyFingerprint(c *fiber.Ctx, rdb *redis.Client, endpoint, scope string) error {
+	routePattern := c.Route().Path
+	if routePattern == "" {
+		// c.Route() returns the placeholder Fiber assigns when the route
+		// hasn't been resolved (shouldn't happen for registered routes,
+		// but defensive against tests that wire the middleware before
+		// app.Post). Fall back to the raw path so we still namespace.
+		routePattern = c.Path()
+	}
+
+	canonBody, canonErr := canonicalRequestBody(c)
+	if canonErr != nil {
+		// Body canonicalisation failed (e.g. unparseable multipart
+		// request that the handler will reject anyway). Skip dedup —
+		// the handler's input validation is the next line of defence.
+		slog.Warn("idempotency.fingerprint_canonicalize_failed",
+			"error", canonErr,
+			"endpoint", endpoint,
+			"request_id", GetRequestID(c),
+		)
+		c.Set(idempotencySourceHeader, idempotencySourceMiss)
+		return c.Next()
+	}
+
+	fp := sha256Hex(scope + "|" + routePattern + "|" + canonBody)
+	cacheKey := fmt.Sprintf("idem-fp:%s:%s:%s", scope, endpoint, fp)
+
+	ctx := c.Context()
+	raw, err := rdb.Get(ctx, cacheKey).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		slog.Warn("idempotency.fingerprint_redis_get_failed",
+			"error", err,
+			"endpoint", endpoint,
+			"request_id", GetRequestID(c),
+		)
+		metrics.RedisErrors.WithLabelValues("idempotency_fingerprint").Inc()
+		c.Set(idempotencySourceHeader, idempotencySourceMiss)
+		return c.Next()
+	}
+
+	if err == nil {
+		var entry idemEntry
+		if jerr := json.Unmarshal([]byte(raw), &entry); jerr != nil {
+			slog.Warn("idempotency.fingerprint_cache_unmarshal_failed",
+				"error", jerr, "endpoint", endpoint)
+			// Corrupt — fall through to handler and overwrite below.
+		} else {
+			c.Set(idempotencySourceHeader, idempotencySourceFingerprint)
+			c.Set(idempotencyReplayHeader, "true")
+			if entry.ContentType != "" {
+				c.Set(fiber.HeaderContentType, entry.ContentType)
+			}
+			return c.Status(entry.StatusCode).Send(entry.Body)
+		}
+	}
+
+	// Miss — run the handler, then cache the response (non-5xx only).
+	c.Set(idempotencySourceHeader, idempotencySourceMiss)
+	nextErr := c.Next()
+	if nextErr != nil && !IsResponseWrittenErr(nextErr) {
+		return nextErr
+	}
+
+	status := c.Response().StatusCode()
+	if status >= 500 {
+		return nextErr
+	}
+
+	body := append([]byte(nil), c.Response().Body()...)
+	ct := string(c.Response().Header.ContentType())
+
+	entry := idemEntry{
+		StatusCode:  status,
+		Body:        body,
+		ContentType: ct,
+		// BodyHash is unused on the fingerprint path (the cache key
+		// already encodes the body) but populated for shape parity with
+		// the explicit-key entry — keeps debugging tools happy.
+		BodyHash: sha256Hex(canonBody),
+	}
+	payload, jerr := json.Marshal(entry)
+	if jerr != nil {
+		slog.Warn("idempotency.fingerprint_marshal_failed",
+			"error", jerr, "endpoint", endpoint)
+		return nextErr
+	}
+
+	if serr := rdb.Set(context.Background(), cacheKey, payload, idempotencyFingerprintTTL).Err(); serr != nil {
+		slog.Warn("idempotency.fingerprint_redis_set_failed",
+			"error", serr,
+			"endpoint", endpoint,
+			"request_id", GetRequestID(c),
+		)
+		metrics.RedisErrors.WithLabelValues("idempotency_fingerprint").Inc()
+	}
+	return nextErr
+}
+
+// canonicalRequestBody returns a deterministic byte-stable representation
+// of the request body suitable for hashing. Three input shapes are
+// handled:
+//
+//   - application/json: parse, re-encode with sorted keys recursively.
+//     {"a":1,"b":2} and {"b":2,"a":1} produce the same canonical form.
+//   - multipart/form-data: hash sha256(tarball-bytes) || sorted-form-fields.
+//     The full multipart blob carries non-deterministic boundary strings
+//     so we can't hash it verbatim — the deterministic parts are the file
+//     content (typically a build tarball) and the form fields (env vars,
+//     name, etc.).
+//   - anything else (raw bytes, text/plain, etc.): hash the raw body.
+//
+// Empty bodies return "" — two empty POSTs with the same scope + route
+// must dedup, which is the correct behaviour for endpoints like
+// /webhook/new that accept empty bodies.
+func canonicalRequestBody(c *fiber.Ctx) (string, error) {
+	ct := strings.ToLower(string(c.Request().Header.ContentType()))
+
+	// Multipart: parse and emit a stable hash of the file contents plus
+	// the sorted form-value pairs. Used by /deploy/new (tarball + env).
+	if strings.HasPrefix(ct, "multipart/form-data") {
+		return canonicalMultipartBody(c)
+	}
+
+	body := c.Body()
+	if len(body) == 0 {
+		return "", nil
+	}
+
+	// JSON: re-encode with sorted keys so {"a":1,"b":2} ≡ {"b":2,"a":1}.
+	// Anything that isn't valid JSON falls back to the raw-bytes path so
+	// a malformed payload still produces a stable fingerprint.
+	if strings.HasPrefix(ct, "application/json") || looksLikeJSON(body) {
+		var v interface{}
+		dec := json.NewDecoder(bytes.NewReader(body))
+		if err := dec.Decode(&v); err == nil {
+			canon, cerr := canonicalJSON(v)
+			if cerr == nil {
+				return canon, nil
 			}
 		}
+		// Fall through to raw-bytes fingerprint on parse failure.
+	}
 
-		// Miss — run the handler, then cache the response.
-		if err := c.Next(); err != nil {
+	return string(body), nil
+}
+
+// canonicalMultipartBody emits a stable digest of a multipart request:
+//
+//	sha256(file1.name || file1.size || file1.sha256(content))
+//	  || sorted(field=value) pairs
+//
+// The multipart boundary is excluded (it's randomly generated per
+// request), as is the field ordering (the spec doesn't fix it). Two
+// requests that upload the same tarball with the same form fields in any
+// order produce the same canonical string.
+func canonicalMultipartBody(c *fiber.Ctx) (string, error) {
+	form, err := c.MultipartForm()
+	if err != nil {
+		return "", err
+	}
+
+	var parts []string
+
+	// Files: sorted by field name, each entry is "name:filename:size:sha256(content)".
+	fieldNames := make([]string, 0, len(form.File))
+	for name := range form.File {
+		fieldNames = append(fieldNames, name)
+	}
+	sort.Strings(fieldNames)
+	for _, name := range fieldNames {
+		for _, fh := range form.File[name] {
+			f, oerr := fh.Open()
+			if oerr != nil {
+				return "", oerr
+			}
+			h := sha256.New()
+			if _, cerr := io.Copy(h, f); cerr != nil {
+				f.Close()
+				return "", cerr
+			}
+			f.Close()
+			parts = append(parts, fmt.Sprintf("file:%s:%s:%d:%x",
+				name, fh.Filename, fh.Size, h.Sum(nil)))
+		}
+	}
+
+	// Form values: sorted by field name. Multi-value fields are joined
+	// by NUL bytes after a per-field sort so duplicate sends with the
+	// same value-set produce the same fingerprint.
+	valueNames := make([]string, 0, len(form.Value))
+	for name := range form.Value {
+		valueNames = append(valueNames, name)
+	}
+	sort.Strings(valueNames)
+	for _, name := range valueNames {
+		vs := append([]string(nil), form.Value[name]...)
+		sort.Strings(vs)
+		parts = append(parts, fmt.Sprintf("field:%s=%s", name, strings.Join(vs, "\x00")))
+	}
+
+	return strings.Join(parts, "|"), nil
+}
+
+// canonicalJSON returns a canonical-form encoding of v with map keys
+// sorted recursively. Used by canonicalRequestBody so two semantically
+// identical JSON bodies that differ only in key order produce the same
+// fingerprint.
+func canonicalJSON(v interface{}) (string, error) {
+	var buf bytes.Buffer
+	if err := writeCanonicalJSON(&buf, v); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+// writeCanonicalJSON is the recursive worker for canonicalJSON. Maps are
+// emitted with sorted keys; arrays preserve order (which is semantic in
+// JSON); primitives delegate to encoding/json for the same string shape
+// the rest of the codebase produces.
+func writeCanonicalJSON(buf *bytes.Buffer, v interface{}) error {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		buf.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			kb, err := json.Marshal(k)
+			if err != nil {
+				return err
+			}
+			buf.Write(kb)
+			buf.WriteByte(':')
+			if err := writeCanonicalJSON(buf, t[k]); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte('}')
+	case []interface{}:
+		buf.WriteByte('[')
+		for i, item := range t {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := writeCanonicalJSON(buf, item); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte(']')
+	default:
+		b, err := json.Marshal(t)
+		if err != nil {
 			return err
 		}
-
-		status := c.Response().StatusCode()
-		// Don't cache 5xx — retries should produce fresh attempts.
-		if status >= 500 {
-			return nil
-		}
-
-		// Snapshot the response body. Fiber/fasthttp owns the underlying
-		// buffer and may pool it after the request returns, so copy.
-		body := append([]byte(nil), c.Response().Body()...)
-		ct := string(c.Response().Header.ContentType())
-
-		entry := idemEntry{
-			StatusCode:  status,
-			Body:        body,
-			ContentType: ct,
-			BodyHash:    reqBodyHash,
-		}
-		payload, jerr := json.Marshal(entry)
-		if jerr != nil {
-			slog.Warn("idempotency.marshal_failed",
-				"error", jerr, "endpoint", endpoint)
-			return nil
-		}
-
-		// Set with NX semantics is tempting (only one writer wins on
-		// race) but the trade-off is that two concurrent first-callers
-		// with the same key would each provision a resource. The 5xx-not-
-		// cached rule means most race losers don't get cached anyway;
-		// the bigger picture is that race-window dedup is a Phase 2
-		// concern and the per-fingerprint rate limit caps the blast
-		// radius today.
-		if serr := rdb.Set(context.Background(), cacheKey, payload, idempotencyTTL).Err(); serr != nil {
-			slog.Warn("idempotency.redis_set_failed",
-				"error", serr,
-				"endpoint", endpoint,
-				"request_id", GetRequestID(c),
-			)
-			metrics.RedisErrors.WithLabelValues("idempotency").Inc()
-			// Fall through — the response is already on the wire.
-		}
-		return nil
+		buf.Write(b)
 	}
+	return nil
+}
+
+// looksLikeJSON is a cheap sniff for bodies that omit a Content-Type
+// header but carry a JSON payload (curl --data-raw without -H is a
+// frequent agent pattern).
+func looksLikeJSON(b []byte) bool {
+	for _, c := range b {
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			continue
+		}
+		return c == '{' || c == '['
+	}
+	return false
 }
 
 // validateIdempotencyKey enforces the wire-format constraints from the

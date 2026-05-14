@@ -99,28 +99,34 @@ func readBody(t *testing.T, resp *http.Response) string {
 	return string(b)
 }
 
-// TestIdempotency_MissingKey_BackwardsCompat — the most important
-// guardrail. When no Idempotency-Key header is sent the middleware must
-// be a complete no-op: handler runs every time, no replay header, no
-// 409s for "different body" because no key means no body-hash compare.
-func TestIdempotency_MissingKey_BackwardsCompat(t *testing.T) {
+// TestIdempotency_MissingKey_FirstCallIsFresh — when no Idempotency-Key
+// header is sent the first call runs the handler (X-Idempotency-Source:
+// miss). The second call IS deduped by the body-fingerprint fallback
+// (see TestFingerprint_DoubleClick_ReplaysSecondCall) — so we only assert
+// the first-call shape here, leaving the replay shape to the dedicated
+// fingerprint tests.
+//
+// Pre-fingerprint contract (retired 2026-05-14): two identical
+// no-header POSTs both reached the handler. That created the bug the
+// fingerprint fallback fixes — agents retrying on transient 5xx, mobile
+// double-taps, and reverse-proxy network-blip retries all created
+// duplicate resources. This test no longer asserts that retired contract.
+func TestIdempotency_MissingKey_FirstCallIsFresh(t *testing.T) {
 	c := &idemCounter{}
 	app, clean := newIdemTestApp(t, c)
 	defer clean()
 
 	ip := uniqueTestIP("missing-key")
 	resp1 := postWithIdem(t, app, "/test", ip, "", `{"x":1}`)
-	resp2 := postWithIdem(t, app, "/test", ip, "", `{"x":1}`)
+	defer resp1.Body.Close()
 
 	assert.Equal(t, http.StatusCreated, resp1.StatusCode)
-	assert.Equal(t, http.StatusCreated, resp2.StatusCode)
 	assert.Empty(t, resp1.Header.Get("X-Idempotent-Replay"),
-		"replay header must NOT be set when no key was provided")
-	assert.Empty(t, resp2.Header.Get("X-Idempotent-Replay"))
-	assert.Equal(t, 2, c.get(),
-		"handler must run on every request when no key is sent")
+		"first call must NOT be marked as a replay even with the new fallback")
+	assert.Equal(t, "miss", resp1.Header.Get("X-Idempotency-Source"),
+		"first call without a header reports X-Idempotency-Source: miss")
+	assert.Equal(t, 1, c.get(), "handler must run on the first call")
 	readBody(t, resp1)
-	readBody(t, resp2)
 }
 
 // TestIdempotency_ReplaySameBody_CachedResponse — the core replay flow.
