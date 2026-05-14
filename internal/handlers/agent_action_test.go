@@ -175,11 +175,14 @@ func TestRespondError_KnownCode_PopulatesAgentAction(t *testing.T) {
 	}
 }
 
-// TestRespondError_UnknownCode_OmitsAgentAction guards the backward
-// compatibility promise: codes not in the registry produce the historical
-// 3-field shape, so existing clients (dashboard, MCP) that didn't know
-// about agent_action keep working.
-func TestRespondError_UnknownCode_OmitsAgentAction(t *testing.T) {
+// TestRespondError_UnknownCode_5xx_FallsBackToContactSupport guards the
+// W7G contract: codes not in the registry MUST still produce an
+// agent_action when the status is 5xx, so the calling agent always has
+// something concrete to relay to the user instead of an empty field.
+// The fallback is AgentActionContactSupport ("email support with this
+// request_id"). upgrade_url stays absent because the remedy is not an
+// upgrade.
+func TestRespondError_UnknownCode_5xx_FallsBackToContactSupport(t *testing.T) {
 	status, body := doErrorRequest(t, func(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "transient failure")
 	})
@@ -188,10 +191,26 @@ func TestRespondError_UnknownCode_OmitsAgentAction(t *testing.T) {
 	assert.Equal(t, "provision_failed", body["error"])
 	assert.Equal(t, "transient failure", body["message"])
 
-	_, hasAction := body["agent_action"]
-	assert.False(t, hasAction, "agent_action must be omitted for unknown codes; got %v", body["agent_action"])
+	action, _ := body["agent_action"].(string)
+	assert.Equal(t, AgentActionContactSupport, action,
+		"5xx with no registry entry must fall back to AgentActionContactSupport")
 	_, hasURL := body["upgrade_url"]
-	assert.False(t, hasURL, "upgrade_url must be omitted for unknown codes; got %v", body["upgrade_url"])
+	assert.False(t, hasURL, "upgrade_url must be omitted for plumbing errors; got %v", body["upgrade_url"])
+}
+
+// TestRespondError_UnknownCode_4xx_OmitsAgentAction confirms that
+// 4xx codes (which lie outside both the registry and the support-fallback
+// path) still produce no agent_action — the agent should fix the request,
+// not relay generic copy that doesn't help.
+func TestRespondError_UnknownCode_4xx_OmitsAgentAction(t *testing.T) {
+	status, body := doErrorRequest(t, func(c *fiber.Ctx) error {
+		return respondError(c, fiber.StatusBadRequest, "invalid_payload", "field missing")
+	})
+	assert.Equal(t, fiber.StatusBadRequest, status)
+	_, hasAction := body["agent_action"]
+	assert.False(t, hasAction, "4xx with no registry entry must omit agent_action")
+	_, hasURL := body["upgrade_url"]
+	assert.False(t, hasURL, "4xx with no registry entry must omit upgrade_url")
 }
 
 // TestRespondErrorWithAgentAction_Override verifies that callers can pass
@@ -234,10 +253,12 @@ func TestRespondErrorWithAgentAction_EmptyURL_Omitted(t *testing.T) {
 }
 
 // TestErrorResponse_JSONShape_OmitemptyEnforced is the contract-level
-// guarantee: ErrorResponse with empty AgentAction and UpgradeURL must
-// marshal to exactly {"ok":false,"error":"x","message":"y"} — no extra
-// keys. Dashboard / MCP clients that don't know about the new fields
-// must see no change on the wire.
+// guarantee: ErrorResponse with empty AgentAction and UpgradeURL marshals
+// without those keys (omitempty). RequestID is also omitempty when blank.
+// retry_after_seconds is intentionally NOT omitempty — it's a required
+// field per the W7G envelope, and a nil pointer marshals as
+// `"retry_after_seconds":null` so agents can distinguish "no retry, fix
+// the request" (null) from "field missing entirely" (a bug).
 func TestErrorResponse_JSONShape_OmitemptyEnforced(t *testing.T) {
 	raw, err := json.Marshal(ErrorResponse{
 		OK:      false,
@@ -249,6 +270,10 @@ func TestErrorResponse_JSONShape_OmitemptyEnforced(t *testing.T) {
 		"agent_action must be omitted when empty; backward-compat would break otherwise")
 	assert.NotContains(t, string(raw), "upgrade_url",
 		"upgrade_url must be omitted when empty")
+	assert.NotContains(t, string(raw), "request_id",
+		"request_id must be omitted when empty (omitempty)")
+	assert.Contains(t, string(raw), `"retry_after_seconds":null`,
+		"retry_after_seconds must marshal explicitly (null on 4xx, int on 5xx) — agents need an unambiguous signal")
 }
 
 // TestErrorResponse_JSONShape_PopulatedFields ensures that when fields
