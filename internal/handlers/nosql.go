@@ -129,20 +129,23 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 			connectionURL := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
 			if connectionURL != "" {
 				metrics.FingerprintAbuseBlocked.Inc()
-				return c.JSON(fiber.Map{
+				// internal_url omitted on the anonymous dedup path — see
+				// internal_url.go (W11 scrub).
+				dedupResp := fiber.Map{
 					"ok":             true,
 					"id":             existing.ID.String(),
 					"token":          existing.Token.String(),
 					"name":           existing.Name.String,
 					"connection_url": connectionURL,
-					"internal_url":   proxiedInternalURL(connectionURL, "mongodb"),
 					"tier":           existing.Tier,
 					"env":            existing.Env,
 					"limits":         nosqlAnonymousLimits(),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
-				})
+				}
+				setInternalURL(dedupResp, existing.Tier, connectionURL, "mongodb")
+				return c.JSON(dedupResp)
 			}
 			// Empty connection_url means provisioning failed mid-flight on the existing
 			// resource. Fall through to provision a fresh one rather than returning
@@ -254,13 +257,13 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 	nosqlStorageLimitMB := h.plans.StorageLimitMB("anonymous", "mongodb")
 	_, nosqlStorageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, nosqlStorageLimitMB)
 
+	// internal_url omitted on the anonymous path — see internal_url.go.
 	nosqlResp := fiber.Map{
 		"ok":             true,
 		"id":             resource.ID.String(),
 		"token":          tokenStr,
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
-		"internal_url":   proxiedInternalURL(creds.URL, "mongodb"),
 		"tier":           "anonymous",
 		"env":            resource.Env,
 		"limits":         nosqlAnonymousLimits(),
@@ -388,7 +391,6 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 		"token":          resource.Token.String(),
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
-		"internal_url":   proxiedInternalURL(creds.URL, "mongodb"),
 		"tier":           tier,
 		"env":            resource.Env,
 		"limits": fiber.Map{
@@ -396,6 +398,7 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 			"connections": h.plans.ConnectionsLimit(tier, "mongodb"),
 		},
 	}
+	setInternalURL(nosqlAuthResp, tier, creds.URL, "mongodb")
 	if nosqlAuthStorageExceeded {
 		nosqlAuthResp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
@@ -450,7 +453,6 @@ func (h *NoSQLHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) 
 		"token":          res.Token,
 		"name":           res.Name,
 		"connection_url": res.ConnectionURL,
-		"internal_url":   res.InternalURL,
 		"tier":           res.Tier,
 		"env":            res.Env,
 		"family_root_id": res.FamilyRootID,
@@ -458,6 +460,11 @@ func (h *NoSQLHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) 
 			"storage_mb":  res.Limits.StorageMB,
 			"connections": res.Limits.Connections,
 		},
+	}
+	// Twin pipeline requires an authenticated team — res.Tier is never
+	// anonymous in practice. Defensive guard preserves the W11 invariant.
+	if res.Tier != tierAnonymous && res.InternalURL != "" {
+		resp[internalURLResponseKey] = res.InternalURL
 	}
 	if res.StorageExceeded {
 		resp["warning"] = "Storage limit reached. Upgrade to continue."

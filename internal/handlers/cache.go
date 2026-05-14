@@ -130,13 +130,14 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 			connectionURL := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
 			if connectionURL != "" {
 				metrics.FingerprintAbuseBlocked.Inc()
+				// internal_url omitted via setInternalURL on the anon dedup
+				// path — see internal_url.go for the W11 scrub rationale.
 				dedupResp := fiber.Map{
 					"ok":             true,
 					"id":             existing.ID.String(),
 					"token":          existing.Token.String(),
 					"name":           existing.Name.String,
 					"connection_url": connectionURL,
-					"internal_url":   proxiedInternalURL(connectionURL, "redis"),
 					"tier":           existing.Tier,
 					"env":            existing.Env,
 					"limits":         cacheAnonymousLimits(),
@@ -144,6 +145,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
 				}
+				setInternalURL(dedupResp, existing.Tier, connectionURL, "redis")
 				if existing.KeyPrefix.String != "" {
 					dedupResp["key_prefix"] = existing.KeyPrefix.String
 				}
@@ -266,13 +268,13 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 	cacheStorageLimitMB := h.plans.StorageLimitMB("anonymous", "redis")
 	_, cacheStorageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, cacheStorageLimitMB)
 
+	// internal_url omitted on the anonymous path — see internal_url.go.
 	resp := fiber.Map{
 		"ok":             true,
 		"id":             resource.ID.String(),
 		"token":          tokenStr,
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
-		"internal_url":   proxiedInternalURL(creds.URL, "redis"),
 		"tier":           "anonymous",
 		"env":            resource.Env,
 		"limits":         cacheAnonymousLimits(),
@@ -411,7 +413,6 @@ func (h *CacheHandler) newCacheAuthenticated(
 		"token":          tokenStr,
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
-		"internal_url":   proxiedInternalURL(creds.URL, "redis"),
 		"tier":           tier,
 		"env":            resource.Env,
 		"dedicated":      dedicated,
@@ -419,6 +420,7 @@ func (h *CacheHandler) newCacheAuthenticated(
 			"memory_mb": cacheAuthStorageLimitMB,
 		},
 	}
+	setInternalURL(authResp, tier, creds.URL, "redis")
 	if creds.KeyPrefix != "" {
 		authResp["key_prefix"] = creds.KeyPrefix
 	}
@@ -475,7 +477,6 @@ func (h *CacheHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) 
 		"token":          res.Token,
 		"name":           res.Name,
 		"connection_url": res.ConnectionURL,
-		"internal_url":   res.InternalURL,
 		"tier":           res.Tier,
 		"env":            res.Env,
 		"family_root_id": res.FamilyRootID,
@@ -483,6 +484,11 @@ func (h *CacheHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) 
 		"limits": fiber.Map{
 			"memory_mb": res.Limits.StorageMB,
 		},
+	}
+	// Twin pipeline requires an authenticated team — res.Tier is never
+	// anonymous in practice. Defensive guard preserves the W11 invariant.
+	if res.Tier != tierAnonymous && res.InternalURL != "" {
+		resp[internalURLResponseKey] = res.InternalURL
 	}
 	if res.StorageExceeded {
 		resp["warning"] = "Storage limit reached. Upgrade to continue."
