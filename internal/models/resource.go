@@ -41,6 +41,12 @@ const (
 	ResourceTypeQueue    = "queue"
 	ResourceTypeStorage  = "storage"
 	ResourceTypeWebhook  = "webhook"
+	// ResourceTypeVector is a pgvector-enabled Postgres database. Same
+	// underlying backend as ResourceTypePostgres — the row is just tagged
+	// "vector" so audit feeds, the storage scanner, and tier-limit lookups
+	// (plans.Registry.StorageLimitMB / ConnectionsLimit) can distinguish
+	// vector workloads from plain Postgres without inspecting the schema.
+	ResourceTypeVector = "vector"
 )
 
 // envPattern restricts the env name to lowercase alphanumerics + dashes,
