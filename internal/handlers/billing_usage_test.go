@@ -41,11 +41,13 @@ import (
 // QueryMatcherEqual=off (default) so substring matching catches both shapes.
 func expectUsageQueries(mock sqlmock.Sqlmock, teamID uuid.UUID) {
 	// 1) teams row → tier "hobby"
+	// Wave FIX-J: GetTeamByID returns default_deployment_ttl_policy as the
+	// 6th column (migration 045). The sqlmock shape must match.
 	mock.ExpectQuery(`SELECT.*FROM teams WHERE id`).
 		WithArgs(teamID).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "name", "plan_tier", "stripe_customer_id", "created_at",
-		}).AddRow(teamID, sql.NullString{}, "hobby", sql.NullString{}, time.Now()))
+			"id", "name", "plan_tier", "stripe_customer_id", "created_at", "default_deployment_ttl_policy",
+		}).AddRow(teamID, sql.NullString{}, "hobby", sql.NullString{}, time.Now(), "auto_24h"))
 
 	// 2-4) storage sums for postgres, redis, mongodb. Each returns 0 bytes
 	// — we only care that the query fires.

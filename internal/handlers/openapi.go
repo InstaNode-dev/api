@@ -405,6 +405,75 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/deployments/{id}/make-permanent": {
+      "post": {
+        "summary": "Opt a deployment out of the auto-24h TTL",
+        "description": "Wave FIX-J. Sets expires_at = NULL and ttl_policy = 'permanent' so the deployment never auto-expires. Idempotent — calling twice is a no-op. Anonymous tier is rejected with 402 (anonymous deploys are always 24h; claim the account first). Cross-tenant requests return 404, not 403, so deploy ids belonging to other teams can't be probed. Emits audit kind 'deploy.made_permanent' with source='make_permanent_endpoint'.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Deployment id (UUID or short app_id slug)." }],
+        "responses": {
+          "200": { "description": "Deployment kept permanently", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
+          "401": { "description": "Unauthorized" },
+          "402": { "description": "upgrade_required — anonymous tier. agent_action points at https://instanode.dev/start." },
+          "404": { "description": "Not found (or owned by another team)" }
+        }
+      }
+    },
+    "/api/v1/deployments/{id}/ttl": {
+      "post": {
+        "summary": "Set a custom TTL for a deployment",
+        "description": "Wave FIX-J. Sets expires_at = now() + hours and ttl_policy = 'custom'. hours must be in [1, 8760]. Also resets reminders_sent so a freshly-extended deploy gets the full six-email warning cycle again. Anonymous tier rejected with 402. Cross-tenant 404. Emits 'deploy.ttl_set' audit kind.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["hours"], "properties": {
+            "hours": { "type": "integer", "minimum": 1, "maximum": 8760, "description": "Number of hours from now until the deploy auto-expires. 1..8760 (1 hour to 1 year)." }
+          }}}}
+        },
+        "responses": {
+          "200": { "description": "TTL updated", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
+          "400": { "description": "invalid_hours — outside 1..8760" },
+          "402": { "description": "upgrade_required — anonymous tier" },
+          "404": { "description": "Not found" }
+        }
+      }
+    },
+    "/api/v1/team/settings": {
+      "get": {
+        "summary": "Read team preferences",
+        "description": "Wave FIX-J. Returns the team's preferences. Today the only field is default_deployment_ttl_policy ('auto_24h' or 'permanent') — flipping this changes the default for every future POST /deploy/new. Per-deploy ttl_policy on /deploy/new always overrides this default.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Team preferences",
+            "content": { "application/json": { "schema": { "type": "object", "properties": {
+              "ok": { "type": "boolean" },
+              "settings": { "type": "object", "properties": {
+                "team_id": { "type": "string" },
+                "default_deployment_ttl_policy": { "type": "string", "enum": ["auto_24h", "permanent"] },
+                "default_deployment_ttl_hours": { "type": "integer", "description": "Convenience field — 24 for auto_24h, 0 for permanent." }
+              }}
+            }}}}
+          },
+          "401": { "description": "Unauthorized" }
+        }
+      },
+      "patch": {
+        "summary": "Mutate team preferences (owner/admin only)",
+        "description": "Wave FIX-J. Updates one or more team preferences. Only owner/admin may call. Each changed field emits a 'team.settings_changed' audit row.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": {
+          "default_deployment_ttl_policy": { "type": "string", "enum": ["auto_24h", "permanent"], "description": "Sets the team-wide default for /deploy/new. 'auto_24h' means every new deploy auto-expires in 24h; 'permanent' means deploys never auto-expire." }
+        }}}}},
+        "responses": {
+          "200": { "description": "Updated" },
+          "400": { "description": "invalid_ttl_policy — not 'auto_24h' or 'permanent'" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Insufficient role (owner/admin required)" }
+        }
+      }
+    },
     "/api/v1/vault/{env}/{key}": {
       "put": {
         "summary": "Store an encrypted secret",
@@ -2547,7 +2616,8 @@ const openAPISpec = `{
           "private": { "type": "string", "description": "Optional flag (\"true\" / \"1\" / \"yes\") that turns this into a private deploy. When set, the resulting Ingress carries an nginx whitelist-source-range annotation built from allowed_ips. Pro / Team / Growth only — hobby/anonymous/free return 402 with agent_action: \"Tell the user private deploys require Pro tier. Upgrade at https://instanode.dev/pricing — takes 30 seconds.\"" },
           "allowed_ips": { "type": "string", "description": "Comma-separated list of CIDRs or IP literals (e.g. \"1.2.3.4,10.0.0.0/8,2001:db8::/32\"). Required when private=true; max 32 entries. Each entry is validated via Go's net.ParseCIDR / net.ParseIP — invalid entries surface in the 400 message so an agent can fix the literal that broke. Larger allowlists belong in CF Access or a real VPN, not an nginx annotation." },
           "notify_webhook": { "type": "string", "description": "Optional https:// URL fired by POST when the deploy reaches a terminal state (status='healthy' or 'failed'). Lets callers subscribe instead of polling GET /deploy/:id. Rejected with 400 + agent_action if the URL is not https, the hostname is unresolvable, or resolves to a private/loopback/link-local/CGNAT IP (SSRF protection). Payload shape: { event: 'deploy.healthy' | 'deploy.failed', deploy_id, app_id, url, commit_id, build_time, duration_s, error_message? }. 2xx → notify_state='sent'; 4xx → 'failed' (no retry — user URL is broken); 5xx/network → up to 3 retries, then 'failed'." },
-          "notify_webhook_secret": { "type": "string", "description": "Optional HMAC-SHA256 signing key. When set, every dispatch includes an X-InstaNode-Signature: sha256=<hex(hmac(secret, body))> header. Stored AES-256-GCM encrypted; plaintext never leaves the request. Omit to dispatch without a signature header." }
+          "notify_webhook_secret": { "type": "string", "description": "Optional HMAC-SHA256 signing key. When set, every dispatch includes an X-InstaNode-Signature: sha256=<hex(hmac(secret, body))> header. Stored AES-256-GCM encrypted; plaintext never leaves the request. Omit to dispatch without a signature header." },
+          "ttl_policy": { "type": "string", "enum": ["auto_24h", "permanent"], "description": "Wave FIX-J. Sets the deploy's lifecycle. 'auto_24h' (default for new deploys) means the deploy auto-expires 24h from creation; the response's agent_action sentence tells the LLM the three explicit routes to keep it permanent. 'permanent' opts the deploy out of TTL up front — useful for production deploys where the agent already knows the user wants it kept. Anonymous tier is FORCED to auto_24h regardless of caller intent. Team-wide default can be flipped via PATCH /api/v1/team/settings." }
         },
         "required": ["tarball"]
       },
@@ -2572,10 +2642,16 @@ const openAPISpec = `{
               "notify_state": { "type": "string", "enum": ["unset", "pending", "sent", "failed"], "description": "Lifecycle of the deploy-notify webhook. 'unset' = no URL configured. 'pending' = URL configured, awaiting terminal state (or worker dispatch). 'sent' = 2xx received. 'failed' = 4xx received OR 5xx/network exhausted retries." },
               "notify_attempts": { "type": "integer", "description": "Count of dispatch attempts made by the worker. Present only when notify_webhook is set. 5xx/network errors retry up to 3 times; 4xx is permanent." },
               "notify_secret_set": { "type": "boolean", "description": "True when an HMAC signing secret was supplied at create time. Present only when notify_webhook is set. The plaintext secret is never returned." },
-              "team_id": { "type": "string", "format": "uuid" }
+              "team_id": { "type": "string", "format": "uuid" },
+              "ttl_policy": { "type": "string", "enum": ["auto_24h", "permanent", "custom"], "description": "Wave FIX-J. Lifecycle policy. 'auto_24h' = expires 24h after creation (default). 'permanent' = no TTL. 'custom' = caller-set TTL via POST /api/v1/deployments/:id/ttl." },
+              "expires_at": { "type": "string", "format": "date-time", "description": "Wave FIX-J. When the deploy auto-expires. Omitted when ttl_policy='permanent'." },
+              "reminders_sent": { "type": "integer", "description": "Wave FIX-J. Count of reminder emails dispatched (0..6). Present when ttl_policy != 'permanent'." },
+              "make_permanent_url": { "type": "string", "description": "Wave FIX-J. Absolute https URL the LLM agent can POST to in order to opt the deploy out of TTL. Present when ttl_policy != 'permanent'." },
+              "extend_ttl_url": { "type": "string", "description": "Wave FIX-J. Absolute https URL the LLM agent can POST to with {hours} to set a custom TTL. Present when ttl_policy != 'permanent'." }
             }
           },
-          "note": { "type": "string" }
+          "note": { "type": "string" },
+          "agent_action": { "type": "string", "description": "Wave FIX-J. Verbatim sentence the LLM agent relays to the user. Present on 202 responses when ttl_policy='auto_24h'; tells the user the three routes to keep the deploy permanent." }
         }
       },
       "GitHubConnection": {
