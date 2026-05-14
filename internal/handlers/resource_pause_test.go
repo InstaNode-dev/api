@@ -229,8 +229,9 @@ func TestResumeResource_NotPaused_409(t *testing.T) {
 	assert.Contains(t, action, "Tell the user")
 }
 
-// TestPauseResource_CrossTeam_403 — Team B cannot pause Team A's resource.
-func TestPauseResource_CrossTeam_403(t *testing.T) {
+// TestPauseResource_CrossTeam_404 — Team B cannot pause Team A's resource.
+// Returns 404 (not 403) — cross-team access must not leak existence.
+func TestPauseResource_CrossTeam_404(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -259,10 +260,10 @@ func TestPauseResource_CrossTeam_403(t *testing.T) {
 	resp := doPauseOrResume(t, app, jwtB, "pause", resourceToken)
 	defer resp.Body.Close()
 
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 	var body map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-	assert.Equal(t, "forbidden", body["error"])
+	assert.Equal(t, "not_found", body["error"])
 }
 
 // TestPauseResource_Unauthenticated_401 — no JWT → 401.
