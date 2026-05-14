@@ -35,6 +35,10 @@ plans:
       backup_retention_days: 0
       backup_restore_enabled: false
       manual_backups_per_day: 0
+      # FIX-G (2026-05-14): per-count cap on custom domains. The boolean
+      # custom_domains feature flag still gates the route entirely; this
+      # cap enforces how many hostnames a team may bind once unlocked.
+      custom_domains_max: 0
     features:
       alerts: false
       custom_domains: false
@@ -71,6 +75,10 @@ plans:
       backup_retention_days: 0
       backup_restore_enabled: false
       manual_backups_per_day: 0
+      # FIX-G (2026-05-14): per-count cap on custom domains. The boolean
+      # custom_domains feature flag still gates the route entirely; this
+      # cap enforces how many hostnames a team may bind once unlocked.
+      custom_domains_max: 0
     features:
       alerts: false
       custom_domains: false
@@ -104,6 +112,10 @@ plans:
       backup_retention_days: 7
       backup_restore_enabled: false
       manual_backups_per_day: 1
+      # FIX-G (2026-05-14): per-count cap on custom domains. The boolean
+      # custom_domains feature flag still gates the route entirely; this
+      # cap enforces how many hostnames a team may bind once unlocked.
+      custom_domains_max: 0
     features:
       alerts: true
       custom_domains: false
@@ -153,6 +165,10 @@ plans:
       backup_retention_days: 14
       backup_restore_enabled: true
       manual_backups_per_day: 5
+      # FIX-G (2026-05-14): per-count cap on custom domains. The boolean
+      # custom_domains feature flag still gates the route entirely; this
+      # cap enforces how many hostnames a team may bind once unlocked.
+      custom_domains_max: 1
     features:
       alerts: true
       custom_domains: true
@@ -188,6 +204,10 @@ plans:
       backup_retention_days: 14
       backup_restore_enabled: true
       manual_backups_per_day: 5
+      # FIX-G (2026-05-14): per-count cap on custom domains. The boolean
+      # custom_domains feature flag still gates the route entirely; this
+      # cap enforces how many hostnames a team may bind once unlocked.
+      custom_domains_max: 1
     features:
       alerts: true
       custom_domains: true
@@ -223,6 +243,10 @@ plans:
       backup_retention_days: 7
       backup_restore_enabled: false
       manual_backups_per_day: 1
+      # FIX-G (2026-05-14): per-count cap on custom domains. The boolean
+      # custom_domains feature flag still gates the route entirely; this
+      # cap enforces how many hostnames a team may bind once unlocked.
+      custom_domains_max: 0
     features:
       alerts: true
       custom_domains: false
@@ -256,6 +280,10 @@ plans:
       backup_retention_days: 30
       backup_restore_enabled: true
       manual_backups_per_day: 100
+      # FIX-G (2026-05-14): per-count cap on custom domains. The boolean
+      # custom_domains feature flag still gates the route entirely; this
+      # cap enforces how many hostnames a team may bind once unlocked.
+      custom_domains_max: 5
     features:
       alerts: true
       custom_domains: true
@@ -288,6 +316,10 @@ plans:
       backup_retention_days: 30
       backup_restore_enabled: true
       manual_backups_per_day: 100
+      # FIX-G (2026-05-14): per-count cap on custom domains. The boolean
+      # custom_domains feature flag still gates the route entirely; this
+      # cap enforces how many hostnames a team may bind once unlocked.
+      custom_domains_max: 5
     features:
       alerts: true
       custom_domains: true
@@ -320,6 +352,10 @@ plans:
       backup_retention_days: 90
       backup_restore_enabled: true
       manual_backups_per_day: 1000
+      # FIX-G (2026-05-14): per-count cap on custom domains. The boolean
+      # custom_domains feature flag still gates the route entirely; this
+      # cap enforces how many hostnames a team may bind once unlocked.
+      custom_domains_max: 50
     features:
       alerts: true
       custom_domains: true
@@ -352,6 +388,10 @@ plans:
       backup_retention_days: 90
       backup_restore_enabled: true
       manual_backups_per_day: 1000
+      # FIX-G (2026-05-14): per-count cap on custom domains. The boolean
+      # custom_domains feature flag still gates the route entirely; this
+      # cap enforces how many hostnames a team may bind once unlocked.
+      custom_domains_max: 50
     features:
       alerts: true
       custom_domains: true
@@ -384,6 +424,10 @@ plans:
       backup_retention_days: 30
       backup_restore_enabled: true
       manual_backups_per_day: 100
+      # FIX-G (2026-05-14): per-count cap on custom domains. The boolean
+      # custom_domains feature flag still gates the route entirely; this
+      # cap enforces how many hostnames a team may bind once unlocked.
+      custom_domains_max: 3
     features:
       alerts: true
       custom_domains: true
