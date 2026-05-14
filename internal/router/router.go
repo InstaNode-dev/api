@@ -938,7 +938,17 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Get("/vault/:env/:key", vaultH.GetSecret)
 	api.Get("/vault/:env", vaultH.ListKeys)
 	api.Delete("/vault/:env/:key", vaultH.DeleteSecret)
-	api.Post("/vault/:env/:key/rotate", vaultH.RotateSecret)
+	// Idempotency middleware (FOLLOWUP-6, 2026-05-14): rotate creates a NEW
+	// versioned row in vault_secrets on every call — double-clicking the
+	// "Rotate" button in the dashboard produced two new versions
+	// (BB2-CHROME-3). The middleware dedups via explicit Idempotency-Key
+	// (24h TTL) or body-fingerprint fallback (120s TTL). PUT /vault/:env/:key
+	// also writes a new row but is state-replacement by contract (caller
+	// supplies the value, retries of the same value are functionally
+	// idempotent at the read-path). DELETE is idempotent-by-construction.
+	// /vault/copy is a bulk variant — flagged separately, out of scope for
+	// this PR.
+	api.Post("/vault/:env/:key/rotate", middleware.Idempotency(rdb, "vault.rotate"), vaultH.RotateSecret)
 	// Vault env-to-env bulk copy (Pro+ tier-gated inside the handler) —
 	// pairs with POST /api/v1/stacks/:slug/promote for the dashboard's
 	// "promote staging → production" flow. RequireEnvAccess gates the
