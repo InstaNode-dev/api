@@ -831,20 +831,6 @@ const openAPISpec = `{
         }
       }
     },
-    "/api/v1/billing/cancel": {
-      "post": {
-        "summary": "Cancel the team's active Razorpay subscription",
-        "description": "Triggers a cancellation on Razorpay's side. Razorpay processes the cancellation asynchronously and emits subscription.cancelled to /razorpay/webhook, which downgrades the team to Hobby. The cancel call returns 200 immediately; the dashboard should re-fetch /api/v1/billing after a few seconds to see the updated state.",
-        "security": [{ "bearerAuth": [] }],
-        "responses": {
-          "200": { "description": "Cancel request accepted by Razorpay" },
-          "401": { "description": "Missing or invalid session token" },
-          "404": { "description": "No active subscription to cancel" },
-          "502": { "description": "Razorpay rejected the cancel call" },
-          "503": { "description": "Razorpay not configured on this environment" }
-        }
-      }
-    },
     "/api/v1/billing/invoices": {
       "get": {
         "summary": "List the team's invoices",
