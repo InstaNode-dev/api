@@ -356,3 +356,64 @@ const AgentActionRestoreRequiresPro = "Tell the user self-serve restore requires
 // or failed). The user must wait for the backup to finish (or pick a
 // different one) before they can restore from it.
 const AgentActionRestoreBackupNotReady = "Tell the user this backup is not ready to restore from yet. Have them check https://instanode.dev/app — pending/running backups need a few minutes, failed backups can never be restored."
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Email-confirmed deletion walls (Wave FIX-I, migration 044)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Two-step destruction: the agent CAN initiate but cannot finalise. Every
+// sentence below is written from the agent's POV so the LLM surfaces it
+// verbatim to the human user without paraphrasing the contract.
+
+// newAgentActionDeletionPendingConfirmation builds the 202 copy returned
+// when DELETE /api/v1/deployments/:id (or /stacks/:slug) queues a
+// pending_deletions row. maskedEmail is the masked recipient
+// ("m***@example.com"); ttlMinutes is the link lifetime.
+//
+// CRITICAL CONTRACT: the agent CANNOT confirm on the user's behalf. Only
+// the human, via the email link or by hitting POST .../confirm-deletion
+// with the plaintext token they pasted in, can finalise. We say this
+// out loud in the sentence so the LLM cannot hallucinate that it has a
+// way to bypass the email step.
+func newAgentActionDeletionPendingConfirmation(maskedEmail string, ttlMinutes int) string {
+	if maskedEmail == "" {
+		maskedEmail = "the team owner's email"
+	}
+	return fmt.Sprintf(
+		"Tell the user to check their email at %s. The deletion link expires in %d minutes. To free the slot the user must click the link (or paste the token from the email and POST it back to the confirm-deletion endpoint). The agent CANNOT confirm on the user's behalf — only the human can. If the user changes their mind, they can cancel from https://instanode.dev/app before the window closes.",
+		maskedEmail, ttlMinutes,
+	)
+}
+
+// AgentActionDeletionAlreadyPending is returned when a second DELETE
+// fires while a pending_deletions row is still in flight. We don't
+// generate a fresh token — that would silently invalidate the
+// already-sent email and confuse the user. Tell the LLM to point the
+// user at the existing email.
+const AgentActionDeletionAlreadyPending = "Tell the user a deletion email is already in flight for this resource. Have them check their inbox (and spam) — the link is still valid. To cancel and start fresh, open https://instanode.dev/app and click Cancel on the pending-deletion banner."
+
+// AgentActionDeletionTokenExpiredOrUsed is returned when the
+// confirm-deletion endpoint cannot find a pending row for the supplied
+// token. We deliberately conflate "expired", "already used", and "never
+// existed" to avoid leaking token validity to an attacker. The remedy
+// is the same in every case: re-request via DELETE.
+const AgentActionDeletionTokenExpiredOrUsed = "Tell the user the confirmation token is expired or already used. Have them call DELETE on the resource again to mint a fresh email — see the flow at https://instanode.dev/docs/api. The previous link is dead either way."
+
+// AgentActionDeletionConfirmed is returned in the 200 success envelope
+// from POST /confirm-deletion. The agent surfaces this to the user as
+// the all-clear that the slot is free.
+const AgentActionDeletionConfirmed = "Tell the user the deletion is confirmed and the resource is fully torn down. The slot on their plan is now free — their next provision call will succeed. Live state at https://instanode.dev/app."
+
+// AgentActionDeletionCancelled is returned in the 200 success envelope
+// from DELETE /confirm-deletion. The resource stayed active; the slot
+// stays consumed.
+const AgentActionDeletionCancelled = "Tell the user the pending deletion is cancelled. The resource stays active and the slot stays consumed. If they want to delete again, they have to start fresh with a new DELETE call — see https://instanode.dev/docs/api."
+
+// AgentActionDeletionEmailDisabled is the fallback used when the team
+// has no primary user email on file (extremely rare — claimed teams
+// always have at least one user row by construction). The handler can
+// either fall back to immediate destruction (back-compat for the
+// anonymous/free path) or refuse with this agent_action. We refuse on
+// paid tiers because silently bypassing the confirm step on the only
+// teams where the protection matters is a worse failure mode.
+const AgentActionDeletionEmailDisabled = "Tell the user no confirmation email could be sent because no verified email is on file for this team. Have them add an owner email at https://instanode.dev/app/team before retrying the deletion."

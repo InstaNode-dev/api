@@ -490,6 +490,77 @@ Open this link while signed in with %s to accept:
 	return c.send(ctx, toEmail, subject, plain, htmlBody)
 }
 
+// SendDeletionConfirmation emails the user a one-click link to confirm
+// the destruction of a deploy or stack. The link MUST already be a
+// fully-formed URL pointing at /auth/email/confirm-deletion?t=<token>
+// (the API redirects through to the dashboard's /app/confirm-deletion
+// surface). This function does not construct the URL — that's the
+// caller's job so a Brevo template change can't accidentally rewrite
+// the path.
+//
+// resourceLabel is what the user sees ("deployment my-app",
+// "stack my-stack/production"). ttlMinutes is the expiry window the
+// email surfaces ("expires in 15 minutes"). Both are formatted into the
+// subject + body so a user with multiple pending deletes can tell which
+// resource the email refers to without opening the link.
+//
+// Wave FIX-I — two-step deletion. The flow is intentionally human-only:
+// the agent can request deletion but cannot confirm it.
+func (c *Client) SendDeletionConfirmation(
+	ctx context.Context,
+	toEmail, resourceLabel, link string,
+	ttlMinutes int,
+) error {
+	subject := fmt.Sprintf("Confirm deletion of %s on instanode.dev (expires in %d min)", resourceLabel, ttlMinutes)
+
+	plain := fmt.Sprintf(`You (or your AI agent) requested deletion of:
+
+  %s
+
+This link expires in %d minutes and can only be used once. Click to
+permanently destroy the resource and free its slot on your plan:
+
+%s
+
+If you did NOT request this, you can safely ignore the email — the
+resource stays active and the request expires automatically. Or cancel
+it from your dashboard at https://instanode.dev/app.
+
+— The instanode.dev team
+`, resourceLabel, ttlMinutes, link)
+
+	safeLink := htmlEscape(link)
+	safeLabel := htmlEscape(resourceLabel)
+	htmlBody := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#111;">
+  <h2>Confirm deletion on instanode.dev</h2>
+  <p>You (or your AI agent) requested deletion of:</p>
+  <p style="background:#f5f5f5;padding:12px 16px;border-radius:6px;font-family:monospace;"><strong>%s</strong></p>
+  <p>This link expires in <strong>%d minutes</strong> and can only be used once. Click to permanently destroy the resource and free its slot on your plan.</p>
+  <p style="margin-top:32px;">
+    <a href="%s"
+       style="background:#c0392b;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:bold;">
+      Confirm deletion &rarr;
+    </a>
+  </p>
+  <p style="margin-top:24px;color:#666;font-size:13px;">
+    If the button doesn't work, copy this URL into your browser:<br>
+    <span style="color:#444;word-break:break-all;">%s</span>
+  </p>
+  <p style="margin-top:24px;color:#666;font-size:13px;">
+    If you did NOT request this, you can safely ignore the email — the
+    resource stays active and the request expires automatically. Or
+    cancel from <a href="https://instanode.dev/app" style="color:#444;">your dashboard</a>.
+  </p>
+  <p style="margin-top:40px;color:#666;font-size:13px;">— The instanode.dev team</p>
+</body>
+</html>`, safeLabel, ttlMinutes, safeLink, safeLink)
+
+	return c.send(ctx, toEmail, subject, plain, htmlBody)
+}
+
 // htmlEscape replaces HTML-unsafe characters with their entity equivalents.
 func htmlEscape(s string) string {
 	s = strings.ReplaceAll(s, "&", "&amp;")

@@ -39,6 +39,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"instant.dev/internal/config"
 	"instant.dev/internal/crypto"
+	"instant.dev/internal/email"
 	"instant.dev/internal/manifest"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/urls"
@@ -51,11 +52,21 @@ import (
 
 // StackHandler handles all /stacks endpoints.
 type StackHandler struct {
-	db        *sql.DB
-	rdb       *redis.Client
-	cfg       *config.Config
-	stackProv compute.StackProvider
-	plans     *plans.Registry
+	db          *sql.DB
+	rdb         *redis.Client
+	cfg         *config.Config
+	stackProv   compute.StackProvider
+	plans       *plans.Registry
+	// emailClient is wired by SetEmailClient. Left nil = email-confirmed
+	// deletion falls back to immediate destruction (same pattern as
+	// DeployHandler; see deletion_confirm.go).
+	emailClient *email.Client
+}
+
+// SetEmailClient wires the email client used by the two-step deletion
+// flow on /stacks/:slug. See DeployHandler.SetEmailClient.
+func (h *StackHandler) SetEmailClient(c *email.Client) {
+	h.emailClient = c
 }
 
 // NewStackHandler initialises the handler and selects the stack compute backend
@@ -832,8 +843,13 @@ func (h *StackHandler) Logs(c *fiber.Ctx) error {
 // ── DELETE /stacks/:slug ──────────────────────────────────────────────────────
 
 // Delete handles DELETE /stacks/:slug.
-// Calls TeardownStack on the provider (best-effort), then deletes the DB row.
-// Follows the same OptionalAuth ownership rules as Get.
+//
+// Wave FIX-I flow:
+//   - Authenticated paid team (hobby/pro/team/growth) AND email client
+//     wired AND X-Skip-Email-Confirmation header NOT set → queue a
+//     pending_deletions row, email the owner, return 202.
+//   - Anonymous stack OR free/unauthenticated caller OR header bypass →
+//     immediate destruction (back-compat).
 func (h *StackHandler) Delete(c *fiber.Ctx) error {
 	team, authErr := h.optionalStackTeam(c)
 	if authErr != nil {
@@ -854,6 +870,28 @@ func (h *StackHandler) Delete(c *fiber.Ctx) error {
 		return ownerErr
 	}
 
+	// Two-step deletion gate. Anonymous stacks (team == nil) fall
+	// through to immediate destruction because no email is on file.
+	if team != nil && teamIsPaid(team) && h.emailClient != nil && !shouldSkipEmailConfirmation(c) {
+		deps := requestDeletionDeps{
+			DB:               h.db,
+			Email:            h.emailClient,
+			APIPublicURL:     h.cfg.APIPublicURL,
+			DashboardBaseURL: h.cfg.DashboardBaseURL,
+			TTLMinutes:       h.cfg.DeletionConfirmationTTLMinutes,
+		}
+		return requestEmailConfirmedDeletion(c, deps, team, stack.ID,
+			models.PendingDeletionResourceStack,
+			"stack "+slug)
+	}
+
+	return h.doImmediateStackDelete(c, stack, slug, team)
+}
+
+// doImmediateStackDelete is the back-compat synchronous destruction path.
+// Extracted so the confirmation flow can call into the same teardown
+// logic without duplicating the audit + log lines.
+func (h *StackHandler) doImmediateStackDelete(c *fiber.Ctx, stack *models.Stack, slug string, team *models.Team) error {
 	// Teardown compute resources (best-effort — don't block delete on provider errors).
 	if teardownErr := h.stackProv.TeardownStack(c.Context(), stack.Namespace); teardownErr != nil {
 		slog.Warn("stack.delete.teardown_failed",
@@ -881,6 +919,71 @@ func (h *StackHandler) Delete(c *fiber.Ctx) error {
 		"ok":      true,
 		"message": "Stack deleted",
 	})
+}
+
+// ConfirmDelete handles POST /api/v1/stacks/:slug/confirm-deletion?token=<tok>.
+// Step 2 of the email-confirmed flow. Auth required — same pattern as
+// the deploy ConfirmDelete.
+func (h *StackHandler) ConfirmDelete(c *fiber.Ctx) error {
+	team, err := h.requireStackTeam(c)
+	if err != nil {
+		return err
+	}
+	if h.emailClient == nil {
+		return respondError(c, fiber.StatusServiceUnavailable,
+			"deletion_email_disabled",
+			"Email confirmation is not enabled on this deployment")
+	}
+
+	deps := requestDeletionDeps{
+		DB:               h.db,
+		Email:            h.emailClient,
+		APIPublicURL:     h.cfg.APIPublicURL,
+		DashboardBaseURL: h.cfg.DashboardBaseURL,
+		TTLMinutes:       h.cfg.DeletionConfirmationTTLMinutes,
+	}
+	token := c.Query("token")
+	deprovisionFn := func(ctx context.Context, p *models.PendingDeletion) error {
+		stack, sErr := models.GetStackByID(ctx, h.db, p.ResourceID)
+		if sErr != nil {
+			return fmt.Errorf("confirm-delete: lookup stack: %w", sErr)
+		}
+		if teardownErr := h.stackProv.TeardownStack(ctx, stack.Namespace); teardownErr != nil {
+			slog.Warn("stack.confirm_delete.teardown_failed",
+				"slug", stack.Slug, "error", teardownErr)
+		}
+		return models.DeleteStack(ctx, h.db, stack.ID)
+	}
+	return resolveEmailConfirmedDeletion(c, deps, team, token, deprovisionFn)
+}
+
+// CancelDelete handles DELETE /api/v1/stacks/:slug/confirm-deletion.
+// Cancels a pending row for the calling team's stack.
+func (h *StackHandler) CancelDelete(c *fiber.Ctx) error {
+	team, err := h.requireStackTeam(c)
+	if err != nil {
+		return err
+	}
+	slug := c.Params("slug")
+	stack, err := models.GetStackBySlug(c.Context(), h.db, slug)
+	if err != nil {
+		var notFound *models.ErrStackNotFound
+		if errors.As(err, &notFound) {
+			return respondError(c, fiber.StatusNotFound, "not_found", "Stack not found")
+		}
+		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch stack")
+	}
+	if stack.TeamID == nil || *stack.TeamID != team.ID {
+		return respondError(c, fiber.StatusNotFound, "not_found", "Stack not found")
+	}
+
+	deps := requestDeletionDeps{
+		DB:               h.db,
+		APIPublicURL:     h.cfg.APIPublicURL,
+		DashboardBaseURL: h.cfg.DashboardBaseURL,
+		TTLMinutes:       h.cfg.DeletionConfirmationTTLMinutes,
+	}
+	return cancelEmailConfirmedDeletion(c, deps, team, stack.ID, models.PendingDeletionResourceStack)
 }
 
 // ── PATCH /stacks/:slug/env ───────────────────────────────────────────────────
