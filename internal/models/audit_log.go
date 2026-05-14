@@ -82,6 +82,138 @@ func InsertAuditEvent(ctx context.Context, db *sql.DB, ev AuditEvent) error {
 	return nil
 }
 
+// AuditCustomerExportQuery is the parameter bundle for
+// ListAuditEventsForCustomerExport. Carries every dial the public
+// GET /api/v1/audit endpoint exposes — kept as a struct (not positional
+// args) so future filters (resource_id, actor) don't ripple through
+// every call site.
+type AuditCustomerExportQuery struct {
+	TeamID    uuid.UUID
+	Limit     int       // capped at auditMaxLimit
+	Before    time.Time // cursor: rows strictly older than this; zero means "no cursor"
+	Kind      string    // exact match; "" means all (excluding admin.* — see below)
+	Since     time.Time // inclusive lower bound; zero means "no lower bound"
+	Until     time.Time // exclusive upper bound; zero means "no upper bound"
+	LookbackS int64     // tier-derived lower bound in seconds; 0 means "unlimited"
+}
+
+// ListAuditEventsForCustomerExport returns audit rows scoped to a single
+// team's surface, suitable for the customer-facing GET /api/v1/audit
+// endpoint. Distinct from ListAuditEventsByTeam:
+//
+//   - Excludes any row whose kind starts with `admin.` — these are
+//     internal-compliance rows about operator access, not customer-facing
+//     transparency. Returning them would leak how the operator tooling
+//     is shaped (a path-prefix probing primitive).
+//   - Includes rows where the actor is the team (team_id = caller_team)
+//     OR the row's metadata->>'resource_id' resolves to a resource the
+//     team owns. The latter covers the case where a different actor
+//     (operator, automation) acted on the team's resource — A4's
+//     nullable team_id pattern.
+//   - Supports cursor-style pagination via `before` on created_at.
+//   - Supports time-range filtering (since/until) AND a tier-derived
+//     hard lookback floor — Team is unbounded, Pro is 90 days, Hobby is
+//     30 days. Anonymous/free never hits this path (the handler returns
+//     402 before calling the model).
+//
+// Returns rows newest-first, capped at AuditExportMaxLimit (200).
+func ListAuditEventsForCustomerExport(ctx context.Context, db *sql.DB, q AuditCustomerExportQuery) ([]*AuditEvent, error) {
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > auditMaxLimit {
+		limit = auditMaxLimit
+	}
+
+	// Build dynamic WHERE clause. Args is parallel to $N placeholders.
+	// Anchor predicates:
+	//   $1  team_id (used twice: direct team_id match OR resource ownership)
+	//   $2  limit
+	// Optional predicates appended in order; index tracked via len(args).
+	args := []interface{}{q.TeamID}
+	// Note: we don't include teamID twice in args list; the SQL re-uses $1
+	// in the EXISTS subquery via a literal $1 reference (parameterised
+	// queries reuse positional markers).
+
+	// admin.* exclusion is a hard rule — never returned regardless of
+	// caller filter. If the caller passed kind=admin.something, the query
+	// returns zero rows (the admin.* filter combined with the prefix
+	// exclusion produces an empty intersection).
+	query := `
+		SELECT id, team_id, user_id, actor, kind, COALESCE(resource_type, ''), resource_id, summary, metadata, created_at
+		  FROM audit_log
+		 WHERE (
+		         team_id = $1
+		      OR (metadata IS NOT NULL
+		          AND metadata ? 'resource_id'
+		          AND EXISTS (
+		                SELECT 1 FROM resources r
+		                 WHERE r.team_id = $1
+		                   AND r.id::text = metadata->>'resource_id'
+		          )
+		         )
+		       )
+		   AND kind NOT LIKE 'admin.%'`
+
+	if q.Kind != "" {
+		args = append(args, q.Kind)
+		query += fmt.Sprintf(" AND kind = $%d", len(args))
+	}
+	if !q.Before.IsZero() {
+		args = append(args, q.Before)
+		query += fmt.Sprintf(" AND created_at < $%d", len(args))
+	}
+	if !q.Since.IsZero() {
+		args = append(args, q.Since)
+		query += fmt.Sprintf(" AND created_at >= $%d", len(args))
+	}
+	if !q.Until.IsZero() {
+		args = append(args, q.Until)
+		query += fmt.Sprintf(" AND created_at < $%d", len(args))
+	}
+	if q.LookbackS > 0 {
+		// Hard tier floor — independent of `since`. If the caller passed
+		// since=older-than-floor, the floor still wins.
+		args = append(args, q.LookbackS)
+		query += fmt.Sprintf(" AND created_at >= now() - ($%d * interval '1 second')", len(args))
+	}
+
+	args = append(args, limit)
+	query += fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d", len(args))
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("models.ListAuditEventsForCustomerExport: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*AuditEvent, 0)
+	for rows.Next() {
+		ev := &AuditEvent{}
+		var metadata sql.NullString
+		if err := rows.Scan(
+			&ev.ID, &ev.TeamID, &ev.UserID, &ev.Actor, &ev.Kind,
+			&ev.ResourceType, &ev.ResourceID, &ev.Summary, &metadata, &ev.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("models.ListAuditEventsForCustomerExport scan: %w", err)
+		}
+		if metadata.Valid {
+			ev.Metadata = []byte(metadata.String)
+		}
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("models.ListAuditEventsForCustomerExport rows: %w", err)
+	}
+	return out, nil
+}
+
+// AuditExportMaxLimit is the public, capped page size for the customer
+// export endpoint. Exported so the handler can document it in OpenAPI
+// without duplicating the constant.
+const AuditExportMaxLimit = auditMaxLimit
+
 // ListAuditEventsByTeam returns the most recent events for a team,
 // newest first. kindFilter == "" means all kinds. Limit is capped at
 // auditMaxLimit; non-positive limits default to 20.
