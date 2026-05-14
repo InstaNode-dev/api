@@ -120,4 +120,12 @@ const (
 	// Pair this with the corresponding "_created" event to bound how long
 	// a given key existed.
 	AuditKindStorageIAMUserDeleted = "storage.iam_user_deleted"
+
+	// AuditKindFamilyBulkTwin fires once per successful POST
+	// /api/v1/families/bulk-twin call. Metadata carries source_env,
+	// target_env, twinned_count, skipped_count, failure_count so the
+	// dashboard's Recent Activity feed can render a single line per
+	// bulk operation (rather than N lines for the underlying twins,
+	// which already each emit their own `provision` kind row).
+	AuditKindFamilyBulkTwin = "family.bulk_twin"
 )

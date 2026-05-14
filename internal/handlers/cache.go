@@ -459,9 +459,41 @@ func cacheAnonymousLimits() fiber.Map {
 // pre-validated twin input. Mirrors DBHandler.ProvisionForTwin — see the
 // doc comment there for the orchestration shape. The twin flow always
 // inherits source.Tier (never elevates to growth/dedicated).
+//
+// Delegates to ProvisionForTwinCore (the fiber-free core) so bulk-twin
+// can reuse the same pipeline without a fiber.Ctx per row.
 func (h *CacheHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) error {
 	ctx := c.UserContext()
+	res, err := h.ProvisionForTwinCore(ctx, in)
+	if err != nil {
+		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", err.Error())
+	}
 
+	resp := fiber.Map{
+		"ok":             true,
+		"id":             res.ID,
+		"token":          res.Token,
+		"name":           res.Name,
+		"connection_url": res.ConnectionURL,
+		"internal_url":   res.InternalURL,
+		"tier":           res.Tier,
+		"env":            res.Env,
+		"family_root_id": res.FamilyRootID,
+		"key_prefix":     res.KeyPrefix,
+		"limits": fiber.Map{
+			"memory_mb": res.Limits.StorageMB,
+		},
+	}
+	if res.StorageExceeded {
+		resp["warning"] = "Storage limit reached. Upgrade to continue."
+		c.Set("X-Instant-Notice", "storage_limit_reached")
+	}
+	return c.Status(fiber.StatusCreated).JSON(resp)
+}
+
+// ProvisionForTwinCore is the fiber-free implementation of ProvisionForTwin.
+// See DBHandler.ProvisionForTwinCore for the contract.
+func (h *CacheHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionForTwinInput) (TwinProvisionResult, error) {
 	resource, err := models.CreateResource(ctx, h.db, models.CreateResourceParams{
 		TeamID:           &in.TeamID,
 		ResourceType:     models.ResourceTypeRedis,
@@ -478,7 +510,7 @@ func (h *CacheHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) 
 	if err != nil {
 		slog.Error("twin.cache.create_resource_failed",
 			"error", err, "team_id", in.TeamID, "env", in.Env, "request_id", in.RequestID)
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to record twin resource")
+		return TwinProvisionResult{}, twinCoreErr("Failed to record twin resource")
 	}
 
 	go func() {
@@ -507,7 +539,7 @@ func (h *CacheHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) 
 			slog.Error("twin.cache.soft_delete_failed",
 				"error", delErr, "resource_id", resource.ID, "request_id", in.RequestID)
 		}
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision Redis twin")
+		return TwinProvisionResult{}, twinCoreErr("Failed to provision Redis twin")
 	}
 
 	if creds.KeyPrefix != "" {
@@ -545,24 +577,20 @@ func (h *CacheHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) 
 	storageLimitMB := h.plans.StorageLimitMB(in.Tier, models.ResourceTypeRedis)
 	_, storageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
 
-	resp := fiber.Map{
-		"ok":             true,
-		"id":             resource.ID.String(),
-		"token":          tokenStr,
-		"name":           resource.Name.String,
-		"connection_url": creds.URL,
-		"internal_url":   proxiedInternalURL(creds.URL, models.ResourceTypeRedis),
-		"tier":           in.Tier,
-		"env":            resource.Env,
-		"family_root_id": derefUUID(in.ParentRootID),
-		"key_prefix":     creds.KeyPrefix,
-		"limits": fiber.Map{
-			"memory_mb": storageLimitMB,
+	return TwinProvisionResult{
+		ID:            resource.ID.String(),
+		Token:         tokenStr,
+		Name:          resource.Name.String,
+		ResourceType:  models.ResourceTypeRedis,
+		ConnectionURL: creds.URL,
+		InternalURL:   proxiedInternalURL(creds.URL, models.ResourceTypeRedis),
+		Tier:          in.Tier,
+		Env:           resource.Env,
+		FamilyRootID:  derefUUID(in.ParentRootID),
+		KeyPrefix:     creds.KeyPrefix,
+		Limits: TwinResultLimits{
+			StorageMB: storageLimitMB,
 		},
-	}
-	if storageExceeded {
-		resp["warning"] = "Storage limit reached. Upgrade to continue."
-		c.Set("X-Instant-Notice", "storage_limit_reached")
-	}
-	return c.Status(fiber.StatusCreated).JSON(resp)
+		StorageExceeded: storageExceeded,
+	}, nil
 }

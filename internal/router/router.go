@@ -158,6 +158,10 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// dispatches to the same low-level provision pipelines as /db/new etc.
 	// Wire AFTER the three constructors so the handler instances exist.
 	twinH := handlers.NewTwinHandler(dbH, cacheH, nosqlH)
+	// bulkTwinH — POST /api/v1/families/bulk-twin. Wires the same three
+	// per-type handlers as twinH so the bulk path reuses the same
+	// provision pipelines (no fork). See family_bulk_twin.go.
+	bulkTwinH := handlers.NewBulkTwinHandler(db, dbH, cacheH, nosqlH, planRegistry)
 	queueH := handlers.NewQueueHandler(db, rdb, cfg, provClient, planRegistry)
 	storageH := handlers.NewStorageHandler(db, rdb, cfg, storageProv, planRegistry)
 	webhookH := handlers.NewWebhookHandler(db, rdb, cfg, planRegistry)
@@ -476,6 +480,12 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// resource type the source row carries determines which low-level
 	// provisioner (db/cache/nosql) runs.
 	api.Post("/resources/:id/provision-twin", twinH.ProvisionTwin)
+	// Bulk env-twinning — one call to twin every "parent" resource in
+	// source_env into target_env. Same Pro+ tier gate. Returns 200 on
+	// full success, 207 Multi-Status when any individual twin fails so
+	// the caller can keep the successful rows and retry just the
+	// failures. See handlers/family_bulk_twin.go for the contract.
+	api.Post("/families/bulk-twin", bulkTwinH.BulkTwin)
 
 	// Team env-policy (slice 6) — owner edits, any member reads.
 	// Owner-check is enforced inside Put (with a structured 403 body that
