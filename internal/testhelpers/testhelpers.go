@@ -421,8 +421,8 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		// missing column when other code paths drop the field.
 		`ALTER TABLE teams DROP COLUMN IF EXISTS trial_ends_at`,
 
-		// 035_app_github_connections — GitHub auto-deploy wiring. Mirrors
-		// migration 035 so handler unit tests reach into the same schema
+		// 036_app_github_connections — GitHub auto-deploy wiring. Mirrors
+		// migration 036 so handler unit tests reach into the same schema
 		// production runs against. The unique index on app_id enforces the
 		// "one connection per deployment" rule that the Connect handler
 		// returns 409 on.
