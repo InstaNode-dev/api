@@ -315,6 +315,35 @@ func PauseResource(ctx context.Context, db *sql.DB, id uuid.UUID) error {
 	return nil
 }
 
+// PauseAllTeamResources flips every active resource for a team to
+// status='paused' in a single statement. Returns the number of rows
+// affected. Idempotent — a second call after every row is already
+// paused returns 0.
+//
+// Used by the internal terminate endpoint after the 7-day payment grace
+// window expires. Pausing (not deleting) preserves the on-disk data —
+// the customer can still recover if they pay within the retention
+// window. Rows already in non-active states (paused, deleted, reaped)
+// are left untouched.
+//
+// Caller is expected to have already established that the team really
+// is past its grace window — this function does no policy enforcement.
+func PauseAllTeamResources(ctx context.Context, db *sql.DB, teamID uuid.UUID) (int64, error) {
+	res, err := db.ExecContext(ctx, `
+		UPDATE resources
+		   SET status = 'paused', paused_at = now()
+		 WHERE team_id = $1 AND status = 'active'
+	`, teamID)
+	if err != nil {
+		return 0, fmt.Errorf("models.PauseAllTeamResources: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("models.PauseAllTeamResources rows_affected: %w", err)
+	}
+	return n, nil
+}
+
 // ResumeResource flips status from 'paused' → 'active' and clears paused_at.
 // Returns ErrResourceNotPaused when the row is missing or not currently paused
 // (mirror of PauseResource). The connection_url is preserved unchanged — the

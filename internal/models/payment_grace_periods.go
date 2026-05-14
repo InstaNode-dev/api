@@ -206,6 +206,71 @@ func MarkPaymentGraceRecovered(ctx context.Context, db *sql.DB, teamID uuid.UUID
 	return n > 0, nil
 }
 
+// TerminateAllPaymentGracePeriodsForTeam flips EVERY active grace row for
+// a team to status='terminated' and stamps terminated_at. Returns the
+// number of rows actually transitioned. Unlike MarkPaymentGraceTerminated
+// (which targets the single active row produced by the partial-unique
+// index), this is the bulk endpoint the internal-terminate handler uses
+// — the brief specifies "Mark every dunning row for this team as
+// status='terminated'", which is conceptually a sweep across the team's
+// dunning history. In practice the unique partial index limits this to
+// at most one row at any given instant, but writing the SQL as an
+// unbounded UPDATE … WHERE status='active' makes the idempotency
+// contract obvious: a second call (or a partial earlier termination)
+// converges to "no active rows left."
+//
+// A return of 0 means there was nothing to terminate — either the team
+// never entered grace, or a prior termination already swept the row.
+// Callers treat 0 as "noop, continue" rather than an error.
+func TerminateAllPaymentGracePeriodsForTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID, terminatedAt time.Time) (int64, error) {
+	if teamID == uuid.Nil {
+		return 0, fmt.Errorf("models.TerminateAllPaymentGracePeriodsForTeam: team_id is required")
+	}
+	if terminatedAt.IsZero() {
+		terminatedAt = time.Now().UTC()
+	}
+	res, err := db.ExecContext(ctx, `
+		UPDATE payment_grace_periods
+		   SET status = $1, terminated_at = $2
+		 WHERE team_id = $3 AND status = $4
+	`, PaymentGraceStatusTerminated, terminatedAt.UTC(), teamID, PaymentGraceStatusActive)
+	if err != nil {
+		return 0, fmt.Errorf("models.TerminateAllPaymentGracePeriodsForTeam: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("models.TerminateAllPaymentGracePeriodsForTeam rows_affected: %w", err)
+	}
+	return n, nil
+}
+
+// HasTerminatedPaymentGracePeriod returns true iff at least one
+// terminated-status row exists for the team. Drives the
+// internal-terminate handler's idempotency check: if a previous
+// terminate already ran (worker retried, network blip, etc.), the
+// second call returns 200 noop without re-pausing resources or
+// re-cancelling Razorpay.
+//
+// We deliberately key idempotency off the dunning row (not off a
+// hypothetical teams.status column) — the dunning row IS the audit
+// trail for "this team was terminated by the grace-expiry sweep,"
+// and there is no separate teams.status column in the schema.
+func HasTerminatedPaymentGracePeriod(ctx context.Context, db *sql.DB, teamID uuid.UUID) (bool, error) {
+	if teamID == uuid.Nil {
+		return false, fmt.Errorf("models.HasTerminatedPaymentGracePeriod: team_id is required")
+	}
+	var n int
+	err := db.QueryRowContext(ctx, `
+		SELECT COUNT(1)
+		  FROM payment_grace_periods
+		 WHERE team_id = $1 AND status = $2
+	`, teamID, PaymentGraceStatusTerminated).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("models.HasTerminatedPaymentGracePeriod: %w", err)
+	}
+	return n > 0, nil
+}
+
 // MarkPaymentGraceTerminated is the destructive end-state. Called by
 // the worker's terminator job (separate PR) when expires_at < now()
 // and no recovery happened. The actual destructive work — Razorpay

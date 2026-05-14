@@ -316,6 +316,20 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Post("/billing/checkout", middleware.RequireAuth(cfg), middleware.RequireWritable(), billing.CreateCheckoutAPI)
 	app.Post("/razorpay/webhook", billing.RazorpayWebhook)
 
+	// Internal machine-to-machine terminate endpoint. Called by the
+	// worker's payment_grace_terminator dispatcher after a team's
+	// 7-day Razorpay-failure grace expires. Authenticated by a
+	// shared HS256 secret (WORKER_INTERNAL_JWT_SECRET) that MUST be
+	// distinct from JWT_SECRET — see config.go for the rationale.
+	// Lives next to /razorpay/webhook because both are non-session
+	// external triggers, NOT under /api/v1 (no team-scoped auth
+	// applies). The handler enforces fail-closed behavior when the
+	// secret is unset: every call 401s until the operator wires the
+	// k8s Secret in both the api and worker workloads.
+	internalTermPortal := &razorpaybilling.Portal{DB: db, Cfg: cfg}
+	internalTerminateH := handlers.NewInternalTerminateHandler(db, cfg, internalTermPortal.CancelAtCycleEnd)
+	app.Post("/internal/teams/:id/terminate", internalTerminateH.Terminate)
+
 	// §10.20 cached-aggregation endpoints. Separate handlers from BillingHandler
 	// so the caching contract (Redis + singleflight + Cache-Control headers)
 	// is visible at the route + handler boundary, not buried inside the billing
