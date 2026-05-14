@@ -44,6 +44,10 @@ func (h *CapabilitiesHandler) Get(c *fiber.Ctx) error {
 	}
 
 	resourceTypes := []string{"postgres", "redis", "mongodb", "queue", "storage", "webhook", "vector"}
+	// Order matches common/plans/rank.go Rank() — anonymous=0, free=1, hobby=2,
+	// hobby_plus=3, growth=4, pro=5, team=6. Keep this list in sync when adding
+	// a tier in common/plans/plans.go, otherwise /capabilities silently drops it
+	// (the failure mode is invisible — the endpoint returns 200 minus the tier).
 	tiers := []struct {
 		key, displayName string
 		priceUSD         int
@@ -52,8 +56,9 @@ func (h *CapabilitiesHandler) Get(c *fiber.Ctx) error {
 		{"anonymous", "Anonymous (24h TTL)", 0, 0},
 		{"free", "Free (claimed sandbox)", 0, 0},
 		{"hobby", "Hobby", 9, 8},
-		{"pro", "Pro", 49, 17},
+		{"hobby_plus", "Hobby Plus", 19, 13},
 		{"growth", "Growth", 99, 17},
+		{"pro", "Pro", 49, 17},
 		{"team", "Team", 199, 17},
 	}
 
