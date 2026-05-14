@@ -216,4 +216,9 @@ const (
 	// p95" from a one-off page load. NOT emitted on tier-gated 402 or
 	// ownership 403/404 paths — pre-auth queries shouldn't pollute the feed.
 	AuditKindResourceMetricsQueried = "resource.metrics_queried"
+
+	// AuditKindTeamUpdated fires on PATCH /api/v1/team. metadata.field +
+	// metadata.new_value document what changed. Per-user-id is captured on
+	// the audit row.
+	AuditKindTeamUpdated = "team.updated"
 )

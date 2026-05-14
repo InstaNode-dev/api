@@ -206,6 +206,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	}
 	customDomainH := handlers.NewCustomDomainHandler(db, cfg, planRegistry, customDomainK8s)
 
+	// Public discovery handlers — instantiated early so they can wire under
+	// `app` (no /api/v1 group, no auth) below.
+	capabilitiesH := handlers.NewCapabilitiesHandler(planRegistry)
+	incidentsH := handlers.NewIncidentsHandler()
+
 	// ── Routes ───────────────────────────────────────────────────────────────
 
 	// Health check — emits buildinfo (so operators / canaries / dashboards
@@ -235,6 +240,13 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 
 	// OpenAPI spec — machine-readable description of the agent-facing API
 	app.Get("/openapi.json", handlers.ServeOpenAPI)
+
+	// Public capability + incident discovery for AI agents — no auth.
+	// /capabilities answers "what can I do at which tier?" without
+	// provisioning-to-discover-limits. /incidents returns [] today and
+	// reserves the response shape for the future incident-feed worker.
+	app.Get("/api/v1/capabilities", capabilitiesH.Get)
+	app.Get("/api/v1/incidents", incidentsH.List)
 
 	// MCP authorization profile — RFC 8414 / OAuth 2.0 Protected Resource Metadata.
 	app.Get("/.well-known/oauth-protected-resource", handlers.ServeOAuthProtectedResourceMetadata)
@@ -408,6 +420,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// state aggregator. Wired below under the /api/v1 group.
 	billingUsageH := handlers.NewBillingUsageHandler(db, rdb, planRegistry)
 	teamSummaryH := handlers.NewTeamSummaryHandler(db, rdb, planRegistry)
+	teamSelfH := handlers.NewTeamSelfHandler(db, planRegistry)
 
 	// Public webhook request listing — token IS the credential (no session needed).
 	// Authenticated callers use the same handler; it additionally verifies team ownership.
@@ -578,6 +591,12 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// consume these instead of computing aggregates client-side.
 	api.Get("/billing/usage", billingUsageH.GetUsage)
 	api.Get("/team/summary", teamSummaryH.GetSummary)
+
+	// GET / PATCH /api/v1/team — wired so the dashboard's TeamPage "Rename
+	// team" stops being a visual lie (previously the api had no PATCH
+	// endpoint; the dashboard's updateTeam() returned the input unchanged).
+	api.Get("/team", teamSelfH.Get)
+	api.Patch("/team", middleware.RequireWritable(), teamSelfH.Update)
 
 	// Deploy management endpoints — Phase 6 (aliases under /api/v1)
 	api.Get("/deployments", deployH.List)
