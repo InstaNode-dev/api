@@ -294,6 +294,52 @@ func GetAllActiveResourcesByFingerprint(ctx context.Context, db *sql.DB, fingerp
 	return resources, rows.Err()
 }
 
+// GetWebhookHMACSecret returns the optional shared secret used to verify
+// X-Hub-Signature-256 on POST /webhook/receive/:token. NULL / empty
+// secret = back-compat open receiver (signed traffic not required).
+// Migration 042 added the column as nullable; if a stale schema is
+// running the missing-column error is wrapped and returned so the
+// caller can fail open.
+func GetWebhookHMACSecret(ctx context.Context, db *sql.DB, resourceID uuid.UUID) (string, error) {
+	var secret sql.NullString
+	err := db.QueryRowContext(ctx,
+		`SELECT hmac_secret FROM resources WHERE id = $1`, resourceID,
+	).Scan(&secret)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", fmt.Errorf("models.GetWebhookHMACSecret: %w", err)
+	}
+	if !secret.Valid {
+		return "", nil
+	}
+	return secret.String, nil
+}
+
+// SetWebhookHMACSecret stores (or clears, when secret == "") the shared
+// HMAC secret on a webhook resource. Empty string sets the column to
+// NULL so the receiver falls back to its back-compat open mode.
+//
+// Caller is expected to have already authorized the mutation
+// (resource ownership / tier gate); this function does no authz of
+// its own.
+func SetWebhookHMACSecret(ctx context.Context, db *sql.DB, resourceID uuid.UUID, secret string) error {
+	var val any
+	if secret != "" {
+		val = secret
+	} else {
+		val = nil
+	}
+	_, err := db.ExecContext(ctx,
+		`UPDATE resources SET hmac_secret = $1 WHERE id = $2`, val, resourceID,
+	)
+	if err != nil {
+		return fmt.Errorf("models.SetWebhookHMACSecret: %w", err)
+	}
+	return nil
+}
+
 // SoftDeleteResource marks a resource status as 'deleted'.
 func SoftDeleteResource(ctx context.Context, db *sql.DB, id uuid.UUID) error {
 	_, err := db.ExecContext(ctx, `
