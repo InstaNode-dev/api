@@ -429,7 +429,16 @@ func nosqlAnonymousLimits() fiber.Map {
 	return fiber.Map{
 		"storage_mb":  5,
 		"connections": 2,
-		"expires_in":  "24h",
+		// FIX-G (2026-05-14, #167): per-token cap is 2, but the underlying
+		// MongoDB pod is shared-tenant and admits up to 20 simultaneous
+		// connections across all anonymous tokens (`--maxConns 20` on the
+		// statefulset). Surfacing the shared cap lets an agent reading
+		// this response avoid the "I asked for 2 and got refused under
+		// burst" footgun — under load, your effective per-token ceiling
+		// is your share of 20, not the nominal 2.
+		"connections_shared_cap_pod": 20,
+		"connections_note":           "shared cap up to 20 across all anonymous tokens",
+		"expires_in":                 "24h",
 	}
 }
 

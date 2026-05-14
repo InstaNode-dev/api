@@ -316,6 +316,48 @@ func (h *CustomDomainHandler) Create(c *fiber.Ctx) error {
 			"Custom domains require the Hobby Plus plan or higher. Upgrade at https://instanode.dev/pricing")
 	}
 
+	// FIX-G (2026-05-14): per-count cap. Until now the only gate was the
+	// boolean feature flag above, so a Hobby Plus team could bind an
+	// unbounded number of hostnames. The cap mirrors plans.yaml
+	// custom_domains_max per tier:
+	//
+	//   hobby_plus → 1   pro → 5   growth → 3   team → 50   (-1 = unlimited)
+	//
+	// Count is "active domain rows for this team" — we don't subtract
+	// pending_verification rows because a stuck pending row that never
+	// finishes still consumes the slot until the team deletes it. That's
+	// intentional: it prevents an agent loop from re-issuing TXT challenges
+	// in a tight retry without ever cleaning up.
+	domainCap := h.plans.CustomDomainsMaxLimit(team.PlanTier)
+	if domainCap >= 0 {
+		existing, listErr := models.ListCustomDomainsByTeam(c.Context(), h.db, team.ID)
+		if listErr != nil {
+			slog.Error("custom_domain.count_failed",
+				"error", listErr, "team_id", team.ID,
+				"request_id", middleware.GetRequestID(c))
+			return respondError(c, fiber.StatusServiceUnavailable, "count_failed",
+				"Failed to verify custom-domain quota")
+		}
+		if len(existing) >= domainCap {
+			return c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
+				"ok":    false,
+				"error": "custom_domains_limit_reached",
+				"message": fmt.Sprintf(
+					"Your %s plan permits %d custom domain(s); you already have %d. Delete an existing binding or upgrade to add more.",
+					team.PlanTier, domainCap, len(existing),
+				),
+				"limit":   domainCap,
+				"current": len(existing),
+				"tier":    team.PlanTier,
+				// agent_action: matches the convention used by other 402
+				// responses (deploy.go, vault.go) so an LLM agent reading
+				// the JSON can pick the right remediation without a
+				// human-language parse.
+				"agent_action": "delete_existing_or_upgrade",
+			})
+		}
+	}
+
 	stack, err := h.requireOwnedStack(c, team, c.Params("slug"))
 	if err != nil {
 		return err
