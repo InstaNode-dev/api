@@ -128,4 +128,20 @@ const (
 	// bulk operation (rather than N lines for the underlying twins,
 	// which already each emit their own `provision` kind row).
 	AuditKindFamilyBulkTwin = "family.bulk_twin"
+
+	// AuditKindBackupRequested fires on every successful POST
+	// /api/v1/resources/:id/backup — the API persisted a pending
+	// resource_backups row and the worker will pick it up within 30s.
+	// Metadata: {resource_id, triggered_by, backup_kind}. The worker
+	// emits its own terminal-state kinds when the backup completes or
+	// fails (not wired into this constant — they live in the worker repo).
+	AuditKindBackupRequested = "backup.requested"
+
+	// AuditKindRestoreRequested fires on every successful POST
+	// /api/v1/resources/:id/restore. Metadata: {resource_id, backup_id,
+	// triggered_by}. Distinct kind from backup.requested so a Loops /
+	// dashboard subscriber can filter to "user clicked Restore" vs
+	// "scheduled backup ran" — a restore is a much higher-signal event
+	// (user is recovering, may need support).
+	AuditKindRestoreRequested = "restore.requested"
 )

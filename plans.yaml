@@ -29,6 +29,12 @@ plans:
       vault_max_entries: 0
       vault_envs_allowed: []
       deployments_apps: 0
+      # Backups: anonymous tier has no backup retention and cannot restore.
+      # The worker's scheduled backup job skips anonymous rows; manual backups
+      # are 402'd up front.
+      backup_retention_days: 0
+      backup_restore_enabled: false
+      manual_backups_per_day: 0
     features:
       alerts: false
       custom_domains: false
@@ -60,6 +66,11 @@ plans:
       vault_max_entries: 0
       vault_envs_allowed: []
       deployments_apps: 0
+      # Mirror anonymous — free is claimed-but-unpaid, same pay-from-day-one
+      # policy applies. No backups, no restore.
+      backup_retention_days: 0
+      backup_restore_enabled: false
+      manual_backups_per_day: 0
     features:
       alerts: false
       custom_domains: false
@@ -86,6 +97,13 @@ plans:
       vault_max_entries: 20
       vault_envs_allowed: ["production"]
       deployments_apps: 1
+      # Hobby: 7-day retention, 1 manual backup per day, no self-serve restore.
+      # The "no restore" is a deliberate Pro upgrade lever — the dashboard
+      # shows a sales nudge on the restore CTA. Hobby customers who need to
+      # recover production data must upgrade to Pro for self-serve restore.
+      backup_retention_days: 7
+      backup_restore_enabled: false
+      manual_backups_per_day: 1
     features:
       alerts: true
       custom_domains: false
@@ -117,6 +135,10 @@ plans:
       vault_max_entries: 20
       vault_envs_allowed: ["production"]
       deployments_apps: 1
+      # Mirror hobby — same limits + features, only billing period differs.
+      backup_retention_days: 7
+      backup_restore_enabled: false
+      manual_backups_per_day: 1
     features:
       alerts: true
       custom_domains: false
@@ -143,6 +165,13 @@ plans:
       vault_max_entries: 200
       vault_envs_allowed: []
       deployments_apps: 10
+      # Pro: 30-day backup retention, 100 manual backups/day, self-serve restore.
+      # 100/day is effectively unlimited for the dashboard CTA but caps a
+      # runaway agent loop. The marketing surface advertises "30-day backups
+      # + 1-click restore" as a Pro headline feature.
+      backup_retention_days: 30
+      backup_restore_enabled: true
+      manual_backups_per_day: 100
     features:
       alerts: true
       custom_domains: true
@@ -171,6 +200,10 @@ plans:
       vault_max_entries: 200
       vault_envs_allowed: []
       deployments_apps: 10
+      # Mirror pro — same limits + features, only billing period differs.
+      backup_retention_days: 30
+      backup_restore_enabled: true
+      manual_backups_per_day: 100
     features:
       alerts: true
       custom_domains: true
@@ -197,6 +230,12 @@ plans:
       vault_max_entries: -1
       vault_envs_allowed: []
       deployments_apps: -1
+      # Team: 90-day retention, 1000 manual backups/day, self-serve restore.
+      # The longer retention is the compliance lever — enterprises asking
+      # for 90-day point-in-time recovery land here.
+      backup_retention_days: 90
+      backup_restore_enabled: true
+      manual_backups_per_day: 1000
     features:
       alerts: true
       custom_domains: true
@@ -225,6 +264,10 @@ plans:
       vault_max_entries: -1
       vault_envs_allowed: []
       deployments_apps: -1
+      # Mirror team — same limits + features, only billing period differs.
+      backup_retention_days: 90
+      backup_restore_enabled: true
+      manual_backups_per_day: 1000
     features:
       alerts: true
       custom_domains: true
@@ -251,6 +294,12 @@ plans:
       vault_max_entries: 200
       vault_envs_allowed: []
       deployments_apps: 5
+      # Growth: matches Pro's backup posture (30-day retention, restore).
+      # Growth sits between Pro and Team — the differentiator is dedicated
+      # infra, not backup retention.
+      backup_retention_days: 30
+      backup_restore_enabled: true
+      manual_backups_per_day: 100
     features:
       alerts: true
       custom_domains: true
