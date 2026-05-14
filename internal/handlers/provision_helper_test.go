@@ -71,3 +71,42 @@ func TestLimitExceededNote_DoesNotMentionTrial(t *testing.T) {
 		})
 	}
 }
+
+// TestSanitizeName_StripsXSSVectors is the W9 audit regression test: resource
+// names land in audit_log.summary (which the dashboard renders via
+// dangerouslySetInnerHTML on its activity-feed fallback path) and in JSON
+// responses across CLI/email/slack surfaces. The strip is defence-in-depth —
+// even if downstream renderers later add escaping, the four HTML-special
+// characters never make it into stored state.
+//
+// `&` is deliberately preserved (legitimate in names like "Smith & Co
+// Postgres"); React's text rendering already escapes it.
+func TestSanitizeName_StripsXSSVectors(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"plain name", "my-db", "my-db"},
+		{"empty", "", ""},
+		{"strips angle brackets", "<script>alert(1)</script>", "scriptalert(1)/script"},
+		{"strips double quote", "name\"value", "namevalue"},
+		{"strips single quote", "it's mine", "its mine"},
+		{"strips mixed", "<img src=\"x\" onerror='alert(1)'>", "img src=x onerror=alert(1)"},
+		{"preserves ampersand", "Smith & Co", "Smith & Co"},
+		{"caps at 120 chars", strings.Repeat("a", 200), strings.Repeat("a", 120)},
+		{"strip before truncate", "<" + strings.Repeat("a", 200) + ">", strings.Repeat("a", 120)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := sanitizeName(c.in)
+			if got != c.want {
+				t.Errorf("sanitizeName(%q) = %q, want %q", c.in, got, c.want)
+			}
+			// Hard assertion: stripped output MUST NOT contain any HTML-special char.
+			for _, banned := range []string{"<", ">", "\"", "'"} {
+				if strings.Contains(got, banned) {
+					t.Errorf("sanitizeName(%q) leaked %q in output %q — XSS sink regressed", c.in, banned, got)
+				}
+			}
+		})
+	}
+}

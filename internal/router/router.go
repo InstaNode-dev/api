@@ -251,7 +251,17 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// before any mutating deploy handler runs. GETs (deployGroup.Get) are
 	// no-ops under the middleware so the impersonated admin can still
 	// inspect deploy state — which is the entire point of view-as-customer.
-	deployGroup := app.Group("/deploy", middleware.RequireAuth(cfg), middleware.PopulateTeamRole(), middleware.RequireWritable())
+	// RequireDPoP is opt-in per token: bearers without `cnf.jkt` pass through
+	// unchanged (back-compat for dashboard/CLI sessions), but agent-issued
+	// key-bound tokens MUST present a fresh DPoP proof on every mutating
+	// /deploy/* call. A stolen bearer alone can't be replayed without the
+	// matching private key. See internal/middleware/dpop.go for the chain.
+	deployGroup := app.Group("/deploy",
+		middleware.RequireAuth(cfg),
+		middleware.PopulateTeamRole(),
+		middleware.RequireDPoP(rdb),
+		middleware.RequireWritable(),
+	)
 	deployGroup.Post("/new",
 		middleware.RequireEnvAccess(middleware.EnvPolicyActionDeploy,
 			middleware.WithEnvLookup(func(c *fiber.Ctx) (string, error) {
@@ -374,7 +384,20 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// holding a *normal* (writable) session, so the gate would never fire
 	// there — but the brief calls out the exemption explicitly, and the
 	// audit-comment in router.go is where reviewers expect to find it.
-	api := app.Group("/api/v1", middleware.RequireAuth(cfg), middleware.PopulateTeamRole(), middleware.RequireWritable())
+	//
+	// RequireDPoP is opt-in per bearer token: only requests whose JWT carries
+	// `cnf.jkt` are gated by the proof check. Dashboard/CLI sessions that
+	// don't bind to a key pass through unchanged. This is what makes wiring
+	// the middleware here back-compat safe — every existing dashboard, MCP,
+	// and CLI client keeps working — while sender-bound agent tokens get
+	// the full RFC 9449 enforcement chain (signature, jkt match, htm/htu,
+	// iat freshness, jti replay). See internal/middleware/dpop.go.
+	api := app.Group("/api/v1",
+		middleware.RequireAuth(cfg),
+		middleware.PopulateTeamRole(),
+		middleware.RequireDPoP(rdb),
+		middleware.RequireWritable(),
+	)
 
 	// /whoami — identity probe for agents. Returning 401 here is the canonical
 	// "your token is bad"; returning anything else from this endpoint means
