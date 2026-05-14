@@ -47,7 +47,22 @@ func generatePassword(n int) (string, error) {
 }
 
 // Provision creates a Postgres database and user for the given token.
+// Equivalent to ProvisionWithExtensions(ctx, token, tier, nil) — kept as a
+// convenience wrapper so existing callers don't need to plumb extensions.
 func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Credentials, error) {
+	return b.ProvisionWithExtensions(ctx, token, tier, nil)
+}
+
+// ProvisionWithExtensions creates a Postgres database and user for the given
+// token, then installs each requested extension (allowlisted in
+// backend.AllowedExtensions). Pass nil/empty to provision a vanilla database.
+// Currently the only allowed extension is "vector" (pgvector) — see
+// backend.ValidateExtensions.
+func (b *LocalBackend) ProvisionWithExtensions(ctx context.Context, token, tier string, extensions []string) (*Credentials, error) {
+	if err := ValidateExtensions(extensions); err != nil {
+		return nil, fmt.Errorf("db.local.Provision: %w", err)
+	}
+
 	dbName := "db_" + token
 	username := "usr_" + token
 
@@ -89,12 +104,21 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Cred
 		return nil, fmt.Errorf("db.local.Provision: GRANT DATABASE: %w", err)
 	}
 
-	// Connect to the new database to grant schema privileges.
-	// Build the new DB URL by substituting the database name in the admin URL.
+	// Connect to the new database to grant schema privileges and install
+	// any requested extensions. Extensions must run inside the new DB —
+	// CREATE EXTENSION is database-scoped, not cluster-scoped — and must
+	// run as a superuser/admin, not the per-token user (which lacks
+	// CREATE-on-pg_catalog privileges).
 	newDBURL := b.buildDBURL(username, pass, dbName)
 	adminNewDB, err := pgx.Connect(ctx, b.buildAdminNewDBURL(dbName))
 	if err != nil {
 		slog.Error("db.local.Provision: connect new db for schema grant (non-fatal)", "error", err)
+		// If extensions were requested and we couldn't connect to the new
+		// DB to install them, fail loudly — silently returning a non-
+		// vector-enabled database would surprise the caller.
+		if len(extensions) > 0 {
+			return nil, fmt.Errorf("db.local.Provision: connect new db to install extensions: %w", err)
+		}
 	} else {
 		defer func() {
 			if discErr := adminNewDB.Close(ctx); discErr != nil {
@@ -104,6 +128,16 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Cred
 		if _, err := adminNewDB.Exec(ctx, fmt.Sprintf("GRANT ALL ON SCHEMA public TO %q", username)); err != nil {
 			slog.Error("db.local.Provision: GRANT SCHEMA (non-fatal)", "token", token, "error", err)
 		}
+		// Install each allowlisted extension. We've already validated the
+		// names against AllowedExtensions, so it's safe to interpolate
+		// them into the DDL (Postgres doesn't accept extension names as
+		// parameters). Use a quoted identifier to defend against any
+		// future allowlist entry that contains uppercase or punctuation.
+		for _, ext := range extensions {
+			if _, err := adminNewDB.Exec(ctx, fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %q", ext)); err != nil {
+				return nil, fmt.Errorf("db.local.Provision: CREATE EXTENSION %q: %w", ext, err)
+			}
+		}
 	}
 
 	slog.Info("db.local.Provision: provisioned",
@@ -111,6 +145,7 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Cred
 		"db", dbName,
 		"user", username,
 		"tier", tier,
+		"extensions", extensions,
 	)
 
 	return &Credentials{
