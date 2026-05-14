@@ -273,9 +273,8 @@ func (h *CLIAuthHandler) GetCurrentUser(c *fiber.Ctx) error {
 		"plan_display_name": plan.DisplayName,
 		"experiments":       exps,
 	}
-	if team.TrialEndsAt.Valid {
-		resp["trial_ends_at"] = team.TrialEndsAt.Time
-	}
+	// trial_ends_at removed — see policy memory project_no_trial_pay_day_one.md.
+	// The platform has no trial period; the column was dropped in migration 034.
 
 	// Admin-only surface: when the caller's email is on the ADMIN_EMAILS
 	// allowlist AND the operator has configured ADMIN_PATH_PREFIX, hand

@@ -351,17 +351,17 @@ func TestE2E_FullStack_AuthMe_ReflectsHobbyTierAfterClaim(t *testing.T) {
 		t.Fatalf("GET /auth/me: want 200, got %d\n%s", meResp.StatusCode, readBody(t, meResp))
 	}
 
-	var me struct {
-		OK          bool   `json:"ok"`
-		Tier        string `json:"tier"`
-		TrialEndsAt any    `json:"trial_ends_at"`
-	}
+	// Decode into a permissive map so we can assert on field PRESENCE
+	// (not just value). The platform has no trial period (see policy memory
+	// project_no_trial_pay_day_one.md); /auth/me must never expose a
+	// trial_ends_at key.
+	var me map[string]any
 	decodeJSON(t, meResp, &me)
 
-	if me.Tier != "hobby" {
-		t.Errorf("GET /auth/me: want tier=hobby after claim, got %q", me.Tier)
+	if tier, _ := me["tier"].(string); tier != "hobby" {
+		t.Errorf("GET /auth/me: want tier=hobby after claim, got %q", tier)
 	}
-	if me.TrialEndsAt == nil {
-		t.Error("GET /auth/me: trial_ends_at must be present for new hobby accounts")
+	if _, present := me["trial_ends_at"]; present {
+		t.Errorf("GET /auth/me: trial_ends_at must NOT be present — no trial period exists; got %v", me["trial_ends_at"])
 	}
 }

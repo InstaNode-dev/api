@@ -23,7 +23,6 @@ type Team struct {
 	Name                   sql.NullString
 	PlanTier               string
 	RazorpaySubscriptionID sql.NullString
-	TrialEndsAt            sql.NullTime
 	CreatedAt              time.Time
 }
 
@@ -68,9 +67,9 @@ func CreateTeam(ctx context.Context, db *sql.DB, name string) (*Team, error) {
 	t := &Team{}
 	err := db.QueryRowContext(ctx, `
 		INSERT INTO teams (name, plan_tier) VALUES ($1, 'free')
-		RETURNING id, name, plan_tier, stripe_customer_id, trial_ends_at, created_at
+		RETURNING id, name, plan_tier, stripe_customer_id, created_at
 	`, name).Scan(
-		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.TrialEndsAt, &t.CreatedAt,
+		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.CreatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("models.CreateTeam: %w", err)
@@ -82,10 +81,10 @@ func CreateTeam(ctx context.Context, db *sql.DB, name string) (*Team, error) {
 func GetTeamByID(ctx context.Context, db *sql.DB, id uuid.UUID) (*Team, error) {
 	t := &Team{}
 	err := db.QueryRowContext(ctx, `
-		SELECT id, name, plan_tier, stripe_customer_id, trial_ends_at, created_at
+		SELECT id, name, plan_tier, stripe_customer_id, created_at
 		FROM teams WHERE id = $1
 	`, id).Scan(
-		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.TrialEndsAt, &t.CreatedAt,
+		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, &ErrTeamNotFound{ID: id}
@@ -207,10 +206,14 @@ func UpdateRazorpaySubscriptionID(ctx context.Context, db *sql.DB, teamID uuid.U
 	return nil
 }
 
-// UpdatePlanTier updates team.plan_tier and clears trial_ends_at.
+// UpdatePlanTier updates team.plan_tier.
+//
+// Trial-clearing semantics are no longer relevant — the platform has no trial
+// (see policy memory project_no_trial_pay_day_one.md). The trial_ends_at column
+// was dropped in migration 034.
 func UpdatePlanTier(ctx context.Context, db *sql.DB, teamID uuid.UUID, tier string) error {
 	_, err := db.ExecContext(ctx, `
-		UPDATE teams SET plan_tier = $1, trial_ends_at = NULL WHERE id = $2
+		UPDATE teams SET plan_tier = $1 WHERE id = $2
 	`, tier, teamID)
 	if err != nil {
 		return fmt.Errorf("models.UpdatePlanTier: %w", err)
@@ -222,10 +225,10 @@ func UpdatePlanTier(ctx context.Context, db *sql.DB, teamID uuid.UUID, tier stri
 func GetTeamByRazorpaySubscriptionID(ctx context.Context, db *sql.DB, subscriptionID string) (*Team, error) {
 	t := &Team{}
 	err := db.QueryRowContext(ctx, `
-		SELECT id, name, plan_tier, stripe_customer_id, trial_ends_at, created_at
+		SELECT id, name, plan_tier, stripe_customer_id, created_at
 		FROM teams WHERE stripe_customer_id = $1
 	`, subscriptionID).Scan(
-		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.TrialEndsAt, &t.CreatedAt,
+		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, &ErrTeamNotFound{}
@@ -236,19 +239,9 @@ func GetTeamByRazorpaySubscriptionID(ctx context.Context, db *sql.DB, subscripti
 	return t, nil
 }
 
-// StartTrial sets trial_ends_at to now+14 days and plan_tier='hobby'.
-func StartTrial(ctx context.Context, db *sql.DB, teamID uuid.UUID) error {
-	_, err := db.ExecContext(ctx, `
-		UPDATE teams
-		SET plan_tier = 'hobby',
-		    trial_ends_at = now() + interval '14 days'
-		WHERE id = $1
-	`, teamID)
-	if err != nil {
-		return fmt.Errorf("models.StartTrial: %w", err)
-	}
-	return nil
-}
+// StartTrial removed — see policy memory project_no_trial_pay_day_one.md.
+// Anonymous (24h TTL) is the only free tier; hobby/pro/team are paid from
+// signup. Migration 034 dropped the trial_ends_at column.
 
 // GetUserByTeamID fetches an owner for the team, or the earliest member if none is marked owner.
 func GetUserByTeamID(ctx context.Context, db *sql.DB, teamID uuid.UUID) (*User, error) {

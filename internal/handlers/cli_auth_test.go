@@ -82,52 +82,11 @@ func TestGetCurrentUser_ReturnsRealTier(t *testing.T) {
 	assert.Equal(t, "Pro", body["plan_display_name"], "plan_display_name must be populated from plans registry")
 	assert.NotEmpty(t, body["user_id"], "user_id must be present")
 	assert.NotEmpty(t, body["team_id"], "team_id must be present")
-	// trial_ends_at should be absent for a non-trial team.
+	// Regression guard: trial_ends_at MUST NOT be present on /auth/me.
+	// The platform has no trial period (see policy memory
+	// project_no_trial_pay_day_one.md); migration 034 dropped the column
+	// and cli_auth.go no longer surfaces it. Reintroducing the field would
+	// silently bring the trial concept back into the API contract.
 	_, hasTrialEndsAt := body["trial_ends_at"]
-	assert.False(t, hasTrialEndsAt, "trial_ends_at must not be present when not in trial")
-}
-
-// TestGetCurrentUser_TrialEndsAt_PresentWhenInTrial verifies that trial_ends_at is
-// included in the response when the team has an active trial.
-func TestGetCurrentUser_TrialEndsAt_PresentWhenInTrial(t *testing.T) {
-	db, cleanDB := testhelpers.SetupTestDB(t)
-	defer cleanDB()
-	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
-	defer cleanRedis()
-
-	app, cleanApp := testhelpers.NewTestApp(t, db, rdb)
-	defer cleanApp()
-
-	// Create a team and start its trial.
-	teamID := testhelpers.MustCreateTeamDB(t, db, "hobby")
-	_, err := db.ExecContext(context.Background(),
-		`UPDATE teams SET trial_ends_at = now() + interval '14 days' WHERE id = $1::uuid`,
-		teamID,
-	)
-	require.NoError(t, err)
-
-	email := testhelpers.UniqueEmail(t)
-	var userID string
-	require.NoError(t, db.QueryRowContext(context.Background(),
-		`INSERT INTO users (team_id, email) VALUES ($1::uuid, $2) RETURNING id::text`,
-		teamID, email,
-	).Scan(&userID))
-
-	token := testhelpers.MustSignSessionJWT(t, userID, teamID, email)
-
-	req := httptest.NewRequest(http.MethodGet, "/auth/me", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := app.Test(req, 5000)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var body map[string]any
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-
-	assert.Equal(t, true, body["ok"])
-	_, hasTrialEndsAt := body["trial_ends_at"]
-	assert.True(t, hasTrialEndsAt, "trial_ends_at must be present when team is in trial")
+	assert.False(t, hasTrialEndsAt, "trial_ends_at must not appear on /auth/me — no trial period exists")
 }
