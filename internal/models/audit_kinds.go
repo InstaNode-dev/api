@@ -107,6 +107,41 @@ const (
 	// message — full error stays in the deployments.error_message column).
 	AuditKindDeployFailed = "deploy.failed"
 
+	// Deploy TTL lifecycle (Wave FIX-J — migration 045). Each kind names one
+	// inflection point in the auto-24h-TTL-with-reminders flow so on-call,
+	// the dashboard's Recent Activity feed, and the Loops/Brevo event
+	// forwarder can render the chain end-to-end without inventing copy.
+	//
+	// AuditKindDeployMadePermanent fires when a caller explicitly opts a
+	// deploy out of TTL — either via POST /deploy/new with ttl_policy =
+	// 'permanent' OR POST /api/v1/deployments/:id/make-permanent. Metadata:
+	// {deploy_id, team_id, source: "deploy_new" | "make_permanent_endpoint",
+	// previous_ttl_policy}.
+	AuditKindDeployMadePermanent = "deploy.made_permanent"
+
+	// AuditKindDeployTTLSet fires on POST /api/v1/deployments/:id/ttl —
+	// the user chose a custom (non-24h) TTL. Metadata: {deploy_id,
+	// team_id, hours, expires_at}. Distinct from made_permanent so a
+	// dashboard subscriber can render the two outcomes differently.
+	AuditKindDeployTTLSet = "deploy.ttl_set"
+
+	// AuditKindDeployExpiringSoon fires once per reminder dispatch — six
+	// rows per deploy over the final 12h (T-12h, T-10h, ..., T-2h). The
+	// worker's deployment_reminder job emits this AFTER the email send
+	// succeeds. Metadata: {deploy_id, team_id, reminder_index (1..6),
+	// hours_remaining, expires_at}.
+	AuditKindDeployExpiringSoon = "deploy.expiring_soon"
+
+	// AuditKindDeployExpired fires when the worker's deployment_expirer
+	// soft-deletes a deploy whose expires_at has passed. Metadata:
+	// {deploy_id, team_id, expires_at, ttl_policy (auto_24h | custom)}.
+	AuditKindDeployExpired = "deploy.expired"
+
+	// AuditKindTeamSettingsChanged fires when an owner/admin mutates a
+	// team's preferences via PATCH /api/v1/team/settings. Metadata:
+	// {field, old_value, new_value, changed_by_user_id}.
+	AuditKindTeamSettingsChanged = "team.settings_changed"
+
 	// AuditKindStorageIAMUserCreated fires when a successful /storage/new
 	// in MinIO admin mode mints a per-tenant IAM user. Surfaces the
 	// "tenant just got their own key" event so on-call / compliance can

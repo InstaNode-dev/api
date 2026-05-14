@@ -53,12 +53,14 @@ func teamSelfTestApp(t *testing.T, db *sql.DB, teamID uuid.UUID, writable bool) 
 }
 
 func expectTeamRow(mock sqlmock.Sqlmock, teamID uuid.UUID, name string, plan string) {
-	row := sqlmock.NewRows([]string{"id", "name", "plan_tier", "stripe_customer_id", "trial_ends_at", "created_at"})
+	// Wave FIX-J: GetTeamByID now SELECTs default_deployment_ttl_policy as the
+	// 6th column (migration 045). The sqlmock row shape MUST match.
+	row := sqlmock.NewRows([]string{"id", "name", "plan_tier", "stripe_customer_id", "created_at", "default_deployment_ttl_policy"})
 	var nm sql.NullString
 	if name != "" {
 		nm = sql.NullString{String: name, Valid: true}
 	}
-	row.AddRow(teamID, nm, plan, sql.NullString{}, nil, time.Now())
+	row.AddRow(teamID, nm, plan, sql.NullString{}, time.Now(), "auto_24h")
 	mock.ExpectQuery(`SELECT.*FROM teams WHERE id`).WithArgs(teamID).WillReturnRows(row)
 }
 

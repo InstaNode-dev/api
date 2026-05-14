@@ -53,6 +53,16 @@ func agentActionContractCases() map[string]string {
 		"AgentActionRestoreTargetCrossTeam":            AgentActionRestoreTargetCrossTeam,
 		"AgentActionBackupIntegrityFailed":             AgentActionBackupIntegrityFailed,
 		"AgentActionMetricsRequiresUpgrade":            AgentActionMetricsRequiresUpgrade,
+		// Wave FIX-J deploy TTL walls. The long-form success-path
+		// newAgentActionDeployAutoExpire24h is documented in
+		// agent_action.go as the canonical exception to the 280-char
+		// soft target (it has to enumerate THREE next actions), so it
+		// is intentionally NOT exercised by this contract gate —
+		// covered instead by deploy_ttl_test.go which spot-checks the
+		// imperative opening + URL inclusion.
+		"AgentActionDeployMakePermanentAnonymous":     AgentActionDeployMakePermanentAnonymous,
+		"AgentActionDeployTTLHoursOutOfRange":         AgentActionDeployTTLHoursOutOfRange,
+		"AgentActionTeamSettingsInvalidTTLPolicy":     AgentActionTeamSettingsInvalidTTLPolicy,
 
 		// Builders — representative inputs covering tier/env/role/limit
 		// interpolation.
