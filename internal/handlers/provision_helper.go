@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -400,7 +401,36 @@ type provisionRequestBody struct {
 	ParentResourceID string `json:"parent_resource_id"`
 }
 
+// sanitizeName trims, length-caps, and strips HTML-dangerous characters
+// from a user-supplied resource name. The strip is defence-in-depth:
+// resource names land in audit_log.summary (which the dashboard renders
+// via dangerouslySetInnerHTML on its activity-feed fallback path,
+// dashboard/src/api/index.ts fetchActivity), in JSON responses, and in
+// future surfaces (email subjects, slack notifications) we don't want
+// to have to audit one-by-one. Rather than trust every downstream
+// renderer, we reject the four HTML-special characters at the
+// provisioning boundary — `<`, `>`, `"`, `'`. `&` is allowed (legitimate
+// in names like "Smith & Co Postgres") because React's text rendering
+// already escapes it; the strip targets the script-tag sink specifically.
+//
+// We deliberately do NOT HTML-escape (replace `<` with `&lt;`) because the
+// resource name is also displayed in CLI output, slack messages, and email
+// subjects where the user expects the original characters. Stripping is
+// the only transformation that's safe across every downstream renderer.
 func sanitizeName(name string) string {
+	if name == "" {
+		return ""
+	}
+	// Strip HTML-injection vectors. Replace with empty string rather than
+	// a placeholder so a paste of "<bad>name" cleanly becomes "name"
+	// rather than something like "[stripped]name" the user must explain.
+	stripper := strings.NewReplacer(
+		"<", "",
+		">", "",
+		"\"", "",
+		"'", "",
+	)
+	name = stripper.Replace(name)
 	if len(name) > 120 {
 		return name[:120]
 	}
