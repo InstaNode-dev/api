@@ -20,5 +20,12 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata docker-cli
 WORKDIR /app
 COPY --from=builder /instant /app/instant
+# plans.yaml is the single source of truth for all plan limits and pricing.
+# It MUST land in the final image — otherwise main.go's plans.Load() falls
+# back to the embedded common/plans.Default() YAML and every edit to
+# api/plans.yaml becomes a no-op at runtime. The builder stage above did
+# `COPY api/ .` into /app, so plans.yaml is at /app/plans.yaml there.
+# PLANS_PATH in the k8s configmap already points at /app/plans.yaml.
+COPY --from=builder /app/plans.yaml /app/plans.yaml
 EXPOSE 8080
 ENTRYPOINT ["/app/instant"]
