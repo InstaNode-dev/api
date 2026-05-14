@@ -33,7 +33,16 @@ import (
 // a no-op in that case, so the rest of the chain is unaffected.
 func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.GeoDBs, emailClient *email.Client, planRegistry *plans.Registry, provClient *provisioner.Client, nrApp *newrelic.Application) *fiber.App {
 	app := fiber.New(fiber.Config{
-		// Disable default error handler — we write our own JSON errors
+		// Disable default error handler — we write our own JSON errors.
+		// Routes that go through respondError write their own body and
+		// return ErrResponseWritten; this handler is only the fallback
+		// path for Fiber-generated errors (404, 405, 413 Payload Too
+		// Large, etc.) that never touched a handler.
+		//
+		// We funnel those into handlers.respondError equivalents so the
+		// envelope shape (request_id, retry_after_seconds, agent_action)
+		// is identical to handler-emitted errors — agents see one shape
+		// regardless of who wrote the body.
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
 			// respondError already wrote the body — must not overwrite, or
 			// every 400/403/etc. becomes a 500 "internal_error" via the
@@ -51,14 +60,25 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 				errKey, msg = "not_found", "The requested resource was not found"
 			case fiber.StatusMethodNotAllowed:
 				errKey, msg = "method_not_allowed", "Method not allowed"
+			case fiber.StatusRequestEntityTooLarge:
+				errKey, msg = "payload_too_large", "Request payload exceeds the maximum allowed size"
+			case fiber.StatusUnsupportedMediaType:
+				errKey, msg = "unsupported_media_type", "Content-Type not supported for this endpoint"
 			default:
 				errKey, msg = "internal_error", "An unexpected error occurred"
 			}
-			return c.Status(code).JSON(fiber.Map{
-				"ok":      false,
-				"error":   errKey,
-				"message": msg,
-			})
+			// Delegate to handlers.WriteFiberError so the standard envelope
+			// (request_id + retry_after_seconds + agent_action fallback +
+			// Retry-After header on 503/429/502/504) is identical to what
+			// handler-layer respondError emits. WriteFiberError returns
+			// ErrResponseWritten to satisfy the same multi-return-helper
+			// contract that respondError honors at the handler layer —
+			// but inside the ErrorHandler itself, returning a non-nil
+			// error to Fiber kicks the default 500 path. Swallow the
+			// sentinel here so Fiber sees a clean nil and serves the
+			// status code we already wrote.
+			_ = handlers.WriteFiberError(c, code, errKey, msg)
+			return nil
 		},
 		// Trust proxy headers for real IPs (adjust in production to specific trusted proxies)
 		ProxyHeader: "X-Forwarded-For",

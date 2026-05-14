@@ -2347,15 +2347,17 @@ const openAPISpec = `{
       },
       "ErrorResponse": {
         "type": "object",
-        "description": "Canonical JSON shape returned by every 4xx/5xx response. agent_action and upgrade_url are populated for error codes where the calling agent benefits from user-facing copy or a remediation link (quota walls, invalid tokens, expired resources, permission denied, tier gates). Codes without remediation guidance (transient db_error, list_failed, stream_failed, etc.) omit these fields. Backward-compatible: omitempty fields are absent on the wire when empty so existing clients that ignored agent_action/upgrade_url see no change.",
+        "description": "Canonical JSON shape returned by every 4xx/5xx response. Every error envelope carries request_id (echo of X-Request-ID, for support tickets), retry_after_seconds (null on 4xx → fix the request; int on 5xx → safe to retry after N seconds), and — for 5xx — an agent_action sentence the calling agent can show the user. For 429/502/503/504 the same retry value is also written to the Retry-After HTTP header so polite HTTP clients honor the wait without parsing the body. Backward-compatible: omitempty fields (agent_action, upgrade_url, request_id) are absent on the wire when empty.",
         "properties": {
           "ok": { "type": "boolean", "enum": [false], "description": "Always false on error responses" },
           "error": { "type": "string", "description": "Stable machine-readable error code (e.g. 'quota_exceeded', 'invalid_token', 'forbidden', 'storage_limit_reached'). Programmatic clients should branch on this." },
           "message": { "type": "string", "description": "Human-readable explanation of the error. May contain tier names, resource IDs, or other context. Not stable — use the 'error' code for programmatic decisions." },
-          "agent_action": { "type": "string", "description": "Optional. A sentence the calling agent should surface verbatim to the human user — e.g. 'Tell the user they've hit the hobby tier storage limit (500MB). Have them upgrade at https://instanode.dev/pricing to provision more storage.' Present on quota walls, invalid-token errors, permission-denied errors, expired-resource errors, and tier-gate errors. Absent on transient infra failures where the right response is silent retry." },
+          "request_id": { "type": "string", "description": "Echo of the X-Request-ID header for this request. Stable correlator agents can quote when emailing support@instanode.dev — saves the user from copy/pasting headers." },
+          "retry_after_seconds": { "type": ["integer", "null"], "description": "Seconds the agent should wait before retrying. null on 4xx (no retry — fix the request). int on transient 5xx: 30 for 503, 60 for 429, 10 for 502/504. For 429/502/503/504 the same value is also set in the Retry-After HTTP header." },
+          "agent_action": { "type": "string", "description": "Optional. A sentence the calling agent should surface verbatim to the human user — e.g. 'Tell the user they've hit the hobby tier storage limit (500MB). Have them upgrade at https://instanode.dev/pricing to provision more storage.' Present on quota walls, invalid-token errors, permission-denied errors, expired-resource errors, tier-gate errors, AND on plumbing 5xx (where it falls back to a generic 'email support with this request_id' sentence)." },
           "upgrade_url": { "type": "string", "format": "uri", "description": "Optional. Where the user can resolve the error — typically the pricing/upgrade page for quota walls and the login page for token errors. Present whenever following the URL would clear the error." }
         },
-        "required": ["ok", "error", "message"]
+        "required": ["ok", "error", "message", "retry_after_seconds"]
       },
       "AuditExportItem": {
         "type": "object",

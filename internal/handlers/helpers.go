@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"errors"
+	"strconv"
 
 	"github.com/gofiber/fiber/v2"
 )
@@ -44,6 +45,17 @@ type errorCodeMeta struct {
 	UpgradeURL  string
 }
 
+// AgentActionContactSupport is the fallback agent_action sentence returned on
+// 5xx codes that don't have a domain-specific entry in codeToAgentAction.
+// Names the support email, the concrete next action ("email with this
+// request_id"), and contains the full https://instanode.dev URL — satisfies
+// every clause of the U3 contract (see agent_action.go).
+//
+// Used by respondError when status >= 500 and the code is not in the
+// registry. Keeps the agent_action field populated even for plumbing
+// errors so the calling agent always has something concrete to relay.
+const AgentActionContactSupport = "Tell the user something on our side went wrong. Email support@instanode.dev with this request_id and a brief description — see https://instanode.dev/support."
+
 // codeToAgentAction maps respondError `code` values to the sentence the
 // agent should surface and, where relevant, the upgrade URL. Codes absent
 // from this map produce a response with no agent_action field (which is
@@ -54,8 +66,9 @@ type errorCodeMeta struct {
 //   - Auth-token errors point at login.
 //   - "Expired" / "not_found" tell the agent to re-provision.
 //   - Pure plumbing errors (db_error, list_failed, stream_failed,
-//     provision_failed) are deliberately omitted — they're transient and
-//     the agent should retry, not show prose to the user.
+//     provision_failed) are deliberately omitted from this static map —
+//     respondError falls back to AgentActionContactSupport for any 5xx
+//     code that doesn't have an entry here.
 var codeToAgentAction = map[string]errorCodeMeta{
 	// ── Quota walls ────────────────────────────────────────────────────────
 	// Each string adheres to the U3 contract (see agent_action.go): opens
@@ -142,21 +155,95 @@ var codeToAgentAction = map[string]errorCodeMeta{
 }
 
 // ErrorResponse is the canonical JSON shape for every 4xx/5xx response.
+//
 // AgentAction and UpgradeURL are omitempty so existing clients (dashboard,
 // MCP, CLI) that ignore them see no change.
+//
+// RequestID is always populated when the request flowed through
+// middleware.RequestID() (every production route does) — the field gives
+// agents a stable correlator they can echo when emailing support without
+// having to read the X-Request-ID header separately.
+//
+// RetryAfterSeconds is a pointer so we can distinguish "no retry — fix the
+// request" (4xx → nil/null in JSON) from "retry in N seconds" (5xx → int).
+// Pairs with the Retry-After HTTP header on 429/502/503/504 responses so
+// polite HTTP clients honor the same wait without parsing the body.
 type ErrorResponse struct {
-	OK          bool   `json:"ok"`
-	Error       string `json:"error"`
-	Message     string `json:"message"`
-	AgentAction string `json:"agent_action,omitempty"`
-	UpgradeURL  string `json:"upgrade_url,omitempty"`
+	OK                bool   `json:"ok"`
+	Error             string `json:"error"`
+	Message           string `json:"message"`
+	RequestID         string `json:"request_id,omitempty"`
+	RetryAfterSeconds *int   `json:"retry_after_seconds"`
+	AgentAction       string `json:"agent_action,omitempty"`
+	UpgradeURL        string `json:"upgrade_url,omitempty"`
+}
+
+// defaultRetryAfterSeconds returns the retry-after value that the standard
+// envelope writes for a given status code:
+//
+//   - 503: 30s (provisioning/db transient failures — retry quickly)
+//   - 429: 60s (rate-limit window default; per-call override accepted)
+//   - 502, 504: 10s (bad gateway / gateway timeout — short retry)
+//   - other 5xx: nil (the client cannot know if retry is safe — fix on our side)
+//   - 4xx: nil (no retry — fix the request)
+//
+// A nil result writes `"retry_after_seconds": null` in the JSON body and
+// omits the Retry-After header.
+func defaultRetryAfterSeconds(status int) *int {
+	var v int
+	switch status {
+	case fiber.StatusServiceUnavailable: // 503
+		v = 30
+	case fiber.StatusTooManyRequests: // 429
+		v = 60
+	case fiber.StatusBadGateway, fiber.StatusGatewayTimeout: // 502, 504
+		v = 10
+	default:
+		return nil
+	}
+	return &v
+}
+
+// shouldSetRetryAfterHeader reports whether the HTTP Retry-After header
+// should accompany the JSON body for the given status. RFC 7231 §7.1.3
+// names 429 + 503 explicitly; 502 + 504 are the other transient-gateway
+// codes our infra emits and clients-in-the-wild honor for those too.
+func shouldSetRetryAfterHeader(status int) bool {
+	switch status {
+	case fiber.StatusTooManyRequests,
+		fiber.StatusBadGateway,
+		fiber.StatusServiceUnavailable,
+		fiber.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// requestIDFromCtx pulls the request_id Fiber local populated by
+// middleware.RequestID() in the production chain. Returns "" if the
+// middleware didn't run (e.g. a test that didn't register it) — the
+// JSON field is omitempty so the wire shape stays clean either way.
+//
+// Kept here (not imported from middleware) to avoid an import cycle:
+// middleware imports handlers/* in several spots already.
+func requestIDFromCtx(c *fiber.Ctx) string {
+	if v, ok := c.Locals("request_id").(string); ok {
+		return v
+	}
+	return ""
 }
 
 // respondError writes a structured JSON error and returns ErrResponseWritten.
 //
-// If `code` is in codeToAgentAction, the response also carries an
-// `agent_action` field (and, where relevant, `upgrade_url`) — copy the
-// agent can surface to the human user.
+// The envelope ALWAYS includes:
+//   - request_id   (from middleware.RequestID; "" when absent)
+//   - retry_after_seconds (status-code-driven default; null on 4xx)
+//   - agent_action (from codeToAgentAction; falls back to
+//     AgentActionContactSupport for 5xx codes without a registry entry)
+//
+// For 429/502/503/504, the matching Retry-After HTTP header is also set so
+// HTTP clients (most agent frameworks, curl --retry-all-errors, etc.) honor
+// the same wait without parsing the body.
 //
 // Always returns a non-nil error so multi-return helpers compose safely:
 //
@@ -171,13 +258,23 @@ type ErrorResponse struct {
 // invalid input.
 func respondError(c *fiber.Ctx, status int, code, message string) error {
 	resp := ErrorResponse{
-		OK:      false,
-		Error:   code,
-		Message: message,
+		OK:                false,
+		Error:             code,
+		Message:           message,
+		RequestID:         requestIDFromCtx(c),
+		RetryAfterSeconds: defaultRetryAfterSeconds(status),
 	}
 	if meta, ok := codeToAgentAction[code]; ok {
 		resp.AgentAction = meta.AgentAction
 		resp.UpgradeURL = meta.UpgradeURL
+	} else if status >= 500 {
+		// Plumbing 5xx with no registry entry: hand the agent a generic
+		// "email support with this request_id" sentence so the user always
+		// has SOMETHING actionable, instead of an empty agent_action.
+		resp.AgentAction = AgentActionContactSupport
+	}
+	if resp.RetryAfterSeconds != nil && shouldSetRetryAfterHeader(status) {
+		c.Set(fiber.HeaderRetryAfter, strconv.Itoa(*resp.RetryAfterSeconds))
 	}
 	_ = c.Status(status).JSON(resp)
 	return ErrResponseWritten
@@ -191,13 +288,72 @@ func respondError(c *fiber.Ctx, status int, code, message string) error {
 // can't carry — e.g. naming the specific tier ("you've hit the *hobby*
 // limit") or the specific resource limit value ("storage limit reached
 // (500MB)"). For the common path, prefer plain respondError.
+//
+// Same auto-populated fields as respondError: request_id, retry_after_seconds,
+// and the Retry-After header on 429/502/503/504.
 func respondErrorWithAgentAction(c *fiber.Ctx, status int, code, message, agentAction, upgradeURL string) error {
 	resp := ErrorResponse{
-		OK:          false,
-		Error:       code,
-		Message:     message,
-		AgentAction: agentAction,
-		UpgradeURL:  upgradeURL,
+		OK:                false,
+		Error:             code,
+		Message:           message,
+		RequestID:         requestIDFromCtx(c),
+		RetryAfterSeconds: defaultRetryAfterSeconds(status),
+		AgentAction:       agentAction,
+		UpgradeURL:        upgradeURL,
+	}
+	if resp.RetryAfterSeconds != nil && shouldSetRetryAfterHeader(status) {
+		c.Set(fiber.HeaderRetryAfter, strconv.Itoa(*resp.RetryAfterSeconds))
+	}
+	_ = c.Status(status).JSON(resp)
+	return ErrResponseWritten
+}
+
+// WriteFiberError is the exported entry point used by the Fiber-level
+// ErrorHandler in router/router.go (and the test ErrorHandler in
+// testhelpers/testhelpers.go) to wrap Fiber-default errors (404, 405,
+// 413, 415, panics → 500) in the same envelope as handler-emitted
+// respondError calls.
+//
+// The router package cannot call the unexported respondError directly
+// (lives in a different package); this wrapper preserves encapsulation
+// while ensuring "wrong-method 405" and "respondError 4xx" produce the
+// identical JSON shape — important for agents that only learn the
+// envelope once per service.
+func WriteFiberError(c *fiber.Ctx, status int, code, message string) error {
+	return respondError(c, status, code, message)
+}
+
+// respondErrorWithRetry is the same as respondError but lets the caller
+// override the auto-computed retry_after_seconds. Pass retryAfter < 0 to
+// force the field to null even on a status that would normally carry a
+// default (e.g. a 503 where the agent should NOT retry because the
+// underlying request is malformed in a way only a human can fix).
+//
+// Most call sites should use respondError (auto-computed) — this exists
+// for the handful of paths that know the right wait better than the
+// status code does (rate-limit middleware that knows when the window
+// resets; queue-overload responses that read backlog depth).
+func respondErrorWithRetry(c *fiber.Ctx, status int, code, message string, retryAfter int) error {
+	var ra *int
+	if retryAfter >= 0 {
+		v := retryAfter
+		ra = &v
+	}
+	resp := ErrorResponse{
+		OK:                false,
+		Error:             code,
+		Message:           message,
+		RequestID:         requestIDFromCtx(c),
+		RetryAfterSeconds: ra,
+	}
+	if meta, ok := codeToAgentAction[code]; ok {
+		resp.AgentAction = meta.AgentAction
+		resp.UpgradeURL = meta.UpgradeURL
+	} else if status >= 500 {
+		resp.AgentAction = AgentActionContactSupport
+	}
+	if ra != nil && shouldSetRetryAfterHeader(status) {
+		c.Set(fiber.HeaderRetryAfter, strconv.Itoa(*ra))
 	}
 	_ = c.Status(status).JSON(resp)
 	return ErrResponseWritten

@@ -173,10 +173,29 @@ func TestOpenAPI_ErrorResponseSchemaDocumented(t *testing.T) {
 	if !ok {
 		t.Fatal("ErrorResponse.properties missing")
 	}
-	for _, k := range []string{"ok", "error", "message", "agent_action", "upgrade_url"} {
+	// W7G envelope: ErrorResponse schema must document every standardized
+	// field — including the three new ones (request_id, retry_after_seconds,
+	// agent_action universal fallback). Agents reading openapi.json alone
+	// must know to expect these on the wire.
+	for _, k := range []string{"ok", "error", "message", "request_id", "retry_after_seconds", "agent_action", "upgrade_url"} {
 		if _, ok := props[k]; !ok {
 			t.Errorf("ErrorResponse.properties.%s missing — agents need this field documented to know it's optional and what to do with it", k)
 		}
+	}
+	// retry_after_seconds must be marked required so the spec's
+	// "null on 4xx, int on 5xx" contract is unambiguous — an agent
+	// reading the JSON Schema should treat its absence as a server
+	// bug, not a "feature unused on this response."
+	required, _ := schema["required"].([]any)
+	hasRetry := false
+	for _, r := range required {
+		if s, _ := r.(string); s == "retry_after_seconds" {
+			hasRetry = true
+			break
+		}
+	}
+	if !hasRetry {
+		t.Error("ErrorResponse.required must include retry_after_seconds — agents distinguish null (no retry) from missing (server bug)")
 	}
 	// The description must teach agents what agent_action means — otherwise
 	// they'll ignore it the same way they'd ignore any unknown field.
