@@ -186,7 +186,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	}
 
 	resourceH := handlers.NewResourceHandler(db, rdb, cfg, planRegistry, provClient, storageProv)
-	teamMembersH := handlers.NewTeamMembersHandler(db, cfg, planRegistry, emailClient)
+	teamMembersH := handlers.NewTeamMembersHandler(db, cfg, planRegistry, emailClient, rdb)
 	envPolicyH := handlers.NewEnvPolicyHandler(db)
 	dbH := handlers.NewDBHandler(db, rdb, cfg, provClient, planRegistry)
 	vectorH := handlers.NewVectorHandler(db, rdb, cfg, provClient, planRegistry)
@@ -619,6 +619,13 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Post("/team/members/invite", teamMembersH.InviteMember)
 	api.Post("/team/members/leave", teamMembersH.LeaveTeam)
 	api.Delete("/team/members/:user_id", teamMembersH.RemoveMember)
+	// PATCH /team/members/:user_id — owner-only role update (admin / developer
+	// / viewer / member). Owner role is NOT assignable via PATCH; use
+	// POST .../promote-to-primary for an atomic ownership transfer.
+	api.Patch("/team/members/:user_id", teamMembersH.UpdateRole)
+	// POST /team/members/:user_id/promote-to-primary — owner-only atomic
+	// transfer of the team's primary anchor + owner role.
+	api.Post("/team/members/:user_id/promote-to-primary", teamMembersH.PromoteToPrimary)
 	api.Get("/team/invitations", teamMembersH.ListInvitations)
 	api.Delete("/team/invitations/:id", teamMembersH.RevokeInvitation)
 	api.Post("/team/invitations/:id/accept", teamMembersH.AcceptInvitation)
