@@ -152,6 +152,31 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"last_owner": {
 		AgentAction: "Tell the user the team needs at least one owner. Have them promote another member to owner at https://instanode.dev/app/team before changing or removing this one.",
 	},
+
+	// ── Fiber-default 4xx routing errors ───────────────────────────────────
+	// The default Fiber 404/405/413/415 paths flow through the ErrorHandler
+	// in router.go which calls handlers.WriteFiberError -> respondError.
+	// Pre-W12 the resulting envelope had `message` and `request_id`
+	// populated but agent_action was empty — agents probing a stale or
+	// wrong URL got no guidance on what to do next. Each sentence below
+	// follows the §10.15 contract: opens with "Tell the user", names the
+	// concrete failure, points at the agent's next action (verify the URL
+	// via the docs, fix the method, shrink the payload, set Content-Type).
+	// Codes match the keywords WriteFiberError emits for Fiber's
+	// StatusNotFound / StatusMethodNotAllowed / StatusRequestEntityTooLarge
+	// / StatusUnsupportedMediaType.
+	"not_found": {
+		AgentAction: "Tell the user the URL is wrong or the resource no longer exists. Have them check the path against https://instanode.dev/docs/api — anon resources also auto-expire after 24h, so re-provision if needed.",
+	},
+	"method_not_allowed": {
+		AgentAction: "Tell the user the HTTP method is wrong for this URL. Have them check the Allow response header (or https://instanode.dev/docs/api) for the supported methods.",
+	},
+	"payload_too_large": {
+		AgentAction: "Tell the user the request body is too big. Have them shrink it — see per-endpoint limits at https://instanode.dev/docs/api.",
+	},
+	"unsupported_media_type": {
+		AgentAction: "Tell the user the Content-Type is wrong. Have them use application/json for JSON routes or multipart/form-data for /deploy/new and /stacks/new — see https://instanode.dev/docs/api.",
+	},
 }
 
 // ErrorResponse is the canonical JSON shape for every 4xx/5xx response.
