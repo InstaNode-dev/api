@@ -11,7 +11,6 @@ plans:
     display_name: "Anonymous"
     audience: "pre-claim"
     price_monthly_cents: 0
-    trial_days: 0
     limits:
       provisions_per_day: 5
       postgres_storage_mb: 10
@@ -41,7 +40,6 @@ plans:
     display_name: "Free"
     audience: "registered"
     price_monthly_cents: 0
-    trial_days: 0
     limits:
       provisions_per_day: 5
       postgres_storage_mb: 10
@@ -66,7 +64,6 @@ plans:
   hobby:
     display_name: "Hobby"
     price_monthly_cents: 900
-    trial_days: 14
     limits:
       provisions_per_day: -1
       postgres_storage_mb: 1024
@@ -96,7 +93,6 @@ plans:
     display_name: "Hobby (yearly)"
     price_monthly_cents: 9000
     billing_period: "yearly"
-    trial_days: 14
     limits:
       provisions_per_day: -1
       postgres_storage_mb: 1024
@@ -121,7 +117,6 @@ plans:
   pro:
     display_name: "Pro"
     price_monthly_cents: 4900
-    trial_days: 0
     limits:
       provisions_per_day: -1
       postgres_storage_mb: 5120
@@ -148,7 +143,6 @@ plans:
     display_name: "Pro (yearly)"
     price_monthly_cents: 49000
     billing_period: "yearly"
-    trial_days: 0
     limits:
       provisions_per_day: -1
       postgres_storage_mb: 5120
@@ -173,7 +167,6 @@ plans:
   team:
     display_name: "Team"
     price_monthly_cents: 19900
-    trial_days: 0
     limits:
       provisions_per_day: -1
       postgres_storage_mb: -1
@@ -200,7 +193,6 @@ plans:
     display_name: "Team (yearly)"
     price_monthly_cents: 199000
     billing_period: "yearly"
-    trial_days: 0
     limits:
       provisions_per_day: -1
       postgres_storage_mb: -1
@@ -225,7 +217,6 @@ plans:
   growth:
     display_name: "Growth"
     price_monthly_cents: 9900
-    trial_days: 0
     limits:
       provisions_per_day: -1
       postgres_storage_mb: 5120
