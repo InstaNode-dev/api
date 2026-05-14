@@ -537,11 +537,27 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 			if e, ok := err.(*fiber.Error); ok {
 				code = e.Code
 			}
-			return c.Status(code).JSON(fiber.Map{
-				"ok":      false,
-				"error":   "internal_error",
-				"message": err.Error(),
-			})
+			var errKey, msg string
+			switch code {
+			case fiber.StatusNotFound:
+				errKey, msg = "not_found", "The requested resource was not found"
+			case fiber.StatusMethodNotAllowed:
+				errKey, msg = "method_not_allowed", "Method not allowed"
+			case fiber.StatusRequestEntityTooLarge:
+				errKey, msg = "payload_too_large", "Request payload exceeds the maximum allowed size"
+			case fiber.StatusUnsupportedMediaType:
+				errKey, msg = "unsupported_media_type", "Content-Type not supported for this endpoint"
+			default:
+				errKey, msg = "internal_error", err.Error()
+			}
+			// Mirror production: route everything through the canonical
+			// envelope writer so handler-tests see the same shape as a
+			// live cluster does. WriteFiberError returns the sentinel —
+			// swallow it here so Fiber's default 500 doesn't overwrite
+			// the body we already committed. See the matching note in
+			// internal/router/router.go.
+			_ = handlers.WriteFiberError(c, code, errKey, msg)
+			return nil
 		},
 		ProxyHeader: "X-Forwarded-For",
 	})
