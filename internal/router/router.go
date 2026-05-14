@@ -713,6 +713,24 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// validatePrivateDeployFields with POST /deploy/new so the rule-set is
 	// audited in one place.
 	api.Patch("/deployments/:id", deployH.Patch)
+	// Deploy TTL keepers (Wave FIX-J — migration 045). make-permanent flips
+	// expires_at to NULL; /ttl sets a custom expires_at = now()+hours.
+	// Both mutate state, so RequireWritable to reject impersonated sessions.
+	// Anonymous tier is rejected inside the handler with the
+	// "claim the account" agent_action.
+	api.Post("/deployments/:id/make-permanent", middleware.RequireWritable(), deployH.MakePermanent)
+	api.Post("/deployments/:id/ttl", middleware.RequireWritable(), deployH.SetTTL)
+
+	// Team settings — Wave FIX-J. GET is open to any team member; PATCH
+	// requires admin role (owner or admin) because flipping the default
+	// affects every future /deploy/new on the team.
+	teamSettingsH := handlers.NewTeamSettingsHandler(db)
+	api.Get("/team/settings", teamSettingsH.Get)
+	api.Patch("/team/settings",
+		middleware.RequireWritable(),
+		middleware.RequireRole(middleware.RoleAdmin),
+		teamSettingsH.Update,
+	)
 
 	// GitHub auto-deploy (migration 035). Customers wire a deployment to
 	// a GitHub repo; pushes to the tracked branch trigger a fresh deploy.

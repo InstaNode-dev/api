@@ -139,6 +139,37 @@ func newAgentActionDeploymentLimitReached(tier string, limit int) string {
 	}
 }
 
+// newAgentActionDeployAutoExpire24h is the headline copy attached to every
+// new auto_24h-TTL deploy. Tells the LLM agent the three explicit routes to
+// keep the deploy permanent so it can relay them to the user.
+//
+// This is NOT a 4xx wall — it's the success-path agent_action embedded in the
+// 202 response. The four-contract requirements still apply: imperative
+// opening, specific reason ("auto-expires in 24h"), exact next actions
+// (make-permanent endpoint, ttl endpoint, team settings), full https URL.
+// The string is intentionally longer than the 280-char tweet ceiling because
+// it has to name THREE next actions; this is the canonical exception to
+// the soft target documented at the top of this file.
+func newAgentActionDeployAutoExpire24h(deployID, expiresAt string) string {
+	return fmt.Sprintf(
+		"Tell the user this deployment auto-expires in 24h (at %s UTC). Three ways to keep it: (1) call POST https://api.instanode.dev/api/v1/deployments/%s/make-permanent to keep it forever, (2) call POST https://api.instanode.dev/api/v1/deployments/%s/ttl {\"hours\":<1..8760>} for a custom TTL, or (3) flip the team default to permanent via PATCH https://api.instanode.dev/api/v1/team/settings {\"default_deployment_ttl_policy\":\"permanent\"} so future deploys never auto-expire. Six reminder emails will fire over the final 12h.",
+		expiresAt, deployID, deployID,
+	)
+}
+
+// AgentActionDeployMakePermanentAnonymous is returned when an anonymous tier
+// caller tries to call POST /deployments/:id/make-permanent. Anonymous deploys
+// are forced to 24h TTL and can't be kept; the only escape is to claim.
+const AgentActionDeployMakePermanentAnonymous = "Tell the user anonymous deploys cannot be made permanent — they always expire in 24h. Claim the account at https://instanode.dev/start to keep deploys, then redeploy and call make-permanent."
+
+// AgentActionDeployTTLHoursOutOfRange is returned when POST
+// /deployments/:id/ttl receives an hours value outside 1..8760.
+const AgentActionDeployTTLHoursOutOfRange = "Tell the user the TTL hours must be between 1 and 8760 (1 hour to 1 year). Have them retry with a valid number — see https://instanode.dev/docs/deploy-ttl."
+
+// AgentActionTeamSettingsInvalidTTLPolicy is returned when PATCH
+// /api/v1/team/settings receives an invalid default_deployment_ttl_policy.
+const AgentActionTeamSettingsInvalidTTLPolicy = "Tell the user the default_deployment_ttl_policy must be 'auto_24h' or 'permanent'. Have them retry the PATCH with one of those values — see https://instanode.dev/docs/team-settings."
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Private-deploy walls (Track A — migration 020)
 // ─────────────────────────────────────────────────────────────────────────────
