@@ -345,11 +345,59 @@ func newAgentActionBackupRateLimited(tier string, perDay int) string {
 	)
 }
 
-// AgentActionRestoreRequiresPro is returned when a hobby/free team hits
-// POST /api/v1/resources/:id/restore. Restore is the Pro upgrade hook —
-// Hobby can take backups but cannot restore from them without upgrading.
-// Names the gated feature, the required tier, and the upgrade URL.
-const AgentActionRestoreRequiresPro = "Tell the user self-serve restore requires Pro tier. Hobby keeps 7-day backups but cannot restore — have them upgrade at https://instanode.dev/pricing for 30-day retention + 1-click restore. Takes 30 seconds."
+// AgentActionRestoreRequiresPro is returned when a free/anonymous team
+// hits POST /api/v1/resources/:id/restore. Restore is the first paid
+// upgrade hook past Hobby. We deliberately name PRO here (and the
+// HobbyPlus copy below for Hobby-tier callers) rather than always
+// nudging to Pro — see AgentActionRestoreRequiresHobbyPlus for the
+// Hobby→Hobby Plus path.
+const AgentActionRestoreRequiresPro = "Tell the user self-serve restore requires the Pro plan or higher. Have them upgrade at https://instanode.dev/pricing for 30-day retention + 1-click restore. Takes 30 seconds."
+
+// AgentActionRestoreRequiresHobbyPlus is the FIX-H (#66/#Q48 B36) fix.
+// Pre-fix the Hobby-tier restore wall returned the Pro-upgrade copy,
+// which silently skip-tiered the customer past the cheapest restore-
+// enabled plan ($19 Hobby Plus) and onto Pro ($49). For a Hobby
+// customer the right ladder is:
+//
+//	Hobby ($9, no restore) → Hobby Plus ($19, RESTORE) → Pro ($49) → Team
+//
+// So the 402 copy returned to a Hobby-tier caller points to Hobby Plus,
+// not Pro. Pro is still the right target for free/anonymous callers
+// because Hobby Plus has no claim-free entry path — a free user must
+// upgrade through Hobby first, at which point the next nudge naturally
+// surfaces Hobby Plus.
+const AgentActionRestoreRequiresHobbyPlus = "Tell the user self-serve restore unlocks at Hobby Plus ($19/mo). Have them upgrade at https://instanode.dev/pricing — Hobby Plus is the cheapest tier with one-click restore."
+
+// AgentActionRestoreInflight is returned when a second POST /restore
+// arrives while a prior restore for the same resource is still in
+// status='pending' or 'running'. Letting both run would race
+// pg_restore --clean against itself and corrupt the target DB.
+// Names the conflicting operation and the action: wait for the prior
+// restore to finish, or contact support if it's stuck.
+const AgentActionRestoreInflight = "Tell the user a restore is already in progress for this resource. Have them wait — re-POST once GET /restores shows the prior row as 'ok' or 'failed' at https://instanode.dev/app. If it stays 'running' past 30 minutes, contact support."
+
+// AgentActionRestoreDestructiveAckRequired is returned when an in-place
+// restore (no target_resource_id) is requested without the explicit
+// destructive_acknowledgment: true field in the body. In-place restore
+// runs `pg_restore --clean --if-exists` which DROPs every table in the
+// target DB — we refuse that without an explicit ack so an agent that
+// "just wants a backup test" can't wipe a live customer DB.
+const AgentActionRestoreDestructiveAckRequired = "Tell the user in-place restore is destructive: pg_restore --clean drops every table in the target DB. Have them re-send with destructive_acknowledgment: true OR pass target_resource_id to restore into a fresh DB. See https://instanode.dev/llms-full.txt."
+
+// AgentActionRestoreTargetCrossTeam is returned when target_resource_id
+// belongs to a different team. We surface this as 403 rather than 404
+// when the resource_id is syntactically valid but cross-tenant — the
+// caller already proved ownership of the SOURCE resource, so a generic
+// 404 on the target would be misleading.
+const AgentActionRestoreTargetCrossTeam = "Tell the user target_resource_id must belong to the same team as the source. Have them check the target resource id at https://instanode.dev/app — restoring into another team's database is not allowed."
+
+// AgentActionBackupIntegrityFailed is returned when a restore-time
+// SHA-256 verification fails: the recomputed digest of the S3 object
+// does not match the stored sha256. Either the S3 object was corrupted
+// in transit, the row's digest was tampered with, or we hit a rare
+// storage-side bit-rot. None of these are recoverable by the agent —
+// the only safe next step is operator escalation.
+const AgentActionBackupIntegrityFailed = "Tell the user this backup's integrity check failed (SHA-256 mismatch). The backup is unsafe to replay — have them email enterprise@instanode.dev with the backup_id. Status at https://instanode.dev/status."
 
 // AgentActionRestoreBackupNotReady is returned when POST /restore references
 // a backup_id that exists but is not in status='ok' (still pending/running,

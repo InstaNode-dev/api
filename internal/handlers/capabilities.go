@@ -42,6 +42,12 @@ type tierCapabilities struct {
 	BackupRetentionDays   int            `json:"backup_retention_days"`
 	BackupRestoreEnabled  bool           `json:"backup_restore_enabled"`
 	ManualBackupsPerDay   int            `json:"manual_backups_per_day"`
+	// RPOMinutes / RTOMinutes — FIX-H #Q50 (B36). 0 means
+	// "not promised" (no scheduled backups / no self-serve restore on
+	// the tier). Lets an agent reason about durability requirements
+	// per-tier without a second round-trip.
+	RPOMinutes            int            `json:"rpo_minutes"`
+	RTOMinutes            int            `json:"rto_minutes"`
 	AnnualDiscountPercent int            `json:"annual_discount_percent"`
 	UpgradeURL            string         `json:"upgrade_url"`
 }
@@ -142,6 +148,8 @@ func (h *CapabilitiesHandler) Get(c *fiber.Ctx) error {
 			BackupRetentionDays:   h.plans.BackupRetentionDays(e.name),
 			BackupRestoreEnabled:  h.plans.BackupRestoreEnabled(e.name),
 			ManualBackupsPerDay:   h.plans.ManualBackupsPerDay(e.name),
+			RPOMinutes:            h.plans.RPOMinutes(e.name),
+			RTOMinutes:            h.plans.RTOMinutes(e.name),
 			AnnualDiscountPercent: annualDiscountPercent(all, e.name),
 			UpgradeURL:            upgradeURL,
 		})

@@ -354,7 +354,7 @@ func TestCreateRestore_Pro_Success(t *testing.T) {
 		RETURNING id::text
 	`, fix.resourceID, fix.userID).Scan(&backupID))
 
-	bodyJSON, _ := json.Marshal(map[string]string{"backup_id": backupID})
+	bodyJSON, _ := json.Marshal(map[string]any{"backup_id": backupID, "destructive_acknowledgment": true})
 	resp := doBackupRequest(t, fix.app, http.MethodPost, fix.jwt, fix.resourceToken, "/restore", bodyJSON)
 	defer resp.Body.Close()
 
@@ -390,7 +390,7 @@ func TestCreateRestore_Hobby_402(t *testing.T) {
 		RETURNING id::text
 	`, fix.resourceID, fix.userID).Scan(&backupID))
 
-	bodyJSON, _ := json.Marshal(map[string]string{"backup_id": backupID})
+	bodyJSON, _ := json.Marshal(map[string]any{"backup_id": backupID, "destructive_acknowledgment": true})
 	resp := doBackupRequest(t, fix.app, http.MethodPost, fix.jwt, fix.resourceToken, "/restore", bodyJSON)
 	defer resp.Body.Close()
 
@@ -425,7 +425,7 @@ func TestCreateRestore_BackupNotReady_409(t *testing.T) {
 		RETURNING id::text
 	`, fix.resourceID, fix.userID).Scan(&backupID))
 
-	bodyJSON, _ := json.Marshal(map[string]string{"backup_id": backupID})
+	bodyJSON, _ := json.Marshal(map[string]any{"backup_id": backupID, "destructive_acknowledgment": true})
 	resp := doBackupRequest(t, fix.app, http.MethodPost, fix.jwt, fix.resourceToken, "/restore", bodyJSON)
 	defer resp.Body.Close()
 
@@ -468,7 +468,7 @@ func TestCreateRestore_BackupResourceMismatch_400(t *testing.T) {
 		RETURNING id::text
 	`, otherResourceID, fix.userID).Scan(&backupID))
 
-	bodyJSON, _ := json.Marshal(map[string]string{"backup_id": backupID})
+	bodyJSON, _ := json.Marshal(map[string]any{"backup_id": backupID, "destructive_acknowledgment": true})
 	resp := doBackupRequest(t, fix.app, http.MethodPost, fix.jwt, fix.resourceToken, "/restore", bodyJSON)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -480,8 +480,9 @@ func TestCreateRestore_BackupResourceMismatch_400(t *testing.T) {
 // TestCreateRestore_BackupNotFound_404 — unknown backup_id is 404.
 func TestCreateRestore_BackupNotFound_404(t *testing.T) {
 	fix := setupBackupFixture(t, "pro")
-	bodyJSON, _ := json.Marshal(map[string]string{
-		"backup_id": uuid.NewString(),
+	bodyJSON, _ := json.Marshal(map[string]any{
+		"backup_id":                  uuid.NewString(),
+		"destructive_acknowledgment": true,
 	})
 	resp := doBackupRequest(t, fix.app, http.MethodPost, fix.jwt, fix.resourceToken, "/restore", bodyJSON)
 	defer resp.Body.Close()
@@ -537,4 +538,194 @@ func TestListRestores_InvalidUUID_400(t *testing.T) {
 	resp := doBackupRequest(t, fix.app, http.MethodGet, fix.jwt, "not-a-uuid", "/restores", nil)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FIX-H regression tests — wave H, B36 BugBash 56-67 / Q45-Q50 / R6 / A2.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestRestore_ReplayBlocked — FIX-H #57/#Q45. Once a restore for a
+// resource is pending or running, a second POST must 409 with
+// restore_in_progress + the AgentActionRestoreInflight copy. Without
+// this guard pg_restore --clean would race itself.
+func TestRestore_ReplayBlocked(t *testing.T) {
+	fix := setupBackupFixture(t, "pro")
+
+	var backupID string
+	require.NoError(t, fix.db.QueryRowContext(context.Background(), `
+		INSERT INTO resource_backups (resource_id, status, backup_kind, tier_at_backup, triggered_by)
+		VALUES ($1::uuid, 'ok', 'scheduled', 'pro', $2::uuid)
+		RETURNING id::text
+	`, fix.resourceID, fix.userID).Scan(&backupID))
+
+	// First POST — succeeds, leaves a 'pending' row.
+	body1, _ := json.Marshal(map[string]any{"backup_id": backupID, "destructive_acknowledgment": true})
+	resp1 := doBackupRequest(t, fix.app, http.MethodPost, fix.jwt, fix.resourceToken, "/restore", body1)
+	defer resp1.Body.Close()
+	require.Equal(t, http.StatusOK, resp1.StatusCode)
+
+	// Second POST — must be rejected.
+	body2, _ := json.Marshal(map[string]any{"backup_id": backupID, "destructive_acknowledgment": true})
+	resp2 := doBackupRequest(t, fix.app, http.MethodPost, fix.jwt, fix.resourceToken, "/restore", body2)
+	defer resp2.Body.Close()
+	assert.Equal(t, http.StatusConflict, resp2.StatusCode)
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(resp2.Body).Decode(&body))
+	assert.Equal(t, "restore_in_progress", body["error"])
+	action, _ := body["agent_action"].(string)
+	assert.Contains(t, action, "Tell the user a restore is already in progress")
+
+	// Exactly one restore row should exist for the resource (the first call's).
+	var count int
+	require.NoError(t, fix.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM resource_restores WHERE resource_id = $1::uuid`,
+		fix.resourceID,
+	).Scan(&count))
+	assert.Equal(t, 1, count, "second POST must not insert a row")
+}
+
+// TestRestore_TargetNewDB — FIX-H #58/#A2. target_resource_id directs
+// the worker to restore into a DIFFERENT resource. The row carries the
+// target id; the source row is untouched (no destructive ack needed).
+func TestRestore_TargetNewDB(t *testing.T) {
+	fix := setupBackupFixture(t, "pro")
+
+	// Backup on the source.
+	var backupID string
+	require.NoError(t, fix.db.QueryRowContext(context.Background(), `
+		INSERT INTO resource_backups (resource_id, status, backup_kind, tier_at_backup, triggered_by)
+		VALUES ($1::uuid, 'ok', 'scheduled', 'pro', $2::uuid)
+		RETURNING id::text
+	`, fix.resourceID, fix.userID).Scan(&backupID))
+
+	// Target — separate postgres resource on the same team.
+	var targetID, targetToken string
+	require.NoError(t, fix.db.QueryRowContext(context.Background(), `
+		INSERT INTO resources (team_id, resource_type, tier, status)
+		VALUES ($1::uuid, 'postgres', 'pro', 'active')
+		RETURNING id::text, token::text
+	`, fix.teamID).Scan(&targetID, &targetToken))
+
+	// Note: NO destructive_acknowledgment — restore-to-new-DB doesn't
+	// require it (the user explicitly chose a different target).
+	body, _ := json.Marshal(map[string]any{
+		"backup_id":          backupID,
+		"target_resource_id": targetToken,
+	})
+	resp := doBackupRequest(t, fix.app, http.MethodPost, fix.jwt, fix.resourceToken, "/restore", body)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var respBody map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&respBody))
+	assert.Equal(t, false, respBody["in_place"], "target_resource_id branch must report in_place=false")
+
+	// Restore row lands on the target, not the source.
+	var gotResourceID string
+	restoreID, _ := respBody["restore_id"].(string)
+	require.NotEmpty(t, restoreID)
+	require.NoError(t, fix.db.QueryRowContext(context.Background(),
+		`SELECT resource_id::text FROM resource_restores WHERE id = $1::uuid`,
+		restoreID,
+	).Scan(&gotResourceID))
+	assert.Equal(t, targetID, gotResourceID, "restore row resource_id must be the target")
+}
+
+// TestRestore_RequiresDestructiveAck — FIX-H #67/#Q49. In-place restore
+// (no target_resource_id) without destructive_acknowledgment: true is
+// rejected with 400 destructive_ack_required.
+func TestRestore_RequiresDestructiveAck(t *testing.T) {
+	fix := setupBackupFixture(t, "pro")
+
+	var backupID string
+	require.NoError(t, fix.db.QueryRowContext(context.Background(), `
+		INSERT INTO resource_backups (resource_id, status, backup_kind, tier_at_backup, triggered_by)
+		VALUES ($1::uuid, 'ok', 'scheduled', 'pro', $2::uuid)
+		RETURNING id::text
+	`, fix.resourceID, fix.userID).Scan(&backupID))
+
+	// Body explicitly omits destructive_acknowledgment.
+	body, _ := json.Marshal(map[string]any{"backup_id": backupID})
+	resp := doBackupRequest(t, fix.app, http.MethodPost, fix.jwt, fix.resourceToken, "/restore", body)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var respBody map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&respBody))
+	assert.Equal(t, "destructive_ack_required", respBody["error"])
+	action, _ := respBody["agent_action"].(string)
+	assert.Contains(t, action, "destructive")
+
+	// No restore row was inserted.
+	var count int
+	require.NoError(t, fix.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM resource_restores WHERE resource_id = $1::uuid`,
+		fix.resourceID,
+	).Scan(&count))
+	assert.Equal(t, 0, count)
+}
+
+// TestRestore_HobbyAgentActionPointsToHobbyPlus — FIX-H #66/#Q48. The
+// 402 envelope on a Hobby-tier restore must point to Hobby Plus ($19),
+// the cheapest restore-enabled plan, NOT Pro ($49).
+func TestRestore_HobbyAgentActionPointsToHobbyPlus(t *testing.T) {
+	fix := setupBackupFixture(t, "hobby")
+
+	var backupID string
+	require.NoError(t, fix.db.QueryRowContext(context.Background(), `
+		INSERT INTO resource_backups (resource_id, status, backup_kind, tier_at_backup, triggered_by)
+		VALUES ($1::uuid, 'ok', 'scheduled', 'hobby', $2::uuid)
+		RETURNING id::text
+	`, fix.resourceID, fix.userID).Scan(&backupID))
+
+	body, _ := json.Marshal(map[string]any{"backup_id": backupID, "destructive_acknowledgment": true})
+	resp := doBackupRequest(t, fix.app, http.MethodPost, fix.jwt, fix.resourceToken, "/restore", body)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusPaymentRequired, resp.StatusCode)
+
+	var respBody map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&respBody))
+	assert.Equal(t, "upgrade_required", respBody["error"])
+	action, _ := respBody["agent_action"].(string)
+	assert.Contains(t, action, "Hobby Plus", "Hobby callers must be nudged to Hobby Plus, not Pro")
+	assert.NotContains(t, action, "Pro plan", "must not route past Hobby Plus straight to Pro")
+}
+
+// TestRestore_CrossTenantBackupID_404 — FIX-H #64/#Q46. A cross-tenant
+// backup_id guess must return 404 backup_not_found (not 400). The
+// pre-fix code surfaced a 400 backup_resource_mismatch which leaked
+// "this id exists somewhere on the platform".
+func TestRestore_CrossTenantBackupID_404(t *testing.T) {
+	fix := setupBackupFixture(t, "pro")
+
+	// Create a separate team + user + resource + backup. The fix's caller
+	// must not be able to tell whether this id exists at all.
+	otherTeamID := testhelpers.MustCreateTeamDB(t, fix.db, "pro")
+	var otherUserID string
+	require.NoError(t, fix.db.QueryRowContext(context.Background(),
+		`INSERT INTO users (team_id, email) VALUES ($1::uuid, $2) RETURNING id::text`,
+		otherTeamID, testhelpers.UniqueEmail(t),
+	).Scan(&otherUserID))
+	var otherResourceID string
+	require.NoError(t, fix.db.QueryRowContext(context.Background(), `
+		INSERT INTO resources (team_id, resource_type, tier, status)
+		VALUES ($1::uuid, 'postgres', 'pro', 'active')
+		RETURNING id::text
+	`, otherTeamID).Scan(&otherResourceID))
+	var crossTeamBackupID string
+	require.NoError(t, fix.db.QueryRowContext(context.Background(), `
+		INSERT INTO resource_backups (resource_id, status, backup_kind, tier_at_backup, triggered_by)
+		VALUES ($1::uuid, 'ok', 'scheduled', 'pro', $2::uuid)
+		RETURNING id::text
+	`, otherResourceID, otherUserID).Scan(&crossTeamBackupID))
+
+	body, _ := json.Marshal(map[string]any{
+		"backup_id":                  crossTeamBackupID,
+		"destructive_acknowledgment": true,
+	})
+	resp := doBackupRequest(t, fix.app, http.MethodPost, fix.jwt, fix.resourceToken, "/restore", body)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode, "cross-tenant backup_id must return 404, not 400")
+	var respBody map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&respBody))
+	assert.Equal(t, "backup_not_found", respBody["error"])
 }

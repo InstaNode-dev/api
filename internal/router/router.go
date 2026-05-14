@@ -482,6 +482,12 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	internalResendH := handlers.NewInternalResendMagicLinkHandler(db, cfg, mlMailer)
 	app.Post("/internal/email/resend-magic-link", internalResendH.Resend)
 
+	// FIX-H (#65/#Q47) — credit the per-team manual-backup daily counter
+	// when the worker observes a manual backup failing terminally. Same
+	// fail-closed auth posture as the other /internal/* routes.
+	internalRefundH := handlers.NewInternalBackupRefundHandler(db, rdb, cfg)
+	app.Post("/internal/teams/:id/backup-quota/refund", internalRefundH.Refund)
+
 	// §10.20 cached-aggregation endpoints. Separate handlers from BillingHandler
 	// so the caching contract (Redis + singleflight + Cache-Control headers)
 	// is visible at the route + handler boundary, not buried inside the billing
