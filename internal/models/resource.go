@@ -97,8 +97,24 @@ type Resource struct {
 	ParentResourceID *uuid.UUID
 	// PausedAt records when status flipped from 'active' to 'paused'. Cleared
 	// (NULL) when the resource resumes. Added by migration 024.
-	PausedAt  sql.NullTime
-	CreatedAt time.Time
+	PausedAt sql.NullTime
+	// LastSeenAt is stamped by the worker's resource_heartbeat job on a
+	// successful probe. NULL means "never probed yet." Added by migration
+	// 030_resource_heartbeat.
+	LastSeenAt sql.NullTime
+	// Degraded is set by the worker's resource_heartbeat job when a probe
+	// fails. The dashboard reads this to surface "your Postgres is
+	// unreachable" banners. Added by migration 030_resource_heartbeat.
+	Degraded bool
+	// DegradedReason carries the last probe error string. Cleared when
+	// Degraded transitions back to false. Heartbeat truncates to 500 chars.
+	// Added by migration 030_resource_heartbeat.
+	DegradedReason sql.NullString
+	// LastReconciledAt is stamped by the worker's provisioner_reconciler
+	// to prevent tight-loop re-sweeping of the same pending row. Added by
+	// migration 030_resource_heartbeat.
+	LastReconciledAt sql.NullTime
+	CreatedAt        time.Time
 }
 
 // ErrResourceNotFound is returned when a resource lookup yields no rows.
@@ -134,7 +150,8 @@ type CreateResourceParams struct {
 // makes it easy to add a new column without touching half a dozen functions.
 const resourceColumns = `id, team_id, token, resource_type, name, connection_url, key_prefix, tier,
        env, fingerprint, cloud_vendor, country_code, status, migration_status,
-       expires_at, storage_bytes, provider_resource_id, created_request_id, parent_resource_id, paused_at, created_at`
+       expires_at, storage_bytes, provider_resource_id, created_request_id, parent_resource_id, paused_at,
+       last_seen_at, degraded, degraded_reason, last_reconciled_at, created_at`
 
 // scanResource reads a single resources row in the order defined by resourceColumns.
 func scanResource(row interface {
@@ -146,7 +163,9 @@ func scanResource(row interface {
 		&r.ID, &r.TeamID, &r.Token, &r.ResourceType, &r.Name, &r.ConnectionURL, &r.KeyPrefix,
 		&r.Tier, &r.Env, &r.Fingerprint, &r.CloudVendor, &r.CountryCode, &r.Status,
 		&r.MigrationStatus, &r.ExpiresAt, &r.StorageBytes, &r.ProviderResourceID, &r.CreatedRequestID,
-		&parentID, &r.PausedAt, &r.CreatedAt,
+		&parentID, &r.PausedAt,
+		&r.LastSeenAt, &r.Degraded, &r.DegradedReason, &r.LastReconciledAt,
+		&r.CreatedAt,
 	); err != nil {
 		return nil, err
 	}

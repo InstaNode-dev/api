@@ -40,6 +40,15 @@ const openAPISpec = `{
   },
   "servers": [{ "url": "https://instant.dev", "description": "Production" }],
   "paths": {
+    "/livez": {
+      "get": {
+        "summary": "Liveness probe",
+        "description": "Returns 200 unconditionally with body {\"alive\":true}. NO database check, NO migration check, NO auth. Exists purely to distinguish 'process alive' from 'process ready' for k8s liveness/readiness probe split. Mirrored on provisioner-sidecar (:8092), worker-healthz (:8091), and migrator (:8090).",
+        "responses": {
+          "200": { "description": "Process is alive", "content": { "application/json": { "schema": { "type": "object", "properties": { "alive": { "type": "boolean", "const": true } }, "required": ["alive"] } } } }
+        }
+      }
+    },
     "/healthz": {
       "get": {
         "summary": "Health check",

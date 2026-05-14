@@ -363,6 +363,15 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			received_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_razorpay_webhook_events_received_at ON razorpay_webhook_events(received_at)`,
+		// 030_resource_heartbeat — companion for the worker's provisioner_reconciler
+		// and resource_heartbeat jobs (shipped 2026-05-13). Mirrored here so a fresh
+		// SetupTestDB has the columns the heartbeat-driven resource model fields read.
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ`,
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS degraded BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS degraded_reason TEXT`,
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS last_reconciled_at TIMESTAMPTZ`,
+		`CREATE INDEX IF NOT EXISTS idx_resources_degraded ON resources(degraded) WHERE degraded`,
+		`CREATE INDEX IF NOT EXISTS idx_resources_pending_sweep ON resources(status, created_at) WHERE status = 'pending'`,
 		// 031_backups — customer-facing Postgres backup + restore tables.
 		`CREATE TABLE IF NOT EXISTS resource_backups (
 			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
