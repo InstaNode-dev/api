@@ -95,17 +95,25 @@ func IsAdminEmail(email string) bool {
 //	  "ok": false,
 //	  "error": "forbidden",
 //	  "message": "platform-admin access required",
+//	  "request_id": "<x-request-id>",
+//	  "retry_after_seconds": null,
 //	  "agent_action": "Tell the user this endpoint requires platform-admin access..."
 //	}
+//
+// W12: request_id + retry_after_seconds match the canonical
+// handlers.ErrorResponse envelope so agents that learn the shape once can
+// inspect any 4xx from this API without per-layer special cases.
 func RequireAdmin() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		email := GetEmail(c)
 		if !IsAdminEmail(email) {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-				"ok":           false,
-				"error":        "forbidden",
-				"message":      "platform-admin access required",
-				"agent_action": adminForbiddenAgentAction,
+				"ok":                  false,
+				"error":               "forbidden",
+				"message":             "platform-admin access required",
+				"request_id":          GetRequestID(c),
+				"retry_after_seconds": nil,
+				"agent_action":        adminForbiddenAgentAction,
 			})
 		}
 		return c.Next()

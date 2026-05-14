@@ -112,13 +112,20 @@ func AdminRateLimit(rdb *redis.Client) fiber.Handler {
 			// RequireAdmin 403 body. Any drift (extra field, different
 			// message wording) leaks "the prefix is right but you're
 			// probing too fast" — exactly the signal we deny attackers.
+			// W12: request_id + retry_after_seconds added to match the
+			// canonical envelope; both fields are also populated on the
+			// RequireAdmin 403, so the bodies stay identical up to the
+			// per-request request_id value (which would be present on
+			// either path anyway).
 			metrics.FingerprintAbuseBlocked.Inc()
 			c.Locals(LocalKeyAdminRateLimitExceeded, true)
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-				"ok":           false,
-				"error":        "forbidden",
-				"message":      "platform-admin access required",
-				"agent_action": adminForbiddenAgentAction,
+				"ok":                  false,
+				"error":               "forbidden",
+				"message":             "platform-admin access required",
+				"request_id":          GetRequestID(c),
+				"retry_after_seconds": nil,
+				"agent_action":        adminForbiddenAgentAction,
 			})
 		}
 		return c.Next()

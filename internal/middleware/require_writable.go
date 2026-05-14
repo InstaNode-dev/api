@@ -93,12 +93,18 @@ func isMutatingMethod(method string) bool {
 //	  "ok": false,
 //	  "error": "read_only_session",
 //	  "message": "this session is read-only (admin impersonation) — mutations are disabled",
+//	  "request_id": "<x-request-id>",
+//	  "retry_after_seconds": null,
 //	  "agent_action": "Tell the user this is a read-only impersonated session..."
 //	}
 //
 // `read_only_session` is distinct from the generic "forbidden" code so an
 // agent inspecting the response can branch on "I need to ask the user to
 // switch back" without a substring match on the agent_action prose.
+//
+// W12: request_id + retry_after_seconds match the canonical
+// handlers.ErrorResponse envelope so the impersonation gate's body has the
+// same field set as any other 4xx from this API.
 func RequireWritable() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		// Fast path: non-impersonated sessions are the vast majority of
@@ -111,10 +117,12 @@ func RequireWritable() fiber.Handler {
 			return c.Next()
 		}
 		return c.Status(http.StatusForbidden).JSON(fiber.Map{
-			"ok":           false,
-			"error":        "read_only_session",
-			"message":      "this session is read-only (admin impersonation) — mutations are disabled",
-			"agent_action": readOnlyForbiddenAgentAction,
+			"ok":                  false,
+			"error":               "read_only_session",
+			"message":             "this session is read-only (admin impersonation) — mutations are disabled",
+			"request_id":          GetRequestID(c),
+			"retry_after_seconds": nil,
+			"agent_action":        readOnlyForbiddenAgentAction,
 		})
 	}
 }
