@@ -104,6 +104,33 @@ curl -sf http://localhost:${NODE_PORT}/healthz
 
 ---
 
+## Step 6b: Post-deploy smoke (catches the 2026-05-13 outage class)
+
+`/healthz` only checks the api process — it does NOT exercise the api→provisioner
+gRPC auth path. The 2026-05-13 outage shipped a green `/healthz` while every
+`/db/new` returned 503 because `PROVISIONER_SECRET` was rotated without
+restarting the provisioner pods (the auth interceptor closes over `secret`
+at server boot). The script below catches that class of failure:
+
+```bash
+EXPECTED_COMMIT=$(git rev-parse --short HEAD)
+NODE_PORT=$(kubectl get svc instant-api -n instant -o jsonpath='{.spec.ports[0].nodePort}')
+bash scripts/post-deploy-smoke.sh "http://localhost:${NODE_PORT}" "${EXPECTED_COMMIT}"
+```
+
+The script asserts `/healthz` commit_id matches the just-built SHA, then
+POSTs to `/db/new` and asserts the response is 200/201/202/402/429 (NOT a
+503 with a provisioner-error body). Exit code 3 specifically signals the
+auth-path regression.
+
+**If exit code 3:** Run
+`kubectl rollout restart deployment/instant-provisioner -n instant-infra`
+to force a re-read of the rotated secret, then re-run the smoke.
+
+**If any other non-zero exit:** **STOP.** Show the script output.
+
+---
+
 ## Step 7: E2E tests
 
 ```bash
