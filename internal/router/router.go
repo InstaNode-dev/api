@@ -230,6 +230,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// `app` (no /api/v1 group, no auth) below.
 	capabilitiesH := handlers.NewCapabilitiesHandler(planRegistry)
 	incidentsH := handlers.NewIncidentsHandler()
+	statusH := handlers.NewStatusHandler(db, rdb)
 
 	// ── Routes ───────────────────────────────────────────────────────────────
 
@@ -267,6 +268,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// reserves the response shape for the future incident-feed worker.
 	app.Get("/api/v1/capabilities", capabilitiesH.Get)
 	app.Get("/api/v1/incidents", incidentsH.List)
+	// Public real-backend status: replaces the dashboard's client-side
+	// probe loop with a server-side aggregate driven by the worker's
+	// `uptime_prober` job. Cached 60s in Redis. No auth — anyone can ask
+	// "is instanode up". See handlers/status.go.
+	app.Get("/api/v1/status", statusH.Get)
 
 	// MCP authorization profile — RFC 8414 / OAuth 2.0 Protected Resource Metadata.
 	app.Get("/.well-known/oauth-protected-resource", handlers.ServeOAuthProtectedResourceMetadata)
