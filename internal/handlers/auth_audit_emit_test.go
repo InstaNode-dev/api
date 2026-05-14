@@ -30,8 +30,15 @@ import (
 	"instant.dev/internal/testhelpers"
 )
 
-// magicLinkMigration mirrors db/migrations/013_magic_links.sql so tests can
-// bring up the table without depending on the full migration set. Idempotent.
+// magicLinkMigration mirrors db/migrations/013_magic_links.sql + the
+// 041_magic_link_send_status.sql additions so tests can bring up the table
+// without depending on the full migration set. Idempotent — uses ALTER
+// ADD COLUMN IF NOT EXISTS so it's safe against pre-041 test DBs.
+//
+// The email_send_* columns were added in migration 041 to support the
+// worker's reconciler (post 2026-05-14 RESEND_API_KEY=CHANGE_ME outage).
+// CreateMagicLink writes 'pending' to email_send_status on every insert,
+// so the test table MUST carry that column or the insert errors out.
 const magicLinkMigration = `
 CREATE TABLE IF NOT EXISTS magic_links (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -42,8 +49,16 @@ CREATE TABLE IF NOT EXISTS magic_links (
     consumed_at  TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE magic_links
+    ADD COLUMN IF NOT EXISTS email_send_status TEXT NOT NULL DEFAULT 'pending',
+    ADD COLUMN IF NOT EXISTS email_send_attempts INT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS email_send_last_error TEXT,
+    ADD COLUMN IF NOT EXISTS email_send_last_attempted_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_magic_links_token ON magic_links (token_hash) WHERE consumed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_magic_links_email ON magic_links (email, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_magic_links_reconcile
+    ON magic_links (created_at, email_send_status)
+    WHERE email_send_status IN ('pending', 'send_failed');
 `
 
 // magicLinkTestApp builds a minimal Fiber app exposing only the magic-link

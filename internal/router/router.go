@@ -425,7 +425,16 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 
 	// Magic-link email login. Start is POST (the dashboard's login form
 	// submits to it); Callback is GET (the user's email client links to it).
-	mlH := handlers.NewMagicLinkHandler(db, cfg, emailClient, authH)
+	//
+	// The email client is wrapped in a circuit breaker that opens after 5
+	// consecutive send failures and stays open for 30s. When open,
+	// SendMagicLink returns errCircuitOpen without invoking the inner client,
+	// which the Start handler treats as any other send failure (warn log,
+	// status='send_failed' persisted, 202 to the caller). NR-facing
+	// counters (email.circuit.attempts/failures/opens) live on the
+	// handlers package and are surfaced through GetMagicLinkCircuitMetrics.
+	mlMailer := handlers.NewCircuitBreakingMagicLinkMailer(emailClient)
+	mlH := handlers.NewMagicLinkHandlerWithMailer(db, cfg, mlMailer, authH)
 	app.Post("/auth/email/start", mlH.Start)
 	app.Get("/auth/email/callback", mlH.Callback)
 
@@ -458,6 +467,20 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	internalTermPortal := &razorpaybilling.Portal{DB: db, Cfg: cfg}
 	internalTerminateH := handlers.NewInternalTerminateHandler(db, cfg, internalTermPortal.CancelAtCycleEnd)
 	app.Post("/internal/teams/:id/terminate", internalTerminateH.Terminate)
+
+	// Internal worker-driven resend for magic_links that failed their first
+	// send attempt. The worker's magic_link_reconciler periodic job (every
+	// 60s) sweeps rows stuck at email_send_status IN ('pending', 'send_failed')
+	// inside the 15-minute TTL window and POSTs the row id here.
+	// Same fail-closed posture as /internal/teams/:id/terminate: when
+	// WORKER_INTERNAL_JWT_SECRET is unset, every call 401s.
+	//
+	// Reuses mlMailer (the circuit-wrapped mailer) so the breaker sees
+	// every email attempt — primary sends AND worker-driven resends. If
+	// the provider is degraded, the breaker opens on whichever path hits
+	// it first, and both paths immediately fast-fail.
+	internalResendH := handlers.NewInternalResendMagicLinkHandler(db, cfg, mlMailer)
+	app.Post("/internal/email/resend-magic-link", internalResendH.Resend)
 
 	// §10.20 cached-aggregation endpoints. Separate handlers from BillingHandler
 	// so the caching contract (Redis + singleflight + Cache-Control headers)
