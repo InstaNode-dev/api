@@ -61,14 +61,34 @@ var AuthLoginURL = "https://instanode.dev/login"
 // remediation prose either way.
 const unauthorizedAgentAction = "The user's INSTANODE_TOKEN is invalid or expired. Have them log in at https://instanode.dev/login to mint a new one."
 
-// respondUnauthorized writes the canonical 401 body shape used by RequireAuth:
+// unauthorizedMessage is the human-readable explanation paired with the
+// "unauthorized" error code in the envelope. Required by the canonical
+// ErrorResponse schema (see handlers/openapi.go) — programmatic clients
+// branch on `error`, humans/dashboards render `message`.
+const unauthorizedMessage = "Authentication required: missing, malformed, or expired session token."
+
+// respondUnauthorized writes the canonical 401 body shape used by RequireAuth.
+// It mirrors the handlers.ErrorResponse schema so an agent inspecting any 401
+// from this API sees one envelope regardless of which layer wrote the body:
 //
 //	{
 //	  "ok": false,
 //	  "error": "unauthorized",
+//	  "message": "Authentication required: ...",
+//	  "request_id": "<x-request-id>",
+//	  "retry_after_seconds": null,
 //	  "agent_action": "The user's INSTANODE_TOKEN is invalid or expired...",
 //	  "upgrade_url": "https://instanode.dev/login"
 //	}
+//
+// Why request_id + retry_after_seconds + message live in the middleware
+// envelope (W12, retro-3 finding): every documented field in
+// handlers.ErrorResponse is in the response — agents that learn the envelope
+// shape once via /openapi.json don't have to special-case the
+// middleware-emitted 401. request_id is pulled from the same Fiber local
+// that RequestID() populates, so it echoes the X-Request-ID header (the
+// agent can quote it when emailing support). retry_after_seconds is
+// unconditionally null on a 401 — re-auth is the remediation, not a retry.
 //
 // agent_action is the verbatim sentence the calling agent should surface to
 // the human user, per the §10.15 agent-action contract. upgrade_url points
@@ -78,10 +98,13 @@ const unauthorizedAgentAction = "The user's INSTANODE_TOKEN is invalid or expire
 // WWW-Authenticate headers in a future PR happens in one place.
 func respondUnauthorized(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-		"ok":           false,
-		"error":        "unauthorized",
-		"agent_action": unauthorizedAgentAction,
-		"upgrade_url":  AuthLoginURL,
+		"ok":                  false,
+		"error":               "unauthorized",
+		"message":             unauthorizedMessage,
+		"request_id":          GetRequestID(c),
+		"retry_after_seconds": nil,
+		"agent_action":        unauthorizedAgentAction,
+		"upgrade_url":         AuthLoginURL,
 	})
 }
 
@@ -189,14 +212,27 @@ func audienceMatches(aud jwt.ClaimStrings, canonical string) bool {
 
 // rejectAudienceMismatch writes an RFC 6750 §3.1-style 401 with a structured
 // error keyword agents can branch on.
+//
+// W12: the envelope carries the same full shape as respondUnauthorized —
+// message, request_id, retry_after_seconds, agent_action, upgrade_url — so
+// an agent inspecting either flavour of 401 sees the same field set.
+// error_description is retained alongside `message` because RFC 6750 §3.1
+// names that exact field as the human-readable detail paired with the
+// error keyword in the WWW-Authenticate header; downstream OAuth-aware
+// clients look for it.
 func rejectAudienceMismatch(c *fiber.Ctx) error {
 	canonical := CanonicalResourceURLFor(c)
 	c.Set("WWW-Authenticate",
 		`Bearer realm="instanode", error="invalid_token", error_description="audience mismatch", resource="`+canonical+`"`)
 	return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-		"ok":                false,
-		"error":             audienceMismatchError,
-		"error_description": "audience mismatch",
+		"ok":                  false,
+		"error":               audienceMismatchError,
+		"error_description":   "audience mismatch",
+		"message":             "Token audience does not match this server (RFC 8707). Mint a new token bound to " + canonical + ".",
+		"request_id":          GetRequestID(c),
+		"retry_after_seconds": nil,
+		"agent_action":        unauthorizedAgentAction,
+		"upgrade_url":         AuthLoginURL,
 	})
 }
 

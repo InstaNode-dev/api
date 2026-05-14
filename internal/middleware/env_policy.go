@@ -193,13 +193,16 @@ func RequireEnvAccess(action string, opts ...EnvPolicyOption) fiber.Handler {
 		// the other two middleware-level constants.
 		agentAction := envPolicyDeniedAgentAction(env, formatAllowedRoles(allowed), action, role)
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"ok":            false,
-			"error":         "env_policy_denied",
-			"env":           env,
-			"action":        action,
-			"role":          role,
-			"allowed_roles": allowed,
-			"agent_action":  agentAction,
+			"ok":                  false,
+			"error":               "env_policy_denied",
+			"message":             "env_policy denies " + action + " on env=" + env + " for role=" + role,
+			"request_id":          GetRequestID(c),
+			"retry_after_seconds": nil,
+			"env":                 env,
+			"action":              action,
+			"role":                role,
+			"allowed_roles":       allowed,
+			"agent_action":        agentAction,
 		})
 	}
 }
