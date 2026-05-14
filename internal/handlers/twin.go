@@ -134,9 +134,9 @@ func (h *TwinHandler) ProvisionTwin(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch source resource")
 	}
 	if !source.TeamID.Valid || source.TeamID.UUID != teamID {
-		// 403 not 404: caller passed an id they presumably know — the
-		// meaningful failure mode is authz, not existence ambiguity.
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this resource")
+		// 404 not 403: never confirm the existence of resources owned by
+		// other teams. Mirrors GetCredentials/Get/Delete/Pause/Resume.
+		return respondError(c, fiber.StatusNotFound, "not_found", "Source resource not found")
 	}
 
 	// Only the three "real" provisionable resource types are in scope —

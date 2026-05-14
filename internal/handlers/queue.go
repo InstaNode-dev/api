@@ -204,7 +204,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("queue.new.soft_delete_failed", "error", delErr, "resource_id", resource.ID)
 		}
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision NATS credentials")
+		return respondProvisionFailed(c, err, "Failed to provision NATS credentials")
 	}
 
 	// Encrypt and persist the connection URL.
@@ -337,7 +337,7 @@ func (h *QueueHandler) newQueueAuthenticated(
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("queue.new.soft_delete_failed_auth", "error", delErr, "resource_id", resource.ID)
 		}
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision NATS credentials")
+		return respondProvisionFailed(c, err, "Failed to provision NATS credentials")
 	}
 
 	// Encrypt and persist the connection URL.

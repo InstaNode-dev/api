@@ -148,11 +148,19 @@ const openAPISpec = `{
     "/webhook/receive/{token}": {
       "post": {
         "summary": "Receive a webhook payload",
-        "description": "Accepts any HTTP method. Stores headers + body in Redis with a 24h TTL. Returns the stored request ID.",
-        "parameters": [{ "name": "token", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "description": "Accepts ANY HTTP method (GET/POST/PUT/DELETE) so verification-challenge flows like Slack URL verify reach the handler. Stores method, path, query string, all duplicate headers (sensitive ones — Authorization, Cookie, X-Api-Key, X-Auth-Token, Proxy-Authorization, Set-Cookie — are redacted to '[REDACTED]'), and the raw body (capped at 1 MiB) in Redis with a tier-based TTL. The ring buffer per token is capped at the tier's webhook_requests_stored limit; the 101st payload evicts the oldest and sets response header X-Webhook-Rotated: <token>. If the resource has an HMAC secret set, every request must carry a valid X-Hub-Signature-256 header (sha256=<hex of HMAC-SHA256(secret, body)>) or returns 401. Senders may pass X-Idempotency-Key for safe retries — the same key replays the original response without writing a duplicate entry.",
+        "parameters": [
+          { "name": "token", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "X-Hub-Signature-256", "in": "header", "required": false, "schema": { "type": "string" }, "description": "sha256=<hex> — required only when the webhook resource has hmac_secret configured." },
+          { "name": "X-Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string" }, "description": "Opaque key (e.g. from Stripe's Idempotency-Key); two requests with the same key replay the original response." }
+        ],
         "requestBody": { "content": { "application/json": {}, "application/x-www-form-urlencoded": {}, "text/plain": {} } },
         "responses": {
-          "200": { "description": "Payload stored", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string" } } } } } }
+          "200": { "description": "Payload stored", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string" } } } } } },
+          "401": { "description": "HMAC signature missing or invalid (when hmac_secret is set on the resource).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "404": { "description": "Token not found.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "410": { "description": "Token exists but resource status != 'active'.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "413": { "description": "Request body exceeds the 1 MiB cap.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
@@ -1047,9 +1055,9 @@ const openAPISpec = `{
     "/api/v1/billing/checkout": {
       "post": {
         "summary": "Create a Razorpay subscription and return its hosted-page URL",
-        "description": "Mints a Razorpay subscription for the requested plan (hobby or pro) tied to the authenticated team. The dashboard redirects the user to the returned short_url to complete payment; on success Razorpay fires subscription.activated to /razorpay/webhook and the team's plan_tier is elevated atomically. The Team tier currently returns 400 tier_unavailable — only ops can set it via /internal/set-tier. plan_frequency selects monthly (default) vs yearly billing — yearly returns 503 billing_not_configured until the operator creates the yearly Razorpay plan and sets RAZORPAY_PLAN_ID_*_YEARLY.",
+        "description": "Mints a Razorpay subscription for the requested plan (hobby, hobby_plus, or pro) tied to the authenticated team. The dashboard redirects the user to the returned short_url to complete payment; on success Razorpay fires subscription.activated to /razorpay/webhook and the team's plan_tier is elevated atomically. The Team tier currently returns 400 tier_unavailable — only ops can set it via /internal/set-tier. plan_frequency selects monthly (default) vs yearly billing — yearly returns 503 billing_not_configured until the operator creates the yearly Razorpay plan and sets RAZORPAY_PLAN_ID_*_YEARLY.",
         "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "pro"] }, "plan_frequency": { "type": "string", "enum": ["monthly", "yearly"], "default": "monthly", "description": "Billing cycle. Empty = monthly. Yearly variants follow the same canonical-tier mapping on the webhook side — teams.plan_tier still stores the bare tier name." } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] }, "plan_frequency": { "type": "string", "enum": ["monthly", "yearly"], "default": "monthly", "description": "Billing cycle. Empty = monthly. Yearly variants follow the same canonical-tier mapping on the webhook side — teams.plan_tier still stores the bare tier name." } } } } } },
         "responses": {
           "200": { "description": "Subscription created — redirect user to short_url", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "short_url": { "type": "string", "format": "uri" }, "subscription_id": { "type": "string" } } } } } },
           "400": { "description": "Invalid plan, invalid plan_frequency, or tier_unavailable" },
@@ -1086,9 +1094,9 @@ const openAPISpec = `{
     "/api/v1/billing/change-plan": {
       "post": {
         "summary": "Switch the team's subscription to a different tier",
-        "description": "Hobby↔Pro on the same Razorpay subscription. Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. Team tier is currently not customer-changeable — returns 400 tier_unavailable.",
+        "description": "Hobby ↔ Hobby Plus ↔ Pro on the same Razorpay subscription. Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. Team tier is currently not customer-changeable — returns 400 tier_unavailable.",
         "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "pro"] } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] } } } } } },
         "responses": {
           "200": { "description": "Plan change accepted by Razorpay" },
           "400": { "description": "Invalid plan or tier_unavailable" },
@@ -1112,7 +1120,7 @@ const openAPISpec = `{
                 "required": ["code", "plan"],
                 "properties": {
                   "code": { "type": "string", "description": "Promotion code (case-insensitive)", "example": "LAUNCH50" },
-                  "plan": { "type": "string", "enum": ["hobby", "pro", "team"], "description": "Plan tier the discount must apply to" }
+                  "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro", "team"], "description": "Plan tier the discount must apply to" }
                 }
               }
             }
@@ -1380,7 +1388,7 @@ const openAPISpec = `{
         "summary": "Legacy alias for POST /api/v1/billing/checkout",
         "description": "Kept for backward compatibility with older dashboard/SDK clients. Identical contract to POST /api/v1/billing/checkout. New callers should use the /api/v1 path.",
         "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "pro"] } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] } } } } } },
         "responses": {
           "200": { "description": "Subscription created — redirect user to short_url", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "short_url": { "type": "string", "format": "uri" }, "subscription_id": { "type": "string" } } } } } },
           "400": { "description": "Invalid plan or tier_unavailable" },
@@ -2315,7 +2323,7 @@ const openAPISpec = `{
           "user_id": { "type": "string", "format": "uuid" },
           "team_id": { "type": "string", "format": "uuid" },
           "email": { "type": "string" },
-          "tier": { "type": "string", "enum": ["hobby", "pro", "team"] }
+          "tier": { "type": "string", "enum": ["hobby", "hobby_plus", "pro", "team", "growth"] }
         }
       },
       "StackRequest": {
@@ -2359,7 +2367,7 @@ const openAPISpec = `{
           "user_id": { "type": "string", "format": "uuid" },
           "team_id": { "type": "string", "format": "uuid" },
           "team_name": { "type": "string", "description": "Present only when the team has a non-empty name" },
-          "plan_tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "pro", "team"], "description": "Best-effort enrichment from the teams table; absent on DB lookup failure" }
+          "plan_tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "hobby_plus", "pro", "team", "growth"], "description": "Best-effort enrichment from the teams table; absent on DB lookup failure" }
         },
         "required": ["ok", "user_id", "team_id"]
       },
@@ -2499,7 +2507,7 @@ const openAPISpec = `{
         "description": "Aggregated billing state served by GET /api/v1/billing.",
         "properties": {
           "ok": { "type": "boolean" },
-          "tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "pro", "team"], "description": "Current plan tier from the team record" },
+          "tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "hobby_plus", "pro", "team", "growth"], "description": "Current plan tier from the team record" },
           "subscription_status": { "type": "string", "enum": ["none", "active", "cancelled"], "description": "'none' when no Razorpay subscription exists; 'cancelled' when Razorpay reports cancelled / completed / expired or cancel_at_cycle_end=true; 'active' otherwise. The platform has no trial period (see policy memory project_no_trial_pay_day_one.md); hobby/pro/team are paid from day one" },
           "next_renewal_at": { "type": ["string", "null"], "format": "date-time", "description": "ISO timestamp for next renewal (Razorpay current_end). null when no active subscription" },
           "amount_inr": { "type": ["integer", "null"], "description": "Monthly subscription amount in INR rupees (not paise). Sourced from the most recent paid invoice when available; falls back to the tier-derived price for brand-new subscriptions. null when no subscription on file" },

@@ -11,7 +11,7 @@ package handlers_test
 //   4. PATCH on hobby tier flipping private → 402 with agent_action
 //   5. PATCH with invalid IP → 400 with the bad literal surfaced
 //   6. PATCH on missing deploy → 404
-//   7. PATCH cross-team → 403
+//   7. PATCH cross-team → 404 (never confirm existence to a non-owner)
 //
 // All tests run against the noop compute provider — same as the POST suite.
 // The handler-level contract (status codes, error keys, agent_action, JSON
@@ -368,12 +368,11 @@ func TestDeployPatch_NotFound(t *testing.T) {
 		"PATCH on a missing deploy must be 404 — must NOT leak 'forbidden' (would tell anonymous probers the id-space exists).")
 }
 
-// TestDeployPatch_CrossTeam_Returns403 is case 7: PATCHing a deploy owned by
-// another team is 403, not 404. The ID is known to exist (the auth'd caller
-// owns a different deploy in the same id-space), so 403 is the honest answer
-// and the dashboard can show a "this isn't yours" message instead of a
-// generic 404.
-func TestDeployPatch_CrossTeam_Returns403(t *testing.T) {
+// TestDeployPatch_CrossTeam_Returns404 is case 7: PATCHing a deploy owned by
+// another team is 404, not 403. Returning 403 would confirm the deploy
+// exists in another tenant — 404 keeps cross-team existence opaque and
+// matches GET/DELETE/Logs/UpdateEnv/Redeploy on the same id-space.
+func TestDeployPatch_CrossTeam_Returns404(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -400,8 +399,8 @@ func TestDeployPatch_CrossTeam_Returns403(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	require.Equal(t, http.StatusForbidden, resp.StatusCode,
-		"cross-team PATCH must be 403 — matches GET / DELETE behaviour on the same id-space.")
+	require.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"cross-team PATCH must be 404 — never confirm the deploy's existence to a non-owner.")
 }
 
 // TestDeployPatch_EmptyBody_Returns400 covers a paranoid edge: an empty {}

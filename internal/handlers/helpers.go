@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/gofiber/fiber/v2"
+	"instant.dev/internal/circuit"
 )
 
 // ErrResponseWritten is the sentinel respondError returns to signal "I
@@ -177,6 +178,25 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"unsupported_media_type": {
 		AgentAction: "Tell the user the Content-Type is wrong. Have them use application/json for JSON routes or multipart/form-data for /deploy/new and /stacks/new — see https://instanode.dev/docs/api.",
 	},
+
+	// ── Circuit-breaker shorts ─────────────────────────────────────────────
+	// Returned when an upstream dependency (provisioner gRPC, Razorpay HTTP,
+	// Redis backing DPoP replay-protection) has been failing fast enough
+	// that the breaker opened and we're refusing calls outright. agent_action
+	// sentences point at the status page so the agent surfaces real-time
+	// recovery info (not a static "try again later").
+	"provisioner_unavailable": {
+		AgentAction: "Tell the user the provisioner is temporarily unavailable. Retry in 30 seconds — see live status at https://instanode.dev/status.",
+		UpgradeURL:  "https://instanode.dev/status",
+	},
+	"billing_provider_unavailable": {
+		AgentAction: "Tell the user the billing provider is temporarily unavailable. Retry the upgrade in 60 seconds — see status at https://instanode.dev/status.",
+		UpgradeURL:  "https://instanode.dev/status",
+	},
+	"dpop_replay_check_unavailable": {
+		AgentAction: "Tell the user the replay-protection store is temporarily degraded. Retry in 30 seconds — token is valid; see https://instanode.dev/status for live recovery info.",
+		UpgradeURL:  "https://instanode.dev/status",
+	},
 }
 
 // ErrorResponse is the canonical JSON shape for every 4xx/5xx response.
@@ -346,6 +366,28 @@ func respondErrorWithAgentAction(c *fiber.Ctx, status int, code, message, agentA
 // envelope once per service.
 func WriteFiberError(c *fiber.Ctx, status int, code, message string) error {
 	return respondError(c, status, code, message)
+}
+
+// respondProvisionFailed centralizes the 503 response for any
+// provisioning path (POST /db/new, /cache/new, /nosql/new, /queue/new,
+// /vector/new, twin redeploys). When the provisioner circuit breaker
+// is open it returns the more specific `provisioner_unavailable`
+// envelope so agents that branch on `error` see a code that signals
+// "the dependency itself is down" rather than "your request was
+// malformed but I'm returning 503 anyway".
+//
+// On any other error it returns the original `provision_failed` envelope
+// the call sites used to emit by hand — same wire shape as before so
+// nothing downstream (CLI, dashboard, MCP) needs to change.
+//
+// Lives in helpers.go (not provisioner/) so it can import circuit
+// without creating an import cycle.
+func respondProvisionFailed(c *fiber.Ctx, err error, fallbackMessage string) error {
+	if errors.Is(err, circuit.ErrOpen) {
+		return respondError(c, fiber.StatusServiceUnavailable, "provisioner_unavailable",
+			"The provisioner is temporarily unavailable. Retry in 30 seconds — see https://instanode.dev/status for live status.")
+	}
+	return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", fallbackMessage)
 }
 
 // respondErrorWithRetry is the same as respondError but lets the caller

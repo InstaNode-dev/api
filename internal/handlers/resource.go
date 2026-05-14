@@ -125,8 +125,12 @@ func (h *ResourceHandler) Get(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch resource")
 	}
 
-	if resource.TeamID.UUID != teamID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this resource")
+	if !resource.TeamID.Valid || resource.TeamID.UUID != teamID {
+		// 404 not 403: never confirm the existence of resources owned by
+		// other teams (or unclaimed anonymous resources). The `!Valid`
+		// guard also closes a latent IDOR — without it a JWT with
+		// tid="00000000-..." would match every unclaimed row.
+		return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
 	}
 
 	storageLimitMB := h.plans.StorageLimitMB(resource.Tier, resource.ResourceType)
@@ -175,8 +179,10 @@ func (h *ResourceHandler) Delete(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch resource")
 	}
 
-	if resource.TeamID.UUID != teamID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this resource")
+	if !resource.TeamID.Valid || resource.TeamID.UUID != teamID {
+		// 404 not 403: never confirm the existence of resources owned by
+		// other teams (or unclaimed anonymous resources).
+		return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
 	}
 
 	if err := models.SoftDeleteResource(c.Context(), h.db, resource.ID); err != nil {
@@ -354,8 +360,10 @@ func (h *ResourceHandler) RotateCredentials(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch resource")
 	}
 
-	if resource.TeamID.UUID != teamID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this resource")
+	if !resource.TeamID.Valid || resource.TeamID.UUID != teamID {
+		// 404 not 403: never confirm the existence of resources owned by
+		// other teams (or unclaimed anonymous resources).
+		return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
 	}
 
 	if !resource.ConnectionURL.Valid || resource.ConnectionURL.String == "" {
@@ -482,8 +490,7 @@ func (h *ResourceHandler) RotateCredentials(c *fiber.Ctx) error {
 //	400 invalid_id
 //	401 unauthorized
 //	402 upgrade_required (hobby/free) — carries agent_action + upgrade_url
-//	403 forbidden       (caller doesn't own resource)
-//	404 not_found
+//	404 not_found       (resource missing OR owned by another team)
 //	409 already_paused  (idempotent error — row is already paused)
 //	503 provider_failed / pause_failed (transient infra)
 func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
@@ -512,7 +519,9 @@ func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
 	}
 
 	if !resource.TeamID.Valid || resource.TeamID.UUID != teamID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this resource")
+		// 404 not 403: never confirm the existence of resources owned by
+		// other teams (or unclaimed anonymous resources).
+		return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
 	}
 
 	// Cheap idempotency-error check up front: if the row is already paused
@@ -649,7 +658,9 @@ func (h *ResourceHandler) Resume(c *fiber.Ctx) error {
 	}
 
 	if !resource.TeamID.Valid || resource.TeamID.UUID != teamID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this resource")
+		// 404 not 403: never confirm the existence of resources owned by
+		// other teams (or unclaimed anonymous resources).
+		return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
 	}
 
 	if resource.Status != "paused" {
