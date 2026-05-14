@@ -1407,6 +1407,50 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/team": {
+      "delete": {
+        "summary": "Request team deletion (GDPR Article 17, owner only, 30-day grace)",
+        "description": "Begins right-to-be-forgotten for the caller's team. Owner role required. Body must include confirm_team_slug matching the team's visible slug (defense-in-depth: typo / paste-error short-circuits before any state change). Effect: teams.status flips to deletion_requested, deletion_requested_at = now(), every team resource is paused (status='paused', paused_at=now()), and the active Razorpay subscription is best-effort cancelled. After 30 days the worker's team_deletion_executor hard-destroys customer DBs / S3 backups / PII fields and flips status to tombstoned. Inside the 30-day window the owner can call POST /api/v1/team/restore to halt deletion.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["confirm_team_slug"],
+                "properties": {
+                  "confirm_team_slug": { "type": "string", "description": "Must match the team's visible slug exactly (case-insensitive). Fetch from GET /api/v1/team/summary if unknown." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": { "description": "Deletion request accepted. Response: { ok, deletion_at, grace_window_days, how_to_cancel }. The deletion_at field is the wall-clock instant the worker will tombstone the team." },
+          "400": { "description": "Missing or invalid body / confirm_team_slug." },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Caller is not the team owner." },
+          "404": { "description": "Team not found." },
+          "409": { "description": "slug_mismatch (confirm_team_slug did not match) or already_pending (deletion has already been requested or the team is tombstoned)." }
+        }
+      }
+    },
+    "/api/v1/team/restore": {
+      "post": {
+        "summary": "Cancel a pending team deletion (owner only, inside 30-day grace)",
+        "description": "Reverses a prior DELETE /api/v1/team if invoked within the 30-day grace window. Sets teams.status back to active, resumes paused team resources, and emits team.deletion_canceled. Past the 30-day window the worker has begun (or completed) destruction and restoration is no longer possible — the endpoint returns 410 Gone.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Restored. Response: { ok, status, resumed_resource_count, days_remaining_at_cancel }." },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Caller is not the team owner." },
+          "404": { "description": "Team not found." },
+          "409": { "description": "not_pending — team is not in deletion_requested status." },
+          "410": { "description": "grace_expired — 30 days have elapsed; restoration is no longer possible." }
+        }
+      }
+    },
     "/api/v1/team/summary": {
       "get": {
         "summary": "Aggregated team counts for the dashboard sidebar (cached)",

@@ -88,6 +88,17 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		// Slice 6 (migration 019_env_policy.sql) — mirror the column here
 		// so tests pick it up on every DB bring-up.
 		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS env_policy JSONB NOT NULL DEFAULT '{}'::jsonb`,
+		// 032_team_deletion — GDPR right-to-be-forgotten state machine.
+		// Mirrored here so handler unit tests see the same lifecycle columns
+		// the API and worker drive in production. CHECK omitted from the test
+		// schema on purpose: handlers always write through the typed helpers,
+		// and the production migration carries the constraint; doubling it up
+		// in the test DDL would make ALTER-friendly additions to the enum a
+		// two-place change for no test value.
+		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'`,
+		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS deletion_requested_at TIMESTAMPTZ`,
+		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS tombstoned_at TIMESTAMPTZ`,
+		`CREATE INDEX IF NOT EXISTS idx_teams_pending_deletion ON teams(deletion_requested_at) WHERE status = 'deletion_requested'`,
 		`CREATE TABLE IF NOT EXISTS users (
 			id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			team_id     UUID REFERENCES teams(id) ON DELETE CASCADE,
@@ -581,7 +592,14 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	deployGroup.Delete("/:id", deployH.Delete)
 	deployGroup.Post("/:id/redeploy", deployH.Redeploy)
 
-	api := app.Group("/api/v1", middleware.RequireAuth(cfg))
+	// Register role lookup so RequireRole can resolve the caller's role
+	// against the test DB (mirror of the production wiring in router.go).
+	// Each call replaces the package-level handle — fine for serial tests;
+	// SetupTestDB gives each test its own DB so parallel tests still see a
+	// consistent role lookup for their own data.
+	middleware.SetRoleLookupDB(db)
+
+	api := app.Group("/api/v1", middleware.RequireAuth(cfg), middleware.PopulateTeamRole())
 	whoamiH := handlers.NewWhoamiHandler(db)
 	api.Get("/whoami", whoamiH.Get)
 	api.Get("/resources", resourceH.List)
@@ -596,6 +614,13 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	api.Post("/resources/:id/rotate-credentials", resourceH.RotateCredentials)
 	api.Post("/resources/:id/pause", resourceH.Pause)
 	api.Post("/resources/:id/resume", resourceH.Resume)
+
+	// GDPR right-to-be-forgotten endpoints (migration 032). Owner-only
+	// per RequireRole. The test fixture inserts users with explicit
+	// role='owner' to exercise the success path.
+	teamDelH := handlers.NewTeamDeletionHandler(db, cfg)
+	api.Delete("/team", middleware.RequireRole("owner"), teamDelH.Delete)
+	api.Post("/team/restore", middleware.RequireRole("owner"), teamDelH.Restore)
 	// Slice 3 of env-aware deployments — spawn a same-type, same-family
 	// twin in a new env. Tier-gated to Pro+ inside the handler. Wired here
 	// so handler-layer tests (twin_test.go) exercise the full route stack.

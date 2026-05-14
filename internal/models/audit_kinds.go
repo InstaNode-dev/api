@@ -176,4 +176,36 @@ const (
 	// must not generate a row per result). Metadata:
 	// {count_returned, env_filter}.
 	AuditKindResourceListByTeam = "resource.list_by_team"
+
+	// Right-to-be-forgotten / GDPR Article 17 lifecycle (migration 032).
+	//
+	// AuditKindTeamDeletionRequested fires when an owner calls
+	// DELETE /api/v1/team with a matching confirm_team_slug. The team
+	// enters a 30-day grace window — resources are paused, the Razorpay
+	// subscription is cancelled best-effort, and the worker's
+	// team_deletion_executor will tombstone the row after the window
+	// elapses. Metadata: {requested_by_user_id, confirm_slug_provided,
+	// razorpay_cancel_result}.
+	AuditKindTeamDeletionRequested = "team.deletion_requested"
+
+	// AuditKindTeamDeletionCanceled fires when an owner calls
+	// POST /api/v1/team/restore inside the 30-day grace window. Reverses
+	// the deletion — status returns to 'active', paused resources
+	// resume. Metadata: {canceled_by_user_id, days_remaining_at_cancel}.
+	AuditKindTeamDeletionCanceled = "team.deletion_canceled"
+
+	// AuditKindTombstoned fires when the worker's team_deletion_executor
+	// completes a per-team destruction pass. Metadata:
+	// {resource_count_destroyed, s3_bytes_freed, duration_seconds}.
+	// Distinct from team.deletion_requested so dashboards and the Loops
+	// forwarder can render the two phases independently. Producer: the
+	// worker module (see worker/internal/jobs/team_deletion_executor.go).
+	AuditKindTombstoned = "team.tombstoned"
+
+	// AuditKindTeamDeletionFailed fires when the worker's executor sees
+	// a per-team error (one resource fails to deprovision, S3 delete
+	// errors, etc.) — the team stays in deletion_requested state so an
+	// operator can investigate and re-run. Metadata: {error,
+	// failed_at_step, resource_id (when applicable)}.
+	AuditKindTeamDeletionFailed = "team.deletion_failed"
 )
