@@ -339,7 +339,10 @@ func TestE2E_Persona_ManagementAPI_Unauthenticated(t *testing.T) {
 		{"get-no-auth", http.MethodGet, "/api/v1/resources/" + uuid.NewString()},
 		{"delete-no-auth", http.MethodDelete, "/api/v1/resources/" + uuid.NewString()},
 		{"billing-no-auth", http.MethodPost, "/billing/checkout"},
-		{"billing-cancel-no-auth", http.MethodPost, "/api/v1/billing/cancel"},
+		// /api/v1/billing/cancel intentionally not in this list — self-serve
+		// cancel was removed per policy (no_self_serve_cancel_downgrade);
+		// the route is now unregistered and returns 404, not 401. See
+		// TestE2E_BillingCancel_RouteRemoved below.
 		{"billing-invoices-no-auth", http.MethodGet, "/api/v1/billing/invoices"},
 		{"billing-update-pay-no-auth", http.MethodPost, "/api/v1/billing/update-payment"},
 		{"billing-change-plan-no-auth", http.MethodPost, "/api/v1/billing/change-plan"},
@@ -366,6 +369,23 @@ func TestE2E_Persona_ManagementAPI_Unauthenticated(t *testing.T) {
 				t.Errorf("%s %s: want 401, got %d", tc.method, tc.path, resp.StatusCode)
 			}
 		})
+	}
+}
+
+// TestE2E_BillingCancel_RouteRemoved verifies that POST /api/v1/billing/cancel
+// is no longer registered. Self-serve cancellation was removed per project
+// policy (project_no_self_serve_cancel_downgrade.md) — cancellation flows
+// only through Razorpay's own dashboard, executed by support staff, which
+// fires the subscription.cancelled webhook into /razorpay/webhook.
+//
+// We assert 404 specifically (route not registered) rather than 401
+// (auth-protected route) to lock the removal in. A future regression that
+// re-adds the route would flip this from 404 → 401 and fail the test.
+func TestE2E_BillingCancel_RouteRemoved(t *testing.T) {
+	resp := post(t, "/api/v1/billing/cancel", map[string]any{})
+	readBody(t, resp)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("POST /api/v1/billing/cancel: want 404 (route removed), got %d", resp.StatusCode)
 	}
 }
 

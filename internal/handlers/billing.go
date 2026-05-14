@@ -828,27 +828,19 @@ func resolveTeamFromNotes(ctx context.Context, h *BillingHandler, sub rzpSubscri
 	return uuid.Nil, errors.New("cannot resolve team: missing notes.team_id and no subscription_id")
 }
 
-// CancelSubscriptionAPI handles POST /api/v1/billing/cancel (session JWT).
-func (h *BillingHandler) CancelSubscriptionAPI(c *fiber.Ctx) error {
-	teamIDStr := middleware.GetTeamID(c)
-	teamID, err := uuid.Parse(teamIDStr)
-	if err != nil {
-		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Valid session token required")
-	}
-	if h.cfg.RazorpayKeyID == "" || h.cfg.RazorpayKeySecret == "" {
-		return respondError(c, fiber.StatusServiceUnavailable, "billing_not_configured", "Billing is not configured")
-	}
-	portal := &razorpaybilling.Portal{DB: h.db, Cfg: h.cfg}
-	subID, err := portal.SubscriptionID(c.Context(), teamID)
-	if err != nil {
-		return respondError(c, fiber.StatusBadRequest, "no_subscription", err.Error())
-	}
-	if err := portal.CancelAtCycleEnd(subID); err != nil {
-		slog.Error("billing.cancel.api_failed", "error", err, "team_id", teamID)
-		return respondError(c, fiber.StatusBadGateway, "razorpay_error", "Failed to cancel subscription")
-	}
-	return c.JSON(fiber.Map{"ok": true, "cancelled_at_cycle_end": true})
-}
+// Self-serve cancel was removed per policy — see project memory
+// project_no_self_serve_cancel_downgrade.md. The POST /api/v1/billing/cancel
+// route is no longer registered (see internal/router/router.go), and no
+// handler is exposed here. Cancellation flows through Razorpay's own
+// dashboard, executed by support staff, which fires the subscription.cancelled
+// webhook → handleSubscriptionCancelled in RazorpayWebhook (unchanged).
+//
+// The dashboard surfaces cancellation as a mailto:support@instanode.dev link,
+// not as a button that calls this API.
+//
+// If a future internal flow (RTBF / team deletion) needs to cancel a
+// subscription programmatically, call razorpaybilling.Portal.CancelAtCycleEnd
+// directly — do NOT re-expose this as an HTTP route.
 
 // monthlyAmountINRForTier returns the monthly subscription price in INR rupees
 // for a given plan tier. Used as a fallback when Razorpay has not reported a

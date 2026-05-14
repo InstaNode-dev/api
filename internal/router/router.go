@@ -422,7 +422,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 
 	api.Get("/billing", billing.GetBillingState)
 	api.Post("/billing/checkout", billing.CreateCheckoutAPI)
-	api.Post("/billing/cancel", billing.CancelSubscriptionAPI)
+	// Self-serve POST /billing/cancel was removed per policy — see project
+	// memory project_no_self_serve_cancel_downgrade.md. Cancellation flows
+	// through Razorpay's own dashboard, executed by support staff, which
+	// fires subscription.cancelled → handleSubscriptionCancelled in the
+	// webhook handler (still wired below at /razorpay/webhook).
 	api.Get("/billing/invoices", billing.ListInvoicesAPI)
 	api.Post("/billing/update-payment", billing.UpdatePaymentMethodAPI)
 	api.Post("/billing/change-plan", billing.ChangePlanAPI)
