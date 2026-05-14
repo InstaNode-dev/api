@@ -36,7 +36,7 @@ const openAPISpec = `{
   "info": {
     "title": "instant.dev API",
     "version": "1.0.0",
-    "description": "Zero-friction developer infrastructure. Provision real databases, caches, and queues with a single HTTP call — no account, no Docker, no setup."
+    "description": "Zero-friction developer infrastructure. Provision real databases, caches, and queues with a single HTTP call — no account, no Docker, no setup.\n\n## Idempotency\n\nEvery POST endpoint that creates a resource is idempotent. Two layered protections cover every retry pattern:\n\n1. Explicit Idempotency-Key header (Stripe-shape, 24h TTL). Pass the same opaque key on each retry of a logical operation and the server replays the first response verbatim. Reusing a key with a different body returns 409.\n2. Body-fingerprint fallback (120s TTL). When the header is absent, the server synthesises a key from sha256(scope, route, canonical-body) and dedups identical retries inside a 120s window. Absorbs double-clicks, mobile double-taps, agent retries on transient 5xx, and reverse-proxy retries on network blips. Use the explicit header for true exactly-once across longer windows.\n\nEvery response from a create endpoint carries:\n- X-Idempotency-Source: explicit | fingerprint | miss — which dedup path matched (explicit = caller passed an Idempotency-Key; fingerprint = the body-fingerprint cache replayed; miss = handler ran fresh).\n- X-Idempotent-Replay: true — present only when the response was served from the cache (either path)."
   },
   "servers": [{ "url": "https://api.instanode.dev", "description": "Production" }],
   "paths": {

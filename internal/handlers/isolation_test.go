@@ -21,6 +21,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -172,23 +173,34 @@ func TestIsolation_FingerprintReuse_ReturnsSameToken(t *testing.T) {
 	// Use a random IP so leftover rows from prior test runs don't pollute this test.
 	sharedIP := fmt.Sprintf("10.60.%d.%d", rand.Intn(255), rand.Intn(255))
 	provisionedTokens := make(map[string]bool)
+	// Each provision sends a DISTINCT body so the idempotency middleware's
+	// body-fingerprint fallback (2026-05-14) doesn't dedup them. The
+	// middleware deliberately replays same-fingerprint-same-body POSTs
+	// within 120s; this test wants five genuine provisions, so we vary
+	// the body. The handler's per-day fingerprint dedup still fires on
+	// the 6th call regardless of body — that's what we assert below.
 	for i := 0; i < 5; i++ {
-		req := httptest.NewRequest(http.MethodPost, "/cache/new", nil)
+		body := strings.NewReader(fmt.Sprintf(`{"name":"prov-%d"}`, i))
+		req := httptest.NewRequest(http.MethodPost, "/cache/new", body)
+		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Forwarded-For", sharedIP)
 		resp, err := app.Test(req, 5000)
 		require.NoError(t, err)
-		var body struct {
+		var rb struct {
 			OK    bool   `json:"ok"`
 			Token string `json:"token"`
 		}
-		require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&rb))
 		resp.Body.Close()
-		provisionedTokens[body.Token] = true
+		provisionedTokens[rb.Token] = true
 	}
 	require.Len(t, provisionedTokens, 5, "should have 5 distinct tokens before rate limit kicks in")
 
 	// 6th provision from the same IP — must return one of the existing tokens, not a new one.
-	req := httptest.NewRequest(http.MethodPost, "/cache/new", nil)
+	// Use a body that doesn't match any of the 5 above so the middleware
+	// fingerprint cache misses and the handler's per-day cap fires.
+	req := httptest.NewRequest(http.MethodPost, "/cache/new", strings.NewReader(`{"name":"prov-6"}`))
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Forwarded-For", sharedIP)
 	resp, err := app.Test(req, 5000)
 	require.NoError(t, err)
@@ -301,6 +313,13 @@ func TestIsolation_ManagementAPI_TeamA_CannotReadTeamB_Resources(t *testing.T) {
 // TestIsolation_DBProvision_DifferentFingerprints_GetDifferentCredentials verifies
 // that two callers with different fingerprints receive distinct tokens and
 // non-overlapping connection URLs.
+//
+// The two IPs MUST land in different /24 subnets — both for the test's
+// stated premise ("different fingerprints") and so the idempotency
+// middleware's fingerprint scope doesn't dedup the two calls. The
+// 10.70.0.x range used previously kept both calls in the same /24,
+// which the middleware now (correctly) dedups; we use IPs from genuinely
+// different /24s here.
 func TestIsolation_DBProvision_DifferentFingerprints_GetDifferentCredentials(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
@@ -310,8 +329,8 @@ func TestIsolation_DBProvision_DifferentFingerprints_GetDifferentCredentials(t *
 	app, cleanApp := testhelpers.NewTestAppWithServices(t, db, rdb, "postgres")
 	defer cleanApp()
 
-	tokenA := testhelpers.MustProvisionDB(t, app, "10.70.0.1")
-	tokenB := testhelpers.MustProvisionDB(t, app, "10.70.0.2")
+	tokenA := testhelpers.MustProvisionDB(t, app, "10.70.1.1")
+	tokenB := testhelpers.MustProvisionDB(t, app, "10.70.2.1")
 	defer db.Exec(`DELETE FROM resources WHERE token IN ($1::uuid, $2::uuid)`, tokenA, tokenB)
 
 	assert.NotEqual(t, tokenA, tokenB, "two callers must get distinct DB tokens")
@@ -333,7 +352,9 @@ func TestIsolation_DBProvision_DifferentFingerprints_GetDifferentCredentials(t *
 }
 
 // TestIsolation_CacheProvision_DifferentFingerprints_GetDifferentCredentials mirrors
-// the DB test for Redis cache resources.
+// the DB test for Redis cache resources. Same IP-subnet considerations as
+// the DB sibling above — two distinct /24s so the fingerprint scope
+// doesn't dedup the calls.
 func TestIsolation_CacheProvision_DifferentFingerprints_GetDifferentCredentials(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
@@ -343,8 +364,8 @@ func TestIsolation_CacheProvision_DifferentFingerprints_GetDifferentCredentials(
 	app, cleanApp := testhelpers.NewTestAppWithServices(t, db, rdb, "redis")
 	defer cleanApp()
 
-	tokenA := testhelpers.MustProvisionCache(t, app, "10.71.0.1")
-	tokenB := testhelpers.MustProvisionCache(t, app, "10.71.0.2")
+	tokenA := testhelpers.MustProvisionCache(t, app, "10.71.1.1")
+	tokenB := testhelpers.MustProvisionCache(t, app, "10.71.2.1")
 	defer db.Exec(`DELETE FROM resources WHERE token IN ($1::uuid, $2::uuid)`, tokenA, tokenB)
 
 	assert.NotEqual(t, tokenA, tokenB, "two callers must get distinct Redis tokens")
