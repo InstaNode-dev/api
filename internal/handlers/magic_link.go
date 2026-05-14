@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"log/slog"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"instant.dev/internal/config"
 	"instant.dev/internal/email"
 	"instant.dev/internal/middleware"
@@ -23,17 +25,34 @@ const magicLinkTTL = 15 * time.Minute
 //   POST /auth/email/start    — generates a token, emails the link, returns 202
 //   GET  /auth/email/callback — consumes the token, mints a session JWT,
 //                               302s back to the dashboard with ?session_token=<jwt>
+//
+// The mailer field is the magicLinkMailer interface (defined in
+// internal_resend_magic_link.go) rather than *email.Client so the circuit-
+// breaker wrapper can be slotted in without touching the handler logic.
+// *email.Client satisfies the interface directly.
 type MagicLinkHandler struct {
 	db   *sql.DB
 	cfg  *config.Config
-	mail *email.Client
+	mail magicLinkMailer
 	auth *AuthHandler // for IssueSessionJWT + FindOrCreateUserByEmail
 }
 
 // NewMagicLinkHandler wires the dependencies. Note that we take an AuthHandler
 // rather than reimplementing user/team upsert and JWT signing — the magic-link
 // flow lands users in exactly the same spot the GitHub/Google flows do.
+//
+// Accepts a concrete *email.Client for backwards compatibility with existing
+// router + test call sites. Tests that need to inject a stub or the circuit-
+// breaker wrapper should use NewMagicLinkHandlerWithMailer.
 func NewMagicLinkHandler(db *sql.DB, cfg *config.Config, mail *email.Client, auth *AuthHandler) *MagicLinkHandler {
+	return &MagicLinkHandler{db: db, cfg: cfg, mail: mail, auth: auth}
+}
+
+// NewMagicLinkHandlerWithMailer is the interface-accepting constructor.
+// router.go uses this when wrapping *email.Client with circuitBreakingMailer;
+// tests use it to inject a stub. The narrow magicLinkMailer surface
+// (SendMagicLink only) keeps the test double tiny.
+func NewMagicLinkHandlerWithMailer(db *sql.DB, cfg *config.Config, mail magicLinkMailer, auth *AuthHandler) *MagicLinkHandler {
 	return &MagicLinkHandler{db: db, cfg: cfg, mail: mail, auth: auth}
 }
 
@@ -75,32 +94,77 @@ func (h *MagicLinkHandler) Start(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"ok": true})
 	}
 
-	if _, err := models.CreateMagicLink(c.Context(), h.db, emailAddr, plaintext, returnTo, magicLinkTTL); err != nil {
+	row, err := models.CreateMagicLink(c.Context(), h.db, emailAddr, plaintext, returnTo, magicLinkTTL)
+	if err != nil {
 		slog.Error("magic_link.start.db_insert", "error", err, "request_id", requestID)
 		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"ok": true})
 	}
 
 	link := canonicalAPIBase + "/auth/email/callback?t=" + plaintext
 	sendErr := h.mail.SendMagicLink(c.Context(), emailAddr, link)
-	if sendErr != nil {
-		// Already logged inside email client; we still 202 to the caller so
-		// a probing client cannot fingerprint provider state. The row exists
-		// in magic_links — an operator can re-send manually.
-		slog.Warn("magic_link.start.email_send_failed", "error", sendErr, "request_id", requestID)
-	} else {
-		// Only log the cheerful success line when the provider actually
-		// accepted the message. Previously this fired unconditionally
-		// after the warn line above, causing the false-success telemetry
-		// that hid the 2026-05-14 RESEND_API_KEY=CHANGE_ME outage from NR
-		// alerting (every magic-link request appeared "sent").
-		slog.Info("magic_link.start.sent",
-			"request_id", requestID,
-			// email is intentionally NOT logged at info level to avoid PII spread —
-			// trace through the magic_links table by created_at if needed.
-		)
-	}
+	logMagicLinkSendResult(sendErr, requestID)
+
+	// Persist the send outcome so the worker's magic_link_reconciler can
+	// pick up the row and retry on failure. Failure paths here log but
+	// never propagate — losing the status write is non-fatal (the
+	// reconciler will still see a 'pending' row inside the 15-min TTL
+	// window and retry).
+	persistMagicLinkSendStatus(c.Context(), h.db, row.ID, sendErr, requestID)
 
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"ok": true})
+}
+
+// persistMagicLinkSendStatus writes the send outcome for the row. Failure
+// to write the status is logged but not propagated — the user-visible
+// behaviour (202) is unchanged, and the worker's reconciler will still
+// pick up rows stuck at 'pending' inside the 15-min TTL window.
+//
+// Exposed (package-private) so the same write path is reachable from the
+// /internal/email/resend-magic-link handler the worker calls; the
+// reconciler must use exactly the same MarkMagicLink* helpers that the
+// Start handler uses, otherwise a model-level invariant could drift.
+func persistMagicLinkSendStatus(ctx context.Context, db *sql.DB, id uuid.UUID, sendErr error, requestID string) {
+	if sendErr != nil {
+		if err := models.MarkMagicLinkSendFailed(ctx, db, id, sendErr); err != nil {
+			slog.Error("magic_link.start.persist_failed_status_failed",
+				"error", err,
+				"link_id", id.String(),
+				"request_id", requestID,
+			)
+		}
+		return
+	}
+	if err := models.MarkMagicLinkSent(ctx, db, id); err != nil {
+		slog.Error("magic_link.start.persist_sent_status_failed",
+			"error", err,
+			"link_id", id.String(),
+			"request_id", requestID,
+		)
+	}
+}
+
+// logMagicLinkSendResult logs the success/failure of an email send attempt.
+// Exposed (package-private) for unit testing — the false-success-telemetry
+// bug of 2026-05-14 (the .sent log fired unconditionally AFTER the warn
+// line, hiding the RESEND_API_KEY=CHANGE_ME outage from NR) is exactly
+// the class of bug that is only catchable by an assertion against the
+// emitted log fields. Keep the two branches mutually exclusive: exactly
+// one of {email_send_failed, sent} must fire per call. The .sent line is
+// what NR alerts off; do not move it back outside the else branch.
+//
+// email is intentionally NOT logged at info level to avoid PII spread —
+// trace through the magic_links table by created_at if needed.
+func logMagicLinkSendResult(sendErr error, requestID string) {
+	if sendErr != nil {
+		slog.Warn("magic_link.start.email_send_failed",
+			"error", sendErr,
+			"request_id", requestID,
+		)
+		return
+	}
+	slog.Info("magic_link.start.sent",
+		"request_id", requestID,
+	)
 }
 
 // Callback handles GET /auth/email/callback?t=<plaintext>.
