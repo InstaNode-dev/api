@@ -89,6 +89,51 @@ func NewDeployHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, planReg
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+// truncateForAudit caps an error summary so a multi-paragraph build log
+// doesn't blow up audit_log.metadata. The full error stays in
+// deployments.error_message; audit_log carries the headline only.
+func truncateForAudit(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}
+
+// emitDeployAudit writes one row to audit_log best-effort. Runs in a
+// goroutine so a slow audit insert never blocks the deploy goroutine that
+// just updated the row's terminal status. kind is one of
+// AuditKindDeployCreated / AuditKindDeployHealthy / AuditKindDeployFailed.
+func emitDeployAudit(db *sql.DB, kind string, d *models.Deployment, extra map[string]any) {
+	go func() {
+		meta := map[string]any{
+			"deploy_id": d.ID.String(),
+			"team_id":   d.TeamID.String(),
+		}
+		for k, v := range extra {
+			meta[k] = v
+		}
+		metaBlob, _ := json.Marshal(meta)
+
+		summary := "deploy " + d.AppID + " " + strings.TrimPrefix(kind, "deploy.")
+		ev := models.AuditEvent{
+			TeamID:       d.TeamID,
+			Actor:        "system",
+			Kind:         kind,
+			ResourceType: "deploy",
+			Summary:      summary,
+			Metadata:     metaBlob,
+		}
+		if err := models.InsertAuditEvent(context.Background(), db, ev); err != nil {
+			slog.Warn("audit.emit.failed",
+				"kind", kind,
+				"team_id", d.TeamID,
+				"deploy_id", d.ID,
+				"error", err,
+			)
+		}
+	}()
+}
+
 // generateAppID produces an 8-char lowercase hex string via crypto/rand.
 func generateAppID() (string, error) {
 	b := make([]byte, 4)
@@ -187,11 +232,18 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
+	startedAt := time.Now()
+
 	resolvedEnv, err := ResolveVaultRefs(ctx, h.db, h.cfg.AESKey, d.TeamID, d.Env, d.EnvVars)
 	if err != nil {
 		slog.Error("deploy.run_deploy.vault_resolve_failed",
 			"app_id", d.AppID, "team_id", d.TeamID, "env", d.Env, "error", err)
 		_ = models.UpdateDeploymentStatus(ctx, h.db, d.ID, "failed", err.Error())
+		// vault resolution happens before the build step — classify as build-stage.
+		emitDeployAudit(h.db, models.AuditKindDeployFailed, d, map[string]any{
+			"failure_stage": "build",
+			"error_summary": truncateForAudit(err.Error(), 256),
+		})
 		return
 	}
 
@@ -210,10 +262,26 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 		slog.Error("deploy.run_deploy.failed",
 			"app_id", d.AppID, "error", err)
 		_ = models.UpdateDeploymentStatus(ctx, h.db, d.ID, "failed", err.Error())
+		// compute.Deploy bundles both the image build and the apply/rollout
+		// step. Without a structured error type from the provider we can't
+		// distinguish in this layer; default to "build" as the most common
+		// failure mode (kaniko build > kube apply).
+		emitDeployAudit(h.db, models.AuditKindDeployFailed, d, map[string]any{
+			"failure_stage": "build",
+			"error_summary": truncateForAudit(err.Error(), 256),
+		})
 		return
 	}
 	_ = models.UpdateDeploymentProviderID(ctx, h.db, d.ID, result.ProviderID, result.AppURL)
 	_ = models.UpdateDeploymentStatus(ctx, h.db, d.ID, result.Status, "")
+
+	// audit_log emit: deploy.healthy fires once compute.Deploy returns
+	// without error and the deployment row has been stamped with the
+	// provider id + status. time_to_healthy is measured from runDeploy
+	// entry; for k8s this includes the kaniko build + apply pipeline.
+	emitDeployAudit(h.db, models.AuditKindDeployHealthy, d, map[string]any{
+		"time_to_healthy_seconds": int(time.Since(startedAt).Round(time.Second).Seconds()),
+	})
 }
 
 // ── POST /deploy/new ─────────────────────────────────────────────────────────
@@ -452,6 +520,14 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed",
 			"Failed to create deployment record")
 	}
+
+	// audit_log emit: deploy.created fires immediately after the row is
+	// inserted — BEFORE the async build runs. Reaching healthy or failed is
+	// reported separately via deploy.healthy / deploy.failed from runDeploy.
+	emitDeployAudit(h.db, models.AuditKindDeployCreated, saved, map[string]any{
+		"env":      saved.Env,
+		"app_name": saved.AppID,
+	})
 
 	// Launch async provisioning; return 202 immediately.
 	go h.runDeploy(saved, tarball)
@@ -749,13 +825,23 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 
+		startedAt := time.Now()
 		result, reErr := h.compute.Redeploy(ctx, d.ProviderID, tarball, d.EnvVars)
 		if reErr != nil {
 			slog.Error("deploy.redeploy.failed", "app_id", appID, "error", reErr)
 			_ = models.UpdateDeploymentStatus(ctx, h.db, d.ID, "failed", reErr.Error())
+			// Redeploy implies the row already exists; failure here is a
+			// rollout (not first-build) issue.
+			emitDeployAudit(h.db, models.AuditKindDeployFailed, d, map[string]any{
+				"failure_stage": "rollout",
+				"error_summary": truncateForAudit(reErr.Error(), 256),
+			})
 			return
 		}
 		_ = models.UpdateDeploymentStatus(ctx, h.db, d.ID, result.Status, "")
+		emitDeployAudit(h.db, models.AuditKindDeployHealthy, d, map[string]any{
+			"time_to_healthy_seconds": int(time.Since(startedAt).Round(time.Second).Seconds()),
+		})
 	}()
 
 	slog.Info("deploy.redeploy.accepted",
