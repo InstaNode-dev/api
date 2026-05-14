@@ -81,16 +81,24 @@ func (h *MagicLinkHandler) Start(c *fiber.Ctx) error {
 	}
 
 	link := canonicalAPIBase + "/auth/email/callback?t=" + plaintext
-	if err := h.mail.SendMagicLink(c.Context(), emailAddr, link); err != nil {
-		// Already logged inside email client; we just don't fail the request.
-		slog.Warn("magic_link.start.email_send_failed", "error", err, "request_id", requestID)
+	sendErr := h.mail.SendMagicLink(c.Context(), emailAddr, link)
+	if sendErr != nil {
+		// Already logged inside email client; we still 202 to the caller so
+		// a probing client cannot fingerprint provider state. The row exists
+		// in magic_links — an operator can re-send manually.
+		slog.Warn("magic_link.start.email_send_failed", "error", sendErr, "request_id", requestID)
+	} else {
+		// Only log the cheerful success line when the provider actually
+		// accepted the message. Previously this fired unconditionally
+		// after the warn line above, causing the false-success telemetry
+		// that hid the 2026-05-14 RESEND_API_KEY=CHANGE_ME outage from NR
+		// alerting (every magic-link request appeared "sent").
+		slog.Info("magic_link.start.sent",
+			"request_id", requestID,
+			// email is intentionally NOT logged at info level to avoid PII spread —
+			// trace through the magic_links table by created_at if needed.
+		)
 	}
-
-	slog.Info("magic_link.start.sent",
-		"request_id", requestID,
-		// email is intentionally NOT logged at info level to avoid PII spread —
-		// trace through the magic_links table by created_at if needed.
-	)
 
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"ok": true})
 }
