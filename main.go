@@ -107,7 +107,13 @@ func main() {
 		defer geoDbs.ASN.Close()
 	}
 
-	emailClient := email.New(cfg.ResendAPIKey)
+	emailClient := email.New(email.Config{
+		Provider:     cfg.EmailProvider,
+		BrevoAPIKey:  cfg.BrevoAPIKey,
+		ResendAPIKey: cfg.ResendAPIKey,
+		FromName:     cfg.EmailFromName,
+		FromAddress:  cfg.EmailFromAddress,
+	})
 
 	plansPath := os.Getenv("PLANS_PATH")
 	if plansPath == "" {
