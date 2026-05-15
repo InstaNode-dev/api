@@ -1,0 +1,180 @@
+# instant.dev/api — Auto-deploy on push to master
+#
+# Why this exists:
+#   Until 2026-05-15, "shipped to master" did NOT mean "running in prod" —
+#   an operator had to manually `docker buildx build && kubectl set image`.
+#   A worker fix landed but never deployed; a user got a broken expiry email
+#   twice as a result. This workflow eliminates that gap.
+#
+# Build context note:
+#   The Dockerfile expects to be invoked from the parent of api/, with
+#   sibling common/ and proto/ directories present (CLAUDE.md convention).
+#   In CI we mirror that by checking out:
+#       . (workspace root)
+#       ├── api/      (this repo)
+#       ├── common/   (sibling repo)
+#       └── proto/    (sibling repo)
+#   then `docker buildx build -f api/Dockerfile .` from the workspace root.
+#
+# Required repo secret:
+#   KUBECONFIG_B64 — base64-encoded kubeconfig with permission to
+#                    `kubectl set image deployment/instant-api -n instant`.
+#                    See CLAUDE.md "Local Kubernetes Setup" for the cluster.
+#
+# GHCR auth uses the per-job GITHUB_TOKEN with `packages: write`.
+
+name: Deploy
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_REPO: ghcr.io/REDACTED/instant-api
+  K8S_NAMESPACE: instant
+  K8S_DEPLOYMENT: instant-api
+  K8S_CONTAINER: api
+  HEALTHZ_URL: https://api.instanode.dev/healthz
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout api (this repo) into ./api
+        uses: actions/checkout@v4
+        with:
+          path: api
+
+      - name: Checkout common sibling into ./common
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: common
+
+      - name: Checkout proto sibling into ./proto
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: proto
+
+      - name: Compute build metadata
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          VERSION="master-${SHORT_SHA}"
+          echo "short_sha=${SHORT_SHA}"  >> "$GITHUB_OUTPUT"
+          echo "build_time=${BUILD_TIME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}"       >> "$GITHUB_OUTPUT"
+          echo "Built ${VERSION} (${BUILD_TIME})"
+
+      - name: Set up Go (for unit tests + go.mod replace directives)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Stage sibling repos for go.mod replace (../common, ../proto)
+        # The api repo's go.mod uses `replace instant.dev/common => ../common`
+        # and `replace instant.dev/proto => ../proto`. When `go test` runs
+        # inside ./api, the relative paths resolve to ./common and ./proto
+        # in the workspace root — which is already correct. No mv needed.
+        run: ls -la
+
+      - name: Run unit tests (short, no integration deps)
+        working-directory: api
+        run: go test ./... -short -count=1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        # Build context = workspace root so Dockerfile's
+        # `COPY proto/`, `COPY common/`, `COPY api/` all resolve.
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            -f api/Dockerfile \
+            --build-arg GIT_SHA="${{ steps.meta.outputs.short_sha }}" \
+            --build-arg BUILD_TIME="${{ steps.meta.outputs.build_time }}" \
+            --build-arg VERSION="${{ steps.meta.outputs.version }}" \
+            -t "${IMAGE_REPO}:${{ steps.meta.outputs.version }}" \
+            -t "${IMAGE_REPO}:latest" \
+            --push \
+            .
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure kubeconfig from KUBECONFIG_B64 secret
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          if [ -z "${KUBECONFIG_B64}" ]; then
+            echo "::error::KUBECONFIG_B64 repo secret is not set. Add it under Settings → Secrets → Actions."
+            exit 1
+          fi
+          mkdir -p "$HOME/.kube"
+          echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl version --client=true
+
+      - name: Roll out new image
+        run: |
+          IMAGE="${IMAGE_REPO}:${{ steps.meta.outputs.version }}"
+          echo "Setting ${K8S_DEPLOYMENT}.${K8S_CONTAINER} to ${IMAGE}"
+          kubectl set image \
+            "deployment/${K8S_DEPLOYMENT}" \
+            "${K8S_CONTAINER}=${IMAGE}" \
+            -n "${K8S_NAMESPACE}"
+          kubectl rollout status \
+            "deployment/${K8S_DEPLOYMENT}" \
+            -n "${K8S_NAMESPACE}" \
+            --timeout=180s
+
+      - name: Verify rolled-out image tag matches built version
+        run: |
+          ROLLED=$(kubectl get deployment "${K8S_DEPLOYMENT}" -n "${K8S_NAMESPACE}" \
+            -o jsonpath="{.spec.template.spec.containers[?(@.name=='${K8S_CONTAINER}')].image}")
+          EXPECTED="${IMAGE_REPO}:${{ steps.meta.outputs.version }}"
+          echo "Live image: ${ROLLED}"
+          echo "Expected:   ${EXPECTED}"
+          if [ "${ROLLED}" != "${EXPECTED}" ]; then
+            echo "::error::Rolled image (${ROLLED}) != expected (${EXPECTED})"
+            exit 1
+          fi
+
+      - name: Curl live /healthz and confirm new SHA is reported
+        run: |
+          SHORT_SHA="${{ steps.meta.outputs.short_sha }}"
+          # Allow up to ~30s for the new pod to start serving the public URL.
+          for i in 1 2 3 4 5 6; do
+            BODY=$(curl -fsSL --max-time 5 "${HEALTHZ_URL}" || echo "")
+            echo "Attempt ${i}: ${BODY}"
+            if echo "${BODY}" | grep -q "${SHORT_SHA}"; then
+              echo "Confirmed live /healthz reports commit_id=${SHORT_SHA}"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::live /healthz never reported commit_id=${SHORT_SHA}"
+          exit 1
