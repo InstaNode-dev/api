@@ -59,6 +59,12 @@ func notifyDeployBody(t *testing.T, fields map[string]string) (*bytes.Buffer, st
 	require.NoError(t, err)
 	_, err = fw.Write([]byte("fake-tarball-bytes"))
 	require.NoError(t, err)
+	// `name` is now a STRICTLY REQUIRED field on /deploy/new (mandatory-
+	// resource-naming contract, 2026-05-16). Inject a default when the
+	// caller's fields map doesn't override it.
+	if _, has := fields["name"]; !has {
+		require.NoError(t, w.WriteField("name", "test deploy"))
+	}
 	for k, v := range fields {
 		require.NoError(t, w.WriteField(k, v))
 	}

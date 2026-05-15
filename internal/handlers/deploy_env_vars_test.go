@@ -27,6 +27,12 @@ func multipartDeployBody(t *testing.T, fields map[string]string) (*bytes.Buffer,
 	require.NoError(t, err)
 	_, err = fw.Write([]byte("fake-tarball"))
 	require.NoError(t, err)
+	// `name` is a STRICTLY REQUIRED field on /deploy/new (mandatory-resource-
+	// naming contract, 2026-05-16). Inject a valid default when the caller
+	// doesn't supply one so legacy deploy tests keep exercising the happy path.
+	if _, has := fields["name"]; !has {
+		require.NoError(t, w.WriteField("name", "test deploy"))
+	}
 	for k, v := range fields {
 		require.NoError(t, w.WriteField(k, v))
 	}
