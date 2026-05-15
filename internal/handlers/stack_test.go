@@ -188,6 +188,17 @@ func multipartBody(t *testing.T, manifestYAML string, tarballs map[string][]byte
 	_, err = io.WriteString(fw, manifestYAML)
 	require.NoError(t, err)
 
+	// `name` is now a STRICTLY REQUIRED field on /stacks/new (mandatory-
+	// resource-naming contract, 2026-05-16). Inject a valid default when the
+	// caller's extraFields map doesn't override it so legacy stack tests keep
+	// exercising the happy path.
+	if _, has := extraFields["name"]; !has {
+		nf, nerr := mw.CreateFormField("name")
+		require.NoError(t, nerr)
+		_, nerr = io.WriteString(nf, "test stack")
+		require.NoError(t, nerr)
+	}
+
 	// Write extra string fields.
 	for k, v := range extraFields {
 		fw, err = mw.CreateFormField(k)

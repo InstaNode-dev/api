@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -205,9 +206,9 @@ func (h *provisionHelper) markRecycleSeen(ctx context.Context, fp string) error 
 // Always read AFTER checkProvisionLimit so the daily-cap dedup branch
 // still wins on its existing path. The recycle gate only fires when:
 //
-//   (a) the recycle_seen:<fp> marker is present, AND
-//   (b) ZERO active anonymous resources exist for this fingerprint
-//       (across all service types — not just the requested one).
+//	(a) the recycle_seen:<fp> marker is present, AND
+//	(b) ZERO active anonymous resources exist for this fingerprint
+//	    (across all service types — not just the requested one).
 //
 // (b) is cross-service on purpose: provisioning 5 Postgres then a Redis is
 // a single agent session, not a recycle. A recycle is specifically the
@@ -471,6 +472,108 @@ func sanitizeName(name string) (string, error) {
 // 400 invalid_name response via sanitizeNameForRequest.
 var errInvalidUTF8Name = errors.New("name contains invalid UTF-8 bytes")
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Mandatory resource naming (BREAKING contract change — 2026-05-16).
+//
+// `name` is now STRICTLY REQUIRED on every provisioning endpoint
+// (POST /db/new, /cache/new, /nosql/new, /queue/new, /storage/new,
+// /webhook/new, /deploy/new, /stacks/new). A missing/empty name leaves the
+// dashboard rendering raw hashes like `db_fcb890cde09d`, which is
+// unacceptable UX. Callers MUST supply a short human label.
+//
+// Validation contract:
+//   - Trim surrounding whitespace.
+//   - After trim: 1–64 chars matching nameValidationRegex.
+//   - Missing / empty-after-trim → 400 `name_required`.
+//   - Present but bad format/length → 400 `invalid_name`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// errCodeNameRequired is the machine-stable error code returned when a
+// provisioning request omits `name` or sends an empty/whitespace-only value.
+const errCodeNameRequired = "name_required"
+
+// errCodeInvalidName is the machine-stable error code returned when `name`
+// is present but fails the length / format validation.
+const errCodeInvalidName = "invalid_name"
+
+// nameMinLength and nameMaxLength are the inclusive length bounds for a
+// resource name, measured in runes after trimming surrounding whitespace.
+const (
+	nameMinLength = 1
+	nameMaxLength = 64
+)
+
+// nameValidationPattern is the regex a resource name must match after
+// trimming: starts with an alphanumeric, followed by any mix of letters,
+// digits, spaces, underscores and hyphens.
+const nameValidationPattern = `^[A-Za-z0-9][A-Za-z0-9 _-]*$`
+
+// nameValidationRegex is the compiled form of nameValidationPattern, compiled
+// once at package init.
+var nameValidationRegex = regexp.MustCompile(nameValidationPattern)
+
+// nameRequiredAgentAction is the verbatim sentence the calling agent surfaces
+// when `name` is missing. Adheres to the U3 contract (agent_action.go):
+// "Tell the user" opening, specific reason, concrete next action.
+const nameRequiredAgentAction = "Tell the user the provisioning request is missing a name. Add a 'name' field with a short human label (1-64 chars; letters, numbers, spaces, dashes) — e.g. \"My App DB\" — and retry."
+
+// invalidNameAgentAction is the verbatim sentence surfaced when `name` is
+// present but invalid (wrong characters or too long).
+const invalidNameAgentAction = "Tell the user the 'name' field is invalid. Use a short human label of 1-64 chars that starts with a letter or digit and contains only letters, numbers, spaces, underscores or dashes — e.g. \"My App DB\" — and retry."
+
+// requireName validates a user-supplied resource name against the mandatory
+// naming contract and returns the trimmed, sanitized name on success.
+//
+// On failure it writes the canonical 400 response (name_required or
+// invalid_name, with the matching agent_action) via respondErrorWithAgentAction
+// and returns ("", ErrResponseWritten). Standard caller pattern:
+//
+//	name, err := requireName(c, body.Name)
+//	if err != nil { return err }
+//
+// requireName runs sanitizeName first (strips control chars / HTML-special
+// chars, rejects invalid UTF-8) so the persisted value is safe across every
+// downstream renderer, then enforces the trim + length + regex contract.
+func requireName(c *fiber.Ctx, raw string) (string, error) {
+	clean, sanErr := sanitizeName(raw)
+	if sanErr != nil {
+		if errors.Is(sanErr, errInvalidUTF8Name) {
+			return "", respondErrorWithAgentAction(c, fiber.StatusBadRequest,
+				errCodeInvalidName,
+				"Field 'name' contains invalid UTF-8 bytes. Use only valid UTF-8 text.",
+				invalidNameAgentAction, "")
+		}
+		return "", respondErrorWithAgentAction(c, fiber.StatusBadRequest,
+			errCodeInvalidName,
+			"Field 'name' could not be sanitized: "+sanErr.Error(),
+			invalidNameAgentAction, "")
+	}
+
+	trimmed := strings.TrimSpace(clean)
+	if trimmed == "" {
+		return "", respondErrorWithAgentAction(c, fiber.StatusBadRequest,
+			errCodeNameRequired,
+			"Field 'name' is required — provide a short human label (1-64 chars) for this resource.",
+			nameRequiredAgentAction, "")
+	}
+
+	if n := utf8.RuneCountInString(trimmed); n < nameMinLength || n > nameMaxLength {
+		return "", respondErrorWithAgentAction(c, fiber.StatusBadRequest,
+			errCodeInvalidName,
+			fmt.Sprintf("Field 'name' must be %d-%d characters after trimming.", nameMinLength, nameMaxLength),
+			invalidNameAgentAction, "")
+	}
+
+	if !nameValidationRegex.MatchString(trimmed) {
+		return "", respondErrorWithAgentAction(c, fiber.StatusBadRequest,
+			errCodeInvalidName,
+			"Field 'name' must start with a letter or digit and contain only letters, numbers, spaces, underscores or dashes.",
+			invalidNameAgentAction, "")
+	}
+
+	return trimmed, nil
+}
+
 // sanitizeNameForRequest wraps sanitizeName with Fiber-aware error handling.
 // On invalid UTF-8 it writes a 400 invalid_name response via respondError
 // and returns ErrResponseWritten — the caller's standard error propagation
@@ -635,9 +738,9 @@ func respondOK(c *fiber.Ctx, resp fiber.Map) error {
 // validates that linking a child of (resourceType, env) is legal for the
 // caller's team. Returns:
 //
-//   (nil, nil)       — no parent_resource_id requested (standalone resource)
-//   (*uuid, nil)     — parent valid; *uuid is the FAMILY ROOT id to store
-//   (nil, fiberErr)  — caller-facing error; response already written
+//	(nil, nil)       — no parent_resource_id requested (standalone resource)
+//	(*uuid, nil)     — parent valid; *uuid is the FAMILY ROOT id to store
+//	(nil, fiberErr)  — caller-facing error; response already written
 //
 // The handlers wire this between the env resolution and CreateResource:
 //
