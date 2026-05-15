@@ -1164,13 +1164,13 @@ const openAPISpec = `{
     },
     "/api/v1/billing/change-plan": {
       "post": {
-        "summary": "Switch the team's subscription to a different tier",
-        "description": "Hobby ↔ Hobby Plus ↔ Pro on the same Razorpay subscription. Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. Team tier is currently not customer-changeable — returns 400 tier_unavailable.",
+        "summary": "Upgrade the team's subscription to a higher tier",
+        "description": "Upgrade-only: Hobby -> Hobby Plus -> Pro on the same Razorpay subscription. Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. Downgrades are NOT self-serve — a target tier at or below the current tier returns 400 downgrade_not_self_serve; email support@instanode.dev. Team tier is currently not customer-changeable — returns 400 tier_unavailable.",
         "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["target_plan"], "properties": { "target_plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] } } } } } },
         "responses": {
           "200": { "description": "Plan change accepted by Razorpay" },
-          "400": { "description": "Invalid plan or tier_unavailable" },
+          "400": { "description": "Invalid plan, same_plan, tier_unavailable, or downgrade_not_self_serve" },
           "401": { "description": "Missing or invalid session token" },
           "404": { "description": "No active subscription" },
           "503": { "description": "Razorpay not configured" }
