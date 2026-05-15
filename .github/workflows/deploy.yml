@@ -48,6 +48,36 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # 2026-05-15: api unit tests require a real Postgres + Redis
+    # (testhelpers.SetupTestDB / SetupTestRedis). First auto-deploy
+    # run failed because no DB was reachable from the runner. These
+    # service containers match the defaults in
+    # api/internal/testhelpers/testhelpers.go:
+    #   defaultTestDBURL = postgres://postgres:postgres@localhost:5432/instant_dev_test
+    #   defaultTestRedisURL = redis://localhost:6379/15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: instant_dev_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
     steps:
       - name: Checkout api (this repo) into ./api
         uses: actions/checkout@v4
@@ -98,6 +128,12 @@ jobs:
 
       - name: Run unit tests (short, no integration deps)
         working-directory: api
+        env:
+          # Match the service container above. testhelpers default would
+          # also work since localhost:5432 is the same, but setting these
+          # explicitly survives any future default-URL drift.
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/instant_dev_test?sslmode=disable
+          TEST_REDIS_URL: redis://localhost:6379/15
         run: go test ./... -short -count=1
 
       - name: Set up Docker Buildx
