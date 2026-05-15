@@ -233,10 +233,19 @@ func Load() *Config {
 		RazorpayPlanIDHobbyPlus:       os.Getenv("RAZORPAY_PLAN_ID_HOBBY_PLUS"),
 		RazorpayPlanIDPro:             os.Getenv("RAZORPAY_PLAN_ID_PRO"),
 		RazorpayPlanIDTeam:            os.Getenv("RAZORPAY_PLAN_ID_TEAM"),
-		RazorpayPlanIDHobbyYearly:     os.Getenv("RAZORPAY_PLAN_ID_HOBBY_YEARLY"),
+		// 2026-05-15: the live instant-secrets uses the `_ANNUAL` suffix
+		// for every yearly plan id. config.go previously read `_YEARLY`
+		// for Hobby + Pro (only HobbyPlus read `_ANNUAL`), so os.Getenv
+		// returned "" and yearly checkout 503'd with
+		// "Razorpay credentials/plans not configured". All four now read
+		// `_ANNUAL` consistently — matching the secret. (Hobby Plus and
+		// Team annual keys aren't in the secret yet; those tiers aren't
+		// a public yearly checkout path, so an empty value is acceptable
+		// until their Razorpay plans are created.)
+		RazorpayPlanIDHobbyYearly:     os.Getenv("RAZORPAY_PLAN_ID_HOBBY_ANNUAL"),
 		RazorpayPlanIDHobbyPlusYearly: os.Getenv("RAZORPAY_PLAN_ID_HOBBY_PLUS_ANNUAL"),
-		RazorpayPlanIDProYearly:       os.Getenv("RAZORPAY_PLAN_ID_PRO_YEARLY"),
-		RazorpayPlanIDTeamYearly:      os.Getenv("RAZORPAY_PLAN_ID_TEAM_YEARLY"),
+		RazorpayPlanIDProYearly:       os.Getenv("RAZORPAY_PLAN_ID_PRO_ANNUAL"),
+		RazorpayPlanIDTeamYearly:      os.Getenv("RAZORPAY_PLAN_ID_TEAM_ANNUAL"),
 		ResendAPIKey:             os.Getenv("RESEND_API_KEY"),
 		EmailProvider:            os.Getenv("EMAIL_PROVIDER"),
 		BrevoAPIKey:              os.Getenv("BREVO_API_KEY"),
