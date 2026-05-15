@@ -2332,8 +2332,9 @@ const openAPISpec = `{
       },
       "ProvisionRequest": {
         "type": "object",
+        "required": ["name"],
         "properties": {
-          "name": { "type": "string", "description": "Optional human-readable label (max 120 chars)" },
+          "name": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9 _-]*$", "description": "REQUIRED. Short human-readable label for this resource (1-64 chars after trimming; must start with a letter or digit, then letters/digits/spaces/underscores/hyphens). Missing/empty → 400 name_required. Bad format/length → 400 invalid_name." },
           "env": { "type": "string", "description": "Optional environment scope (production / staging / dev / ...). Defaults to 'development' (migration 026) so accidental no-env provisions land in the lowest-stakes bucket. Anonymous tier is always 'development'. Every provisioning response echoes the resolved env so callers know which bucket they landed in.", "default": "development" },
           "parent_resource_id": { "type": "string", "format": "uuid", "description": "Optional. Link the new resource into an existing env-twin family — the new row becomes a sibling of the parent (same family root, different env). Validated against same-team + same-type + no-duplicate-twin before provisioning. Authenticated callers only. Errors: 400 type_mismatch (parent is a different resource_type), 403 forbidden_parent_resource (parent belongs to another team), 404 parent_not_found, 409 twin_exists (family already has a row in this env). See GET /api/v1/resources/{id}/family + /api/v1/resources/families." }
         }
@@ -2515,9 +2516,10 @@ const openAPISpec = `{
         "description": "Multipart form. The 'manifest' field is the YAML instant.yaml text; each service declared under services: must have a matching multipart field named after the service whose content is a gzipped tar archive of that service's build context.",
         "properties": {
           "manifest": { "type": "string", "description": "instant.yaml contents. Example: services:\\n  api:\\n    build: ./api\\n    port: 8080\\n  web:\\n    build: ./web\\n    port: 8080\\n    expose: true\\n    env: { API_URL: service://api }" },
+          "name": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9 _-]*$", "description": "REQUIRED. Short human-readable label for this stack (1-64 chars after trimming; must start with a letter or digit, then letters/digits/spaces/underscores/hyphens). Missing/empty → 400 name_required. Bad format/length → 400 invalid_name." },
           "<service-name>": { "type": "string", "format": "binary", "description": "One field per service declared in the manifest, named after the service. Value is a gzipped tar archive containing that service's Dockerfile + source. Total request body cap is 200 MB." }
         },
-        "required": ["manifest"]
+        "required": ["manifest", "name"]
       },
       "StackResponse": {
         "type": "object",
@@ -2610,7 +2612,7 @@ const openAPISpec = `{
         "type": "object",
         "properties": {
           "tarball": { "type": "string", "format": "binary", "description": "gzipped tar archive containing the Dockerfile + source (max 50 MB). When MINIO_ENDPOINT is configured the build context is uploaded to MinIO and kaniko pulls it via the S3 path; otherwise it falls back to a k8s Secret which caps at ~1 MiB." },
-          "name": { "type": "string", "description": "Optional human-readable label" },
+          "name": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9 _-]*$", "description": "REQUIRED. Short human-readable label for this deployment (1-64 chars after trimming; must start with a letter or digit, then letters/digits/spaces/underscores/hyphens). Missing/empty → 400 name_required. Bad format/length → 400 invalid_name." },
           "port": { "type": "integer", "description": "Container port (default 8080)" },
           "env": { "type": "string", "description": "Environment scope (production / staging / dev / ...). Defaults to 'development' when omitted (migration 026 — the resolved env is echoed back as 'environment' on the response so callers know which bucket they landed in)." },
           "env_vars": { "type": "string", "description": "Optional JSON object of env vars to inject into the deployed pod on the FIRST build — e.g. '{\"DATABASE_URL\":\"postgres://...\",\"REDIS_URL\":\"redis://...\"}'. Avoids the (POST /deploy/new) → (PATCH /env) → (POST /redeploy) round-trip pattern. Values may use 'vault://KEY' refs which resolve at deploy time. Keys starting with underscore are reserved and ignored." },
@@ -2621,7 +2623,7 @@ const openAPISpec = `{
           "notify_webhook_secret": { "type": "string", "description": "Optional HMAC-SHA256 signing key. When set, every dispatch includes an X-InstaNode-Signature: sha256=<hex(hmac(secret, body))> header. Stored AES-256-GCM encrypted; plaintext never leaves the request. Omit to dispatch without a signature header." },
           "ttl_policy": { "type": "string", "enum": ["auto_24h", "permanent"], "description": "Wave FIX-J. Sets the deploy's lifecycle. 'auto_24h' (default for new deploys) means the deploy auto-expires 24h from creation; the response's agent_action sentence tells the LLM the three explicit routes to keep it permanent. 'permanent' opts the deploy out of TTL up front — useful for production deploys where the agent already knows the user wants it kept. Anonymous tier is FORCED to auto_24h regardless of caller intent. Team-wide default can be flipped via PATCH /api/v1/team/settings." }
         },
-        "required": ["tarball"]
+        "required": ["tarball", "name"]
       },
       "DeployResponse": {
         "type": "object",

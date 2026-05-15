@@ -49,6 +49,7 @@ func createPrivateDeploy(t *testing.T, app httpTester, sessionJWT, initialIPs st
 	require.NoError(t, err)
 	require.NoError(t, w.WriteField("private", "true"))
 	require.NoError(t, w.WriteField("allowed_ips", initialIPs))
+	require.NoError(t, w.WriteField("name", "test deploy"))
 	require.NoError(t, w.Close())
 
 	req := httptest.NewRequest(http.MethodPost, "/deploy/new", body)
@@ -80,6 +81,7 @@ func createPublicDeploy(t *testing.T, app httpTester, sessionJWT string) string 
 	require.NoError(t, err)
 	_, err = fw.Write([]byte("fake-tarball-bytes"))
 	require.NoError(t, err)
+	require.NoError(t, w.WriteField("name", "test deploy"))
 	require.NoError(t, w.Close())
 
 	req := httptest.NewRequest(http.MethodPost, "/deploy/new", body)

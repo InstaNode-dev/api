@@ -28,6 +28,7 @@ package handlers_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -48,9 +49,10 @@ const bomJSON = "\xef\xbb\xbf{}"
 // errorEnvelope is the canonical { ok, error, message } shape every
 // respondError emits. Same shape used by the existing agent_action_test.go.
 type errorEnvelope struct {
-	OK      bool   `json:"ok"`
-	Error   string `json:"error"`
-	Message string `json:"message"`
+	OK          bool   `json:"ok"`
+	Error       string `json:"error"`
+	Message     string `json:"message"`
+	AgentAction string `json:"agent_action"`
 }
 
 // provisioningEndpoint enumerates the seven /{service}/new endpoints that
@@ -391,4 +393,142 @@ func TestProvisioning_ControlCharsInName_Stripped(t *testing.T) {
 		"response name must not contain CR")
 	assert.NotContains(t, result.Name, "\n",
 		"response name must not contain LF")
+}
+
+// provisioningJSONEndpoints is the set of JSON provisioning endpoints where
+// `name` is a STRICTLY REQUIRED field (mandatory-resource-naming contract,
+// 2026-05-16). The mandatory-name tests below iterate this list so a future
+// JSON provisioning endpoint can't silently skip the contract.
+//
+// /storage/new is intentionally omitted: the storage handler returns 503
+// service_disabled when storageProvider is nil (test env has no MinIO),
+// short-circuiting BEFORE the name gate fires — the same reason
+// provisioningEndpoints excludes it from the BOM/wrong-type tests above.
+var provisioningJSONEndpoints = []string{
+	"/db/new", "/cache/new", "/nosql/new",
+	"/queue/new", "/webhook/new",
+}
+
+// TestProvisioning_NameRequired_MissingOrEmpty_Returns400 verifies that every
+// JSON provisioning endpoint rejects a request whose `name` is missing or
+// empty-after-trim with 400 name_required. This is a BREAKING contract change:
+// before 2026-05-16 a name-less POST returned 201 and the dashboard showed a
+// raw hash like `db_fcb890cde09d`.
+func TestProvisioning_NameRequired_MissingOrEmpty_Returns400(t *testing.T) {
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
+	defer cleanRedis()
+
+	app, cleanApp := testhelpers.NewTestAppWithServices(t, db, rdb, "postgres,redis,mongodb,queue,webhook,storage,vector")
+	defer cleanApp()
+
+	// Each case carries an explicit `name` key so the testhelpers
+	// inject-default-name middleware leaves it untouched.
+	cases := map[string]string{
+		"missing":         `{"env":"development"}`,
+		"empty_string":    `{"name":""}`,
+		"whitespace_only": `{"name":"   "}`,
+	}
+	octet := 10
+	for _, path := range provisioningJSONEndpoints {
+		for label, jsonBody := range cases {
+			octet++
+			t.Run(strings.TrimPrefix(path, "/")+"_"+label, func(t *testing.T) {
+				req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(jsonBody))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-Forwarded-For", fmt.Sprintf("10.96.%d.1", octet))
+				// Opt out of the testhelpers default-name injection so the
+				// name-less body reaches the handler verbatim.
+				req.Header.Set(testhelpers.NoNameDefaultHeader, "1")
+
+				resp, err := app.Test(req, 5000)
+				require.NoError(t, err)
+				defer resp.Body.Close()
+
+				require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+					"%s with %s name must be 400", path, label)
+
+				var env errorEnvelope
+				require.NoError(t, json.NewDecoder(resp.Body).Decode(&env))
+				assert.False(t, env.OK)
+				assert.Equal(t, "name_required", env.Error,
+					"%s must return error code name_required", path)
+			})
+		}
+	}
+}
+
+// TestProvisioning_InvalidName_BadFormat_Returns400 verifies that a `name`
+// which is present but fails the length / character contract is rejected
+// with 400 invalid_name.
+func TestProvisioning_InvalidName_BadFormat_Returns400(t *testing.T) {
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
+	defer cleanRedis()
+
+	app, cleanApp := testhelpers.NewTestAppWithServices(t, db, rdb, "postgres,redis,mongodb,queue,webhook,storage,vector")
+	defer cleanApp()
+
+	// 65-char name (one over the 64-char cap).
+	tooLong := strings.Repeat("a", 65)
+	cases := map[string]string{
+		"leading_symbol": `{"name":"-bad-start"}`,
+		"illegal_char":   `{"name":"bad@name"}`,
+		"too_long":       `{"name":"` + tooLong + `"}`,
+	}
+	octet := 50
+	for label, jsonBody := range cases {
+		octet++
+		t.Run(label, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/cache/new", strings.NewReader(jsonBody))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Forwarded-For", fmt.Sprintf("10.97.%d.1", octet))
+
+			resp, err := app.Test(req, 5000)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+				"name %q must be rejected", label)
+
+			var env errorEnvelope
+			require.NoError(t, json.NewDecoder(resp.Body).Decode(&env))
+			assert.False(t, env.OK)
+			assert.Equal(t, "invalid_name", env.Error,
+				"bad-format name must return error code invalid_name")
+			assert.NotEmpty(t, env.AgentAction,
+				"invalid_name envelope must carry an agent_action")
+		})
+	}
+}
+
+// TestProvisioning_ValidName_TrimmedAndAccepted verifies that a valid name
+// with surrounding whitespace is trimmed and the resource provisions 201.
+func TestProvisioning_ValidName_TrimmedAndAccepted(t *testing.T) {
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
+	defer cleanRedis()
+
+	app, cleanApp := testhelpers.NewTestAppWithServices(t, db, rdb, "postgres,redis,mongodb,queue,webhook,storage,vector")
+	defer cleanApp()
+
+	req := httptest.NewRequest(http.MethodPost, "/cache/new",
+		strings.NewReader(`{"name":"  My App Cache  "}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forwarded-For", "10.98.1.1")
+
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	var result struct {
+		Name string `json:"name"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+	assert.Equal(t, "My App Cache", result.Name,
+		"surrounding whitespace must be trimmed before persistence")
 }

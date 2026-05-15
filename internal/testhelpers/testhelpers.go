@@ -572,6 +572,63 @@ func LastBulkTwinHandler() *handlers.BulkTwinHandler {
 // using the same handler/middleware chain as production (minus GeoIP lookup).
 // Routes registered: POST /cache/new, GET /start, POST /claim, /api/v1/resources.
 // Only the "redis" service is enabled. Use NewTestAppWithServices to enable others.
+// provisioningNamePaths is the set of JSON provisioning endpoints where
+// `name` is now a STRICTLY REQUIRED field. injectDefaultProvisionName
+// supplies a default for these paths when a legacy test omits it.
+var provisioningNamePaths = map[string]bool{
+	"/db/new":      true,
+	"/cache/new":   true,
+	"/nosql/new":   true,
+	"/queue/new":   true,
+	"/storage/new": true,
+	"/webhook/new": true,
+}
+
+// injectDefaultProvisionName is a test-only Fiber middleware that injects a
+// valid default `name` into a JSON provisioning request body when the body
+// omits one. It is a no-op for non-provisioning paths, multipart requests,
+// and bodies that already carry a `name` key (so negative-path tests that
+// send `name:""` or an invalid value still see exactly what they sent).
+// NoNameDefaultHeader is the request header a test sets to opt out of
+// injectDefaultProvisionName. Negative-path tests that deliberately exercise
+// the name_required contract (a name-less body must 400) set this header so
+// the middleware leaves their body untouched.
+const NoNameDefaultHeader = "X-Test-No-Name-Default"
+
+func injectDefaultProvisionName(c *fiber.Ctx) error {
+	if c.Method() != http.MethodPost || !provisioningNamePaths[c.Path()] {
+		return c.Next()
+	}
+	if c.Get(NoNameDefaultHeader) != "" {
+		return c.Next()
+	}
+	if ct := string(c.Request().Header.ContentType()); strings.HasPrefix(ct, "multipart/") {
+		return c.Next()
+	}
+	const defaultName = "test resource"
+	raw := c.Body()
+	var m map[string]any
+	if len(raw) == 0 {
+		m = map[string]any{}
+	} else if err := json.Unmarshal(raw, &m); err != nil {
+		// Not a JSON object (malformed body negative tests) — leave it alone
+		// so parseProvisionBody surfaces the real 400.
+		return c.Next()
+	}
+	if _, has := m["name"]; has {
+		return c.Next()
+	}
+	m["name"] = defaultName
+	patched, err := json.Marshal(m)
+	if err != nil {
+		return c.Next()
+	}
+	c.Request().SetBody(patched)
+	c.Request().Header.SetContentLength(len(patched))
+	c.Request().Header.SetContentType("application/json")
+	return c.Next()
+}
+
 func NewTestApp(t *testing.T, db *sql.DB, rdb *redis.Client) (*fiber.App, func()) {
 	t.Helper()
 	return NewTestAppWithServices(t, db, rdb, "redis")
@@ -626,6 +683,14 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	app.Use(middleware.RequestID())
 	// GeoEnrich is skipped in tests (no MaxMind DB in CI).
 	app.Use(middleware.Fingerprint())
+	// `name` is a STRICTLY REQUIRED field on every provisioning endpoint
+	// (mandatory-resource-naming contract, 2026-05-16). Handler tests that
+	// pre-date the contract POST to /db/new, /cache/new, etc. with a nil or
+	// name-less body; this test-only middleware injects a valid default
+	// `name` for those paths so the legacy tests keep exercising the happy
+	// path. Tests that explicitly send a `name` (including an empty string,
+	// or an invalid value for negative-path coverage) are left untouched.
+	app.Use(injectDefaultProvisionName)
 	app.Use(middleware.RateLimit(rdb, middleware.RateLimitConfig{
 		Limit:     provisionLimit,
 		KeyPrefix: "rl",

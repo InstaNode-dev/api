@@ -171,9 +171,64 @@ func post(t *testing.T, path string, body any, headers ...string) *http.Response
 	return postCtx(t, context.Background(), path, body, headers...)
 }
 
+// provisioningPaths is the set of POST endpoints where `name` is a STRICTLY
+// REQUIRED field (mandatory-resource-naming contract, 2026-05-16). The post
+// helper injects a default `name` for these paths when the test body omits
+// one, so the ~285 existing call sites that pre-date the contract keep
+// working without hand-editing each. Tests that deliberately exercise the
+// name_required / invalid_name paths set `name` explicitly (an explicit
+// value — including "" — is never overwritten).
+var provisioningPaths = map[string]bool{
+	"/db/new":      true,
+	"/cache/new":   true,
+	"/nosql/new":   true,
+	"/queue/new":   true,
+	"/storage/new": true,
+	"/webhook/new": true,
+}
+
+// withDefaultName injects a valid default `name` into a JSON provisioning
+// body when the path requires one and the body does not already carry a
+// `name` key. nil bodies become a fresh {"name": "..."} map. Bodies that
+// already set `name` (to any value, including "") are returned untouched so
+// negative-path tests still see exactly what they sent.
+func withDefaultName(path string, body any) any {
+	base := path
+	if i := strings.IndexByte(base, '?'); i >= 0 {
+		base = base[:i]
+	}
+	if !provisioningPaths[base] {
+		return body
+	}
+	const defaultName = "e2e resource"
+	if body == nil {
+		return map[string]any{"name": defaultName}
+	}
+	if m, ok := body.(map[string]any); ok {
+		if _, has := m["name"]; !has {
+			m["name"] = defaultName
+		}
+		return m
+	}
+	// Struct/other bodies: round-trip through JSON to inspect for a name key.
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return body
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil {
+		return body
+	}
+	if _, has := m["name"]; !has {
+		m["name"] = defaultName
+	}
+	return m
+}
+
 // postCtx is like post but honors ctx for deadline / cancellation (e.g. per-request timeout).
 func postCtx(t *testing.T, ctx context.Context, path string, body any, headers ...string) *http.Response {
 	t.Helper()
+	body = withDefaultName(path, body)
 	var r io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)

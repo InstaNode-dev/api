@@ -173,6 +173,17 @@ func e2eMultipartBody(t *testing.T, manifestYAML string, tarballs map[string][]b
 		t.Fatalf("e2eMultipartBody: WriteString(manifest): %v", err)
 	}
 
+	// Write the required `name` field (mandatory-resource-naming contract,
+	// 2026-05-16). Every /stacks/new call now needs a valid human label;
+	// stack tests don't assert on it, so a fixed default keeps them green.
+	nf, err := mw.CreateFormField("name")
+	if err != nil {
+		t.Fatalf("e2eMultipartBody: CreateFormField(name): %v", err)
+	}
+	if _, err = io.WriteString(nf, "e2e stack"); err != nil {
+		t.Fatalf("e2eMultipartBody: WriteString(name): %v", err)
+	}
+
 	// Write per-service tarballs.
 	for svcName, tarball := range tarballs {
 		ff, err := mw.CreateFormFile(svcName, svcName+".tar.gz")
