@@ -281,23 +281,29 @@ func (h *CLIAuthHandler) GetCurrentUser(c *fiber.Ctx) error {
 	// The platform has no trial period; the column was dropped in migration 034.
 
 	// Admin-only surface: when the caller's email is on the ADMIN_EMAILS
-	// allowlist AND the operator has configured ADMIN_PATH_PREFIX, hand
-	// the caller the unguessable URL segment they need to reach the
-	// founder-only customer-management endpoints. Silence is golden for
-	// every non-admin caller — we never even send an empty-string field,
-	// because the field's mere presence would leak that the endpoint
-	// exists. The dashboard's admin page reads this value and builds
-	// /api/v1/<prefix>/customers/... URLs from it; non-admin sessions
-	// have no way to learn the prefix from the wire.
+	// allowlist, emit is_platform_admin:true so the dashboard renders the
+	// founder-only sidebar entry + admin pages. Additionally, when
+	// ADMIN_PATH_PREFIX is configured, hand the caller the unguessable
+	// URL segment they need to reach the customer-management endpoints.
+	// Silence is golden for every non-admin caller — we never even send
+	// empty-string fields, because their mere presence would leak that
+	// the endpoint exists.
 	//
 	// Two gates collaborating here:
-	//   1. middleware.IsAdminEmail — second factor (ADMIN_EMAILS)
+	//   1. middleware.IsAdminEmail — first factor (ADMIN_EMAILS)
 	//   2. cfg.AdminPathPrefix     — secret URL segment
 	//
-	// If either is missing the field is omitted; the admin UI then
-	// hides the route because the URL builder has nothing to build with.
-	if h.cfg != nil && h.cfg.AdminPathPrefix != "" && middleware.IsAdminEmail(user.Email) {
-		resp["admin_path_prefix"] = h.cfg.AdminPathPrefix
+	// 2026-05-15 (FIX): is_platform_admin was previously never emitted at
+	// all — the dashboard contract at instanode-web/src/api/index.ts:228
+	// requires `me.is_platform_admin === true`, so the sidebar entry
+	// stayed hidden for every real admin and /app/admin/customers
+	// 404-redirected via RouteTracker. Emit the boolean now, gated on the
+	// same ADMIN_EMAILS check that gates the prefix.
+	if middleware.IsAdminEmail(user.Email) {
+		resp["is_platform_admin"] = true
+		if h.cfg != nil && h.cfg.AdminPathPrefix != "" {
+			resp["admin_path_prefix"] = h.cfg.AdminPathPrefix
+		}
 	}
 
 	// Impersonation surfacing — when the caller's JWT carries read_only=true
