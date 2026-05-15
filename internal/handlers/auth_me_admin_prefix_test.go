@@ -87,6 +87,16 @@ func TestAuthMe_AdminPrefix_IncludedForAdminCaller(t *testing.T) {
 	got, has := body["admin_path_prefix"]
 	require.True(t, has, "admin caller must receive admin_path_prefix")
 	assert.Equal(t, prefix, got, "admin_path_prefix must equal cfg.AdminPathPrefix verbatim")
+
+	// 2026-05-15 regression guard: the dashboard at
+	// instanode-web/src/api/index.ts:228 requires
+	// `me.is_platform_admin === true` to render the "platform admin"
+	// sidebar entry + /app/admin/customers route. Emitting only
+	// admin_path_prefix is insufficient — the boolean MUST be present
+	// and truthy for admin callers.
+	isAdmin, hasIsAdmin := body["is_platform_admin"]
+	require.True(t, hasIsAdmin, "admin caller must receive is_platform_admin (dashboard sidebar contract)")
+	assert.Equal(t, true, isAdmin, "is_platform_admin must be the literal JSON boolean true for admin callers")
 }
 
 // TestAuthMe_AdminPrefix_OmittedForNonAdminCaller — leak-boundary test.
@@ -136,6 +146,12 @@ func TestAuthMe_AdminPrefix_OmittedForNonAdminCaller(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 	_, has := body["admin_path_prefix"]
 	assert.False(t, has, "non-admin caller MUST NOT receive admin_path_prefix — its presence alone leaks that the surface exists")
+
+	// is_platform_admin must also be absent for non-admin callers — same
+	// leak-boundary rule. We omit the field entirely rather than send
+	// false, because field presence alone signals the surface exists.
+	_, hasIsAdmin := body["is_platform_admin"]
+	assert.False(t, hasIsAdmin, "non-admin caller MUST NOT receive is_platform_admin — omit entirely, do not send false")
 }
 
 // TestAuthMe_AdminPrefix_OmittedWhenPrefixUnset — closed-by-default at
