@@ -367,14 +367,14 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 			"Failed to read tarball bytes")
 	}
 
-	// Optional name field.
-	name := ""
+	// Required name field — the human-readable deployment label.
+	rawName := ""
 	if names := form.Value["name"]; len(names) > 0 {
-		clean, sanErr := sanitizeNameForRequest(c, names[0])
-		if sanErr != nil {
-			return sanErr
-		}
-		name = clean
+		rawName = names[0]
+	}
+	name, nameErr := requireName(c, rawName)
+	if nameErr != nil {
+		return nameErr
 	}
 
 	// Optional port field (default 8080).

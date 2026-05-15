@@ -559,14 +559,14 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 			"Failed to generate stack ID")
 	}
 
-	// Optional human-readable name.
-	name := ""
+	// Required human-readable stack name.
+	rawName := ""
 	if names := form.Value["name"]; len(names) > 0 {
-		clean, sanErr := sanitizeNameForRequest(c, names[0])
-		if sanErr != nil {
-			return sanErr
-		}
-		name = clean
+		rawName = names[0]
+	}
+	name, nameErr := requireName(c, rawName)
+	if nameErr != nil {
+		return nameErr
 	}
 
 	// Anonymous stacks: nil TeamID + 24h TTL + fingerprint (same model as /db/new).

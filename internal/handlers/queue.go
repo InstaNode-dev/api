@@ -97,9 +97,9 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 	if err := parseProvisionBody(c, &body); err != nil {
 		return err
 	}
-	cleanName, sanErr := sanitizeNameForRequest(c, body.Name)
-	if sanErr != nil {
-		return sanErr
+	cleanName, nameErr := requireName(c, body.Name)
+	if nameErr != nil {
+		return nameErr
 	}
 	body.Name = cleanName
 
@@ -248,6 +248,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 	slog.Info("provision.success",
 		"service", "queue",
 		"token", tokenStr,
+		"name", resource.Name.String,
 		"fingerprint", fp,
 		"cloud_vendor", vendor,
 		"tier", "anonymous",
@@ -371,6 +372,7 @@ func (h *QueueHandler) newQueueAuthenticated(
 	slog.Info("provision.success",
 		"service", "queue",
 		"token", tokenStr,
+		"name", resource.Name.String,
 		"team_id", teamIDStr,
 		"tier", tier,
 		"dedicated", dedicated,

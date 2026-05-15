@@ -51,6 +51,12 @@ func privateDeployBody(t *testing.T, private string, allowedIPs string, extra ma
 	if allowedIPs != "" {
 		require.NoError(t, w.WriteField("allowed_ips", allowedIPs))
 	}
+	// `name` is now a STRICTLY REQUIRED field on /deploy/new (mandatory-
+	// resource-naming contract, 2026-05-16). Inject a default when the
+	// caller's `extra` map doesn't override it.
+	if _, has := extra["name"]; !has {
+		require.NoError(t, w.WriteField("name", "test deploy"))
+	}
 	for k, v := range extra {
 		require.NoError(t, w.WriteField(k, v))
 	}
