@@ -58,14 +58,19 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # 2026-05-15: GITHUB_TOKEN is scoped to THIS repo only and 404s
+          # on private sibling repos in the same org. REPO_ACCESS_TOKEN
+          # is a fine-grained PAT with read access to
+          # InstaNode-dev/{common,proto}. Set via
+          # `gh secret set REPO_ACCESS_TOKEN --repo InstaNode-dev/<name>`.
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
           path: common
 
       - name: Checkout proto sibling into ./proto
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
           path: proto
 
       - name: Compute build metadata
