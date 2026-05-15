@@ -166,9 +166,16 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		// team as primary; the partial unique index enforces at most
 		// one primary per team.
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT false`,
+		// Idempotency guard (NOT EXISTS): the weak "AND u.is_primary = false"
+		// guard isn't sufficient — if a different non-earliest user has
+		// is_primary=true (which a prior test can leave behind), the
+		// DISTINCT ON would pick the earliest with is_primary=false and
+		// trip uq_users_one_primary_per_team. NOT EXISTS skips the whole
+		// team when any primary already exists. Mirrors migration 029.
 		`UPDATE users u SET is_primary = true FROM (
 			SELECT DISTINCT ON (team_id) id FROM users WHERE team_id IS NOT NULL ORDER BY team_id, created_at ASC
-		) AS first_primary WHERE u.id = first_primary.id AND u.is_primary = false`,
+		) AS first_primary WHERE u.id = first_primary.id
+		  AND NOT EXISTS (SELECT 1 FROM users u2 WHERE u2.team_id = u.team_id AND u2.is_primary = true)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS uq_users_one_primary_per_team ON users(team_id) WHERE is_primary`,
 		`CREATE TABLE IF NOT EXISTS team_invitations (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

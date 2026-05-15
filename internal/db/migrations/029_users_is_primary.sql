@@ -33,13 +33,26 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT f
 -- Backfill: mark the earliest-created user per team as primary. The
 -- DISTINCT ON guarantees exactly one row per team, so the partial
 -- unique index below will accept the backfill without violations.
+--
+-- Idempotency guard (NOT EXISTS): if this migration is replayed against
+-- a database that already has a primary for some team, the inner
+-- DISTINCT ON would pick a candidate row and try to set it primary —
+-- which trips uq_users_one_primary_per_team for any team where a
+-- DIFFERENT row is already primary. The NOT EXISTS clause skips teams
+-- that already have ANY primary, making the UPDATE a no-op on replay
+-- without churning existing data.
 UPDATE users u SET is_primary = true
  FROM (
      SELECT DISTINCT ON (team_id) id FROM users
       WHERE team_id IS NOT NULL
       ORDER BY team_id, created_at ASC
  ) AS first
- WHERE u.id = first.id;
+ WHERE u.id = first.id
+   AND NOT EXISTS (
+       SELECT 1 FROM users u2
+        WHERE u2.team_id = u.team_id
+          AND u2.is_primary = true
+   );
 
 -- Enforce: at most one primary user per team. The partial predicate
 -- (WHERE is_primary) lets the rest of the table coexist freely while
