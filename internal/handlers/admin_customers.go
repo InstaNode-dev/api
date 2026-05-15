@@ -279,9 +279,14 @@ func (h *AdminCustomersHandler) List(c *fiber.Ctx) error {
 			GROUP BY team_id
 		),
 		deploy_agg AS (
+			-- The deployments table has no deleted_at column — soft-deletion
+			-- is tracked via status ('deleted'/'expired'), the same predicate
+			-- models.CountActiveDeployments and the worker expirer use. The
+			-- earlier deleted_at IS NULL clause referenced a nonexistent
+			-- column and failed the whole List query with db_failed (503).
 			SELECT team_id, COUNT(*) AS active_deployments, MAX(created_at) AS last_deploy_at
 			FROM deployments
-			WHERE team_id IS NOT NULL AND deleted_at IS NULL
+			WHERE team_id IS NOT NULL AND status NOT IN ('deleted', 'expired')
 			GROUP BY team_id
 		),
 		audit_agg AS (
