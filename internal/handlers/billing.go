@@ -555,16 +555,24 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 		trace.WithAttributes(attribute.String("rzp.event", event.Event)))
 	defer span.End()
 
-	// Replay protection: Razorpay sends a unique event_id in the
-	// `X-Razorpay-Event-Id` header (canonical) and in the body `id` field
-	// (fallback). The signature check above proves the payload came from
+	// Replay protection: Razorpay sends a unique event_id in the body `id`
+	// field (canonical, signed) and in the `X-Razorpay-Event-Id` header
+	// (unsigned). The signature check above proves the payload came from
 	// Razorpay, but signed payloads can be re-POSTed N times — each replay
 	// would re-fire the state machine. Atomic INSERT into the dedup table
 	// returns 0-rows-affected on conflict; treat that as "already
 	// processed" and return 200 OK without further side-effects.
-	eventID := c.Get("X-Razorpay-Event-Id")
+	//
+	// SECURITY: the dedup key MUST come from the signed body, NOT the
+	// HTTP header. The header is outside the HMAC envelope — an attacker
+	// who captures one valid signed payload can replay it indefinitely
+	// while mutating `X-Razorpay-Event-Id` to a fresh value each time,
+	// minting a new dedup key per replay and bypassing this guard. Only
+	// `event.ID` (covered by the signature) is trustworthy. The header is
+	// used purely as a fallback for the rare payload that omits body `id`.
+	eventID := event.ID
 	if eventID == "" {
-		eventID = event.ID
+		eventID = c.Get("X-Razorpay-Event-Id")
 	}
 	if eventID != "" && h.db != nil {
 		res, err := h.db.ExecContext(ctx,
