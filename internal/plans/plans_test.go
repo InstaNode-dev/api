@@ -159,10 +159,16 @@ func TestHobbyPlus_TierMatrix(t *testing.T) {
 		"hobby_plus must allow 2 deployment apps")
 	assert.True(t, r.CustomDomainsAllowed("hobby_plus"),
 		"hobby_plus must enable custom_domains (the W11 headline feature)")
-	// Multi-env vault.
+	// 2026-05-15 (W12 pricing pass): hobby_plus rolled back to
+	// production-only — multi-env is now Pro+ only (see
+	// multiEnvTierAllowed in api/internal/handlers/stack.go).
+	// Coverage gap: the common/plans_test.go peer was updated when
+	// the rollback shipped but this api wrapper test was missed —
+	// classic single-site-fallacy. CLAUDE.md rule 16 added afterward.
 	assert.Equal(t, 50, r.VaultMaxEntries("hobby_plus"))
-	assert.Equal(t, []string{"development", "staging", "production"},
-		r.VaultEnvsAllowed("hobby_plus"))
+	assert.Equal(t, []string{"production"},
+		r.VaultEnvsAllowed("hobby_plus"),
+		"hobby_plus is production-only post 2026-05-15; Pro is the multi-env unlock")
 	// Storage / connection limits — mirror hobby on cheap services, bump
 	// mongodb + object storage to mid-tier values.
 	assert.Equal(t, 1024, r.StorageLimitMB("hobby_plus", "postgres"))
