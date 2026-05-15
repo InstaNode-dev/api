@@ -12,7 +12,7 @@ package handlers
 //	  "connection_url": "postgres://usr_<token>:<pass>@postgres-customers:5432/db_<token>",
 //	  "tier":           "anonymous",
 //	  "env":            "development",
-//	  "limits":         { "storage_mb": 10, "connections": 3, "expires_in": "24h" },
+//	  "limits":         { "storage_mb": 10, "connections": 2, "expires_in": "24h" },
 //	  "note":           "Works now. Free forever with a free account: <url>"
 //	}
 
@@ -160,7 +160,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 					"connection_url": connectionURL,
 					"tier":           existing.Tier,
 					"env":            existing.Env,
-					"limits":         dbAnonymousLimits(),
+					"limits":         dbAnonymousLimits(h.plans),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
@@ -299,7 +299,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 		"connection_url": creds.URL,
 		"tier":           "anonymous",
 		"env":            resource.Env,
-		"limits":         dbAnonymousLimits(),
+		"limits":         dbAnonymousLimits(h.plans),
 		"note":           upgradeNote(upgradeURL),
 		"upgrade":        upgradeURL,
 		"upgrade_jwt":    jwtToken,
@@ -462,10 +462,14 @@ func (h *DBHandler) decryptConnectionURL(encrypted, requestID string) string {
 	return plain
 }
 
-func dbAnonymousLimits() fiber.Map {
+// dbAnonymousLimits returns the limits map for anonymous Postgres resources.
+// Values are read from plans.Registry (the single source of truth) rather than
+// hardcoded — see CLAUDE.md rule 3. Previously this returned literal 10/2,
+// which silently drifted from plans.yaml on any anonymous-tier limit edit.
+func dbAnonymousLimits(reg *plans.Registry) fiber.Map {
 	return fiber.Map{
-		"storage_mb":  10,
-		"connections": 2,
+		"storage_mb":  reg.StorageLimitMB("anonymous", "postgres"),
+		"connections": reg.ConnectionsLimit("anonymous", "postgres"),
 		"expires_in":  "24h",
 	}
 }
