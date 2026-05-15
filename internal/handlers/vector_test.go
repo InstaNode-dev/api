@@ -293,9 +293,12 @@ func TestPlansRegistry_VectorTierLimits(t *testing.T) {
 		{"anonymous", 10, 2},
 		{"free", 10, 2},
 		{"hobby", 500, 5},
-		{"pro", 5120, 20},
+		// 2026-05-15: Pro vector storage tracked Pro Postgres bump
+		// (5120 → 10240 MB). Growth bumped in tandem so the tier
+		// ladder stays ordered above Pro.
+		{"pro", 10240, 20},
 		{"team", -1, -1},
-		{"growth", 5120, 20},
+		{"growth", 20480, 20},
 	}
 	for _, tc := range cases {
 		t.Run(tc.tier, func(t *testing.T) {

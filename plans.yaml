@@ -275,17 +275,24 @@ plans:
     price_monthly_cents: 4900
     limits:
       provisions_per_day: -1
-      postgres_storage_mb: 5120
+      # 2026-05-15 storage bump (PRICING-AUDIT-2026-05-15.md R1):
+      # Pro headline limits raised so Pro is defensible against a 30-second
+      # Supabase Pro comparison ($25 / 8 GB Postgres / 100 GB object).
+      # Same $49/mo. Marginal infra cost on shared k8s + DO Spaces is
+      # ~$0.05/GB-mo for Postgres and ~$0.04/GB for object — under
+      # $3/customer at full saturation, and most Pro customers use a tiny
+      # fraction of their ceiling.
+      postgres_storage_mb: 10240
       postgres_connections: 20
-      vector_storage_mb: 5120
+      vector_storage_mb: 10240
       vector_connections: 20
-      redis_memory_mb: 256
+      redis_memory_mb: 512
       redis_commands_per_day: 500000
-      mongodb_storage_mb: 2048
+      mongodb_storage_mb: 5120
       mongodb_connections: 20
       mongodb_ops_per_minute: 10000
       queue_storage_mb: 10240
-      storage_storage_mb: 10240
+      storage_storage_mb: 51200
       webhook_requests_stored: 10000
       team_members: 5
       vault_max_entries: 200
@@ -317,17 +324,18 @@ plans:
     billing_period: "yearly"
     limits:
       provisions_per_day: -1
-      postgres_storage_mb: 5120
+      # Mirror pro monthly limits (2026-05-15 storage bump).
+      postgres_storage_mb: 10240
       postgres_connections: 20
-      vector_storage_mb: 5120
+      vector_storage_mb: 10240
       vector_connections: 20
-      redis_memory_mb: 256
+      redis_memory_mb: 512
       redis_commands_per_day: 500000
-      mongodb_storage_mb: 2048
+      mongodb_storage_mb: 5120
       mongodb_connections: 20
       mongodb_ops_per_minute: 10000
       queue_storage_mb: 10240
-      storage_storage_mb: 10240
+      storage_storage_mb: 51200
       webhook_requests_stored: 10000
       team_members: 5
       vault_max_entries: 200
@@ -432,11 +440,15 @@ plans:
     price_monthly_cents: 9900
     limits:
       provisions_per_day: -1
-      postgres_storage_mb: 5120
+      # 2026-05-15: bumped to keep Growth strictly above Pro after Pro's
+      # storage bump. Growth's identity is still "unlimited supporting
+      # services" (mongo/queue/storage/webhook) — the Postgres/Redis bump
+      # just preserves tier-ladder ordering.
+      postgres_storage_mb: 20480
       postgres_connections: 20
-      vector_storage_mb: 5120
+      vector_storage_mb: 20480
       vector_connections: 20
-      redis_memory_mb: 256
+      redis_memory_mb: 1024
       redis_commands_per_day: -1
       mongodb_storage_mb: -1
       mongodb_connections: -1
