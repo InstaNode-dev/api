@@ -1126,7 +1126,7 @@ const openAPISpec = `{
     "/api/v1/billing/checkout": {
       "post": {
         "summary": "Create a Razorpay subscription and return its hosted-page URL",
-        "description": "Mints a Razorpay subscription for the requested plan (hobby, hobby_plus, or pro) tied to the authenticated team. The dashboard redirects the user to the returned short_url to complete payment; on success Razorpay fires subscription.activated to /razorpay/webhook and the team's plan_tier is elevated atomically. The Team tier currently returns 400 tier_unavailable — only ops can set it via /internal/set-tier. plan_frequency selects monthly (default) vs yearly billing — yearly returns 503 billing_not_configured until the operator creates the yearly Razorpay plan and sets RAZORPAY_PLAN_ID_*_YEARLY.",
+        "description": "Mints a Razorpay subscription for the requested plan (hobby, hobby_plus, or pro) tied to the authenticated team. The dashboard redirects the user to the returned short_url to complete payment; on the first successful charge Razorpay fires subscription.charged to /razorpay/webhook, which elevates the team's plan_tier and then promotes the team's existing permanent resources. The tier flip and the resource promotion are two separate writes — the tier flip is the authoritative state. The Team tier currently returns 400 tier_unavailable — only ops can set it via /internal/set-tier. plan_frequency selects monthly (default) vs yearly billing — yearly returns 503 billing_not_configured until the operator creates the yearly Razorpay plan and sets RAZORPAY_PLAN_ID_*_YEARLY.",
         "security": [{ "bearerAuth": [] }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] }, "plan_frequency": { "type": "string", "enum": ["monthly", "yearly"], "default": "monthly", "description": "Billing cycle. Empty = monthly. Yearly variants follow the same canonical-tier mapping on the webhook side — teams.plan_tier still stores the bare tier name." } } } } } },
         "responses": {
@@ -1164,13 +1164,13 @@ const openAPISpec = `{
     },
     "/api/v1/billing/change-plan": {
       "post": {
-        "summary": "Switch the team's subscription to a different tier",
-        "description": "Hobby ↔ Hobby Plus ↔ Pro on the same Razorpay subscription. Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. Team tier is currently not customer-changeable — returns 400 tier_unavailable.",
+        "summary": "Upgrade the team's subscription to a higher tier",
+        "description": "Upgrade-only: Hobby -> Hobby Plus -> Pro on the same Razorpay subscription. Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. Downgrades are NOT self-serve — a target tier at or below the current tier returns 400 downgrade_not_self_serve; email support@instanode.dev. Team tier is currently not customer-changeable — returns 400 tier_unavailable.",
         "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["target_plan"], "properties": { "target_plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] } } } } } },
         "responses": {
           "200": { "description": "Plan change accepted by Razorpay" },
-          "400": { "description": "Invalid plan or tier_unavailable" },
+          "400": { "description": "Invalid plan, same_plan, tier_unavailable, or downgrade_not_self_serve" },
           "401": { "description": "Missing or invalid session token" },
           "404": { "description": "No active subscription" },
           "503": { "description": "Razorpay not configured" }
