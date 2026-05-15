@@ -1414,13 +1414,19 @@ const auditActorSystem = "system"
 const auditResourceTypeVault = "vault"
 
 // multiEnvTierAllowed reports whether the given tier may use the env-promotion
-// endpoints. Hobby Plus / Pro / Team / Growth (and their *_yearly variants).
+// endpoints. Pro / Team / Growth (and their *_yearly variants).
 //
-// W11 (2026-05-13) extended this to hobby_plus: plans.yaml now lists
-// vault_envs_allowed: [development, staging, production] for hobby_plus, so
-// the env-aware surface (promote, families/bulk-twin, vault/copy, twin,
-// pause/resume) must accept it too — otherwise FIX-A6/Q23 leaves Hobby Plus
-// structurally broken.
+// 2026-05-15 (W12 pricing pass): hobby_plus removed from the allow-list.
+// The tier was previously the cheapest unlock for multi-env workflows
+// (W11 launched it at $19/mo with vault_envs_allowed:[dev,staging,prod]);
+// the new pricing posture makes multi-env an exclusively Pro+ feature so
+// (a) Pro looks more defensible against Supabase/Render comparisons and
+// (b) Hobby Plus stays a quiet upsell from Hobby on storage + 1-click
+// restore + custom domain rather than its own marquee feature.
+//
+// Hobby Plus rows that were already in dev/staging vault entries continue
+// to READ fine (no read-path gating); subsequent writes / promotes /
+// vault copies for non-prod envs return 402 with the canonical agent_action.
 //
 // The *_yearly suffixes are belt-and-braces: webhooks canonicalize plan_tier
 // to the bare name before writing teams.plan_tier (see planIDToTier →
@@ -1433,7 +1439,7 @@ const auditResourceTypeVault = "vault"
 // teeth, promote this into plans.yaml as a `features.multi_env` flag.
 func multiEnvTierAllowed(tier string) bool {
 	switch plans.CanonicalTier(tier) {
-	case "hobby_plus", "pro", "team", "growth":
+	case "pro", "team", "growth":
 		return true
 	default:
 		return false
@@ -1448,7 +1454,7 @@ func respondMultiEnvUpgradeRequired(c *fiber.Ctx, currentTier string) error {
 	_ = c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
 		"ok":           false,
 		"error":        "upgrade_required",
-		"message":      "Multi-env workflows require the Hobby Plus plan or higher. Your team is on the " + currentTier + " plan.",
+		"message":      "Multi-env workflows require the Pro plan or higher. Your team is on the " + currentTier + " plan.",
 		"upgrade_url":  "https://instanode.dev/pricing",
 		"agent_action": AgentActionMultiEnvUpgradeRequired,
 	})

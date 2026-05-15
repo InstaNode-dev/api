@@ -165,7 +165,13 @@ plans:
       webhook_requests_stored: 5000
       team_members: 1
       vault_max_entries: 50
-      vault_envs_allowed: ["development", "staging", "production"]
+      # 2026-05-15: multi-env vault rolled back to production-only.
+      # Multi-env workflows (vault copy, stack promote, env families,
+      # twin/bulk-twin, pause/resume) are now Pro+ only — Hobby Plus stays
+      # a quiet upsell on storage + restore + custom domain rather than
+      # its own marquee multi-env tier. See multiEnvTierAllowed in
+      # api/internal/handlers/stack.go for the corresponding code gate.
+      vault_envs_allowed: ["production"]
       deployments_apps: 2
       # Backups: 14-day retention sits between hobby's 7 and pro's 30.
       # Restore is enabled — hobby_plus is the cheapest tier with
@@ -211,7 +217,8 @@ plans:
       webhook_requests_stored: 5000
       team_members: 1
       vault_max_entries: 50
-      vault_envs_allowed: ["development", "staging", "production"]
+      # Mirror hobby_plus monthly: multi-env rolled back to production-only.
+      vault_envs_allowed: ["production"]
       deployments_apps: 2
       backup_retention_days: 14
       backup_restore_enabled: true
