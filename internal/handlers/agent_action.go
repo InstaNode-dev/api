@@ -72,15 +72,15 @@ import (
 // Multi-env / stack tier walls
 // ─────────────────────────────────────────────────────────────────────────────
 
-// AgentActionMultiEnvUpgradeRequired is returned when a hobby/free team
-// tries to use a multi-env workflow (stack family read, stack promote,
-// vault copy, twin, family bulk-twin, pause/resume).
+// AgentActionMultiEnvUpgradeRequired is returned when a hobby/hobby_plus/
+// free/anonymous team tries to use a multi-env workflow (stack family read,
+// stack promote, vault copy, twin, family bulk-twin, pause/resume).
 //
-// W11 (2026-05-13) update: Hobby Plus ($19/mo) is the cheapest tier that
-// unlocks multi-env (vault_envs_allowed: [development, staging, production]),
-// so the upgrade copy points there rather than Pro — the agent surfaces
-// the closer step to the user.
-const AgentActionMultiEnvUpgradeRequired = "Tell the user multi-env workflows (staging/prod promote, env families, vault copy) need Hobby Plus or higher. Have them upgrade at https://instanode.dev/pricing — $19/mo, 30 seconds."
+// 2026-05-15 (W12 pricing pass): multi-env is Pro+ only now. The W11 era
+// briefly granted hobby_plus multi-env access; that was rolled back so
+// Pro is the cheapest unlock and Hobby Plus stays a quiet upsell on
+// storage + restore + custom domain rather than its own marquee feature.
+const AgentActionMultiEnvUpgradeRequired = "Tell the user multi-env workflows (staging/prod promote, env families, vault copy) need the Pro plan. Have them upgrade at https://instanode.dev/pricing — $49/mo, 30 seconds."
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Resource pause/resume walls (POST /api/v1/resources/:id/pause | /resume)

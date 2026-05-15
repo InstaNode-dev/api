@@ -1,14 +1,13 @@
 package handlers
 
-// agent_action_hobby_plus_test.go — FIX-R16 lock-in: the agent_action
-// strings that hobby_plus structurally solves (multi-env workflows,
-// hobby's 1-deploy cap) must reference Hobby Plus by name + the $19/mo
-// price, not jump the user straight to Pro at $49/mo.
+// agent_action_hobby_plus_test.go — coverage for the agent_action strings
+// that route off-tier callers to the right upgrade step.
 //
-// The downstream LLM agent reproduces the agent_action string verbatim to
-// the user. If the copy says "Upgrade to Pro" when "Upgrade to Hobby Plus"
-// is the closer and cheaper next step, the agent leaks unnecessary money
-// out of the wedge.
+// 2026-05-15 (W12 pricing pass): multi-env was rolled back to Pro+. This
+// test file was originally the FIX-R16 lock-in for hobby_plus naming;
+// the multi-env case now names Pro instead. The deployment-cap routing
+// (hobby → hobby_plus) stays put: hobby_plus is still a real internal
+// upsell step for the 1-deploy cap, just no longer the multi-env unlock.
 
 import (
 	"strings"
@@ -17,23 +16,26 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// TestAgentActionMultiEnvUpgradeRequired_PointsAtHobbyPlus pins the
-// FIX-R16 update — the multi-env wall mentions Hobby Plus by name because
-// it's the cheapest tier that unlocks staging/production envs.
-func TestAgentActionMultiEnvUpgradeRequired_PointsAtHobbyPlus(t *testing.T) {
+// TestAgentActionMultiEnvUpgradeRequired_PointsAtPro pins the W12 update:
+// the multi-env wall names Pro because it is now the cheapest tier that
+// unlocks staging/production envs. (Was Hobby Plus before 2026-05-15.)
+func TestAgentActionMultiEnvUpgradeRequired_PointsAtPro(t *testing.T) {
 	got := AgentActionMultiEnvUpgradeRequired
-	assert.Contains(t, got, "Hobby Plus",
-		"multi-env upgrade copy must name Hobby Plus — it's the cheapest tier with multi-env vault")
-	assert.Contains(t, got, "$19",
-		"multi-env upgrade copy must include the $19/mo price so the LLM agent can quote it to the user")
+	assert.Contains(t, got, "Pro",
+		"multi-env upgrade copy must name Pro — it's the cheapest tier with multi-env vault as of 2026-05-15")
+	assert.NotContains(t, got, "Hobby Plus",
+		"multi-env upgrade copy must NOT name Hobby Plus — that tier was rolled back to production-only on 2026-05-15")
+	assert.Contains(t, got, "$49",
+		"multi-env upgrade copy must include the $49/mo Pro price so the LLM agent can quote it to the user")
 	assert.Contains(t, got, "https://instanode.dev/",
 		"contract: agent_action must contain a full https://instanode.dev/ URL")
 }
 
 // TestNewAgentActionDeploymentLimitReached_HobbyPointsAtHobbyPlus pins
-// the routing logic: a hobby caller hitting their 1-deploy cap should be
-// nudged to Hobby Plus (2 deploys), not Pro (10 deploys). Pro stays the
-// nudge once the caller is already on hobby_plus.
+// the deploy-cap routing: a hobby caller hitting their 1-deploy cap is
+// still nudged to Hobby Plus (2 deploys), not Pro (10 deploys), since
+// hobby_plus remains a real upsell step on storage + restore + 2nd
+// deploy + custom domain — just no longer on multi-env.
 func TestNewAgentActionDeploymentLimitReached_HobbyPointsAtHobbyPlus(t *testing.T) {
 	hobbyCopy := newAgentActionDeploymentLimitReached("hobby", 1)
 	assert.Contains(t, hobbyCopy, "Hobby Plus",
@@ -60,7 +62,7 @@ func TestNewAgentActionDeploymentLimitReached_HobbyPointsAtHobbyPlus(t *testing.
 }
 
 // TestAgentActionMultiEnvUpgradeRequired_UnderTweetCeiling — the U3
-// contract requires < 280 chars. The Hobby Plus rewrite must stay under
+// contract requires < 280 chars. The W12 Pro rewrite must stay under
 // budget (asserted globally by TestAgentActionContract, but the rewrite
 // gets a focused assertion here too so a regression points at this PR).
 func TestAgentActionMultiEnvUpgradeRequired_UnderTweetCeiling(t *testing.T) {
