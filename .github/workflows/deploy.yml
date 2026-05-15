@@ -39,7 +39,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_REPO: ghcr.io/REDACTED/instant-api
+  IMAGE_REPO: ghcr.io/instanode-dev/instant-api
   K8S_NAMESPACE: instant
   K8S_DEPLOYMENT: instant-api
   K8S_CONTAINER: api
