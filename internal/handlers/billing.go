@@ -1313,6 +1313,16 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 	if strings.EqualFold(strings.TrimSpace(planTier), target) {
 		return respondError(c, fiber.StatusBadRequest, "same_plan", "Already on requested plan")
 	}
+	// Policy guardrail (project_no_self_serve_cancel_downgrade.md): downgrade
+	// is NOT self-serve. The dashboard ChangePlanModal already filters to
+	// upgrade-only targets, but the raw API (curl / MCP) is not gated by the
+	// UI — enforce the same rule server-side. A target whose rank is <= the
+	// current tier is a downgrade (or lateral move) and must go through
+	// support, which fires the Razorpay subscription.cancelled webhook.
+	if plans.Rank(target) <= plans.Rank(strings.TrimSpace(planTier)) {
+		return respondError(c, fiber.StatusBadRequest, "downgrade_not_self_serve",
+			"Downgrades are not self-serve. Email support@instanode.dev to change to a lower plan.")
+	}
 	planIDs := h.razorpayPlanIDs()
 	if _, ok := planIDs[target]; !ok {
 		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "target_plan must be hobby, hobby_plus, pro, or team")
