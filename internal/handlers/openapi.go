@@ -640,6 +640,17 @@ const openAPISpec = `{
         }
       }
     },
+    "/auth/logout": {
+      "post": {
+        "summary": "Log out — revoke the current session token server-side",
+        "description": "Adds the bearer token's JTI to a Redis revocation set (TTL = remaining token lifetime) so the token is rejected by RequireAuth even before it expires. Idempotent; safe to call without a valid token.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Session revoked", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } } } } },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
     "/api/v1/whoami": {
       "get": {
         "summary": "Identity probe — confirms the bearer token is valid and returns the team it grants access to",
