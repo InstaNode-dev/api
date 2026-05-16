@@ -78,7 +78,7 @@ func TestClient_PresentsAuthToken_OnEveryRPC(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			_, err = c.ProvisionPostgres(ctx, "00000000-0000-0000-0000-000000000001", "anonymous")
+			_, err = c.ProvisionPostgres(ctx, "00000000-0000-0000-0000-000000000001", "anonymous", "")
 			gotCode := status.Code(err)
 			if gotCode != tt.wantCode {
 				t.Fatalf("got code=%v err=%v, want %v", gotCode, err, tt.wantCode)
@@ -118,7 +118,7 @@ func TestClient_AttachesRequestIDMetadata(t *testing.T) {
 	// Here we only assert the auth header is always present (sniffer below).
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_, _ = c.ProvisionPostgres(ctx, "00000000-0000-0000-0000-000000000002", "anonymous")
+	_, _ = c.ProvisionPostgres(ctx, "00000000-0000-0000-0000-000000000002", "anonymous", "")
 	if sniffer.tokenLastSeen != serverSecret {
 		t.Fatalf("auth token not propagated to server; sniffer saw %q want %q", sniffer.tokenLastSeen, serverSecret)
 	}

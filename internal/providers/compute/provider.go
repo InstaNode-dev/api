@@ -21,6 +21,7 @@ import (
 type DeployOptions struct {
 	AppID      string            // short slug, used as k8s Deployment name and subdomain
 	Token      string            // instant.dev resource token (for env var injection)
+	TeamID     string            // owning team UUID — used to scope the NetworkPolicy DB-port egress rule to the team's own customer-resource namespaces (pentest fix 2026-05-16)
 	Tarball    []byte            // gzipped tar archive of the source directory (must contain Dockerfile)
 	EnvVars    map[string]string // merged: infra resource URLs + user-defined vars
 	Port       int               // port the app listens on (default 8080)

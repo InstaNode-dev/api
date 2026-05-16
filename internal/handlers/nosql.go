@@ -48,9 +48,10 @@ func NewNoSQLHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, provClie
 
 // provisionNoSQL provisions a MongoDB database, using gRPC provisioner if available,
 // falling back to local provider otherwise.
-func (h *NoSQLHandler) provisionNoSQL(ctx context.Context, token, tier string) (*nosqlprovider.Credentials, error) {
+// teamID scopes the dedicated namespace label — pass empty for anonymous provisions.
+func (h *NoSQLHandler) provisionNoSQL(ctx context.Context, token, tier, teamID string) (*nosqlprovider.Credentials, error) {
 	if h.provClient != nil {
-		creds, err := h.provClient.ProvisionNoSQL(ctx, token, tier)
+		creds, err := h.provClient.ProvisionNoSQL(ctx, token, tier, teamID)
 		if err != nil {
 			return nil, err
 		}
@@ -189,7 +190,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 	// Provision the real MongoDB database and user.
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, "mongodb", "anonymous", "", fp, tokenStr)
-	creds, err := h.provisionNoSQL(provCtx, tokenStr, "anonymous")
+	creds, err := h.provisionNoSQL(provCtx, tokenStr, "anonymous", "") // no teamID for anonymous
 	finishProvisionSpan(span, err)
 	metrics.ProvisionDuration.WithLabelValues("mongodb", "anonymous").Observe(time.Since(provStart).Seconds())
 	if err != nil {
@@ -349,7 +350,7 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 	// Provision the real MongoDB database and user.
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, "mongodb", tier, teamIDStr, fp, tokenStr)
-	creds, err := h.provisionNoSQL(provCtx, tokenStr, tier)
+	creds, err := h.provisionNoSQL(provCtx, tokenStr, tier, teamIDStr)
 	finishProvisionSpan(span, err)
 	metrics.ProvisionDuration.WithLabelValues("mongodb", tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {
@@ -532,7 +533,7 @@ func (h *NoSQLHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 	tokenStr := resource.Token.String()
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, models.ResourceTypeMongoDB, in.Tier, in.TeamID.String(), in.Fingerprint, tokenStr)
-	creds, err := h.provisionNoSQL(provCtx, tokenStr, in.Tier)
+	creds, err := h.provisionNoSQL(provCtx, tokenStr, in.Tier, in.TeamID.String())
 	finishProvisionSpan(span, err)
 	metrics.ProvisionDuration.WithLabelValues(models.ResourceTypeMongoDB, in.Tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {

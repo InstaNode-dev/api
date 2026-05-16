@@ -49,9 +49,10 @@ func NewCacheHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, provClie
 
 // provisionCache provisions a Redis cache, using gRPC provisioner if available,
 // falling back to local provider otherwise.
-func (h *CacheHandler) provisionCache(ctx context.Context, token, tier string) (*cacheprovider.Credentials, error) {
+// teamID scopes the dedicated namespace label — pass empty for anonymous provisions.
+func (h *CacheHandler) provisionCache(ctx context.Context, token, tier, teamID string) (*cacheprovider.Credentials, error) {
 	if h.provClient != nil {
-		creds, err := h.provClient.ProvisionCache(ctx, token, tier)
+		creds, err := h.provClient.ProvisionCache(ctx, token, tier, teamID)
 		if err != nil {
 			return nil, err
 		}
@@ -193,7 +194,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 	// Provision the real Redis namespace.
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, "redis", "anonymous", "", fp, tokenStr)
-	creds, err := h.provisionCache(provCtx, tokenStr, "anonymous")
+	creds, err := h.provisionCache(provCtx, tokenStr, "anonymous", "") // no teamID for anonymous
 	finishProvisionSpan(span, err)
 	metrics.ProvisionDuration.WithLabelValues("redis", "anonymous").Observe(time.Since(provStart).Seconds())
 	if err != nil {
@@ -363,7 +364,7 @@ func (h *CacheHandler) newCacheAuthenticated(
 	// Provision the real Redis namespace.
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, "redis", tier, teamIDStr, fp, tokenStr)
-	creds, err := h.provisionCache(provCtx, tokenStr, tier)
+	creds, err := h.provisionCache(provCtx, tokenStr, tier, teamIDStr)
 	finishProvisionSpan(span, err)
 	metrics.ProvisionDuration.WithLabelValues("redis", tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {
@@ -547,7 +548,7 @@ func (h *CacheHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 	tokenStr := resource.Token.String()
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, models.ResourceTypeRedis, in.Tier, in.TeamID.String(), in.Fingerprint, tokenStr)
-	creds, err := h.provisionCache(provCtx, tokenStr, in.Tier)
+	creds, err := h.provisionCache(provCtx, tokenStr, in.Tier, in.TeamID.String())
 	finishProvisionSpan(span, err)
 	metrics.ProvisionDuration.WithLabelValues(models.ResourceTypeRedis, in.Tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {
