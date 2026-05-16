@@ -216,9 +216,7 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 	}
 
 	// Pre-check: verify the JTI exists and has not already been converted.
-	// This check is not the atomic single-use gate (MarkOnboardingConverted is),
-	// but it prevents wasteful team/user creation and gives a clean 409 in the
-	// common double-claim case (replayed link, browser back-button, etc.).
+	// This is a fast-path read before the atomic gate below.
 	ev, err := models.GetOnboardingByJTI(ctx, h.db, claims.ID)
 	if err != nil {
 		var notFound *models.ErrOnboardingNotFound
@@ -230,6 +228,40 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 	}
 	if ev.ConvertedAt.Valid {
 		return respondError(c, fiber.StatusConflict, "already_claimed", "This upgrade token has already been used")
+	}
+
+	// A01 (P1): Mark the JWT as consumed BEFORE creating team+user.
+	//
+	// Problem (original order): Create team → Create user → MarkConverted.
+	// If MarkConverted fails after a successful team+user creation, we return
+	// 503 but leave orphaned team+user rows AND an unconsumed JWT — re-claimable
+	// by the same or a different caller. Under concurrent load (race between two
+	// POST /claim with the same JWT), both could slip past the pre-check SELECT
+	// and both create their own team+user before either MarkConverted runs,
+	// producing two orphaned teams and a data-integrity gap.
+	//
+	// Fix: flip the order so MarkOnboardingConvertedPreliminary (atomic UPDATE
+	// … WHERE converted_at IS NULL) is the first write. Exactly one concurrent
+	// caller wins (0 rows affected → ErrOnboardingAlreadyUsed → 409). The
+	// winner then creates team+user. If team/user creation subsequently fails,
+	// the JWT is already consumed — the caller sees a 503 and must contact
+	// support to re-issue a fresh JWT (acceptable: far better than orphaned
+	// rows or a re-claimable JWT).
+	//
+	// We use the "preliminary" variant which sets only converted_at (leaves
+	// team_id NULL). A best-effort UPDATE below patches in the real team_id
+	// after the team is created — see onboarding_events patch below.
+	if markErr := models.MarkOnboardingConvertedPreliminary(ctx, h.db, claims.ID); markErr != nil {
+		var alreadyUsed *models.ErrOnboardingAlreadyUsed
+		if errors.As(markErr, &alreadyUsed) {
+			return respondError(c, fiber.StatusConflict, "already_claimed", "This upgrade token has already been used")
+		}
+		slog.Error("onboarding.claim.mark_converted_failed",
+			"error", markErr,
+			"jti", claims.ID,
+			"request_id", requestID,
+		)
+		return respondError(c, fiber.StatusServiceUnavailable, "mark_converted_failed", "Failed to mark upgrade token as used")
 	}
 
 	// Resolve team + user: if the email already has an account (e.g. created by
@@ -283,18 +315,20 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 		newUser = createdUser
 	}
 
-	// Mark JWT as used (single-use enforcement)
-	if markErr := models.MarkOnboardingConverted(ctx, h.db, claims.ID, team.ID); markErr != nil {
-		var alreadyUsed *models.ErrOnboardingAlreadyUsed
-		if errors.As(markErr, &alreadyUsed) {
-			return respondError(c, fiber.StatusConflict, "already_claimed", "This upgrade token has already been used")
-		}
-		slog.Error("onboarding.claim.mark_converted_failed",
-			"error", markErr,
+	// Patch the real team_id onto the onboarding_event row now that we have it.
+	// This is best-effort: a failure here is non-fatal because the JWT is already
+	// consumed (converted_at is set) and the team+user exist. The team_id column
+	// on the row is only informational at this point.
+	if _, patchErr := h.db.ExecContext(ctx,
+		`UPDATE onboarding_events SET team_id = $1 WHERE jti = $2`,
+		team.ID, claims.ID,
+	); patchErr != nil {
+		slog.Warn("onboarding.claim.patch_team_id_failed",
+			"error", patchErr,
 			"jti", claims.ID,
+			"team_id", team.ID,
 			"request_id", requestID,
 		)
-		// Non-fatal: proceed
 	}
 
 	// Transfer anonymous resources to new team.

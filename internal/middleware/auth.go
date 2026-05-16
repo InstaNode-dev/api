@@ -299,6 +299,20 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 			}
 		}
 
+		// A03 (P1): server-side JTI revocation check.
+		// POST /auth/logout stores "session.revoked:<jti>" in Redis with TTL =
+		// remaining token lifetime. Fail-open (convention 1): a Redis outage
+		// returns (false, err) and we continue — see revocation.go.
+		if jti := claims.ID; jti != "" {
+			if revoked, err := IsJTIRevoked(c.UserContext(), jti); err != nil {
+				// Redis error — log and fail-open (continue to serve the request).
+				// Logged inside IsJTIRevoked; no additional log here to avoid duplication.
+				_ = err
+			} else if revoked {
+				return respondUnauthorized(c)
+			}
+		}
+
 		c.Locals(LocalKeyUserID, claims.UserID)
 		c.Locals(LocalKeyTeamID, claims.TeamID)
 		if claims.Email != "" {

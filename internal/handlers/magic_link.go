@@ -2,14 +2,17 @@ package handlers
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"instant.dev/internal/config"
 	"instant.dev/internal/email"
 	"instant.dev/internal/middleware"
@@ -20,6 +23,19 @@ import (
 // 15 minutes is long enough to survive an email-client preview round-trip
 // and short enough that a leaked token is rarely useful.
 const magicLinkTTL = 15 * time.Minute
+
+// magicLinkEmailRateLimit is the maximum number of magic-link emails
+// allowed per normalised email address per hour (A04 fix).
+// Fail-open per CLAUDE.md convention 1: a Redis error never blocks the request.
+const magicLinkEmailRateLimit = 5
+
+// magicLinkEmailRateLimitWindow is the rolling window for the per-email counter.
+const magicLinkEmailRateLimitWindow = time.Hour
+
+// magicLinkEmailRLKeyPrefix is the Redis key prefix for per-email rate limits.
+// Kept as a named constant so tests and monitoring can grep for it without
+// coupling to a string literal buried in a format string.
+const magicLinkEmailRLKeyPrefix = "ml:email:rl"
 
 // MagicLinkHandler implements the passwordless email login flow:
 //   POST /auth/email/start    — generates a token, emails the link, returns 202
@@ -35,6 +51,7 @@ type MagicLinkHandler struct {
 	cfg  *config.Config
 	mail magicLinkMailer
 	auth *AuthHandler // for IssueSessionJWT + FindOrCreateUserByEmail
+	rdb  *redis.Client // for per-email rate limiting (A04); nil → fail-open
 }
 
 // NewMagicLinkHandler wires the dependencies. Note that we take an AuthHandler
@@ -56,6 +73,46 @@ func NewMagicLinkHandlerWithMailer(db *sql.DB, cfg *config.Config, mail magicLin
 	return &MagicLinkHandler{db: db, cfg: cfg, mail: mail, auth: auth}
 }
 
+// NewMagicLinkHandlerWithMailerAndRedis is the full constructor used by
+// router.go. It wires Redis for the per-email rate limit (A04). When rdb
+// is nil the handler falls back to NewMagicLinkHandlerWithMailer behaviour
+// (no per-email rate limit — fail-open).
+func NewMagicLinkHandlerWithMailerAndRedis(db *sql.DB, cfg *config.Config, mail magicLinkMailer, auth *AuthHandler, rdb *redis.Client) *MagicLinkHandler {
+	return &MagicLinkHandler{db: db, cfg: cfg, mail: mail, auth: auth, rdb: rdb}
+}
+
+// emailRateLimitKey returns the Redis key for a given normalised email address.
+// Uses a SHA-256 hash of the email so PII (email addresses) never appear as
+// Redis key names in logs, Redis MONITOR output, or memory dumps.
+func emailRateLimitKey(emailAddr string) string {
+	h := sha256.Sum256([]byte(emailAddr))
+	return fmt.Sprintf("%s:%x", magicLinkEmailRLKeyPrefix, h[:8])
+}
+
+// checkEmailRateLimit increments the per-email Redis counter and returns
+// (limited, err). If Redis is unavailable the function returns (false, err)
+// so the caller fails open (convention 1 in CLAUDE.md). A limited==true
+// result means the caller should silently absorb the request (return 202)
+// without generating a new magic-link token — the attacker learns nothing
+// from the response shape.
+func checkEmailRateLimit(ctx context.Context, rdb *redis.Client, emailAddr string) (limited bool, err error) {
+	if rdb == nil {
+		return false, nil
+	}
+	key := emailRateLimitKey(emailAddr)
+	pipe := rdb.Pipeline()
+	incrCmd := pipe.Incr(ctx, key)
+	pipe.Expire(ctx, key, magicLinkEmailRateLimitWindow)
+	if _, execErr := pipe.Exec(ctx); execErr != nil {
+		return false, fmt.Errorf("magic_link.email_rl: %w", execErr)
+	}
+	count, resultErr := incrCmd.Result()
+	if resultErr != nil {
+		return false, fmt.Errorf("magic_link.email_rl.result: %w", resultErr)
+	}
+	return count > int64(magicLinkEmailRateLimit), nil
+}
+
 // magicLinkStartRequest is the body for POST /auth/email/start.
 type magicLinkStartRequest struct {
 	Email    string `json:"email"`
@@ -71,6 +128,14 @@ type magicLinkStartRequest struct {
 // Email send errors are logged but do NOT change the response: the user might
 // still get the email seconds later through Resend's retry pipeline, and a
 // timing/error-rate side-channel would defeat the enumeration defence above.
+//
+// A04 (P1): a per-email counter in Redis caps magic-link requests to
+// magicLinkEmailRateLimit per magicLinkEmailRateLimitWindow. On Redis error
+// the check fails open (CLAUDE.md convention 1) — a Redis outage must never
+// block legitimate sign-in attempts. The per-IP global rate limit
+// (middleware.RateLimit) still applies and acts as the primary backstop;
+// the per-email limit is the second layer that prevents targeted mailbox
+// flooding by an attacker with many IPs.
 func (h *MagicLinkHandler) Start(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
@@ -82,6 +147,24 @@ func (h *MagicLinkHandler) Start(c *fiber.Ctx) error {
 	emailAddr := strings.ToLower(strings.TrimSpace(body.Email))
 	if !looksLikeEmail(emailAddr) {
 		return respondError(c, fiber.StatusBadRequest, "invalid_email", "A valid email address is required")
+	}
+
+	// Per-email rate limit (A04). Fail-open on Redis error so a cache
+	// outage never blocks sign-in. The 202 response on the limited path is
+	// identical to the success path — the attacker gains no signal.
+	limited, rlErr := checkEmailRateLimit(c.Context(), h.rdb, emailAddr)
+	if rlErr != nil {
+		slog.Warn("magic_link.start.email_rl_error",
+			"error", rlErr,
+			"request_id", requestID,
+		)
+		// fail-open: continue as if not limited
+	} else if limited {
+		slog.Warn("magic_link.start.email_rate_limited",
+			"request_id", requestID,
+		)
+		// Silently absorb — same 202 the non-limited path returns.
+		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"ok": true})
 	}
 
 	returnTo := validateReturnTo(strings.TrimSpace(body.ReturnTo))

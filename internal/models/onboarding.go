@@ -96,7 +96,35 @@ func GetOnboardingByJTI(ctx context.Context, db *sql.DB, jti string) (*Onboardin
 	return ev, nil
 }
 
+// MarkOnboardingConvertedPreliminary atomically marks a JTI as consumed by
+// setting converted_at = now() WITHOUT touching team_id (leaves it NULL).
+//
+// This is the A01 fix: called as the very first write in POST /claim, before
+// team/user creation. Exactly one concurrent caller wins the race
+// (0 rows affected → ErrOnboardingAlreadyUsed → 409). After team creation
+// the caller must update team_id separately via MarkOnboardingTeamID.
+//
+// Why not MarkOnboardingConverted with uuid.Nil? onboarding_events.team_id
+// is a FK to teams.id — passing uuid.Nil would violate the constraint
+// (no team with that UUID exists). NULL is allowed (column has no NOT NULL).
+func MarkOnboardingConvertedPreliminary(ctx context.Context, db *sql.DB, jti string) error {
+	result, err := db.ExecContext(ctx, `
+		UPDATE onboarding_events
+		SET converted_at = now()
+		WHERE jti = $1 AND converted_at IS NULL
+	`, jti)
+	if err != nil {
+		return fmt.Errorf("models.MarkOnboardingConvertedPreliminary: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return &ErrOnboardingAlreadyUsed{JTI: jti}
+	}
+	return nil
+}
+
 // MarkOnboardingConverted sets converted_at and team_id on an onboarding event.
+// For the A01 fix ordering see MarkOnboardingConvertedPreliminary.
 func MarkOnboardingConverted(ctx context.Context, db *sql.DB, jti string, teamID uuid.UUID) error {
 	result, err := db.ExecContext(ctx, `
 		UPDATE onboarding_events
