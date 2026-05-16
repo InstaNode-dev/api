@@ -5,6 +5,7 @@ package k8s
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -804,6 +805,62 @@ func (p *K8sProvider) Logs(ctx context.Context, providerID string, follow bool) 
 		return nil, fmt.Errorf("k8s.Logs: stream logs for pod %q: %w", podName, err)
 	}
 	return stream, nil
+}
+
+// FetchBuildLogs implements compute.BuildLogFetcher.
+//
+// It locates the kaniko build pod for appID (job label "job-name=build-<appID>"
+// in namespace "instant-deploy-<appID>"), reads its "kaniko" container stdout,
+// and returns the last ≤200 lines. Null bytes are stripped for safety.
+//
+// Fail-soft contract: any error (pod gone, namespace deleted, logs unavailable)
+// is returned as (nil, err) so the caller writes the autopsy row with an empty
+// last_lines slice rather than panicking or blocking.
+func (p *K8sProvider) FetchBuildLogs(ctx context.Context, appID string) ([]string, error) {
+	const maxLines = 200
+	ns := deployNamespace(appID)
+	jobName := "build-" + sanitizeName(appID)
+
+	pods, err := p.clientset.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
+		LabelSelector: "job-name=" + jobName,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("k8s.FetchBuildLogs: list pods for job %q in %q: %w", jobName, ns, err)
+	}
+	if len(pods.Items) == 0 {
+		return nil, fmt.Errorf("k8s.FetchBuildLogs: no pods found for job %q in %q (pod may have been GC'd)", jobName, ns)
+	}
+
+	// Use the first pod (there is exactly one per build Job).
+	podName := pods.Items[0].Name
+	req := p.clientset.CoreV1().Pods(ns).GetLogs(podName, &corev1.PodLogOptions{
+		Container: "kaniko",
+		TailLines: int64Ptr(maxLines),
+	})
+	stream, err := req.Stream(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("k8s.FetchBuildLogs: stream logs for pod %q container kaniko: %w", podName, err)
+	}
+	defer stream.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(stream)
+	for scanner.Scan() {
+		line := strings.ReplaceAll(scanner.Text(), "\x00", "") // strip null bytes
+		lines = append(lines, line)
+	}
+	if err := scanner.Err(); err != nil {
+		// Partial logs are still better than none — return what we have.
+		slog.Warn("k8s.FetchBuildLogs: scanner error reading kaniko logs",
+			"app_id", appID, "pod", podName, "lines_so_far", len(lines), "error", err)
+	}
+
+	// Cap defensively (TailLines is advisory — some k8s implementations ignore it).
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+
+	return lines, nil
 }
 
 // Teardown deletes the entire per-deployment namespace and all resources inside it.
