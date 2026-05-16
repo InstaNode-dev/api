@@ -68,10 +68,27 @@ type Provider interface {
 	UpdateAccessControl(ctx context.Context, appID string, private bool, allowedIPs []string) error
 }
 
-// BuildLogFetcher is an optional interface that compute providers may implement
-// to expose raw build-job (kaniko) logs. Handlers type-assert against this
-// interface so that non-k8s providers (noop, test doubles) silently opt out
-// without requiring changes to the core Provider interface.
+// BuildLogFetcher is an optional, server-side-only interface that compute
+// providers may implement so the platform can SNAPSHOT build-job logs at the
+// moment of failure. Handlers type-assert against it so non-k8s providers
+// (noop, test doubles) silently opt out without changing the core Provider
+// interface.
+//
+// IMPORTANT — this is NOT an exposure surface:
+//
+//   - It is called exactly once, server-side, inside the async runDeploy
+//     goroutine, the instant a build fails. The lines it returns are persisted
+//     into deployment_events.last_lines (a column in the platform DB).
+//   - GET /deploy/:id then serves that stored snapshot straight from the
+//     platform DB — it never calls back into k8s, never proxies the cluster,
+//     and never hands the caller a path or credential into build infra.
+//   - This mirrors how GitHub Actions / CircleCI / Render capture build logs:
+//     run → capture → persist snapshot → serve the snapshot from the product's
+//     own store. The build infrastructure stays fully behind the API boundary.
+//
+// Do NOT wire FetchBuildLogs into an HTTP route. The user-facing contract is
+// the immutable "failure.last_lines" snapshot on GET /deploy/:id, not a live
+// tail of the build cluster.
 //
 // FetchBuildLogs lists pods for the build job named "build-<appID>" in the
 // deploy namespace "instant-deploy-<appID>", reads the "kaniko" container's
