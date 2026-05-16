@@ -23,6 +23,7 @@ plans:
       mongodb_connections: 2
       mongodb_ops_per_minute: 100
       queue_storage_mb: 1024
+      queue_count: -1
       storage_storage_mb: 10
       webhook_requests_stored: 100
       team_members: 1
@@ -67,6 +68,7 @@ plans:
       mongodb_connections: 2
       mongodb_ops_per_minute: 100
       queue_storage_mb: 1024
+      queue_count: -1
       storage_storage_mb: 10
       webhook_requests_stored: 100
       team_members: 1
@@ -105,6 +107,7 @@ plans:
       mongodb_connections: 5
       mongodb_ops_per_minute: 1000
       queue_storage_mb: 5120
+      queue_count: 3
       storage_storage_mb: 512
       webhook_requests_stored: 1000
       team_members: 1
@@ -161,6 +164,7 @@ plans:
       mongodb_connections: 5
       mongodb_ops_per_minute: 1000
       queue_storage_mb: 5120
+      queue_count: 5
       storage_storage_mb: 5120
       webhook_requests_stored: 5000
       team_members: 1
@@ -213,6 +217,7 @@ plans:
       mongodb_connections: 5
       mongodb_ops_per_minute: 1000
       queue_storage_mb: 5120
+      queue_count: 5
       storage_storage_mb: 5120
       webhook_requests_stored: 5000
       team_members: 1
@@ -255,6 +260,7 @@ plans:
       mongodb_connections: 5
       mongodb_ops_per_minute: 1000
       queue_storage_mb: 5120
+      queue_count: 3
       storage_storage_mb: 512
       webhook_requests_stored: 1000
       team_members: 1
@@ -299,6 +305,7 @@ plans:
       mongodb_connections: 20
       mongodb_ops_per_minute: 10000
       queue_storage_mb: 10240
+      queue_count: 20
       storage_storage_mb: 51200
       webhook_requests_stored: 10000
       team_members: 5
@@ -342,6 +349,7 @@ plans:
       mongodb_connections: 20
       mongodb_ops_per_minute: 10000
       queue_storage_mb: 10240
+      queue_count: 20
       storage_storage_mb: 51200
       webhook_requests_stored: 10000
       team_members: 5
@@ -379,6 +387,7 @@ plans:
       mongodb_connections: -1
       mongodb_ops_per_minute: -1
       queue_storage_mb: -1
+      queue_count: -1
       storage_storage_mb: -1
       webhook_requests_stored: -1
       team_members: -1
@@ -420,6 +429,7 @@ plans:
       mongodb_connections: -1
       mongodb_ops_per_minute: -1
       queue_storage_mb: -1
+      queue_count: -1
       storage_storage_mb: -1
       webhook_requests_stored: -1
       team_members: -1
@@ -461,6 +471,7 @@ plans:
       mongodb_connections: -1
       mongodb_ops_per_minute: -1
       queue_storage_mb: -1
+      queue_count: -1
       storage_storage_mb: -1
       webhook_requests_stored: -1
       team_members: 10

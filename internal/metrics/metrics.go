@@ -111,6 +111,29 @@ var (
 		Name: "instant_storage_iam_users_failed_total",
 		Help: "Per-tenant MinIO IAM user create/delete failures",
 	}, []string{"op", "phase"})
+
+	// DedicatedTierUpgradeBlocked counts requests rejected because the team's
+	// tier is not dedicated-eligible (i.e., not growth+). Labelled by
+	// handler ("db", "cache", "nosql", "queue", "vector") and team_tier.
+	// A rise here means free/hobby/pro customers are trying dedicated infra.
+	DedicatedTierUpgradeBlocked = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_dedicated_tier_upgrade_blocked_total",
+		Help: "Requests rejected because team tier is not dedicated-eligible (growth+)",
+	}, []string{"handler", "team_tier"})
+
+	// StackProvisionLimitBlocked counts stack provision attempts rejected by the
+	// per-tier deployments_apps cap from plans.yaml.
+	StackProvisionLimitBlocked = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_stack_provision_limit_blocked_total",
+		Help: "Stack provision attempts rejected by per-tier deployments_apps cap",
+	}, []string{"team_tier"})
+
+	// QueueProvisionLimitBlocked counts queue provision attempts rejected by the
+	// per-tier queue_count cap from plans.yaml.
+	QueueProvisionLimitBlocked = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_queue_provision_limit_blocked_total",
+		Help: "Queue provision attempts rejected by per-tier queue_count cap",
+	}, []string{"team_tier"})
 )
 
 // StatusClass converts an HTTP status code to a label-safe class string.

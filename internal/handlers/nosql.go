@@ -301,6 +301,11 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 
 	tier := team.PlanTier
 	if dedicated {
+		if !h.plans.IsDedicatedTier(team.PlanTier) {
+			metrics.DedicatedTierUpgradeBlocked.WithLabelValues("nosql", team.PlanTier).Inc()
+			return respondError(c, fiber.StatusPaymentRequired, "upgrade_required",
+				"Isolated (dedicated) resources require a Growth plan. Upgrade at "+urls.StartURLPrefix)
+		}
 		tier = "growth"
 	}
 

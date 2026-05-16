@@ -41,6 +41,7 @@ import (
 	"instant.dev/internal/crypto"
 	"instant.dev/internal/email"
 	"instant.dev/internal/manifest"
+	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/urls"
 	"instant.dev/internal/models"
@@ -405,6 +406,30 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		} else if exceeded {
 			return respondError(c, fiber.StatusTooManyRequests, "rate_limit_exceeded",
 				"Anonymous deploy limit reached. Upgrade at "+urls.StartURLPrefix)
+		}
+	}
+
+	// A5: per-tier stack count cap from plans.yaml (authenticated teams only).
+	// Anonymous deployments are gated only by the rate limit above.
+	if !anon && h.plans != nil {
+		limit := h.plans.DeploymentsAppsLimit(team.PlanTier)
+		if limit >= 0 {
+			existing, countErr := models.CountActiveStacksByTeam(c.Context(), h.db, team.ID)
+			if countErr != nil {
+				slog.Error("stack.new.count_failed", "error", countErr,
+					"team_id", team.ID, "team_tier", team.PlanTier)
+				return respondError(c, fiber.StatusServiceUnavailable, "quota_check_failed",
+					"Failed to check deployment quota")
+			}
+			if existing >= limit {
+				metrics.StackProvisionLimitBlocked.WithLabelValues(team.PlanTier).Inc()
+				return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired,
+					"deployment_limit_reached",
+					fmt.Sprintf("Your %s tier allows %d deployment(s). Upgrade at %s", team.PlanTier, limit, urls.StartURLPrefix),
+					newAgentActionDeploymentLimitReached(team.PlanTier, limit),
+					"https://instanode.dev/pricing",
+				)
+			}
 		}
 	}
 

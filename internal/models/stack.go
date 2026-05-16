@@ -543,3 +543,18 @@ func UpdateStackServiceImageRef(ctx context.Context, db *sql.DB, id uuid.UUID, i
 	}
 	return nil
 }
+
+// CountActiveStacksByTeam returns the number of stacks owned by teamID that are
+// NOT in status 'deleted' or 'expired'. Used by the A5 tier-gate check in
+// stack.go to enforce the per-tier deployments_apps cap from plans.yaml.
+func CountActiveStacksByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) (int, error) {
+	var n int
+	err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM stacks
+		WHERE team_id = $1 AND status NOT IN ('deleted', 'expired')
+	`, teamID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("models.CountActiveStacksByTeam: %w", err)
+	}
+	return n, nil
+}
