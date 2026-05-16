@@ -2055,6 +2055,19 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/stacks/{slug}": {
+      "get": {
+        "summary": "Get a single stack by slug",
+        "description": "Returns one stack and its current status — used by the dashboard to poll build progress after POST /stacks/new without fetching the full list.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Stack", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "stack_id": { "type": "string", "description": "Slug (same as path /stacks/{slug})" }, "name": { "type": "string" }, "status": { "type": "string" }, "tier": { "type": "string" }, "namespace": { "type": "string" }, "env": { "type": "string", "description": "Deployment env (production / staging / dev / ...)." }, "parent_stack_id": { "type": "string", "description": "Root stack id when this is a promoted child. Empty string for the root." }, "created_at": { "type": "string", "format": "date-time" } } } } } },
+          "401": { "description": "Unauthorized" },
+          "404": { "description": "Stack not found" }
+        }
+      }
+    },
     "/api/v1/stacks/{slug}/family": {
       "get": {
         "summary": "Get every env sibling of a stack (Pro+)",
