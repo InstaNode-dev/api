@@ -183,7 +183,10 @@ func deploymentToMap(d *models.Deployment) fiber.Map {
 		"port":        d.Port,
 		"tier":        d.Tier,
 		"status":      d.Status,
-		"env":         d.EnvVars,
+		// redactEnvVars masks credential-bearing values before they leave the
+		// server. The stored JSONB row is untouched — only the outbound JSON
+		// is sanitised. See deploy_env_redact.go for the two-pass heuristic.
+		"env":         redactEnvVars(d.EnvVars),
 		"environment": d.Env,
 		"private":     d.Private,
 		"allowed_ips": allowedIPs,
@@ -805,7 +808,9 @@ func (h *DeployHandler) UpdateEnv(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"ok":   true,
 		"note": "Env vars updated. Run POST /deploy/" + appID + "/redeploy to apply changes.",
-		"env":  merged,
+		// Redact outbound env vars for consistency with GET /deploy/:id.
+		// The stored value is the unredacted merged map; only the response JSON is masked.
+		"env":  redactEnvVars(merged),
 	})
 }
 

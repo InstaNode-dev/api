@@ -92,7 +92,11 @@ func TestDeployNew_EnvVarsJSON_Parsed_Into_InitEnv(t *testing.T) {
 		}
 		require.NoError(t, json.Unmarshal(bodyBytes, &created))
 		assert.Contains(t, created.Item.Env, "DATABASE_URL", "env_vars key must land in the deployment's env")
-		assert.Equal(t, "postgres://x/y", created.Item.Env["DATABASE_URL"])
+		// DATABASE_URL ends with the URL suffix — redactEnvVars masks it in the
+		// outbound response (P0 fix: credentials must not appear in API JSON).
+		// The stored value is unchanged; only the response JSON is sanitised.
+		assert.Equal(t, "***", created.Item.Env["DATABASE_URL"],
+			"DATABASE_URL is a secret-keyed var and must be redacted in the API response")
 		assert.Contains(t, created.Item.Env, "CUSTOM")
 		assert.NotContains(t, created.Item.Env, "_secret",
 			"underscore-prefixed keys are reserved and must be silently dropped — _secret leaking through is the regression")
