@@ -1204,11 +1204,16 @@ func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecre
 						// the Kaniko executor to unpack layers that set file ownership.
 						SecurityContext: func() *corev1.SecurityContext {
 							falseVal := false
+							// Capabilities are intentionally NOT dropped: kaniko
+							// unpacks the build context + every image layer and
+							// replays their chown/chmod/setuid (plus user
+							// `RUN chown`/`COPY --chown`). Dropping ALL removes
+							// CHOWN/DAC_OVERRIDE/FOWNER/SETUID/SETGID and kaniko
+							// fails at the first step ("chown: operation not
+							// permitted"). Build-pod isolation comes from the
+							// per-namespace NetworkPolicy + resource limits.
 							return &corev1.SecurityContext{
 								AllowPrivilegeEscalation: &falseVal,
-								Capabilities: &corev1.Capabilities{
-									Drop: []corev1.Capability{"ALL"},
-								},
 							}
 						}(),
 						VolumeMounts: mounts,
