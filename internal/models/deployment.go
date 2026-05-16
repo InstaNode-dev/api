@@ -509,6 +509,36 @@ func MakeDeploymentPermanent(ctx context.Context, db *sql.DB, id uuid.UUID) erro
 	return nil
 }
 
+// ElevateDeploymentTiersByTeam promotes every non-terminal deployment owned by
+// the team to newTier and clears the anonymous 24h TTL. Called from the
+// Razorpay subscription.charged webhook (via UpgradeTeamAllTiers) and from the
+// dev-only /internal/set-tier endpoint.
+//
+// The query intentionally avoids filtering on the current tier value — both
+// anonymous and free-tier deployments must be lifted on first payment. Terminal
+// statuses ('deleted', 'expired') are excluded because they no longer consume
+// infrastructure.
+//
+// reminders_sent / last_reminder_at are reset so the full 6-email warning cycle
+// fires again if the newly-permanent deployment is ever given a custom TTL later.
+func ElevateDeploymentTiersByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID, newTier string) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE deployments
+		SET tier             = $1,
+		    expires_at       = NULL,
+		    ttl_policy       = 'permanent',
+		    reminders_sent   = 0,
+		    last_reminder_at = NULL,
+		    updated_at       = now()
+		WHERE team_id = $2
+		  AND status NOT IN ('deleted', 'expired')
+	`, newTier, teamID)
+	if err != nil {
+		return fmt.Errorf("models.ElevateDeploymentTiersByTeam: %w", err)
+	}
+	return nil
+}
+
 // SetDeploymentTTL sets expires_at = now()+hours and ttl_policy = 'custom'.
 // Backs POST /api/v1/deployments/:id/ttl. Callers must validate hours
 // (1..8760) BEFORE invoking this — the model trusts its input. Resets

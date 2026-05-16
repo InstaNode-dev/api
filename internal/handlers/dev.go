@@ -43,14 +43,11 @@ func NewSetTierHandler(db *sql.DB, aesKey string) fiber.Handler {
 			return respondError(c, fiber.StatusBadRequest, "invalid_team_id", "team_id must be a valid UUID")
 		}
 
-		if err := models.UpdatePlanTier(c.Context(), db, teamID, req.Tier); err != nil {
-			slog.Error("dev.set_tier.update_plan_failed", "error", err, "team_id", req.TeamID)
-			return respondError(c, fiber.StatusServiceUnavailable, "update_failed", "Failed to update plan tier")
-		}
-
-		// Elevate all existing permanent resources to the new tier immediately.
-		if err := models.ElevateResourceTiersByTeam(c.Context(), db, teamID, req.Tier); err != nil {
-			slog.Warn("dev.set_tier.elevate_failed", "error", err, "team_id", req.TeamID)
+		// Atomically upgrade the team tier + resources + deployments + stacks.
+		// Mirrors the production Razorpay webhook path exactly.
+		if err := models.UpgradeTeamAllTiers(c.Context(), db, teamID, req.Tier); err != nil {
+			slog.Error("dev.set_tier.upgrade_all_tiers_failed", "error", err, "team_id", req.TeamID)
+			return respondError(c, fiber.StatusServiceUnavailable, "upgrade_failed", "Failed to upgrade team tier")
 		}
 
 		slog.Info("dev.set_tier.done", "team_id", req.TeamID, "tier", req.Tier)

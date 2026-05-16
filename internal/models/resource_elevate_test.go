@@ -181,3 +181,244 @@ func TestElevate_OtherTeam_Untouched(t *testing.T) {
 	assert.Equal(t, "anonymous", tier, "team B resource must not be touched")
 	assert.True(t, expiresAt.Valid, "team B expires_at must remain set")
 }
+
+// ---- Deployment elevation tests ----
+
+// insertDeploymentForTest inserts a deployment row with specific tier and expires_at
+// so we can test elevation without going through the full provision flow.
+func insertDeploymentForTest(t *testing.T, db *sql.DB, teamID uuid.UUID, tier string, expiresAt sql.NullTime, ttlPolicy string) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	err := db.QueryRowContext(context.Background(), `
+		INSERT INTO deployments (team_id, tier, expires_at, ttl_policy, status, env)
+		VALUES ($1, $2, $3, $4, 'healthy', 'development')
+		RETURNING id
+	`, teamID, tier, expiresAt, ttlPolicy).Scan(&id)
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Exec(`DELETE FROM deployments WHERE id = $1`, id) })
+	return id
+}
+
+// TestElevateDeployments_AnonymousTTL_GetsClearedOnUpgrade verifies the
+// P1-cluster-C fix: when a paying user's subscription.charged fires, an
+// anonymous deployment (still within its 24h TTL) must be elevated to the
+// paid tier and have its TTL cleared and ttl_policy set to 'permanent'.
+func TestElevateDeployments_AnonymousTTL_GetsClearedOnUpgrade(t *testing.T) {
+	requireDBElevate(t)
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+
+	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, "hobby"))
+	deployID := insertDeploymentForTest(t, db, teamID, "anonymous",
+		sql.NullTime{Time: time.Now().Add(10 * time.Hour), Valid: true}, "auto_24h")
+
+	err := models.ElevateDeploymentTiersByTeam(context.Background(), db, teamID, "hobby")
+	require.NoError(t, err)
+
+	var tier, ttlPolicy string
+	var expiresAt sql.NullTime
+	err = db.QueryRow(`SELECT tier, expires_at, ttl_policy FROM deployments WHERE id = $1`, deployID).
+		Scan(&tier, &expiresAt, &ttlPolicy)
+	require.NoError(t, err)
+	assert.Equal(t, "hobby", tier, "deployment tier must be elevated")
+	assert.False(t, expiresAt.Valid, "expires_at must be cleared on elevation")
+	assert.Equal(t, "permanent", ttlPolicy, "ttl_policy must be set to permanent")
+}
+
+// TestElevateDeployments_TerminalStatuses_Skipped verifies that deleted and
+// expired deployments are NOT resurrected during an upgrade.
+func TestElevateDeployments_TerminalStatuses_Skipped(t *testing.T) {
+	requireDBElevate(t)
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+
+	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, "hobby"))
+
+	// Insert two terminal-status deployments. We simulate by inserting normally
+	// then updating status so we can track the IDs.
+	deletedID := insertDeploymentForTest(t, db, teamID, "anonymous",
+		sql.NullTime{Time: time.Now().Add(10 * time.Hour), Valid: true}, "auto_24h")
+	_, err := db.Exec(`UPDATE deployments SET status = 'deleted' WHERE id = $1`, deletedID)
+	require.NoError(t, err)
+
+	expiredID := insertDeploymentForTest(t, db, teamID, "anonymous",
+		sql.NullTime{Time: time.Now().Add(10 * time.Hour), Valid: true}, "auto_24h")
+	_, err = db.Exec(`UPDATE deployments SET status = 'expired' WHERE id = $1`, expiredID)
+	require.NoError(t, err)
+
+	err = models.ElevateDeploymentTiersByTeam(context.Background(), db, teamID, "hobby")
+	require.NoError(t, err)
+
+	for _, id := range []uuid.UUID{deletedID, expiredID} {
+		var tier string
+		var expiresAt sql.NullTime
+		err = db.QueryRow(`SELECT tier, expires_at FROM deployments WHERE id = $1`, id).
+			Scan(&tier, &expiresAt)
+		require.NoError(t, err)
+		assert.Equal(t, "anonymous", tier, "terminal deployment must not be elevated (id=%s)", id)
+		assert.True(t, expiresAt.Valid, "terminal deployment expires_at must remain set (id=%s)", id)
+	}
+}
+
+// ---- Stack elevation tests ----
+
+// insertStackForTest inserts a stack row with specific tier and expires_at.
+func insertStackForTest(t *testing.T, db *sql.DB, teamID uuid.UUID, tier string, expiresAt sql.NullTime) uuid.UUID {
+	t.Helper()
+	slug := uuid.NewString()[:8] // short random slug to avoid unique-index collisions
+	var id uuid.UUID
+	err := db.QueryRowContext(context.Background(), `
+		INSERT INTO stacks (team_id, slug, tier, expires_at, status, env)
+		VALUES ($1, $2, $3, $4, 'healthy', 'development')
+		RETURNING id
+	`, teamID, slug, tier, expiresAt).Scan(&id)
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Exec(`DELETE FROM stacks WHERE id = $1`, id) })
+	return id
+}
+
+// TestElevateStacks_AnonymousTTL_GetsClearedOnUpgrade verifies the
+// P1-cluster-C fix for stacks: a paying user's subscription.charged fires
+// and an anonymous stack (still within its 24h TTL) must be elevated to the
+// paid tier and have its TTL cleared.
+func TestElevateStacks_AnonymousTTL_GetsClearedOnUpgrade(t *testing.T) {
+	requireDBElevate(t)
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+
+	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, "hobby"))
+	stackID := insertStackForTest(t, db, teamID, "anonymous",
+		sql.NullTime{Time: time.Now().Add(10 * time.Hour), Valid: true})
+
+	err := models.ElevateStackTiersByTeam(context.Background(), db, teamID, "hobby")
+	require.NoError(t, err)
+
+	var tier string
+	var expiresAt sql.NullTime
+	err = db.QueryRow(`SELECT tier, expires_at FROM stacks WHERE id = $1`, stackID).
+		Scan(&tier, &expiresAt)
+	require.NoError(t, err)
+	assert.Equal(t, "hobby", tier, "stack tier must be elevated")
+	assert.False(t, expiresAt.Valid, "expires_at must be cleared on elevation")
+}
+
+// TestElevateStacks_DeletingStatus_Skipped verifies that mid-teardown stacks
+// (status='deleting') are NOT touched during an upgrade.
+func TestElevateStacks_DeletingStatus_Skipped(t *testing.T) {
+	requireDBElevate(t)
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+
+	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, "hobby"))
+	stackID := insertStackForTest(t, db, teamID, "anonymous",
+		sql.NullTime{Time: time.Now().Add(10 * time.Hour), Valid: true})
+	_, err := db.Exec(`UPDATE stacks SET status = 'deleting' WHERE id = $1`, stackID)
+	require.NoError(t, err)
+
+	err = models.ElevateStackTiersByTeam(context.Background(), db, teamID, "hobby")
+	require.NoError(t, err)
+
+	var tier string
+	var expiresAt sql.NullTime
+	err = db.QueryRow(`SELECT tier, expires_at FROM stacks WHERE id = $1`, stackID).
+		Scan(&tier, &expiresAt)
+	require.NoError(t, err)
+	assert.Equal(t, "anonymous", tier, "deleting stack must not be elevated")
+	assert.True(t, expiresAt.Valid, "deleting stack expires_at must remain set")
+}
+
+// ---- UpgradeTeamAllTiers integration tests ----
+
+// TestUpgradeTeamAllTiers_HobbyTeam_PromotesResourceDeploymentAndStack is the
+// primary P1-cluster-C regression test. A hobby team with one anonymous
+// resource, one anonymous deployment, and one anonymous stack all with live
+// TTLs — after UpgradeTeamAllTiers to "pro" all three rows must have tier=pro
+// and expires_at=NULL.
+func TestUpgradeTeamAllTiers_HobbyTeam_PromotesResourceDeploymentAndStack(t *testing.T) {
+	requireDBElevate(t)
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+
+	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, "hobby"))
+	ttl := sql.NullTime{Time: time.Now().Add(10 * time.Hour), Valid: true}
+
+	resourceID := insertResourceForTest(t, db, &teamID, "anonymous", ttl)
+	deployID := insertDeploymentForTest(t, db, teamID, "anonymous", ttl, "auto_24h")
+	stackID := insertStackForTest(t, db, teamID, "anonymous", ttl)
+
+	err := models.UpgradeTeamAllTiers(context.Background(), db, teamID, "pro")
+	require.NoError(t, err)
+
+	// Verify resource elevated.
+	var tier string
+	var expiresAt sql.NullTime
+	err = db.QueryRow(`SELECT tier, expires_at FROM resources WHERE id = $1`, resourceID).
+		Scan(&tier, &expiresAt)
+	require.NoError(t, err)
+	assert.Equal(t, "pro", tier, "resource tier must be elevated")
+	assert.False(t, expiresAt.Valid, "resource expires_at must be cleared")
+
+	// Verify deployment elevated.
+	var ttlPolicy string
+	err = db.QueryRow(`SELECT tier, expires_at, ttl_policy FROM deployments WHERE id = $1`, deployID).
+		Scan(&tier, &expiresAt, &ttlPolicy)
+	require.NoError(t, err)
+	assert.Equal(t, "pro", tier, "deployment tier must be elevated")
+	assert.False(t, expiresAt.Valid, "deployment expires_at must be cleared")
+	assert.Equal(t, "permanent", ttlPolicy, "deployment ttl_policy must be permanent")
+
+	// Verify stack elevated.
+	err = db.QueryRow(`SELECT tier, expires_at FROM stacks WHERE id = $1`, stackID).
+		Scan(&tier, &expiresAt)
+	require.NoError(t, err)
+	assert.Equal(t, "pro", tier, "stack tier must be elevated")
+	assert.False(t, expiresAt.Valid, "stack expires_at must be cleared")
+
+	// Verify team tier updated.
+	var planTier string
+	err = db.QueryRow(`SELECT plan_tier FROM teams WHERE id = $1`, teamID).Scan(&planTier)
+	require.NoError(t, err)
+	assert.Equal(t, "pro", planTier, "team plan_tier must be updated")
+}
+
+// TestUpgradeTeamAllTiers_OtherTeam_Untouched verifies cross-team isolation:
+// upgrading team A must not affect any of team B's rows (resource, deployment, stack).
+func TestUpgradeTeamAllTiers_OtherTeam_Untouched(t *testing.T) {
+	requireDBElevate(t)
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+
+	teamA := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, "hobby"))
+	teamB := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, "hobby"))
+	ttl := sql.NullTime{Time: time.Now().Add(10 * time.Hour), Valid: true}
+
+	resB := insertResourceForTest(t, db, &teamB, "anonymous", ttl)
+	depB := insertDeploymentForTest(t, db, teamB, "anonymous", ttl, "auto_24h")
+	stkB := insertStackForTest(t, db, teamB, "anonymous", ttl)
+
+	err := models.UpgradeTeamAllTiers(context.Background(), db, teamA, "pro")
+	require.NoError(t, err)
+
+	// Team B resource untouched.
+	var tier string
+	var expiresAt sql.NullTime
+	err = db.QueryRow(`SELECT tier, expires_at FROM resources WHERE id = $1`, resB).
+		Scan(&tier, &expiresAt)
+	require.NoError(t, err)
+	assert.Equal(t, "anonymous", tier, "team B resource must not be elevated")
+	assert.True(t, expiresAt.Valid, "team B resource expires_at must remain set")
+
+	// Team B deployment untouched.
+	err = db.QueryRow(`SELECT tier, expires_at FROM deployments WHERE id = $1`, depB).
+		Scan(&tier, &expiresAt)
+	require.NoError(t, err)
+	assert.Equal(t, "anonymous", tier, "team B deployment must not be elevated")
+	assert.True(t, expiresAt.Valid, "team B deployment expires_at must remain set")
+
+	// Team B stack untouched.
+	err = db.QueryRow(`SELECT tier, expires_at FROM stacks WHERE id = $1`, stkB).
+		Scan(&tier, &expiresAt)
+	require.NoError(t, err)
+	assert.Equal(t, "anonymous", tier, "team B stack must not be elevated")
+	assert.True(t, expiresAt.Valid, "team B stack expires_at must remain set")
+}

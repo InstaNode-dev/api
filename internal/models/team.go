@@ -245,6 +245,83 @@ func UpdatePlanTier(ctx context.Context, db *sql.DB, teamID uuid.UUID, tier stri
 	return nil
 }
 
+// UpgradeTeamAllTiers atomically upgrades the team tier and promotes every
+// active resource, deployment, and stack owned by that team. All four updates
+// run inside a single transaction so a partial failure (e.g. ElevateDeployments
+// succeeds but Commit fails) cannot leave the DB in a half-upgraded state.
+//
+// This is the authoritative upgrade function. Call sites:
+//   - billing.go handleSubscriptionCharged (Razorpay webhook)
+//   - handlers/dev.go POST /internal/set-tier
+//
+// The admin tier-change path (admin_customers.go ChangeTier) intentionally does
+// NOT use this function because (a) it already has its own UpdatePlanTier call
+// followed by best-effort elevation, and (b) the admin path also handles
+// demotions where the elevation step is skipped entirely. Keeping that path
+// separate avoids conflating two different flows.
+//
+// ElevateResourceTiersByTeam carries the reaper-race guard
+// (expires_at > now()), so already-expired resources are never resurrected.
+// ElevateDeploymentTiersByTeam and ElevateStackTiersByTeam carry analogous
+// terminal-status filters.
+func UpgradeTeamAllTiers(ctx context.Context, db *sql.DB, teamID uuid.UUID, newTier string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("models.UpgradeTeamAllTiers: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// 1. Update the team's plan tier.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE teams SET plan_tier = $1 WHERE id = $2
+	`, newTier, teamID); err != nil {
+		return fmt.Errorf("models.UpgradeTeamAllTiers: update_plan_tier: %w", err)
+	}
+
+	// 2. Resources — reaper-race guard: only lift non-expired rows.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE resources
+		SET tier = $1, expires_at = NULL
+		WHERE team_id = $2
+		  AND status = 'active'
+		  AND (expires_at IS NULL OR expires_at > now())
+	`, newTier, teamID); err != nil {
+		return fmt.Errorf("models.UpgradeTeamAllTiers: elevate_resources: %w", err)
+	}
+
+	// 3. Deployments — clear 24h TTL; skip terminal statuses.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE deployments
+		SET tier             = $1,
+		    expires_at       = NULL,
+		    ttl_policy       = 'permanent',
+		    reminders_sent   = 0,
+		    last_reminder_at = NULL,
+		    updated_at       = now()
+		WHERE team_id = $2
+		  AND status NOT IN ('deleted', 'expired')
+	`, newTier, teamID); err != nil {
+		return fmt.Errorf("models.UpgradeTeamAllTiers: elevate_deployments: %w", err)
+	}
+
+	// 4. Stacks — clear anonymous 24h TTL; skip mid-teardown rows.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE stacks
+		SET tier       = $1,
+		    expires_at = NULL,
+		    updated_at = now()
+		WHERE team_id = $2
+		  AND status NOT IN ('deleting')
+	`, newTier, teamID); err != nil {
+		return fmt.Errorf("models.UpgradeTeamAllTiers: elevate_stacks: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("models.UpgradeTeamAllTiers: commit: %w", err)
+	}
+	return nil
+}
+
 // GetTeamByRazorpaySubscriptionID looks up a team by Razorpay subscription ID.
 func GetTeamByRazorpaySubscriptionID(ctx context.Context, db *sql.DB, subscriptionID string) (*Team, error) {
 	t := &Team{}

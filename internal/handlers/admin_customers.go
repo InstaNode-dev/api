@@ -673,7 +673,13 @@ func (h *AdminCustomersHandler) ChangeTier(c *fiber.Ctx) error {
 	// current tier — same user-benefit policy as the Razorpay path.
 	if toR > fromR {
 		if err := models.ElevateResourceTiersByTeam(c.Context(), h.db, teamID, req.Tier); err != nil {
-			slog.Warn("admin.customers.tier.elevate_failed", "error", err, "team_id", teamID)
+			slog.Warn("admin.customers.tier.elevate_resources_failed", "error", err, "team_id", teamID)
+		}
+		if err := models.ElevateDeploymentTiersByTeam(c.Context(), h.db, teamID, req.Tier); err != nil {
+			slog.Warn("admin.customers.tier.elevate_deployments_failed", "error", err, "team_id", teamID)
+		}
+		if err := models.ElevateStackTiersByTeam(c.Context(), h.db, teamID, req.Tier); err != nil {
+			slog.Warn("admin.customers.tier.elevate_stacks_failed", "error", err, "team_id", teamID)
 		}
 	}
 
