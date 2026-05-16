@@ -659,7 +659,14 @@ func TestNetworkPolicy_CrossTenantIsolation_TableDriven(t *testing.T) {
 //
 // Gap 1: Disk fill (noisy-neighbour DoS)
 // Gap 2: Build pod no timeout
-// Gap 3: No explicit pids limit
+// Gap 3: Per-pod PID limiting
+//   NOTE: k8s LimitRange does NOT support "pids" as a resource — the API server
+//   rejects it ("pids: must be a standard resource for containers"). Per-pod PID
+//   limits require a node-level kubelet setting (--pod-max-pids / podPidsLimit),
+//   which is an operator/infrastructure action outside the scope of namespace
+//   setup. The practical risk is backstopped by the per-pod memory limit: fork
+//   bombs consume memory and trigger OOM eviction before the process count
+//   becomes dangerous. See createLimitRangeForNS for the full rationale.
 
 // TestDeployPodHasEphemeralStorageLimit is the noisy-neighbour disk-fill
 // regression guard. A customer deployment that writes unbounded to its
@@ -849,11 +856,13 @@ func TestBuildJobActiveDeadlineSeconds_TableDriven(t *testing.T) {
 	}
 }
 
-// TestLimitRangeHasPidsDefault guards Gap 3 (defence-in-depth pids fork-bomb
-// cap). The LimitRange should include a "pids" default when the API server
-// supports it (k8s 1.20+ with SupportPodPidsLimit). The fake clientset accepts
-// any resource name, so this test can assert the pids field is present.
-func TestLimitRangeHasPidsDefault(t *testing.T) {
+// TestLimitRangeHasNoPids guards that createLimitRangeForNS does NOT attempt to
+// add a "pids" resource to the LimitRange. The Kubernetes API server rejects
+// "pids" in a LimitRange ("pids: must be a standard resource for containers") —
+// verified in production on DOKS 1.32. The previous try-with-pids / fallback
+// code was dead: the fallback always fired. This test asserts the clean state:
+// the LimitRange is created once with cpu, memory, and ephemeral-storage only.
+func TestLimitRangeHasNoPids(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	p := &K8sProvider{clientset: cs}
 
@@ -871,11 +880,27 @@ func TestLimitRangeHasPidsDefault(t *testing.T) {
 		if item.Type != corev1.LimitTypeContainer {
 			continue
 		}
-		// Pids cap should be present in the Default map on clusters that support it.
-		// The fake API server never rejects resources, so the first Create (with pids)
-		// always succeeds — assert accordingly.
-		if _, ok := item.Default[corev1.ResourceName("pids")]; !ok {
-			t.Error("LimitRange 'instant-limits' Default is missing 'pids' resource — Gap 3 (fork-bomb defence) has regressed; check pidsLimitPerContainer constant and createLimitRangeForNS")
+		// Verify the three real resources are present.
+		for _, r := range []corev1.ResourceName{
+			corev1.ResourceMemory,
+			corev1.ResourceCPU,
+			corev1.ResourceEphemeralStorage,
+		} {
+			if _, ok := item.Default[r]; !ok {
+				t.Errorf("LimitRange 'instant-limits' Default is missing %s", r)
+			}
+			if r != corev1.ResourceCPU {
+				// CPU has no DefaultRequest distinction needed here; memory + eph do.
+				if _, ok := item.DefaultRequest[r]; !ok {
+					t.Errorf("LimitRange 'instant-limits' DefaultRequest is missing %s", r)
+				}
+			}
+		}
+
+		// Pids must NOT be present — the k8s API server rejects it in a LimitRange.
+		if _, ok := item.Default[corev1.ResourceName("pids")]; ok {
+			t.Error("LimitRange 'instant-limits' Default contains 'pids' resource — " +
+				"k8s rejects this in production; remove the pids entry from createLimitRangeForNS")
 		}
 	}
 }
