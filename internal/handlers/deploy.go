@@ -293,6 +293,7 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 	opts := compute.DeployOptions{
 		AppID:      d.AppID,
 		Token:      d.ID.String(),
+		TeamID:     d.TeamID.String(), // scopes NetworkPolicy DB-egress to this team's namespaces
 		Tarball:    tarball,
 		Port:       d.Port,
 		Tier:       d.Tier,

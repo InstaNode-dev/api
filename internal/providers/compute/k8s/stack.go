@@ -142,8 +142,9 @@ func (p *K8sStackProvider) DeployStack(
 	}
 
 	// ── Step 2: Create stack namespace with security primitives ──────────────
-
-	if err := p.setupTenantNamespace(ctx, stackNamespace, opts.StackID, opts.Tier); err != nil {
+	// opts.TeamID scopes the NetworkPolicy DB-egress rule to this team's
+	// customer-resource namespaces — preventing cross-tenant DB access.
+	if err := p.setupTenantNamespace(ctx, stackNamespace, opts.StackID, opts.TeamID, opts.Tier); err != nil {
 		return fmt.Errorf("k8s.DeployStack: setup namespace: %w", err)
 	}
 

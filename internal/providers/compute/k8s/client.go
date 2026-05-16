@@ -36,6 +36,20 @@ const (
 	imageRegistry = "instant-apps"
 	labelApp      = "instant-app"
 	labelAppID    = "instant-app-id"
+
+	// labelCustomerResourceRole / labelCustomerResourceRoleValue are the namespace
+	// labels applied to every instant-customer-* namespace by the provisioner.
+	// The deploy-side NetworkPolicy egress rule for DB ports uses these to select
+	// which namespaces a customer deployment may reach.
+	labelCustomerResourceRole      = "instant.dev/role"
+	labelCustomerResourceRoleValue = "customer-resource"
+
+	// labelOwnerTeam is the namespace label applied to dedicated (k8s-backed)
+	// customer-resource namespaces by the provisioner.  Combined with
+	// labelCustomerResourceRole in the NetworkPolicy DB-egress selector, it
+	// ensures a deployment can only reach its own team's databases.
+	// Pentest fix: 2026-05-16.
+	labelOwnerTeam = "instant.dev/owner-team"
 )
 
 // BuildContextConfig holds the MinIO/S3 settings used to deliver the kaniko
@@ -125,7 +139,11 @@ func deployNamespace(appID string) string {
 // namespaceName: the k8s namespace name (e.g. "instant-deploy-abc" or "instant-stack-xyz")
 // tenantID: used for labels (instant.dev/tenant label)
 // tier: "hobby"|"pro"|"team" — controls ResourceQuota and LimitRange sizes
-func (p *K8sProvider) setupTenantNamespace(ctx context.Context, namespaceName, tenantID, tier string) error {
+// teamID: owning team UUID — scopes the NetworkPolicy DB-port egress to this
+// team's customer-resource namespaces only, preventing cross-tenant DB access.
+// Pass empty string for unowned/anonymous deploys (NetworkPolicy falls back to
+// role-only selector, less restrictive but acceptable for anonymous workloads).
+func (p *K8sProvider) setupTenantNamespace(ctx context.Context, namespaceName, tenantID, teamID, tier string) error {
 	// Step 1: Create namespace with PSS labels.
 	ns := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -149,7 +167,8 @@ func (p *K8sProvider) setupTenantNamespace(ctx context.Context, namespaceName, t
 	}
 
 	// Step 2: Default-deny NetworkPolicy with targeted allow rules.
-	if err := p.createNetworkPolicyInNS(ctx, namespaceName); err != nil {
+	// teamID scopes the DB-port egress to the team's own customer namespaces.
+	if err := p.createNetworkPolicyInNS(ctx, namespaceName, teamID); err != nil {
 		return fmt.Errorf("create network policy in %q: %w", namespaceName, err)
 	}
 
@@ -169,8 +188,8 @@ func (p *K8sProvider) setupTenantNamespace(ctx context.Context, namespaceName, t
 // createDeployNamespace creates a per-deployment namespace with Pod Security Standards
 // labels and relevant tenant labels. Uses "baseline" enforcement (not "restricted")
 // because restricted blocks legitimate patterns like writing to /tmp.
-func (p *K8sProvider) createDeployNamespace(ctx context.Context, appID, tier string) error {
-	return p.setupTenantNamespace(ctx, deployNamespace(appID), appID, tier)
+func (p *K8sProvider) createDeployNamespace(ctx context.Context, appID, teamID, tier string) error {
+	return p.setupTenantNamespace(ctx, deployNamespace(appID), appID, teamID, tier)
 }
 
 // ptrProto / ptrPort — addressable temporaries for inline NetworkPolicyPort literals.
@@ -185,11 +204,34 @@ func ptrPort(p int) *intstr.IntOrString          { v := intstr.FromInt(p); retur
 //   - Allow intra-namespace pod-to-pod communication
 //   - Allow ingress from the "instant" namespace (API health checks)
 //
-// This blocks user app pods from reaching postgres-platform, redis, or other tenant namespaces.
-func (p *K8sProvider) createNetworkPolicyInNS(ctx context.Context, ns string) error {
+// teamID scopes the DB-port egress rule to the team's own customer-resource namespaces.
+// When teamID is non-empty, the selector uses BOTH "instant.dev/role=customer-resource"
+// AND "instant.dev/owner-team=<teamID>" so a deployment can only reach databases
+// provisioned under its own team — not another tenant's.  This closes the
+// cross-tenant network-isolation gap confirmed by pentest on 2026-05-16.
+//
+// When teamID is empty (anonymous deploys), the rule falls back to the role-only
+// selector — less restrictive, but acceptable: anonymous namespaces have no
+// dedicated databases to protect against each other in the same way.
+//
+// This blocks user app pods from reaching postgres-platform, redis, or other tenants' namespaces.
+func (p *K8sProvider) createNetworkPolicyInNS(ctx context.Context, ns, teamID string) error {
 	proto53UDP := corev1.ProtocolUDP
 	proto53TCP := corev1.ProtocolTCP
 	port53 := intstr.FromInt(53)
+
+	// Build the DB-port egress selector.
+	//
+	// SECURITY: When teamID is set, both labels MUST match. A deployment from
+	// team A cannot reach namespaces labelled owner-team=B even though they
+	// share the role=customer-resource label. This enforces the tenant boundary
+	// at the network layer (defence-in-depth alongside application-level auth).
+	dbEgressLabels := map[string]string{
+		labelCustomerResourceRole: labelCustomerResourceRoleValue,
+	}
+	if teamID != "" {
+		dbEgressLabels[labelOwnerTeam] = teamID
+	}
 
 	np := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
@@ -274,18 +316,24 @@ func (p *K8sProvider) createNetworkPolicyInNS(ctx context.Context, ns string) er
 					},
 				},
 				{
-					// Allow egress to dedicated DB pods in customer-resource namespaces
-					// on the data ports. Each /db/new, /cache/new, etc. creates a namespace
-					// labelled "instant.dev/role=customer-resource" — this rule lets the
-					// stack's app pods reach the postgres/redis/mongo/nats pod they `needs:`.
-					// Without this, Cilium-backed clusters (DOKS) silently drop service-IP
-					// traffic even though the broad `0.0.0.0/0` rule below ought to cover it.
+					// Allow egress to THIS TEAM'S dedicated DB pods in customer-resource namespaces.
+					//
+					// SECURITY FIX (pentest 2026-05-16): previously the selector only matched
+					// "instant.dev/role=customer-resource", allowing ANY deployment to reach
+					// ANY other tenant's database. Now the selector ALSO requires
+					// "instant.dev/owner-team=<teamID>" so a deployment can only reach the
+					// namespaces owned by its own team.
+					//
+					// Preservation of legitimate access: a deployment WITH a resource_binding
+					// to its own team's DB has teamID == the label on those namespaces →
+					// still reachable. Other teams' namespaces → blocked at the network layer.
+					//
+					// When teamID is empty (anonymous deploy) we keep the role-only selector
+					// as a safe fallback.
 					To: []networkingv1.NetworkPolicyPeer{
 						{
 							NamespaceSelector: &metav1.LabelSelector{
-								MatchLabels: map[string]string{
-									"instant.dev/role": "customer-resource",
-								},
+								MatchLabels: dbEgressLabels,
 							},
 						},
 					},
@@ -296,25 +344,12 @@ func (p *K8sProvider) createNetworkPolicyInNS(ctx context.Context, ns string) er
 						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(4222)},  // nats
 					},
 				},
-				{
-					// Allow egress to the `instant` namespace on data ports, so stacks can
-					// reach the in-cluster pg-proxy (and future redis/mongo/nats proxies).
-					To: []networkingv1.NetworkPolicyPeer{
-						{
-							NamespaceSelector: &metav1.LabelSelector{
-								MatchLabels: map[string]string{
-									"kubernetes.io/metadata.name": "instant",
-								},
-							},
-						},
-					},
-					Ports: []networkingv1.NetworkPolicyPort{
-						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(5432)},
-						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(6379)},
-						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(27017)},
-						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(4222)},
-					},
-				},
+				// NOTE: The former rule that allowed DB-port egress to the entire "instant"
+				// namespace (platform Redis, platform Postgres) has been intentionally
+				// removed.  Customer deployments have no legitimate need to reach
+				// platform-internal datastores — the shared proxies (pg-proxy, redis-proxy)
+				// face the public internet, not cluster-internal ports.  Removing this rule
+				// eliminates gap (a) from the 2026-05-16 pentest finding.
 				{
 					// Allow DNS resolution via kube-dns in kube-system (UDP + TCP port 53).
 					// Without this, hostname resolution fails entirely.
@@ -334,12 +369,15 @@ func (p *K8sProvider) createNetworkPolicyInNS(ctx context.Context, ns string) er
 				},
 				{
 					// Allow general internet egress (user apps need to call external APIs).
-					// We block specific internal namespaces via ingress rules on those namespaces,
-					// not here — network policies are additive and ingress-side deny is the right place.
+					// Cluster-internal CIDRs and the cloud metadata endpoint (169.254.169.254)
+					// are in the Except list — user apps must not be able to exfiltrate
+					// credentials from the DO/AWS instance metadata service.
+					//
+					// SECURITY FIX (pentest 2026-05-16 gap b): 169.254.0.0/16 (link-local)
+					// added to Except so the DO droplet metadata endpoint at
+					// 169.254.169.254 is unreachable from customer workloads.
 					To: []networkingv1.NetworkPolicyPeer{
 						{
-							// Block only internal instant namespaces from receiving traffic.
-							// ipBlock allows all non-cluster traffic (external internet).
 							IPBlock: &networkingv1.IPBlock{
 								CIDR: "0.0.0.0/0",
 								Except: []string{
@@ -348,6 +386,9 @@ func (p *K8sProvider) createNetworkPolicyInNS(ctx context.Context, ns string) er
 									// (postgres-platform, redis, instant-infra, instant-data).
 									"10.42.0.0/16",
 									"10.43.0.0/16",
+									// Link-local: blocks the cloud instance metadata endpoint
+									// (169.254.169.254 on DO / AWS / GCP).
+									"169.254.0.0/16",
 								},
 							},
 						},
@@ -364,8 +405,10 @@ func (p *K8sProvider) createNetworkPolicyInNS(ctx context.Context, ns string) er
 }
 
 // createDefaultDenyNetworkPolicy is a backward-compat shim over createNetworkPolicyInNS.
+// The teamID is empty here — this shim is only called by legacy code paths
+// that have not yet been updated to pass a team ID.
 func (p *K8sProvider) createDefaultDenyNetworkPolicy(ctx context.Context, appID string) error {
-	return p.createNetworkPolicyInNS(ctx, deployNamespace(appID))
+	return p.createNetworkPolicyInNS(ctx, deployNamespace(appID), "")
 }
 
 // createResourceQuotaInNS installs a ResourceQuota in the given namespace.
@@ -485,7 +528,9 @@ func (p *K8sProvider) Deploy(ctx context.Context, opts compute.DeployOptions) (*
 	}
 
 	// Step 2: Create per-deployment namespace with all security primitives.
-	if err := p.setupTenantNamespace(ctx, ns, opts.AppID, opts.Tier); err != nil {
+	// opts.TeamID scopes the NetworkPolicy DB-egress rule to this team's
+	// customer-resource namespaces — preventing cross-tenant DB access.
+	if err := p.setupTenantNamespace(ctx, ns, opts.AppID, opts.TeamID, opts.Tier); err != nil {
 		return nil, fmt.Errorf("k8s.Deploy: setup namespace: %w", err)
 	}
 

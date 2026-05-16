@@ -710,8 +710,15 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		})
 	}
 
+	// Build the team ID string for NetworkPolicy scoping. Anonymous stacks use
+	// empty string — no dedicated DBs to protect across anonymous namespaces.
+	stackTeamIDStr := ""
+	if stackTeamID != nil {
+		stackTeamIDStr = stackTeamID.String()
+	}
 	opts := compute.StackDeployOptions{
 		StackID:  stack.Slug,
+		TeamID:   stackTeamIDStr, // scopes NetworkPolicy DB-egress to this team's namespaces
 		Tier:     stackTier,
 		Services: services,
 	}
