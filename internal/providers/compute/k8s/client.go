@@ -88,9 +88,20 @@ const (
 // Rationale for each field:
 //   - AllowPrivilegeEscalation=false: prevents a child process from gaining
 //     more privileges than its parent (blocks setuid-binary privilege escalation).
-//   - Capabilities drop ALL + add NET_BIND_SERVICE: removes the full Docker
-//     default capability set (NET_RAW, SYS_CHROOT, …) while preserving the
-//     ability to bind privileged ports, which many customer HTTP servers require.
+//   - Capabilities drop NET_RAW: removes raw-socket access (the main in-cluster
+//     packet-spoofing / ARP-poisoning vector) while LEAVING the rest of the
+//     Docker default set intact.
+//
+// Why NOT drop ALL (the 2026-05-17 fix): `Drop: ALL` is a restricted-PSS
+// pattern that is only safe for images WE control. It also strips CHOWN,
+// SETUID, SETGID, DAC_OVERRIDE, FOWNER, … which arbitrary customer images
+// routinely need — a root-in-container process still requires the CHOWN
+// capability to chown(). Stock `nginx`, `postgres`, `redis` and most images
+// that adjust file ownership or drop privileges at startup crash-loop under
+// `Drop: ALL` (verified: `nginx: [emerg] chown(...) Operation not permitted`).
+// Dropping only NET_RAW keeps the meaningful isolation (no raw sockets, plus
+// AllowPrivilegeEscalation=false and the RuntimeDefault seccomp profile on the
+// pod) without breaking the deploy product for the most common image types.
 //
 // Deliberately NOT set on customer containers:
 //   - RunAsNonRoot — customer images are arbitrary; many legitimately run as
@@ -105,8 +116,9 @@ func customerContainerSecCtx() *corev1.SecurityContext {
 	return &corev1.SecurityContext{
 		AllowPrivilegeEscalation: &falseVal,
 		Capabilities: &corev1.Capabilities{
-			Drop: []corev1.Capability{"ALL"},
-			Add:  []corev1.Capability{capNetBindService},
+			// NET_BIND_SERVICE stays available (it is in the Docker default
+			// set we are no longer dropping), so privileged-port binds work.
+			Drop: []corev1.Capability{"NET_RAW"},
 		},
 	}
 }
