@@ -282,6 +282,38 @@ func deploymentToMapWithDB(d *models.Deployment, db *sql.DB) fiber.Map {
 
 // ── captureAutopsy — best-effort build failure snapshot ──────────────────────
 
+// fetchBuildLogsForAutopsy attempts to retrieve the kaniko build logs for appID
+// by type-asserting the compute provider to compute.BuildLogFetcher. Returns
+// nil when the provider does not support log fetching (noop, test doubles) or
+// when the build pod is already gone — the caller then writes the autopsy with
+// an empty last_lines slice (fail-soft).
+//
+// A short timeout (30 s) is applied so a slow k8s API server never blocks the
+// autopsy write indefinitely.
+func fetchBuildLogsForAutopsy(ctx context.Context, cp compute.Provider, appID string) []string {
+	fetcher, ok := cp.(compute.BuildLogFetcher)
+	if !ok {
+		// Provider (noop, test double) does not implement BuildLogFetcher — skip.
+		return nil
+	}
+
+	// Give the log fetch a short deadline so a slow k8s API never blocks the
+	// autopsy write (the context from runDeploy may already be near its limit).
+	fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	lines, err := fetcher.FetchBuildLogs(fetchCtx, appID)
+	if err != nil {
+		// Fail-soft: pod gone or logs unavailable — write autopsy without lines.
+		slog.Warn("deploy.run_deploy.build_log_fetch_failed",
+			"app_id", appID,
+			"error", err,
+		)
+		return nil
+	}
+	return lines
+}
+
 // captureAutopsy writes (or updates) a failure_autopsy deployment_events row
 // for a build-path failure. The worker writes runtime-failure autopsies; this
 // function handles the build path (vault error + kaniko failure) because the
@@ -391,7 +423,12 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 		if errors.Is(err, context.DeadlineExceeded) {
 			reason = models.FailureReasonDeadlineExceeded
 		}
-		captureAutopsy(ctx, h.db, d.ID, reason, err.Error(), nil)
+		// Fetch the kaniko build pod logs for the autopsy so the user can see
+		// the actual Dockerfile error (e.g. a failing RUN step) rather than just
+		// "build failed". fetchBuildLogsForAutopsy is fail-soft: returns nil when
+		// the pod is gone or the provider doesn't support log fetching.
+		buildLogs := fetchBuildLogsForAutopsy(ctx, h.compute, d.AppID)
+		captureAutopsy(ctx, h.db, d.ID, reason, err.Error(), buildLogs)
 		return
 	}
 	_ = models.UpdateDeploymentProviderID(ctx, h.db, d.ID, result.ProviderID, result.AppURL)
