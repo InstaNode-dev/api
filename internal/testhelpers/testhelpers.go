@@ -511,6 +511,149 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			error_msg   TEXT,
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		// 005_stacks_anon — anonymous-tier stacks carry a name + fingerprint.
+		`ALTER TABLE stacks ADD COLUMN IF NOT EXISTS name TEXT`,
+		`ALTER TABLE stacks ADD COLUMN IF NOT EXISTS fingerprint TEXT`,
+		// 020_deployment_access_control — private deploys (Pro/Team/Growth).
+		// Both columns mirrored so deployment model + handler tests that go
+		// through models.CreateDeployment (which writes every column) work
+		// against the CI bare-Postgres path, not just the migrated local DB.
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS private BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS allowed_ips TEXT NOT NULL DEFAULT ''`,
+		// 025_email_events — provider delivery feedback (bounce/unsubscribe/
+		// spam) consumed by the worker's send-suppression check.
+		`CREATE TABLE IF NOT EXISTS email_events (
+			id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			provider    TEXT NOT NULL,
+			event_type  TEXT NOT NULL,
+			email       TEXT NOT NULL,
+			reason      TEXT,
+			raw         JSONB NOT NULL,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_email_events_email_type
+			ON email_events(email, event_type, created_at DESC)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_email_events_dedupe
+			ON email_events(provider, event_type, email, (raw->>'message_id'))
+			WHERE raw->>'message_id' IS NOT NULL`,
+		// 044_pending_deletions — email-confirmed two-step deletion state
+		// machine for paid-tier deploys/stacks. CHECK constraints kept: the
+		// AtomicCAS test exercises the status transitions, so the test DB
+		// should enforce the same valid-value set as production.
+		`CREATE TABLE IF NOT EXISTS pending_deletions (
+			id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			resource_id             UUID NOT NULL,
+			resource_type           TEXT NOT NULL CHECK (resource_type IN ('deploy', 'stack')),
+			team_id                 UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			requested_by_user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			requested_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+			expires_at              TIMESTAMPTZ NOT NULL,
+			confirmation_token_hash TEXT NOT NULL UNIQUE,
+			status                  TEXT NOT NULL CHECK (status IN ('pending', 'confirmed', 'cancelled', 'expired')),
+			confirmed_at            TIMESTAMPTZ,
+			cancelled_at            TIMESTAMPTZ,
+			email_sent_to           TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_deletions_team
+			ON pending_deletions (team_id, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_deletions_resource_pending
+			ON pending_deletions (resource_id, resource_type) WHERE status = 'pending'`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_deletions_expires
+			ON pending_deletions (expires_at) WHERE status = 'pending'`,
+		// 050_deployment_events — failure-autopsy records read by
+		// GET /deploy/:id as the top-level "failure" object.
+		`CREATE TABLE IF NOT EXISTS deployment_events (
+			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			deployment_id   UUID NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+			kind            TEXT NOT NULL,
+			reason          TEXT NOT NULL,
+			exit_code       INT,
+			event           TEXT NOT NULL DEFAULT '',
+			last_lines      JSONB NOT NULL DEFAULT '[]'::jsonb,
+			hint            TEXT NOT NULL DEFAULT '',
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS deployment_events_deployment_id_idx
+			ON deployment_events (deployment_id, created_at DESC)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS deployment_events_autopsy_uniq
+			ON deployment_events (deployment_id, kind) WHERE kind = 'failure_autopsy'`,
+		// 011_api_keys — per-team programmatic API keys.
+		`CREATE TABLE IF NOT EXISTS api_keys (
+			id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id      UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			created_by   UUID REFERENCES users(id) ON DELETE SET NULL,
+			name         TEXT NOT NULL,
+			key_hash     TEXT NOT NULL UNIQUE,
+			scopes       TEXT[] NOT NULL DEFAULT ARRAY['read','write']::TEXT[],
+			last_used_at TIMESTAMPTZ,
+			revoked_at   TIMESTAMPTZ,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		// 013_magic_links + 041_magic_link_send_status — passwordless login
+		// tokens. email_send_* columns mirrored for the worker reconcile path.
+		`CREATE TABLE IF NOT EXISTS magic_links (
+			id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			email        TEXT NOT NULL,
+			token_hash   TEXT NOT NULL UNIQUE,
+			return_to    TEXT NOT NULL,
+			expires_at   TIMESTAMPTZ NOT NULL,
+			consumed_at  TIMESTAMPTZ,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`ALTER TABLE magic_links ADD COLUMN IF NOT EXISTS email_send_status TEXT NOT NULL DEFAULT 'pending'`,
+		`ALTER TABLE magic_links ADD COLUMN IF NOT EXISTS email_send_attempts INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE magic_links ADD COLUMN IF NOT EXISTS email_send_last_error TEXT`,
+		`ALTER TABLE magic_links ADD COLUMN IF NOT EXISTS email_send_last_attempted_at TIMESTAMPTZ`,
+		// 014_custom_domains — customer-owned hostnames bound to a stack.
+		`CREATE TABLE IF NOT EXISTS custom_domains (
+			id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id            UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			stack_id           UUID NOT NULL REFERENCES stacks(id) ON DELETE CASCADE,
+			hostname           TEXT NOT NULL UNIQUE,
+			verification_token TEXT NOT NULL,
+			status             TEXT NOT NULL DEFAULT 'pending_verification',
+			verified_at        TIMESTAMPTZ,
+			cert_ready_at      TIMESTAMPTZ,
+			last_check_at      TIMESTAMPTZ,
+			last_check_err     TEXT,
+			created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		// 035_service_components_uptime — public status-page components +
+		// their health samples.
+		`CREATE TABLE IF NOT EXISTS service_components (
+			id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			slug         TEXT UNIQUE NOT NULL,
+			display_name TEXT NOT NULL,
+			category     TEXT NOT NULL,
+			description  TEXT,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE TABLE IF NOT EXISTS uptime_samples (
+			id             BIGSERIAL PRIMARY KEY,
+			component_slug TEXT NOT NULL REFERENCES service_components(slug),
+			sampled_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+			healthy        BOOLEAN NOT NULL,
+			latency_ms     INTEGER
+		)`,
+		// --- Column drift catch-up -------------------------------------------
+		// Columns added by later migrations to tables created above. Kept as
+		// a trailing block so the table DDL stays migration-grouped; every
+		// ALTER is ADD COLUMN IF NOT EXISTS so the order is irrelevant.
+		// 004_stacks — stacks.namespace (NOT NULL in prod; the mirror omits
+		// the UNIQUE constraint, matching the existing slug simplification).
+		`ALTER TABLE stacks ADD COLUMN IF NOT EXISTS namespace TEXT NOT NULL DEFAULT ''`,
+		// deploy webhook-notify state machine (notify_state/attempts/webhook).
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS notify_webhook TEXT`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS notify_webhook_secret TEXT`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS notify_state TEXT NOT NULL DEFAULT 'unset'`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS notify_attempts INT NOT NULL DEFAULT 0`,
+		// 046_resources_reminder_stages — multi-stage expiry reminders.
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS reminders_sent INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS last_reminder_at TIMESTAMPTZ`,
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS expiry_reminded_at TIMESTAMPTZ`,
+		// 047_resources_applied_conn_limit — snapshot of the connection limit
+		// actually applied at provision time.
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS applied_conn_limit INT`,
 	}
 
 	for _, s := range stmts {

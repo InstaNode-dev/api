@@ -9,11 +9,18 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// errNilRedisClient is returned by local-backend operations when the Provider
+// was constructed without a Redis admin connection. Provisioning a cache
+// resource genuinely requires Redis, so this surfaces as a clean 503 instead
+// of a nil-pointer panic.
+var errNilRedisClient = errors.New("redis admin client is not configured")
 
 // aclAllowlist is the safe command allowlist applied to every provisioned ACL
 // user on the shared Redis backend. It replaces "+@all" which would grant
@@ -105,6 +112,13 @@ func (p *Provider) Provision(ctx context.Context, token, tier string) (*Credenti
 // provisionLocal attempts ACL-based isolation first, then falls back to
 // key-namespace isolation.
 func (p *Provider) provisionLocal(ctx context.Context, token string) (*Credentials, error) {
+	// The local backend genuinely requires a Redis admin connection to create
+	// the ACL user / namespace. A nil client means the service is misconfigured
+	// (REDIS_URL unset) — return a clean error so the handler responds 503
+	// rather than panicking with a nil-pointer dereference. CLAUDE.md #2.
+	if p.rdb == nil {
+		return nil, fmt.Errorf("cache.provisionLocal: %w", errNilRedisClient)
+	}
 	short := token
 	if len(short) > 8 {
 		short = short[:8]
@@ -156,6 +170,9 @@ func (p *Provider) provisionUpstash(ctx context.Context, token, tier string) (*C
 // Iterates with SCAN MATCH "{token}:*" COUNT 100, sums MEMORY USAGE for each key.
 // Capped at 1000 keys to avoid blocking the Redis event loop.
 func (p *Provider) StorageBytes(ctx context.Context, token string) (int64, error) {
+	if p.rdb == nil {
+		return 0, fmt.Errorf("cache.StorageBytes: %w", errNilRedisClient)
+	}
 	prefix := token + ":*"
 	const maxKeys = 1000
 

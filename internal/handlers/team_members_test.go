@@ -97,7 +97,16 @@ func teamMembersNeedsDB(t *testing.T) (*sql.DB, func()) {
 // seedMembersTeam inserts a team + a primary owner. Returns (teamID, ownerID).
 func seedMembersTeam(t *testing.T, db *sql.DB) (uuid.UUID, uuid.UUID) {
 	t.Helper()
-	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, "pro"))
+	return seedMembersTeamTier(t, db, "pro")
+}
+
+// seedMembersTeamTier is seedMembersTeam with an explicit plan tier. Tests that
+// exercise a path which itself consumes seats (e.g. the invite rate-limit test
+// firing 10 invites) need an unlimited-seat tier so the per-tier member cap
+// does not pre-empt the behaviour under test.
+func seedMembersTeamTier(t *testing.T, db *sql.DB, tier string) (uuid.UUID, uuid.UUID) {
+	t.Helper()
+	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, tier))
 	owner, err := models.CreateUser(context.Background(), db, teamID,
 		testhelpers.UniqueEmail(t), "", "", "owner")
 	require.NoError(t, err)
@@ -375,22 +384,28 @@ func TestRemoveMember_ReturnsOrphanTeamID(t *testing.T) {
 func TestInviteMember_SeatLimitEnforcedOnRBACPath(t *testing.T) {
 	db, cleanup := teamMembersNeedsDB(t)
 	defer cleanup()
-	// hobby tier (member_limit per plans.yaml is small). Pad the team out
-	// to the cap then attempt to invite — RBAC path must refuse.
-	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, "hobby"))
+	// Use a tier with a finite member cap >= 2. The seat count includes the
+	// owner (both the legacy and RBAC paths count rows in `users`), so the
+	// "final-seat" scenario only exists when the cap leaves room for at least
+	// one non-owner. hobby is team_members=1 — the owner alone fills it, so it
+	// cannot exercise a successful-then-refused pair. pro is team_members=5.
+	const seatCapTier = "pro"
+	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, seatCapTier))
 	owner, err := models.CreateUser(context.Background(), db, teamID,
 		testhelpers.UniqueEmail(t), "", "", "owner")
 	require.NoError(t, err)
 
-	// Resolve the configured cap and pad the team to (cap - 1) so a
-	// single further invite would push it to the cap and a second one
-	// would exceed it.
+	// Resolve the configured cap and pad the team to (cap - 1) members so a
+	// single further invite would push it to the cap and a second one would
+	// exceed it. The owner already occupies seat 1, so seed (cap - 2) extras.
 	reg := plans.Default()
-	limit := reg.TeamMemberLimit("hobby")
+	limit := reg.TeamMemberLimit(seatCapTier)
 	if limit < 0 {
-		t.Skip("hobby tier is unlimited in this build; seat-cap test does not apply")
+		t.Skip("seat-cap tier is unlimited in this build; seat-cap test does not apply")
 	}
-	for i := 1; i < limit; i++ {
+	require.GreaterOrEqual(t, limit, 2,
+		"seat-cap test requires a tier whose member cap leaves room for a non-owner")
+	for i := 0; i < limit-2; i++ {
 		_ = seedMember(t, db, teamID, "developer")
 	}
 
@@ -418,7 +433,10 @@ func TestInviteMember_SeatLimitEnforcedOnRBACPath(t *testing.T) {
 func TestInviteMember_RateLimit_10PerHour(t *testing.T) {
 	db, cleanup := teamMembersNeedsDB(t)
 	defer cleanup()
-	teamID, ownerID := seedMembersTeam(t, db)
+	// team tier has unlimited members (team_members=-1) so the per-tier seat
+	// cap does not pre-empt the 10-invites-per-hour rate limit under test —
+	// pro (team_members=5) would 409 on the 5th invite before the limit fires.
+	teamID, ownerID := seedMembersTeamTier(t, db, "team")
 	rdb := miniRedis(t)
 
 	app := teamMembersApp(t, db, rdb, ownerID.String(), teamID.String())
@@ -481,12 +499,14 @@ func TestAcceptInvitation_OwnerSilentlyDemoted_CarriesWarning(t *testing.T) {
 	ctx := context.Background()
 
 	// Hand-craft an "owner" role invitation. Legacy InviteMember refuses
-	// non-"member" roles, so insert directly.
+	// non-"member" roles, so insert directly. team_invitations.token is
+	// NOT NULL (migration 010) with no DEFAULT — supply a unique 64-char hex
+	// token, matching the 32-byte format models.CreateRBACInvitation uses.
 	inviteEmail := testhelpers.UniqueEmail(t)
 	var invID uuid.UUID
 	err := db.QueryRowContext(ctx, `
-		INSERT INTO team_invitations (team_id, email, role, invited_by, status)
-		VALUES ($1, $2, 'owner', $3, 'pending')
+		INSERT INTO team_invitations (team_id, email, role, token, invited_by, status)
+		VALUES ($1, $2, 'owner', encode(gen_random_bytes(32), 'hex'), $3, 'pending')
 		RETURNING id
 	`, teamID, inviteEmail, ownerID).Scan(&invID)
 	require.NoError(t, err)

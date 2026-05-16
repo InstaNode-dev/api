@@ -334,8 +334,13 @@ func AcceptInvitation(ctx context.Context, db *sql.DB, invitationID, userID uuid
 		}
 	}
 
+	// is_primary is always cleared on accept: joining a team via invitation
+	// never grants the primary slot (that is a separate promote-to-primary
+	// transfer). If the user was the primary of their previous team, leaving
+	// it set would violate uq_users_one_primary_per_team once they land on a
+	// team that already has a primary.
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE users SET team_id = $1, role = $2 WHERE id = $3
+		UPDATE users SET team_id = $1, role = $2, is_primary = false WHERE id = $3
 	`, inv.TeamID, role, userID); err != nil {
 		return result, fmt.Errorf("models.AcceptInvitation: update user: %w", err)
 	}
