@@ -450,7 +450,10 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// counters (email.circuit.attempts/failures/opens) live on the
 	// handlers package and are surfaced through GetMagicLinkCircuitMetrics.
 	mlMailer := handlers.NewCircuitBreakingMagicLinkMailer(emailClient)
-	mlH := handlers.NewMagicLinkHandlerWithMailer(db, cfg, mlMailer, authH)
+	// A04 (P1): pass Redis so the handler can enforce per-email rate limits.
+	// NewMagicLinkHandlerWithMailerAndRedis falls back to fail-open when rdb
+	// is nil, so this is safe even in environments where Redis is unavailable.
+	mlH := handlers.NewMagicLinkHandlerWithMailerAndRedis(db, cfg, mlMailer, authH, rdb)
 	app.Post("/auth/email/start", mlH.Start)
 	app.Get("/auth/email/callback", mlH.Callback)
 	// Wave FIX-I — email-link 302 to the dashboard's confirm-deletion
@@ -463,6 +466,16 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Post("/auth/cli", cliAuthH.CreateCLISession)
 	app.Get("/auth/cli/:id", cliAuthH.PollCLISession)
 	app.Get("/auth/me", middleware.RequireAuth(cfg), cliAuthH.GetCurrentUser)
+
+	// A03 (P1): server-side session invalidation. POST /auth/logout stores the
+	// JWT's jti in Redis so subsequent requests with the same token are rejected
+	// by RequireAuth. RequireAuth checks the revocation set via IsJTIRevoked.
+	// SetRevocationDB wires the Redis client into the middleware package once
+	// so every RequireAuth call can query it without threading rdb through
+	// every handler constructor.
+	middleware.SetRevocationDB(rdb)
+	logoutH := handlers.NewLogoutHandler(cfg, rdb)
+	app.Post("/auth/logout", middleware.RequireAuth(cfg), logoutH.Logout)
 
 	// Billing
 	billing := handlers.NewBillingHandler(db, cfg, emailClient)
@@ -717,8 +730,12 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// GET / PATCH /api/v1/team — wired so the dashboard's TeamPage "Rename
 	// team" stops being a visual lie (previously the api had no PATCH
 	// endpoint; the dashboard's updateTeam() returned the input unchanged).
+	// D05 (P1): PATCH requires owner role — only the team owner may rename the
+	// team. RequireRole("owner") is installed at the route layer so the
+	// handler itself need not repeat the check, and audit consumers can
+	// distinguish a forbidden rename from a forbidden resource deletion.
 	api.Get("/team", teamSelfH.Get)
-	api.Patch("/team", middleware.RequireWritable(), teamSelfH.Update)
+	api.Patch("/team", middleware.RequireRole(middleware.RoleOwner), middleware.RequireWritable(), teamSelfH.Update)
 
 	// Deploy management endpoints — Phase 6 (aliases under /api/v1)
 	api.Get("/deployments", deployH.List)
