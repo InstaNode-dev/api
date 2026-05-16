@@ -79,20 +79,6 @@ const (
 	// reduce if the median real-world build time warrants it.
 	buildJobActiveDeadlineSecs = int64(600)
 
-	// pidsLimitPerContainer is the maximum number of concurrent processes a
-	// customer container may own. Applied as a named resource in the LimitRange
-	// Default map.
-	//
-	// The 256Mi memory limit already backstops a naive fork-bomb (allocating
-	// processes costs memory), but an explicit pids cap blocks fork attacks that
-	// stay below the memory threshold via short-lived processes. 1024 is
-	// generous for a web service, tight enough to cap any practical fork bomb.
-	//
-	// k8s LimitRange supports "pids" as a resource name since k8s 1.20; the
-	// feature gate PodAndContainerStatsFromCRI must be enabled on the kubelet.
-	// On older or misconfigured clusters the API will reject the LimitRange item
-	// with a validation error — the caller handles this gracefully (logs + skips).
-	pidsLimitPerContainer = "1024"
 )
 
 // customerContainerSecCtx returns the SecurityContext applied to every
@@ -582,63 +568,36 @@ func (p *K8sProvider) createResourceQuota(ctx context.Context, appID, tier strin
 	return p.createResourceQuotaInNS(ctx, deployNamespace(appID), tier)
 }
 
-// createLimitRangeForNS installs per-pod default resource requests/limits in the
-// given namespace so pods without explicit resources get sensible defaults.
+// createLimitRangeForNS installs per-container default resource requests/limits
+// in the given namespace so pods without explicit resources get sensible defaults.
 //
-// Gap 1 fix (disk fill / noisy-neighbour DoS): the LimitRange now includes
+// Gap 1 fix (disk fill / noisy-neighbour DoS): the LimitRange includes
 // ephemeral-storage default + defaultRequest so that any customer container
 // that does NOT set explicit resources (or whose Deployment falls through the
 // applyDeploymentInNS path) still gets a storage cap. This is a defence-in-
 // depth backstop; applyDeploymentInNS and createStackDeployment ALSO set
 // explicit ephemeral-storage on every container spec.
 //
-// Gap 3 (pids fork-bomb defence): adds a "pids" default to the LimitRange.
-// Supported since k8s 1.20 with the SupportPodPidsLimit feature gate (on by
-// default from 1.24+). On older clusters the API rejects the item; we log and
-// fall back gracefully to a LimitRange without the pids cap rather than
-// aborting namespace setup.
+// NOTE — per-pod PID limiting (fork-bomb defence):
+// Kubernetes does NOT support "pids" as a LimitRange resource. Attempts to add
+// it are rejected by the API server with:
+//   "pids: must be a standard resource for containers"
+// This was verified in production (DOKS 1.32). The previous code attempted a
+// try-with-pids / fallback pattern, but the fallback always fired, making the
+// pids branch permanently dead code.
+//
+// Kubernetes per-pod PID limiting requires a node-level kubelet configuration:
+//   --pod-max-pids / podPidsLimit (kubelet config or DOKS node-pool kubelet arg).
+// This is an operator/infrastructure action, not something the API server or a
+// LimitRange can enforce per-namespace. The practical risk is contained: the
+// per-pod memory limit (256Mi for hobby) OOM-backstops naive fork bombs because
+// spawning thousands of processes consumes memory. A dedicated PID cap requires
+// a DOKS node-pool kubelet customization if the threat model warrants it.
 func (p *K8sProvider) createLimitRangeForNS(ctx context.Context, ns, tier string) error {
 	memReq, memLimit, cpuReq := compute.TierResources(tier)
 	ephReq, ephLimit := compute.TierEphemeralStorage(tier)
 
-	// Attempt to include a pids limit (k8s 1.20+ with feature gate enabled).
-	// If the API rejects it, fall back to a LimitRange without the pids cap.
-	lrWithPids := &corev1.LimitRange{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "instant-limits",
-			Namespace: ns,
-		},
-		Spec: corev1.LimitRangeSpec{
-			Limits: []corev1.LimitRangeItem{
-				{
-					Type: corev1.LimitTypeContainer,
-					Default: corev1.ResourceList{
-						corev1.ResourceMemory:                         resource.MustParse(memLimit),
-						corev1.ResourceCPU:                            resource.MustParse(cpuReq),
-						corev1.ResourceEphemeralStorage:               resource.MustParse(ephLimit),
-						corev1.ResourceName("pids"):                   resource.MustParse(pidsLimitPerContainer),
-					},
-					DefaultRequest: corev1.ResourceList{
-						corev1.ResourceMemory:           resource.MustParse(memReq),
-						corev1.ResourceCPU:              resource.MustParse(cpuReq),
-						corev1.ResourceEphemeralStorage: resource.MustParse(ephReq),
-					},
-				},
-			},
-		},
-	}
-
-	_, err := p.clientset.CoreV1().LimitRanges(ns).Create(ctx, lrWithPids, metav1.CreateOptions{})
-	if err == nil || apierrors.IsAlreadyExists(err) {
-		return nil
-	}
-
-	// Pids resource not supported on this cluster — fall back without it.
-	// Log so the operator knows the partial coverage.
-	slog.Warn("createLimitRangeForNS: pids resource rejected by API server; creating LimitRange without pids cap (k8s < 1.20 or feature gate disabled)",
-		"namespace", ns, "error", err)
-
-	lrNoPids := &corev1.LimitRange{
+	lr := &corev1.LimitRange{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "instant-limits",
 			Namespace: ns,
@@ -661,7 +620,8 @@ func (p *K8sProvider) createLimitRangeForNS(ctx context.Context, ns, tier string
 			},
 		},
 	}
-	_, err = p.clientset.CoreV1().LimitRanges(ns).Create(ctx, lrNoPids, metav1.CreateOptions{})
+
+	_, err := p.clientset.CoreV1().LimitRanges(ns).Create(ctx, lr, metav1.CreateOptions{})
 	if err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create limit range in %q: %w", ns, err)
 	}
