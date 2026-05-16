@@ -79,7 +79,7 @@ func (h *ResourceHandler) List(c *fiber.Ctx) error {
 
 	items := make([]fiber.Map, 0, len(resources))
 	for _, r := range resources {
-		items = append(items, resourceToMap(r))
+		items = append(items, resourceToMap(r, h.plans))
 	}
 
 	// W7-C: emit a single lower-resolution audit row per list call. The
@@ -136,7 +136,10 @@ func (h *ResourceHandler) Get(c *fiber.Ctx) error {
 	storageLimitMB := h.plans.StorageLimitMB(resource.Tier, resource.ResourceType)
 	_, storageExceeded, _ := quota.CheckStorageQuota(c.Context(), h.db, resource.ID, storageLimitMB)
 
-	item := resourceToMap(resource)
+	item := resourceToMap(resource, h.plans)
+	// Override the inline storage_exceeded (set by resourceToMap) with the
+	// accurate DB-backed result from quota.CheckStorageQuota. This is safe
+	// because CheckStorageQuota treats limitMB==-1 as "never exceeded".
 	item["storage_exceeded"] = storageExceeded
 
 	// W7-C: per-resource read audit row. Best-effort goroutine — failures
@@ -622,7 +625,7 @@ func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
 		"token":    resource.Token,
 		"status":   "paused",
 		"message":  "Resource paused. Storage is preserved and the connection URL is unchanged; new connections are refused until resume.",
-		"resource": resourceToMap(resource),
+		"resource": resourceToMap(resource, h.plans),
 	})
 }
 
@@ -739,7 +742,7 @@ func (h *ResourceHandler) Resume(c *fiber.Ctx) error {
 		"token":    resource.Token,
 		"status":   "active",
 		"message":  "Resource resumed. The connection URL is unchanged — your existing config still works.",
-		"resource": resourceToMap(resource),
+		"resource": resourceToMap(resource, h.plans),
 	})
 }
 
@@ -1027,8 +1030,16 @@ func parseTeamID(s string) (uuid.UUID, error) {
 	return uuid.Parse(s)
 }
 
-// resourceToMap converts a Resource to a JSON-friendly map, omitting sensitive fields.
-func resourceToMap(r *models.Resource) fiber.Map {
+// unlimitedSentinel is the int64 value emitted in storage_limit_bytes and
+// connections_limit when the tier has no cap (e.g. team tier). The TypeScript
+// side branches on -1 to render "unlimited" instead of "/ -1 MB".
+const unlimitedSentinel = int64(-1)
+
+// resourceToMap converts a Resource to a JSON-friendly map, omitting sensitive
+// fields. reg is the plans.Registry used to compute tier-entitlement limit
+// fields (storage_limit_bytes, connections_limit, storage_exceeded) so the
+// dashboard quota bars never render NaN. Pass nil to omit those fields.
+func resourceToMap(r *models.Resource, reg *plans.Registry) fiber.Map {
 	m := fiber.Map{
 		"id":            r.ID,
 		"token":         r.Token,
@@ -1057,6 +1068,36 @@ func resourceToMap(r *models.Resource) fiber.Map {
 		m["team_id"] = r.TeamID.UUID
 	}
 	m["storage_bytes"] = r.StorageBytes
+
+	// Inject tier-entitlement limits so the dashboard quota bars render
+	// correctly. All values come from plans.Registry (never hardcoded) and
+	// reflect the resource's snapshot tier — the same tier set at creation
+	// time and elevated on upgrade by ElevateResourceTiersByTeam.
+	//
+	// storageLimitMB == -1 means unlimited (e.g. team tier). Propagated as
+	// unlimitedSentinel (-1) so the TypeScript side can render "unlimited"
+	// rather than "/ -1 MB".
+	if reg != nil {
+		storageLimitMB := reg.StorageLimitMB(r.Tier, r.ResourceType)
+		var storageLimitBytes int64
+		if storageLimitMB == -1 {
+			storageLimitBytes = unlimitedSentinel
+		} else {
+			storageLimitBytes = int64(storageLimitMB) * 1_000_000
+		}
+		m["storage_limit_bytes"] = storageLimitBytes
+		m["connections_limit"] = reg.ConnectionsLimit(r.Tier, r.ResourceType)
+
+		// Inline storage_exceeded avoids N extra DB round-trips on the list
+		// path. r.StorageBytes is the scanner-updated value from the resource
+		// row. On the single-GET path the caller may override with the more
+		// accurate quota.CheckStorageQuota result.
+		storageExceeded := storageLimitBytes != unlimitedSentinel &&
+			storageLimitBytes > 0 &&
+			r.StorageBytes >= storageLimitBytes
+		m["storage_exceeded"] = storageExceeded
+	}
+
 	// Never expose connection_url in API responses
 	return m
 }
