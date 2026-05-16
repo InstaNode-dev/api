@@ -769,6 +769,12 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 
 	// Stack management endpoints — Phase 6 (under /api/v1)
 	api.Get("/stacks", stackH.List)
+	// GET /api/v1/stacks/:slug — per-stack status polling for StackCreatePage.
+	// The Get handler uses optionalStackTeam internally; under the /api/v1 group
+	// auth is already enforced by RequireAuth so any authenticated team member
+	// can poll their own stack's status. D09/C06 fix: this route was absent,
+	// causing every fetchStackStatus() call to 404 and the build page to time out.
+	api.Get("/stacks/:slug", stackH.Get)
 	// Wave FIX-I — stack-side two-step deletion. Same contract as the
 	// deploy-side endpoints; the shared resolver lives in
 	// handlers/deletion_confirm.go.
