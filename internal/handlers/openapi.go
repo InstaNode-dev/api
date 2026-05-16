@@ -414,7 +414,7 @@ const openAPISpec = `{
         "responses": {
           "200": { "description": "Deployment kept permanently", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
           "401": { "description": "Unauthorized" },
-          "402": { "description": "upgrade_required — anonymous tier. agent_action points at https://instanode.dev/start." },
+          "402": { "description": "upgrade_required — anonymous tier. agent_action points at https://api.instanode.dev/start." },
           "404": { "description": "Not found (or owned by another team)" }
         }
       }

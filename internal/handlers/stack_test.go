@@ -483,7 +483,7 @@ func TestStackNew_Anonymous_Returns202(t *testing.T) {
 	assert.NotEmpty(t, body.StackID)
 	assert.Equal(t, "anonymous", body.Tier)
 	assert.Equal(t, "24h", body.ExpiresIn)
-	assert.Contains(t, body.Note, "instanode.dev/start", "upgrade URL must appear in note")
+	assert.Contains(t, body.Note, "api.instanode.dev/start", "upgrade URL must appear in note")
 
 	// Verify DB: stack has nil team_id and non-nil expires_at.
 	var teamIDNull sql.NullString
