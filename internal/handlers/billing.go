@@ -103,14 +103,15 @@ func (h *BillingHandler) WithRedis(rdb *redis.Client) *BillingHandler {
 //
 // PromotionCode is an optional admin-issued promo code (one of the rows in
 // admin_promo_codes). When set, we resolve the code's DB row server-side and
-// stamp its id into the Razorpay subscription `notes` field — the webhook
-// handler then marks used_at = now() on subscription.activated /
-// subscription.charged. We do NOT forward the code text to Razorpay's
-// `offer_id` field today (Razorpay's offer model is separate from our
-// admin-issued codes); the discount is bookkeeping-only at this layer
-// pending the offer-mapping migration. Plans-yaml codes (LAUNCH50 etc.) are
-// still allowed in this field but produce no notes side-effect — they're
-// handled at validate-time via plans.Registry and never need DB tracking.
+// stamp its id into the Razorpay subscription `notes` field for future
+// tracking. The webhook handler does NOT mark used_at on the code (Slice 3
+// interim fix — DESIGN-P1-B-billing-resilience.md §5 Option B): no Razorpay
+// Offer (offer_id) is attached to the subscription, so no discount is applied
+// and consuming the code at webhook time would be a financial broken promise.
+// Codes remain available until Option A (real Razorpay Offers) is wired.
+// Plans-yaml codes (LAUNCH50 etc.) are still allowed in this field but
+// produce no notes side-effect — they're handled at validate-time via
+// plans.Registry and never need DB tracking.
 type checkoutRequest struct {
 	Plan          string `json:"plan"`
 	PlanFrequency string `json:"plan_frequency"`
@@ -171,18 +172,36 @@ func (h *BillingHandler) razorpayPlanIDFor(tier, frequency string) string {
 	return ""
 }
 
+// planIDToTierFallback is the tier returned when a Razorpay plan_id cannot be
+// mapped to any configured tier. Deliberately the LOWEST paid tier (hobby)
+// rather than "pro": an env-var typo may result in a $9 Hobby grant instead
+// of a $49 Pro grant — 5× smaller blast radius — and the discrepancy will be
+// caught and corrected upward by the billing reconciler on its next tick.
+//
+// DO NOT change this to "pro". See DESIGN-P1-B-billing-resilience.md §4.
+const planIDToTierFallback = "hobby"
+
 // planIDToTier maps a Razorpay plan_id back to a canonical instant.dev tier
 // name. Recognises both monthly and yearly plan IDs and returns the bare
 // tier (e.g. "pro") in either case — the webhook stores canonical tiers on
-// teams.plan_tier so limits resolution stays cycle-agnostic. Defaults to
-// "pro" when the plan_id is unrecognised.
+// teams.plan_tier so limits resolution stays cycle-agnostic.
+//
+// Fail-safe default: returns planIDToTierFallback ("hobby") — the lowest paid
+// tier — when the plan_id is empty or does not match any configured env var.
+// An slog.Error is emitted so New Relic can alert on misconfiguration; the
+// reconciler will correct the tier upward within 15 minutes once the env var
+// is fixed.
 //
 // An empty planID never matches anything: in development some env vars may
 // be "" and we must not silently classify a missing/empty webhook plan_id
 // or coincidentally-empty cfg slot as the matching tier.
 func (h *BillingHandler) planIDToTier(planID string) string {
 	if planID == "" {
-		return "pro"
+		slog.Error("billing.plan_id_to_tier.empty",
+			"fallback_tier", planIDToTierFallback,
+			"action", "Check RAZORPAY_PLAN_ID_* env vars — an empty plan_id will be treated as "+planIDToTierFallback,
+		)
+		return planIDToTierFallback
 	}
 	// Explicit per-tier comparison to skip empty cfg slots — an unconfigured
 	// yearly variant should not consume a "" webhook plan_id and steal its
@@ -211,7 +230,15 @@ func (h *BillingHandler) planIDToTier(planID string) string {
 	if h.cfg.RazorpayPlanIDHobbyYearly != "" && planID == h.cfg.RazorpayPlanIDHobbyYearly {
 		return "hobby"
 	}
-	return "pro"
+	// No configured plan_id matched. Log at Error level so NR picks this up as
+	// a critical alert — the operator must fix RAZORPAY_PLAN_ID_* env vars.
+	// The reconciler will detect and correct the tier mismatch within 15 min.
+	slog.Error("billing.plan_id_to_tier.unrecognised",
+		"plan_id", planID,
+		"fallback_tier", planIDToTierFallback,
+		"action", "Check RAZORPAY_PLAN_ID_* env vars — an unknown plan_id will be treated as "+planIDToTierFallback,
+	)
+	return planIDToTierFallback
 }
 
 // CreateCheckoutAPI handles POST /api/v1/billing/checkout (and the legacy
@@ -589,6 +616,23 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 	}
 
 	switch event.Event {
+	case "subscription.activated":
+		// subscription.activated fires when the card/mandate is authorised
+		// (Razorpay lifecycle: created → authenticated → active). For Indian
+		// payment methods (UPI, NACH), the first charge may be delayed hours
+		// or days after activation. Routing to handleSubscriptionCharged is
+		// safe because that function is idempotent (UpgradeTeamAllTiers is
+		// idempotent at the DB level; the dedup table entry uses the unique
+		// event_id so activated and the later charged event do not collide).
+		// Return 500 on failure so Razorpay retries — same contract as charged.
+		if upgradeErr := h.handleSubscriptionCharged(ctx, c, event); upgradeErr != nil {
+			slog.Error("billing.webhook.subscription_activated.upgrade_failed",
+				"error", upgradeErr, "event_id", eventID)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"ok":    false,
+				"error": "upgrade_failed",
+			})
+		}
 	case "subscription.charged":
 		if upgradeErr := h.handleSubscriptionCharged(ctx, c, event); upgradeErr != nil {
 			slog.Error("billing.webhook.subscription_charged.upgrade_failed",
@@ -650,6 +694,22 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 
 	tier := h.planIDToTier(sub.PlanID)
 
+	// Tier validation guard: verify the resolved tier exists in the plans
+	// registry before writing it to the DB. A tier rename or a future
+	// plans.yaml change could otherwise introduce an unknown string into
+	// teams.plan_tier, breaking limits resolution everywhere.
+	// Fail-safe: log Error + return nil (swallow). Razorpay retrying won't
+	// help — the fix is an env-var or plans.yaml update by the operator.
+	if _, tierKnown := plans.Default().All()[tier]; !tierKnown {
+		slog.Error("billing.subscription.charged.unknown_tier",
+			"plan_id", sub.PlanID,
+			"resolved_tier", tier,
+			"team_id", teamID,
+			"action", "Resolved tier is not in plans.yaml — check RAZORPAY_PLAN_ID_* env vars and plans.yaml",
+		)
+		return nil
+	}
+
 	// Snapshot the prior tier BEFORE the update so we can classify the
 	// transition as upgrade / downgrade / same. A miss here just means we
 	// emit no audit row and the Loops lifecycle email is skipped — the
@@ -690,17 +750,21 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 	// Fail-open: a recovery-flip miss does not roll back the tier update.
 	maybeRecoverPaymentGrace(ctx, h.db, teamID, sub.ID)
 
-	// Admin-code redemption: if the subscription notes carry an
-	// admin_promo_code_id (stamped at checkout time by CreateCheckoutAPI),
-	// mark the corresponding admin_promo_codes row as used. Best-effort:
-	// failures log only — the tier upgrade is already committed. The brief
-	// names the trigger event as subscription.activated; Razorpay's
-	// subscription.charged is the equivalent for subscriptions paid by
-	// invoice (which is our checkout flow), so we hook here instead.
-	// MarkAdminPromoCodeUsed uses `WHERE used_at IS NULL` so two concurrent
-	// webhook deliveries can't double-spend the code — the second one
-	// returns ErrAdminPromoCodeAlreadyUsed and we log + return.
-	maybeMarkAdminPromoCodeUsed(ctx, h.db, sub, teamID)
+	// Promo-code redemption is intentionally NOT triggered here (Slice 3,
+	// DESIGN-P1-B-billing-resilience.md §5 Option B). The current checkout
+	// flow stamps admin_promo_code_id into Razorpay subscription notes but
+	// does NOT attach a Razorpay Offer (offer_id) — so no discount is
+	// actually applied. Marking the code used_at here would consume a
+	// single-use code while the customer paid full price, which is a
+	// financial broken promise.
+	//
+	// The code is preserved for redemption once Option A (real Razorpay
+	// Offers) is wired in a follow-up PR. When that lands, re-enable
+	// maybeMarkAdminPromoCodeUsed gated on sub.Notes["offer_applied"]=="true"
+	// so codes are only burned when a discount was actually applied.
+	//
+	// REGRESSION GUARD: do not re-add a maybeMarkAdminPromoCodeUsed call
+	// here without first implementing Razorpay Offer wiring (Slice 5).
 	return nil
 }
 
