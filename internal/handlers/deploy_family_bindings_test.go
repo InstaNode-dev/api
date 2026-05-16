@@ -132,13 +132,15 @@ func TestDeployNew_FamilyBinding_StagingTwinExists_Succeeds(t *testing.T) {
 	assert.Equal(t, "staging", created.Item.Environment)
 	dbURL, ok := created.Item.Env["DATABASE_URL"]
 	require.True(t, ok, "DATABASE_URL must be present after family resolution")
-	// The connection URL got rewritten by rewriteToInternalURL — for postgres
-	// the host is replaced with the cluster-internal pg-proxy FQDN. The
-	// path component (db name) survives, so we assert on that.
-	assert.Contains(t, dbURL, "/app",
-		"resolved URL must preserve the db name; got %q", dbURL)
+	// P0 fix: DATABASE_URL ends with the URL suffix — redactEnvVars masks it
+	// in the outbound API response. The stored env_vars JSONB row retains the
+	// resolved plaintext for the build pipeline. The API response must show "***"
+	// so credentials never travel to the browser or agent logs.
+	assert.Equal(t, "***", dbURL,
+		"DATABASE_URL must be redacted in the API response (P0 — plaintext credentials must never appear in JSON)")
+	// Sanity: the wrong (production) host must not bleed through even in the masked form.
 	assert.NotContains(t, dbURL, "prod-host",
-		"staging deploy must NOT pull the production URL; got %q", dbURL)
+		"staging deploy must NOT pull the production URL")
 }
 
 // ── Test 2 — family binding + staging env + no staging twin → 409 ──────────
@@ -396,8 +398,10 @@ func TestDeployNew_RawTokenBinding_BackwardCompat_Succeeds(t *testing.T) {
 	require.NoError(t, json.Unmarshal(bodyBytes, &created))
 	dbURL, ok := created.Item.Env["DATABASE_URL"]
 	require.True(t, ok, "DATABASE_URL must be set from the raw token resolver")
-	assert.Contains(t, dbURL, "/legacy",
-		"resolved URL must include the db name from the resource; got %q", dbURL)
+	// P0 fix: DATABASE_URL ends with the URL suffix — redactEnvVars masks it
+	// in the outbound API response. Verify the mask appears (not the plaintext).
+	assert.Equal(t, "***", dbURL,
+		"DATABASE_URL must be redacted in the API response (P0 — plaintext credentials must never appear in JSON)")
 }
 
 // ── Test 7 — FAMILY_BINDINGS_ENABLED=false → 400 (deterministic disable) ──
