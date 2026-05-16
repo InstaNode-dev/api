@@ -68,6 +68,21 @@ type Provider interface {
 	UpdateAccessControl(ctx context.Context, appID string, private bool, allowedIPs []string) error
 }
 
+// BuildLogFetcher is an optional interface that compute providers may implement
+// to expose raw build-job (kaniko) logs. Handlers type-assert against this
+// interface so that non-k8s providers (noop, test doubles) silently opt out
+// without requiring changes to the core Provider interface.
+//
+// FetchBuildLogs lists pods for the build job named "build-<appID>" in the
+// deploy namespace "instant-deploy-<appID>", reads the "kaniko" container's
+// stdout, and returns the last ≤200 lines. If the pod is already gone or logs
+// cannot be fetched for any reason, implementations MUST return (nil, err)
+// — callers treat nil as "logs unavailable" and write the autopsy row with
+// an empty last_lines slice (fail-soft).
+type BuildLogFetcher interface {
+	FetchBuildLogs(ctx context.Context, appID string) ([]string, error)
+}
+
 // TierResources returns k8s resource requests/limits for a tier.
 func TierResources(tier string) (memoryRequest, memoryLimit, cpuRequest string) {
 	switch tier {
