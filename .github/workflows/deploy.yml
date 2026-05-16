@@ -159,10 +159,19 @@ jobs:
         # removed once their real causes were fixed: the OpenAPI test had a
         # stale internal-route whitelist, TestCrossTeam_ never needed a
         # second DB at all, and TestCustomDomainCreate_ had a stale 5-column
-        # sqlmock row. The whole `./...` suite now passes here against the
-        # migrated DB — keep it that way; do not re-add a -skip list.
+        # sqlmock row. The whole `./...` suite passes — keep it that way; do
+        # not re-add a -skip list.
+        #
+        # `-p 1` is load-bearing: every package shares the single
+        # instant_dev_test DB + redis/15. With the default parallelism,
+        # `go test ./...` runs ~25 package binaries at once and they corrupt
+        # each other's DB/redis state mid-test (a handler test CREATEs a real
+        # DB while a models test TRUNCATEs, a middleware test's rate-limit
+        # counter is FLUSHed by another package, …). The Makefile's
+        # `test-unit` target sidesteps this by running per-package; `-p 1`
+        # serialises package execution for the same effect in one invocation.
         run: |
-          go test ./... -short -count=1
+          go test ./... -short -count=1 -p 1
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
