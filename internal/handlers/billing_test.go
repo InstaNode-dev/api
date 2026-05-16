@@ -1026,13 +1026,238 @@ func TestPlanIDToTier_MapsYearlyPlanIDsToCanonicalTier(t *testing.T) {
 		{"plan_yearly_pro", "pro"},
 		{"plan_monthly_team", "team"},
 		{"plan_yearly_team", "team"},
-		{"", "pro"},               // empty defaults to pro (unchanged)
-		{"plan_unknown_xx", "pro"}, // unknown defaults to pro (unchanged)
+		// Slice 1 (DESIGN-P1-B §4): empty / unknown plan_ids must fail SAFE to
+		// "hobby" (lowest paid tier), NOT "pro". An env-var typo grants $9
+		// Hobby instead of $49 Pro — 5× smaller blast radius; the reconciler
+		// corrects upward within 15 min once the env var is fixed.
+		{"", handlers.PlanIDToTierFallbackForTest},               // empty → safe fallback
+		{"plan_unknown_xx", handlers.PlanIDToTierFallbackForTest}, // unrecognised → safe fallback
 	}
 	for _, c := range cases {
 		got := handlers.ExportedPlanIDToTier(bh, c.planID)
 		assert.Equal(t, c.want, got, "planIDToTier(%q)", c.planID)
 	}
+}
+
+// ── Slice 1: planIDToTier fail-safe regression tests ─────────────────────────
+//
+// These table-driven tests are the regression guard for DESIGN-P1-B §4:
+// unknown/empty plan_ids must never silently grant "pro". They run without
+// a DB and are fast enough for CI gating.
+
+// TestPlanIDToTier_UnknownPlanID_ReturnsHobbyNotPro asserts that empty and
+// unrecognised plan_ids resolve to the safe fallback tier (hobby), not "pro".
+// Regression guard: if someone changes planIDToTierFallback or the fallback
+// branch, this test will catch it immediately.
+func TestPlanIDToTier_UnknownPlanID_ReturnsHobbyNotPro(t *testing.T) {
+	cfg := &config.Config{
+		RazorpayPlanIDHobby: "plan_test_hobby",
+		RazorpayPlanIDPro:   "plan_test_pro",
+		RazorpayPlanIDTeam:  "plan_test_team",
+	}
+	bh := handlers.NewBillingHandler(nil, cfg, email.NewNoop())
+
+	cases := []struct {
+		name   string
+		planID string
+	}{
+		{"empty string", ""},
+		{"junk id", "plan_unknown_junk"},
+		{"looks like real but isn't", "plan_BADCONFIG_pro"},
+		{"whitespace-only", "   "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := handlers.ExportedPlanIDToTier(bh, tc.planID)
+			assert.NotEqual(t, "pro", got,
+				"planIDToTier(%q) must NOT return 'pro' on unrecognised input — silent Pro grants on misconfiguration are a P1 revenue bug",
+				tc.planID)
+			assert.Equal(t, handlers.PlanIDToTierFallbackForTest, got,
+				"planIDToTier(%q) must return the safe fallback tier %q",
+				tc.planID, handlers.PlanIDToTierFallbackForTest)
+		})
+	}
+}
+
+// ── Slice 2: subscription.activated handler regression tests ──────────────────
+//
+// These tests assert that subscription.activated is routed to the same upgrade
+// path as subscription.charged. Tests run against the nil-DB path (missing
+// team_id / missing sub_id → 200 OK, no crash) and against the real DB path
+// (requires TEST_DATABASE_URL).
+
+// makeSubscriptionActivatedPayload builds a subscription.activated webhook
+// event in the same shape as makeSubscriptionChargedPayload.
+func makeSubscriptionActivatedPayload(t *testing.T, teamID, subscriptionID string) []byte {
+	t.Helper()
+	notes := map[string]any{}
+	if teamID != "" {
+		notes["team_id"] = teamID
+	}
+	subEntity, _ := json.Marshal(map[string]any{
+		"id":      subscriptionID,
+		"entity":  "subscription",
+		"plan_id": "",
+		"status":  "authenticated",
+		"notes":   notes,
+	})
+	event := map[string]any{
+		"entity": "event",
+		"event":  "subscription.activated",
+		"payload": map[string]any{
+			"subscription": map[string]any{
+				"entity": json.RawMessage(subEntity),
+			},
+		},
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("makeSubscriptionActivatedPayload: %v", err)
+	}
+	return payload
+}
+
+// TestBillingWebhook_SubscriptionActivated_MissingTeamID_Returns200 verifies
+// that subscription.activated with no team_id in notes and no sub_id returns
+// 200 (matches the subscription.charged behaviour — fail-safe with nil DB).
+func TestBillingWebhook_SubscriptionActivated_MissingTeamID_Returns200(t *testing.T) {
+	app := billingTestApp(t)
+
+	payload := makeSubscriptionActivatedPayload(t, "", "")
+	req := signedWebhookRequest(t, payload)
+
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	// Must return 200 — team resolution failure is a swallow, not a retry signal.
+	assert.Equal(t, http.StatusOK, resp.StatusCode,
+		"subscription.activated with missing team_id must return 200 (same as subscription.charged)")
+}
+
+// TestBillingWebhook_SubscriptionActivated_UpgradesTeam asserts that a valid
+// subscription.activated event upgrades the team's plan_tier — identical
+// contract to subscription.charged. Requires a real test DB.
+func TestBillingWebhook_SubscriptionActivated_UpgradesTeam(t *testing.T) {
+	db, cleanDB := billingStateNeedsDB(t)
+	defer cleanDB()
+
+	app, cfg := billingWebhookDBApp(t, db)
+
+	teamID := testhelpers.MustCreateTeamDB(t, db, "hobby")
+	defer db.Exec(`DELETE FROM teams WHERE id = $1::uuid`, teamID)
+
+	// Build an activated event with the pro plan_id so we can assert the tier
+	// moves from hobby → pro.
+	notes := map[string]any{"team_id": teamID}
+	subEntity, _ := json.Marshal(map[string]any{
+		"id":      "sub_activated_test_" + uuid.NewString(),
+		"entity":  "subscription",
+		"plan_id": cfg.RazorpayPlanIDPro,
+		"status":  "authenticated",
+		"notes":   notes,
+	})
+	event := map[string]any{
+		"entity": "event",
+		"event":  "subscription.activated",
+		"payload": map[string]any{
+			"subscription": map[string]any{
+				"entity": json.RawMessage(subEntity),
+			},
+		},
+	}
+	payload, err := json.Marshal(event)
+	require.NoError(t, err)
+	req := signedWebhookRequest(t, payload)
+
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// The team must have been elevated to pro.
+	var newTier string
+	require.NoError(t, db.QueryRow(`SELECT plan_tier FROM teams WHERE id = $1::uuid`, teamID).Scan(&newTier))
+	assert.Equal(t, "pro", newTier,
+		"subscription.activated must trigger the same tier-elevation path as subscription.charged")
+}
+
+// ── Slice 3: Promo code not consumed regression tests ─────────────────────────
+//
+// This test asserts the regression guard for DESIGN-P1-B §5 Option B:
+// subscription.charged (and by extension subscription.activated) must NOT
+// mark an admin_promo_codes row used_at when no Razorpay Offer was applied.
+
+// TestBillingWebhook_SubscriptionCharged_PromoCode_NotConsumed asserts that
+// a subscription.charged event with admin_promo_code_id in notes does NOT
+// mark the promo code row used_at. Requires a real test DB.
+//
+// Regression guard: if someone re-adds maybeMarkAdminPromoCodeUsed to
+// handleSubscriptionCharged without wiring a Razorpay Offer, this test will
+// catch it immediately (the code row will have used_at set → test fails).
+func TestBillingWebhook_SubscriptionCharged_PromoCode_NotConsumed(t *testing.T) {
+	db, cleanDB := billingStateNeedsDB(t)
+	defer cleanDB()
+
+	app, cfg := billingWebhookDBApp(t, db)
+
+	teamID := testhelpers.MustCreateTeamDB(t, db, "hobby")
+	defer db.Exec(`DELETE FROM teams WHERE id = $1::uuid`, teamID)
+
+	// Insert a dummy admin_promo_code row. We don't call CreateAdminPromoCode
+	// (that may not exist as an exported model); we insert directly to keep
+	// this test self-contained.
+	teamUUID := uuid.MustParse(teamID)
+	codeID := uuid.New()
+	_, err := db.Exec(`
+		INSERT INTO admin_promo_codes (id, team_id, code, percent_off, expires_at, created_at)
+		VALUES ($1, $2, $3, 50, now() + interval '30 days', now())
+		ON CONFLICT DO NOTHING`,
+		codeID, teamUUID, "TESTPROMO50_"+codeID.String()[:8])
+	if err != nil {
+		// If admin_promo_codes doesn't exist in this DB schema, skip gracefully.
+		t.Skipf("admin_promo_codes table not available: %v", err)
+	}
+	defer db.Exec(`DELETE FROM admin_promo_codes WHERE id = $1`, codeID)
+
+	// Build a subscription.charged event that references the promo code in notes.
+	notes := map[string]any{
+		"team_id":            teamID,
+		"admin_promo_code_id": codeID.String(),
+	}
+	subEntity, _ := json.Marshal(map[string]any{
+		"id":      "sub_promo_test_" + uuid.NewString(),
+		"entity":  "subscription",
+		"plan_id": cfg.RazorpayPlanIDPro,
+		"status":  "active",
+		"notes":   notes,
+	})
+	event := map[string]any{
+		"entity": "event",
+		"event":  "subscription.charged",
+		"payload": map[string]any{
+			"subscription": map[string]any{
+				"entity": json.RawMessage(subEntity),
+			},
+		},
+	}
+	payload, err := json.Marshal(event)
+	require.NoError(t, err)
+	req := signedWebhookRequest(t, payload)
+
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// The promo code row must NOT have used_at set — no Razorpay Offer was
+	// applied so no discount was given, and the code must remain redeemable
+	// for future use once Option A (real Razorpay Offers) ships.
+	var usedAt sql.NullTime
+	err = db.QueryRow(`SELECT used_at FROM admin_promo_codes WHERE id = $1`, codeID).Scan(&usedAt)
+	require.NoError(t, err)
+	assert.False(t, usedAt.Valid,
+		"promo code must NOT be marked used_at when no Razorpay Offer was applied (Slice 3 regression guard — re-adding maybeMarkAdminPromoCodeUsed without Slice 5 is the bug)")
 }
 
 // Ensure the billing test file compiles and is non-empty.
