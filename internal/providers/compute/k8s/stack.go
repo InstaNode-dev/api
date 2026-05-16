@@ -404,6 +404,9 @@ func (p *K8sStackProvider) createStackDeployment(
 				},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken: &saFalse,
+					// Pod-level seccomp: RuntimeDefault restricts ~400 rarely-needed
+					// but CVE-exploited syscalls (clone/CLONE_NEWUSER, keyctl, etc.).
+					SecurityContext: customerPodSecCtx(),
 					ImagePullSecrets: []corev1.LocalObjectReference{
 						{Name: "ghcr-pull"}, // copied into the deploy ns by buildImage
 					},
@@ -416,6 +419,11 @@ func (p *K8sStackProvider) createStackDeployment(
 								{ContainerPort: int32(port), Protocol: corev1.ProtocolTCP},
 							},
 							Env: envVarsToK8s(envVars),
+							// Container-level hardening: drop ALL capabilities, re-add only
+							// NET_BIND_SERVICE (ports <1024), block privilege escalation.
+							// RunAsNonRoot and ReadOnlyRootFilesystem are intentionally omitted
+							// — see customerContainerSecCtx in client.go for rationale.
+							SecurityContext: customerContainerSecCtx(),
 							Resources: corev1.ResourceRequirements{
 								Requests: corev1.ResourceList{
 									corev1.ResourceMemory: resource.MustParse(memReq),
