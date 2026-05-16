@@ -1307,7 +1307,7 @@ const openAPISpec = `{
     "/storage/new": {
       "post": {
         "summary": "Provision S3-compatible object storage",
-        "description": "Returns S3-compatible credentials (access_key_id + secret_access_key) scoped to a per-token prefix inside a shared MinIO/R2 bucket. Anonymous tier: 1024MB, 24h TTL. Returns 503 service_disabled when MINIO_ENDPOINT / R2_API_TOKEN are not configured on the server.\n\nSupports Stripe/AWS-style idempotency via the optional Idempotency-Key request header.",
+        "description": "Returns S3-compatible credentials (access_key_id + secret_access_key) scoped to a per-token prefix inside a shared MinIO/R2 bucket. Anonymous tier: 10MB, 24h TTL (plans.yaml storage_storage_mb=10; was incorrectly documented as 1024MB — FIX-K 2026-05-16). Returns 503 service_disabled when MINIO_ENDPOINT / R2_API_TOKEN are not configured on the server.\n\nSupports Stripe/AWS-style idempotency via the optional Idempotency-Key request header.",
         "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars). First response cached for 24h; replays return the cached body with X-Idempotent-Replay: true. Reusing the key with a different body returns 409." }],
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
