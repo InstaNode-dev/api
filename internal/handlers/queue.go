@@ -23,6 +23,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -297,7 +298,34 @@ func (h *QueueHandler) newQueueAuthenticated(
 
 	tier := team.PlanTier
 	if dedicated {
+		if !h.plans.IsDedicatedTier(team.PlanTier) {
+			metrics.DedicatedTierUpgradeBlocked.WithLabelValues("queue", team.PlanTier).Inc()
+			return respondError(c, fiber.StatusPaymentRequired, "upgrade_required",
+				"Isolated (dedicated) resources require a Growth plan. Upgrade at "+urls.StartURLPrefix)
+		}
 		tier = "growth"
+	}
+
+	// A6: per-tier queue count cap from plans.yaml.
+	if h.plans != nil {
+		queueLimit := h.plans.QueueCountLimit(team.PlanTier)
+		if queueLimit >= 0 {
+			existing, countErr := models.CountActiveResourcesByTeamAndType(ctx, h.db, teamUUID, "queue")
+			if countErr != nil {
+				slog.Error("queue.new.count_failed", "error", countErr, "team_id", teamIDStr, "request_id", requestID)
+				return respondError(c, fiber.StatusServiceUnavailable, "quota_check_failed",
+					"Failed to check queue quota")
+			}
+			if existing >= queueLimit {
+				metrics.QueueProvisionLimitBlocked.WithLabelValues(team.PlanTier).Inc()
+				return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired,
+					"queue_limit_reached",
+					fmt.Sprintf("Your %s plan allows %d queue(s). Upgrade at %s", team.PlanTier, queueLimit, urls.StartURLPrefix),
+					fmt.Sprintf("Tell the user they've hit the %s tier queue cap (%d). Upgrade at https://instanode.dev/pricing for more queues.", team.PlanTier, queueLimit),
+					"https://instanode.dev/pricing",
+				)
+			}
+		}
 	}
 
 	resource, err := models.CreateResource(ctx, h.db, models.CreateResourceParams{

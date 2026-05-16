@@ -315,6 +315,11 @@ func (h *CacheHandler) newCacheAuthenticated(
 
 	tier := team.PlanTier
 	if dedicated {
+		if !h.plans.IsDedicatedTier(team.PlanTier) {
+			metrics.DedicatedTierUpgradeBlocked.WithLabelValues("cache", team.PlanTier).Inc()
+			return respondError(c, fiber.StatusPaymentRequired, "upgrade_required",
+				"Isolated (dedicated) resources require a Growth plan. Upgrade at "+urls.StartURLPrefix)
+		}
 		tier = "growth"
 	}
 
