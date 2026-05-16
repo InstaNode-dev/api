@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"testing"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	compute "instant.dev/internal/providers/compute"
 )
 
 // TestKanikoJobHasExplicitResources guards against regressing the build pod's
@@ -148,7 +151,7 @@ func TestAppDeploymentUsesPullAlways(t *testing.T) {
 	if err := p.applyDeploymentInNS(context.Background(),
 		ns, name, "ghcr.io/x/y:latest",
 		map[string]string{"FOO": "bar"},
-		8080, "64Mi", "256Mi", "50m",
+		8080, "64Mi", "256Mi", "50m", "512Mi", "2Gi",
 	); err != nil {
 		t.Fatalf("applyDeploymentInNS: %v", err)
 	}
@@ -261,7 +264,7 @@ func TestSecurityHardeningDeployPod(t *testing.T) {
 	if err := p.applyDeploymentInNS(context.Background(),
 		ns, name, "ghcr.io/x/y:latest",
 		map[string]string{"FOO": "bar"},
-		8080, "64Mi", "256Mi", "50m",
+		8080, "64Mi", "256Mi", "50m", "512Mi", "2Gi",
 	); err != nil {
 		t.Fatalf("applyDeploymentInNS: %v", err)
 	}
@@ -284,7 +287,7 @@ func TestSecurityHardeningStackPod(t *testing.T) {
 	if err := p.createStackDeployment(context.Background(),
 		ns, stackID, svcName, "ghcr.io/x/y:latest",
 		8080, map[string]string{"FOO": "bar"},
-		"64Mi", "256Mi", "50m",
+		"64Mi", "256Mi", "50m", "512Mi", "2Gi",
 	); err != nil {
 		t.Fatalf("createStackDeployment: %v", err)
 	}
@@ -317,7 +320,7 @@ func TestSecurityHardeningBothPodSpecsTableDriven(t *testing.T) {
 				name := "app-tbl"
 				if err := p.applyDeploymentInNS(context.Background(),
 					ns, name, "ghcr.io/x/y:latest",
-					nil, 8080, "64Mi", "256Mi", "50m",
+					nil, 8080, "64Mi", "256Mi", "50m", "512Mi", "2Gi",
 				); err != nil {
 					t.Fatalf("applyDeploymentInNS: %v", err)
 				}
@@ -335,7 +338,7 @@ func TestSecurityHardeningBothPodSpecsTableDriven(t *testing.T) {
 				ns := "instant-stack-tbl"
 				if err := sp.createStackDeployment(context.Background(),
 					ns, "tblstack", "api", "ghcr.io/x/y:latest",
-					8080, nil, "64Mi", "256Mi", "50m",
+					8080, nil, "64Mi", "256Mi", "50m", "512Mi", "2Gi",
 				); err != nil {
 					t.Fatalf("createStackDeployment: %v", err)
 				}
@@ -649,3 +652,249 @@ func TestNetworkPolicy_CrossTenantIsolation_TableDriven(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Pentest 2026-05-16 — resource-abuse regression tests
+// ---------------------------------------------------------------------------
+//
+// Gap 1: Disk fill (noisy-neighbour DoS)
+// Gap 2: Build pod no timeout
+// Gap 3: No explicit pids limit
+
+// TestDeployPodHasEphemeralStorageLimit is the noisy-neighbour disk-fill
+// regression guard. A customer deployment that writes unbounded to its
+// container filesystem can exhaust the node disk and trigger cluster-wide
+// DiskPressure → pod eviction for all other tenants. The fix: every
+// container spec carries an explicit ephemeral-storage request + limit so
+// k8s evicts ONLY the offending pod at its own limit.
+//
+// If this test fails after a refactor, the disk-fill DoS gap has regressed.
+func TestDeployPodHasEphemeralStorageLimit(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	p := &K8sProvider{clientset: cs}
+
+	const ns, name = "instant-deploy-eph-test", "app-eph-test"
+	if err := p.applyDeploymentInNS(context.Background(),
+		ns, name, "ghcr.io/x/y:latest",
+		map[string]string{"FOO": "bar"},
+		8080, "64Mi", "256Mi", "50m", "512Mi", "2Gi",
+	); err != nil {
+		t.Fatalf("applyDeploymentInNS: %v", err)
+	}
+
+	d, err := cs.AppsV1().Deployments(ns).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get deployment: %v", err)
+	}
+	if len(d.Spec.Template.Spec.Containers) == 0 {
+		t.Fatal("deployment has no containers")
+	}
+	c := d.Spec.Template.Spec.Containers[0]
+
+	if _, ok := c.Resources.Requests[corev1.ResourceEphemeralStorage]; !ok {
+		t.Error("deploy container is missing ephemeral-storage Request — node disk fill DoS gap (Gap 1) has regressed")
+	}
+	if _, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]; !ok {
+		t.Error("deploy container is missing ephemeral-storage Limit — node disk fill DoS gap (Gap 1) has regressed; k8s cannot evict the offending pod without this")
+	}
+
+	// Concrete floor check: request must be >= 512Mi for the default tier.
+	if got, ok := c.Resources.Requests[corev1.ResourceEphemeralStorage]; ok {
+		if got.Value() < 512*1024*1024 {
+			t.Errorf("deploy container ephemeral-storage request %s is below the 512Mi floor for default tier", got.String())
+		}
+	}
+	// Limit must be >= 1Gi (meaningful cap).
+	if got, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]; ok {
+		if got.Value() < 1024*1024*1024 {
+			t.Errorf("deploy container ephemeral-storage limit %s is below 1Gi — cap is too small to be useful", got.String())
+		}
+	}
+}
+
+// TestStackPodHasEphemeralStorageLimit mirrors TestDeployPodHasEphemeralStorageLimit
+// for the stack-service deployment path (createStackDeployment — backs POST /stacks/new).
+// Both code paths must carry the ephemeral-storage bound to close the noisy-
+// neighbour disk-fill gap across all customer compute surfaces.
+func TestStackPodHasEphemeralStorageLimit(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	sp := &K8sStackProvider{K8sProvider: &K8sProvider{clientset: cs}}
+
+	const ns, stackID, svcName = "instant-stack-eph-test", "ephstack", "api"
+	if err := sp.createStackDeployment(context.Background(),
+		ns, stackID, svcName, "ghcr.io/x/y:latest",
+		8080, map[string]string{"FOO": "bar"},
+		"64Mi", "256Mi", "50m", "512Mi", "2Gi",
+	); err != nil {
+		t.Fatalf("createStackDeployment: %v", err)
+	}
+
+	d, err := cs.AppsV1().Deployments(ns).Get(context.Background(), svcName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get deployment: %v", err)
+	}
+	if len(d.Spec.Template.Spec.Containers) == 0 {
+		t.Fatal("stack deployment has no containers")
+	}
+	c := d.Spec.Template.Spec.Containers[0]
+
+	if _, ok := c.Resources.Requests[corev1.ResourceEphemeralStorage]; !ok {
+		t.Error("stack container is missing ephemeral-storage Request — node disk fill DoS gap (Gap 1) has regressed")
+	}
+	if _, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]; !ok {
+		t.Error("stack container is missing ephemeral-storage Limit — node disk fill DoS gap (Gap 1) has regressed")
+	}
+}
+
+// TestLimitRangeHasEphemeralStorageDefault guards that the per-namespace
+// LimitRange (instant-limits) carries an ephemeral-storage default and
+// defaultRequest. This is the backstop for any pod that bypasses the
+// explicit resource setting in applyDeploymentInNS / createStackDeployment.
+func TestLimitRangeHasEphemeralStorageDefault(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	p := &K8sProvider{clientset: cs}
+
+	const ns = "instant-deploy-lr-eph-test"
+	if err := p.createLimitRangeForNS(context.Background(), ns, "hobby"); err != nil {
+		t.Fatalf("createLimitRangeForNS: %v", err)
+	}
+
+	lr, err := cs.CoreV1().LimitRanges(ns).Get(context.Background(), "instant-limits", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get limit range: %v", err)
+	}
+
+	found := false
+	for _, item := range lr.Spec.Limits {
+		if item.Type != corev1.LimitTypeContainer {
+			continue
+		}
+		found = true
+
+		if _, ok := item.Default[corev1.ResourceEphemeralStorage]; !ok {
+			t.Error("LimitRange 'instant-limits' Default is missing ephemeral-storage — backstop for disk-fill DoS (Gap 1) has regressed")
+		}
+		if _, ok := item.DefaultRequest[corev1.ResourceEphemeralStorage]; !ok {
+			t.Error("LimitRange 'instant-limits' DefaultRequest is missing ephemeral-storage — backstop for disk-fill DoS (Gap 1) has regressed")
+		}
+	}
+	if !found {
+		t.Fatal("LimitRange has no Container-type item — entire LimitRange is missing")
+	}
+}
+
+// TestBuildJobHasActiveDeadlineSeconds guards Gap 2: the Kaniko build Job must
+// carry an ActiveDeadlineSeconds so a slow or malicious Dockerfile cannot hold
+// a build slot indefinitely. Without this, an attacker can queue unbounded
+// build time by RUN sleep 1e9 in their Dockerfile.
+//
+// If this test fails after a refactor the build-timeout DoS gap has regressed.
+func TestBuildJobHasActiveDeadlineSeconds(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	p := &K8sProvider{clientset: cs}
+
+	const ns, jobName = "instant-deploy-deadline-test", "build-deadline"
+	if err := p.createKanikoJob(context.Background(), ns, jobName, "ctx-sec", "auth-sec", "ghcr.io/x/y:latest", ""); err != nil {
+		t.Fatalf("createKanikoJob: %v", err)
+	}
+
+	job, err := cs.BatchV1().Jobs(ns).Get(context.Background(), jobName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+
+	if job.Spec.ActiveDeadlineSeconds == nil {
+		t.Fatal("kaniko build Job is missing ActiveDeadlineSeconds — build-timeout DoS gap (Gap 2) has regressed; a slow Dockerfile can hold a build slot forever")
+	}
+
+	const wantMinDeadline = int64(300) // at least 5 minutes
+	if *job.Spec.ActiveDeadlineSeconds < wantMinDeadline {
+		t.Errorf("kaniko build Job ActiveDeadlineSeconds=%d; want >= %d (builds need at least 5 min for non-trivial installs)",
+			*job.Spec.ActiveDeadlineSeconds, wantMinDeadline)
+	}
+}
+
+// TestBuildJobActiveDeadlineSeconds_TableDriven tests both the secret-path and
+// the HTTP (MinIO) path for the kaniko build Job. Both paths share createKanikoJob;
+// this test ensures neither path silently loses the deadline.
+func TestBuildJobActiveDeadlineSeconds_TableDriven(t *testing.T) {
+	cases := []struct {
+		name           string
+		httpContextURL string // empty → secret path; non-empty → init-container path
+	}{
+		{name: "secret_path", httpContextURL: ""},
+		{name: "minio_http_path", httpContextURL: "http://minio.test:9000/ctx/abc.tar.gz?sig=fake"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset()
+			p := &K8sProvider{clientset: cs}
+			ns := "instant-deploy-dl-" + tc.name
+			jobName := "build-dl-" + tc.name
+
+			if err := p.createKanikoJob(context.Background(), ns, jobName, "ctx-sec", "auth-sec", "ghcr.io/x/y:latest", tc.httpContextURL); err != nil {
+				t.Fatalf("createKanikoJob: %v", err)
+			}
+
+			job, err := cs.BatchV1().Jobs(ns).Get(context.Background(), jobName, metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("get job: %v", err)
+			}
+			if job.Spec.ActiveDeadlineSeconds == nil {
+				t.Errorf("[%s] kaniko Job missing ActiveDeadlineSeconds — Gap 2 regressed", tc.name)
+			}
+		})
+	}
+}
+
+// TestLimitRangeHasPidsDefault guards Gap 3 (defence-in-depth pids fork-bomb
+// cap). The LimitRange should include a "pids" default when the API server
+// supports it (k8s 1.20+ with SupportPodPidsLimit). The fake clientset accepts
+// any resource name, so this test can assert the pids field is present.
+func TestLimitRangeHasPidsDefault(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	p := &K8sProvider{clientset: cs}
+
+	const ns = "instant-deploy-lr-pids-test"
+	if err := p.createLimitRangeForNS(context.Background(), ns, "hobby"); err != nil {
+		t.Fatalf("createLimitRangeForNS: %v", err)
+	}
+
+	lr, err := cs.CoreV1().LimitRanges(ns).Get(context.Background(), "instant-limits", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get limit range: %v", err)
+	}
+
+	for _, item := range lr.Spec.Limits {
+		if item.Type != corev1.LimitTypeContainer {
+			continue
+		}
+		// Pids cap should be present in the Default map on clusters that support it.
+		// The fake API server never rejects resources, so the first Create (with pids)
+		// always succeeds — assert accordingly.
+		if _, ok := item.Default[corev1.ResourceName("pids")]; !ok {
+			t.Error("LimitRange 'instant-limits' Default is missing 'pids' resource — Gap 3 (fork-bomb defence) has regressed; check pidsLimitPerContainer constant and createLimitRangeForNS")
+		}
+	}
+}
+
+// TestTierEphemeralStorage guards that TierEphemeralStorage returns sensible
+// non-empty values for all known tiers and that limits are consistent.
+func TestTierEphemeralStorage(t *testing.T) {
+	tiers := []string{"hobby", "anonymous", "pro", "team", ""}
+	for _, tier := range tiers {
+		req, limit := compute.TierEphemeralStorage(tier)
+		if req == "" {
+			t.Errorf("TierEphemeralStorage(%q): empty request", tier)
+		}
+		if limit == "" {
+			t.Errorf("TierEphemeralStorage(%q): empty limit", tier)
+		}
+	}
+}
+
+// Ensure the batchv1 import is used (compile guard).
+var _ batchv1.Job
+

@@ -162,6 +162,7 @@ func (p *K8sStackProvider) DeployStack(
 	serviceURLs := make(map[string]string, len(opts.Services))
 
 	memReq, memLimit, cpuReq := compute.TierResources(opts.Tier)
+	ephReq, ephLimit := compute.TierEphemeralStorage(opts.Tier)
 
 	for _, svc := range opts.Services {
 		port := svc.Port
@@ -179,7 +180,7 @@ func (p *K8sStackProvider) DeployStack(
 		}
 
 		// Deployment
-		if err := p.createStackDeployment(ctx, stackNamespace, opts.StackID, svc.Name, tag, port, svc.EnvVars, memReq, memLimit, cpuReq); err != nil {
+		if err := p.createStackDeployment(ctx, stackNamespace, opts.StackID, svc.Name, tag, port, svc.EnvVars, memReq, memLimit, cpuReq, ephReq, ephLimit); err != nil {
 			onUpdate(svc.Name, "failed", "", err.Error())
 			teardownOnFailure()
 			return fmt.Errorf("k8s.DeployStack: create deployment %q: %w", svc.Name, err)
@@ -367,12 +368,17 @@ func (p *K8sStackProvider) RedeployStack(
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 // createStackDeployment creates a k8s Deployment for a stack service.
+//
+// Gap 1 fix: ephReq/ephLimit carry the ephemeral-storage bounds so a stack
+// service pod is evicted by k8s when it exceeds its disk budget — preventing
+// it from filling the node disk and causing cluster-wide DiskPressure.
 func (p *K8sStackProvider) createStackDeployment(
 	ctx context.Context,
 	ns, stackID, svcName, imageTag string,
 	port int,
 	envVars map[string]string,
 	memReq, memLimit, cpuReq string,
+	ephReq, ephLimit string,
 ) error {
 	replicas := int32(1)
 	// PullAlways for the same reason as client.go: images are pushed under
@@ -425,13 +431,17 @@ func (p *K8sStackProvider) createStackDeployment(
 							// RunAsNonRoot and ReadOnlyRootFilesystem are intentionally omitted
 							// — see customerContainerSecCtx in client.go for rationale.
 							SecurityContext: customerContainerSecCtx(),
+							// Gap 1 fix: ephemeral-storage bounds the writable layer + /tmp.
+							// k8s evicts THIS pod at ephLimit, not the whole node.
 							Resources: corev1.ResourceRequirements{
 								Requests: corev1.ResourceList{
-									corev1.ResourceMemory: resource.MustParse(memReq),
-									corev1.ResourceCPU:    resource.MustParse(cpuReq),
+									corev1.ResourceMemory:           resource.MustParse(memReq),
+									corev1.ResourceCPU:              resource.MustParse(cpuReq),
+									corev1.ResourceEphemeralStorage: resource.MustParse(ephReq),
 								},
 								Limits: corev1.ResourceList{
-									corev1.ResourceMemory: resource.MustParse(memLimit),
+									corev1.ResourceMemory:           resource.MustParse(memLimit),
+									corev1.ResourceEphemeralStorage: resource.MustParse(ephLimit),
 								},
 							},
 						},
