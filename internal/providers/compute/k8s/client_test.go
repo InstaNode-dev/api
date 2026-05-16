@@ -218,28 +218,29 @@ func assertCustomerContainerSecCtx(t *testing.T, podSpec corev1.PodSpec, label s
 			t.Errorf("[%s] AllowPrivilegeEscalation=true; must be false", ctxLabel)
 		}
 
-		// Capabilities: ALL must be dropped, NET_BIND_SERVICE must be added.
+		// Capabilities: NET_RAW must be dropped; ALL must NOT be dropped.
+		// `Drop: ALL` strips CHOWN/SETUID/SETGID/… which arbitrary customer
+		// images need — it crash-loops stock nginx/postgres/redis. See
+		// customerContainerSecCtx for the full rationale.
 		if csc.Capabilities == nil {
-			t.Errorf("[%s] Capabilities is nil; must drop ALL and add NET_BIND_SERVICE", ctxLabel)
+			t.Errorf("[%s] Capabilities is nil; must drop NET_RAW", ctxLabel)
 			continue
 		}
-		hasDrop := false
+		hasNetRaw, hasAll := false, false
 		for _, cap := range csc.Capabilities.Drop {
-			if cap == "ALL" {
-				hasDrop = true
+			switch cap {
+			case "NET_RAW":
+				hasNetRaw = true
+			case "ALL":
+				hasAll = true
 			}
 		}
-		if !hasDrop {
-			t.Errorf("[%s] Capabilities.Drop does not contain ALL; got %v", ctxLabel, csc.Capabilities.Drop)
+		if !hasNetRaw {
+			t.Errorf("[%s] Capabilities.Drop does not contain NET_RAW; got %v", ctxLabel, csc.Capabilities.Drop)
 		}
-		hasAdd := false
-		for _, cap := range csc.Capabilities.Add {
-			if cap == capNetBindService {
-				hasAdd = true
-			}
-		}
-		if !hasAdd {
-			t.Errorf("[%s] Capabilities.Add does not contain NET_BIND_SERVICE; got %v", ctxLabel, csc.Capabilities.Add)
+		if hasAll {
+			t.Errorf("[%s] Capabilities.Drop contains ALL — that breaks arbitrary "+
+				"customer images (chown/setuid); drop only NET_RAW", ctxLabel)
 		}
 
 		// RunAsNonRoot and ReadOnlyRootFilesystem must NOT be set on customer
