@@ -279,11 +279,16 @@ func UpgradeTeamAllTiers(ctx context.Context, db *sql.DB, teamID uuid.UUID, newT
 	}
 
 	// 2. Resources — reaper-race guard: only lift non-expired rows.
+	// Include 'paused' rows so that a terminated-then-reinstated team's paused
+	// resources are promoted to the new tier. Without this, a hobby team that was
+	// terminated (resources paused + tier→free) and then re-subscribed to hobby
+	// would have their resources stuck at tier='free' and be unable to resume them
+	// (the Resume handler re-derives access rights from the resource tier).
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE resources
 		SET tier = $1, expires_at = NULL
 		WHERE team_id = $2
-		  AND status = 'active'
+		  AND status IN ('active', 'paused')
 		  AND (expires_at IS NULL OR expires_at > now())
 	`, newTier, teamID); err != nil {
 		return fmt.Errorf("models.UpgradeTeamAllTiers: elevate_resources: %w", err)
