@@ -160,7 +160,7 @@ func newAgentActionDeployAutoExpire24h(deployID, expiresAt string) string {
 // AgentActionDeployMakePermanentAnonymous is returned when an anonymous tier
 // caller tries to call POST /deployments/:id/make-permanent. Anonymous deploys
 // are forced to 24h TTL and can't be kept; the only escape is to claim.
-const AgentActionDeployMakePermanentAnonymous = "Tell the user anonymous deploys cannot be made permanent — they always expire in 24h. Claim the account at https://instanode.dev/start to keep deploys, then redeploy and call make-permanent."
+const AgentActionDeployMakePermanentAnonymous = "Tell the user anonymous deploys cannot be made permanent — they always expire in 24h. Claim the account at https://instanode.dev/claim to keep deploys, then redeploy and call make-permanent."
 
 // AgentActionDeployTTLHoursOutOfRange is returned when POST
 // /deployments/:id/ttl receives an hours value outside 1..8760.
