@@ -128,19 +128,35 @@ func customerPodSecCtx() *corev1.PodSecurityContext {
 	}
 }
 
-// platformContainerSecCtx returns the SecurityContext for PLATFORM-OWNED helper
-// containers (e.g. the Kaniko build container and the curl init-container).
-// These run known, pinned images controlled entirely by instant.dev, so we CAN
-// apply the stricter set that we deliberately omit for customer containers:
-//   - RunAsNonRoot=true — kaniko and curlimages/curl both run as non-root.
-//   - ReadOnlyRootFilesystem=true — neither container needs to write outside
-//     its declared volume mounts.
+// curlImageUID / curlImageGID are the numeric uid/gid of `curlimages/curl`
+// (the image's `curl_user`). RunAsNonRoot REQUIRES a numeric RunAsUser —
+// k8s cannot verify a non-numeric image user is non-root and refuses to
+// start the container ("image has non-numeric user (curl_user), cannot
+// verify user is non-root"). Setting these explicitly is what makes the
+// hardened platformContainerSecCtx actually schedulable.
+const (
+	curlImageUID int64 = 100
+	curlImageGID int64 = 100
+)
+
+// platformContainerSecCtx returns the SecurityContext for the PLATFORM-OWNED
+// curl init-container (`fetch-context`). It runs a known, pinned image
+// controlled by instant.dev, so we apply the stricter set:
+//   - RunAsNonRoot=true + an explicit numeric RunAsUser/RunAsGroup (100) so
+//     the kubelet can verify non-root and the container actually starts.
+//   - ReadOnlyRootFilesystem=true — curl writes only to its declared volume.
+// NOTE: the Kaniko build container does NOT use this — it sets its own
+// SecurityContext without RunAsNonRoot (kaniko requires uid=0).
 func platformContainerSecCtx() *corev1.SecurityContext {
 	falseVal := false
 	trueVal := true
+	uid := curlImageUID
+	gid := curlImageGID
 	return &corev1.SecurityContext{
 		AllowPrivilegeEscalation: &falseVal,
 		RunAsNonRoot:             &trueVal,
+		RunAsUser:                &uid,
+		RunAsGroup:               &gid,
 		ReadOnlyRootFilesystem:   &trueVal,
 		Capabilities: &corev1.Capabilities{
 			Drop: []corev1.Capability{"ALL"},
