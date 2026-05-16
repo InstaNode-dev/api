@@ -406,6 +406,29 @@ func GetExpiredStacks(ctx context.Context, db *sql.DB) ([]*Stack, error) {
 	return results, rows.Err()
 }
 
+// ElevateStackTiersByTeam promotes every non-deleting stack owned by the team
+// to newTier and clears the anonymous 24h TTL. Called from the Razorpay
+// subscription.charged webhook (via UpgradeTeamAllTiers) and from the dev-only
+// /internal/set-tier endpoint.
+//
+// The 'deleting' status is the only terminal-ish state for stacks (unlike
+// deployments which have both 'deleted' and 'expired'). Stacks in 'deleting'
+// are mid-teardown and should not be touched.
+func ElevateStackTiersByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID, newTier string) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE stacks
+		SET tier       = $1,
+		    expires_at = NULL,
+		    updated_at = now()
+		WHERE team_id = $2
+		  AND status NOT IN ('deleting')
+	`, newTier, teamID)
+	if err != nil {
+		return fmt.Errorf("models.ElevateStackTiersByTeam: %w", err)
+	}
+	return nil
+}
+
 // DeleteStack hard-deletes the stack row. stack_services are cascade-deleted.
 func DeleteStack(ctx context.Context, db *sql.DB, id uuid.UUID) error {
 	_, err := db.ExecContext(ctx, `DELETE FROM stacks WHERE id = $1`, id)

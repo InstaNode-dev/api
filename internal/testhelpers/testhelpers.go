@@ -481,6 +481,36 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_github_deploys_queued ON pending_github_deploys(enqueued_at) WHERE status = 'queued'`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_github_deploys_commit ON pending_github_deploys(connection_id, commit_sha)`,
+
+		// stacks + stack_services (Phase 6 multi-service stacks)
+		// Added so elevation tests (TestElevateStacks_*, TestUpgradeTeamAllTiers_*)
+		// can create stack fixtures without needing a full real DB.
+		`CREATE TABLE IF NOT EXISTS stacks (
+			id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			team_id     UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			slug        TEXT NOT NULL,
+			status      TEXT NOT NULL DEFAULT 'pending',
+			tier        TEXT NOT NULL DEFAULT 'anonymous',
+			env         TEXT NOT NULL DEFAULT 'development',
+			expires_at  TIMESTAMPTZ,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_stacks_team_slug ON stacks(team_id, slug)`,
+		`CREATE INDEX IF NOT EXISTS idx_stacks_team ON stacks(team_id)`,
+		`CREATE TABLE IF NOT EXISTS stack_services (
+			id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			stack_id    UUID NOT NULL REFERENCES stacks(id) ON DELETE CASCADE,
+			name        TEXT NOT NULL,
+			image_tag   TEXT,
+			image_ref   TEXT,
+			status      TEXT NOT NULL DEFAULT 'pending',
+			expose      BOOLEAN NOT NULL DEFAULT true,
+			port        INT NOT NULL DEFAULT 8080,
+			app_url     TEXT,
+			error_msg   TEXT,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
 	}
 
 	for _, s := range stmts {

@@ -590,7 +590,14 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 
 	switch event.Event {
 	case "subscription.charged":
-		h.handleSubscriptionCharged(ctx, c, event)
+		if upgradeErr := h.handleSubscriptionCharged(ctx, c, event); upgradeErr != nil {
+			slog.Error("billing.webhook.subscription_charged.upgrade_failed",
+				"error", upgradeErr, "event_id", eventID)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"ok":    false,
+				"error": "upgrade_failed",
+			})
+		}
 	case "subscription.cancelled":
 		h.handleSubscriptionCancelled(ctx, c, event)
 	case "subscription.charged_failed":
@@ -624,18 +631,21 @@ func verifyRazorpaySignature(body []byte, signature, secret string) bool {
 }
 
 // handleSubscriptionCharged processes subscription.charged events (payment confirmed → upgrade).
-func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) {
+// Returns a non-nil error on critical failures so the caller can return HTTP 500,
+// causing Razorpay to retry the webhook delivery. Best-effort steps (subscription ID
+// storage, audit emit, grace recovery, promo redemption) are fail-open.
+func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) error {
 	sub, ok := parseSubscriptionEntity(event)
 	if !ok {
 		slog.Error("billing.subscription.charged.parse_failed")
-		return
+		return nil // malformed payload — retrying won't help; swallow
 	}
 
 	teamID, err := resolveTeamFromNotes(ctx, h, sub)
 	if err != nil {
 		slog.Error("billing.subscription.charged.team_resolve_failed",
 			"error", err, "sub_id", sub.ID)
-		return
+		return nil // team not found — retrying won't help; swallow
 	}
 
 	tier := h.planIDToTier(sub.PlanID)
@@ -649,16 +659,12 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 		fromTier = team.PlanTier
 	}
 
-	if updateErr := models.UpdatePlanTier(ctx, h.db, teamID, tier); updateErr != nil {
-		slog.Error("billing.subscription.charged.update_plan_failed",
-			"error", updateErr, "team_id", teamID)
-		return
-	}
-
-	if elevErr := models.ElevateResourceTiersByTeam(ctx, h.db, teamID, tier); elevErr != nil {
-		slog.Error("billing.subscription.charged.elevate_tiers_failed",
-			"error", elevErr, "team_id", teamID, "tier", tier)
-		// Non-fatal: team tier updated; resource elevation is best-effort.
+	// Atomically upgrade the team tier + all resources, deployments, and stacks.
+	// Returns an error on failure — caller will return HTTP 500 so Razorpay retries.
+	if upgradeErr := models.UpgradeTeamAllTiers(ctx, h.db, teamID, tier); upgradeErr != nil {
+		slog.Error("billing.subscription.charged.upgrade_all_tiers_failed",
+			"error", upgradeErr, "team_id", teamID, "tier", tier)
+		return upgradeErr
 	}
 
 	// Store subscription ID for future lookups.
@@ -695,6 +701,7 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 	// webhook deliveries can't double-spend the code — the second one
 	// returns ErrAdminPromoCodeAlreadyUsed and we log + return.
 	maybeMarkAdminPromoCodeUsed(ctx, h.db, sub, teamID)
+	return nil
 }
 
 // maybeMarkAdminPromoCodeUsed marks an admin-issued promo code as redeemed
