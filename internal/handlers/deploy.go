@@ -174,6 +174,11 @@ func deploymentToMap(d *models.Deployment) fiber.Map {
 	if allowedIPs == nil {
 		allowedIPs = []string{}
 	}
+	// name is stored as env_vars["_name"] (no dedicated DB column). Extract it
+	// here so the dashboard and agents can read it as a top-level field without
+	// parsing the env map. Empty string for deploys created before mandatory
+	// naming was enforced (2026-05-16).
+	deployName := d.EnvVars["_name"]
 	m := fiber.Map{
 		"id":          d.ID,
 		"token":       d.AppID, // public-facing alias
@@ -183,6 +188,7 @@ func deploymentToMap(d *models.Deployment) fiber.Map {
 		"port":        d.Port,
 		"tier":        d.Tier,
 		"status":      d.Status,
+		"name":        deployName,
 		// redactEnvVars masks credential-bearing values before they leave the
 		// server. The stored JSONB row is untouched — only the outbound JSON
 		// is sanitised. See deploy_env_redact.go for the two-pass heuristic.

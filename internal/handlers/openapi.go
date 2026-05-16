@@ -2461,8 +2461,9 @@ const openAPISpec = `{
         "properties": {
           "id": { "type": "string", "format": "uuid" },
           "app_id": { "type": "string", "description": "8-char public identifier used in the URL" },
+          "name": { "type": "string", "description": "Human-readable label supplied at creation time (stored in env_vars._name; emitted as a top-level field for convenience). Empty string when created before mandatory-naming was enforced." },
           "url": { "type": "string" },
-          "status": { "type": "string", "enum": ["building", "deploying", "healthy", "failed", "stopped"] },
+          "status": { "type": "string", "enum": ["building", "deploying", "healthy", "failed", "stopped", "expired"] },
           "tier": { "type": "string" },
           "environment": { "type": "string" },
           "env": { "type": "object", "additionalProperties": { "type": "string" } },
@@ -2634,8 +2635,9 @@ const openAPISpec = `{
             "properties": {
               "id": { "type": "string", "format": "uuid" },
               "app_id": { "type": "string", "description": "8-char public identifier used in the URL" },
+              "name": { "type": "string", "description": "Human-readable label supplied at creation time (stored in env_vars._name; emitted as a top-level field for convenience). Empty string when created before mandatory-naming was enforced." },
               "url": { "type": "string", "description": "Live HTTPS URL (set once status=healthy)" },
-              "status": { "type": "string", "enum": ["building", "deploying", "healthy", "failed", "stopped"] },
+              "status": { "type": "string", "enum": ["building", "deploying", "healthy", "failed", "stopped", "expired"] },
               "tier": { "type": "string" },
               "environment": { "type": "string", "description": "Env scope (production/staging/dev). Note: 'env' on this object is the env_vars map, not the scope." },
               "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Env vars map — vault://KEY references resolve at deploy time" },
