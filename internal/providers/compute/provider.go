@@ -79,3 +79,24 @@ func TierResources(tier string) (memoryRequest, memoryLimit, cpuRequest string) 
 		return "64Mi", "256Mi", "50m"
 	}
 }
+
+// TierEphemeralStorage returns the ephemeral-storage request and limit for a
+// tier. Ephemeral storage bounds the container's writable layer + /tmp usage;
+// without it a single rogue pod can fill the node disk and trigger cluster-wide
+// DiskPressure → pod eviction across all tenants (noisy-neighbour DoS).
+//
+// Values are deliberately conservative for shared tiers (hobby/anonymous):
+//   - request 512Mi: scheduler can place the pod on a node with enough runway
+//   - limit   2Gi:   k8s evicts THIS pod (only) when it exceeds the cap
+//
+// Pro and team tiers get proportionally more headroom.
+func TierEphemeralStorage(tier string) (ephemeralStorageRequest, ephemeralStorageLimit string) {
+	switch tier {
+	case "pro":
+		return "1Gi", "4Gi"
+	case "team":
+		return "2Gi", "8Gi"
+	default: // hobby + anonymous
+		return "512Mi", "2Gi"
+	}
+}
