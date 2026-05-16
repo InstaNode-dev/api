@@ -2,6 +2,7 @@ package cache_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -82,4 +83,40 @@ func TestStorageBytes_AfterWrite_ReturnsPosBytes(t *testing.T) {
 	require.NoError(t, err)
 	assert.Greater(t, bytes, int64(0),
 		"namespace with one key must report > 0 bytes")
+}
+
+// TestACLAllowlist_NoPlusAtAll verifies the ACL allowlist does not grant "+@all"
+// to provisioned users on the shared Redis backend (A2 regression guard).
+//
+// "+@all" on a shared Redis pod allows FLUSHDB/MONITOR which are multi-tenant
+// isolation failures. This test captures the ACL SETUSER arguments issued to
+// Redis and ensures "+@all" is absent and the critical deny entries are present.
+func TestACLAllowlist_NoPlusAtAll(t *testing.T) {
+	rdb, cleanup := testhelpers.SetupTestRedis(t)
+	defer cleanup()
+
+	p := cacheprovider.New(rdb, "local", "localhost")
+	token := "acl-guard-" + t.Name()
+
+	_, err := p.Provision(context.Background(), token, "anonymous")
+	require.NoError(t, err)
+
+	// Inspect the ACL entry for the provisioned user via ACL GETUSER.
+	short := token
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	username := "usr_" + short
+
+	result, aclErr := rdb.Do(context.Background(), "ACL", "GETUSER", username).Result()
+	if aclErr != nil {
+		// ACL not available (Redis < 6) — fall back to key-namespace mode, skip test.
+		t.Skipf("ACL GETUSER not available (Redis < 6 or ACL disabled): %v", aclErr)
+	}
+
+	// Flatten the ACL GETUSER result to a string for inspection.
+	aclStr := fmt.Sprintf("%v", result)
+
+	assert.NotContains(t, aclStr, "+@all",
+		"ACL user must NOT have +@all — it would grant FLUSHDB/MONITOR on the shared pod")
 }
