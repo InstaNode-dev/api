@@ -166,7 +166,18 @@ func generateAppID() (string, error) {
 // that meaning for backwards compatibility and add a separate "environment"
 // field for the new env scope (production / staging / dev / ...). Callers can
 // continue to read .env as a map of vars; .environment is the scope name.
+//
+// The optional "failure" field is populated by querying deployment_events for
+// the latest failure_autopsy row. It is present only when the deployment is in
+// a failure state and an autopsy exists. Requires a db parameter.
 func deploymentToMap(d *models.Deployment) fiber.Map {
+	return deploymentToMapWithDB(d, nil)
+}
+
+// deploymentToMapWithDB is the internal implementation. db may be nil (in which
+// case the failure field is omitted). All route handlers that want the failure
+// object must pass h.db.
+func deploymentToMapWithDB(d *models.Deployment, db *sql.DB) fiber.Map {
 	// allowed_ips is always emitted (as [] when empty) so a Pro-tier dashboard
 	// can branch on "is this deployment private?" without having to special-case
 	// the missing-key path. private mirrors the column verbatim.
@@ -235,7 +246,64 @@ func deploymentToMap(d *models.Deployment) fiber.Map {
 		m["make_permanent_url"] = "https://api.instanode.dev/api/v1/deployments/" + d.ID.String() + "/make-permanent"
 		m["extend_ttl_url"] = "https://api.instanode.dev/api/v1/deployments/" + d.ID.String() + "/ttl"
 	}
+	// Failure autopsy (migration 050) — present only when:
+	//   (a) the deployment is in a failure state, AND
+	//   (b) a db handle was passed (non-nil), AND
+	//   (c) a deployment_events row with kind='failure_autopsy' exists.
+	//
+	// We skip the DB query entirely for non-failed deployments so the read
+	// path for healthy/building/deploying is zero-overhead. The "stopped"
+	// state (namespace torn down) is NOT considered a failure — the pod
+	// is gone but the user deleted it intentionally.
+	if d.Status == "failed" && db != nil {
+		autopsy, err := models.GetLatestDeploymentAutopsy(context.Background(), db, d.ID)
+		if err != nil {
+			// Non-fatal: log and omit the field rather than returning a 500.
+			slog.Warn("deploy.deploymentToMap.autopsy_query_failed",
+				"deployment_id", d.ID, "error", err)
+		} else if autopsy != nil {
+			failureMap := fiber.Map{
+				"reason":      autopsy.Reason,
+				"event":       autopsy.Event,
+				"last_lines":  autopsy.LastLines,
+				"hint":        autopsy.Hint,
+				"occurred_at": autopsy.CreatedAt.UTC().Format(time.RFC3339),
+			}
+			if autopsy.ExitCode.Valid {
+				failureMap["exit_code"] = autopsy.ExitCode.Int32
+			} else {
+				failureMap["exit_code"] = nil
+			}
+			m["failure"] = failureMap
+		}
+	}
 	return m
+}
+
+// ── captureAutopsy — best-effort build failure snapshot ──────────────────────
+
+// captureAutopsy writes (or updates) a failure_autopsy deployment_events row
+// for a build-path failure. The worker writes runtime-failure autopsies; this
+// function handles the build path (vault error + kaniko failure) because the
+// worker only polls k8s Deployments, not kaniko Job logs.
+//
+// lastLines may be nil when the build log is unavailable (e.g. vault error
+// before a build even started). The function is best-effort: errors are logged
+// and swallowed so a failed audit write never surfaces as a 500 to the caller.
+func captureAutopsy(ctx context.Context, db *sql.DB, deploymentID uuid.UUID, reason, event string, lastLines []string) {
+	if err := models.UpsertDeploymentAutopsy(ctx, db, models.UpsertAutopsyParams{
+		DeploymentID: deploymentID,
+		Reason:       reason,
+		Event:        event,
+		LastLines:    lastLines,
+		Hint:         models.HintForReason(reason),
+	}); err != nil {
+		slog.Warn("deploy.captureAutopsy.failed",
+			"deployment_id", deploymentID,
+			"reason", reason,
+			"error", err,
+		)
+	}
 }
 
 // requireTeam extracts and validates the team from the request context.
@@ -287,6 +355,9 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 			"failure_stage": "build",
 			"error_summary": truncateForAudit(err.Error(), 256),
 		})
+		// Capture a BuildFailed autopsy so GET /deploy/:id surfaces the vault
+		// error under the "failure" object immediately (no worker tick needed).
+		captureAutopsy(ctx, h.db, d.ID, models.FailureReasonBuildFailed, err.Error(), nil)
 		return
 	}
 
@@ -314,6 +385,13 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 			"failure_stage": "build",
 			"error_summary": truncateForAudit(err.Error(), 256),
 		})
+		// Classify the error: context deadline exceeded maps to DeadlineExceeded;
+		// everything else is BuildFailed (kaniko job error is the modal case).
+		reason := models.FailureReasonBuildFailed
+		if errors.Is(err, context.DeadlineExceeded) {
+			reason = models.FailureReasonDeadlineExceeded
+		}
+		captureAutopsy(ctx, h.db, d.ID, reason, err.Error(), nil)
 		return
 	}
 	_ = models.UpdateDeploymentProviderID(ctx, h.db, d.ID, result.ProviderID, result.AppURL)
@@ -680,7 +758,7 @@ func (h *DeployHandler) Get(c *fiber.Ctx) error {
 
 	return c.JSON(fiber.Map{
 		"ok":   true,
-		"item": deploymentToMap(d),
+		"item": deploymentToMapWithDB(d, h.db),
 	})
 }
 
@@ -1117,7 +1195,7 @@ func (h *DeployHandler) List(c *fiber.Ctx) error {
 
 	items := make([]fiber.Map, 0, len(deploys))
 	for _, d := range deploys {
-		items = append(items, deploymentToMap(d))
+		items = append(items, deploymentToMapWithDB(d, h.db))
 	}
 
 	return c.JSON(fiber.Map{
