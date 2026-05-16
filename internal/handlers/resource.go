@@ -570,14 +570,16 @@ func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
 	// still sees the original error.
 	if pauseErr := models.PauseResource(ctx, h.db, resource.ID); pauseErr != nil {
 		if errors.Is(pauseErr, models.ErrResourceNotActive) {
-			// Race: another caller flipped it between our SELECT and UPDATE.
-			// Roll back the revoke so the row's effective state matches the
-			// DB (which a parallel caller may have left as paused already —
-			// in which case the rollback is a no-op).
-			if rbErr := h.resumeProvider(context.Background(), resource); rbErr != nil {
-				slog.Warn("resource.pause.race_rollback_failed",
-					"error", rbErr, "resource_id", resource.ID, "request_id", requestID)
-			}
+			// Race: a concurrent caller already won the PauseResource UPDATE.
+			// The DB row is already 'paused'. Our pauseProvider revoke above was
+			// idempotent (REVOKE is a no-op on an already-revoked connection),
+			// so the net infra state is correctly revoked. Do NOT call
+			// resumeProvider here — that would re-grant access while the DB row
+			// still says 'paused', leaving the resource in an open-but-paused
+			// split-brain state.
+			slog.Info("resource.pause.race_lost",
+				"resource_id", resource.ID, "request_id", requestID,
+				"note", "concurrent caller already paused; skipping rollback to avoid re-granting access")
 			return respondErrorWithAgentAction(c, fiber.StatusConflict, "already_paused",
 				"Resource is already paused.",
 				AgentActionResourceAlreadyPaused, "")
@@ -672,14 +674,13 @@ func (h *ResourceHandler) Resume(c *fiber.Ctx) error {
 			AgentActionResourceNotPaused, "")
 	}
 
-	team, err := models.GetTeamByID(ctx, h.db, teamID)
-	if err != nil {
-		slog.Error("resource.resume.team_lookup_failed", "error", err, "team_id", teamID, "request_id", requestID)
-		return respondError(c, fiber.StatusServiceUnavailable, "team_lookup_failed", "Failed to look up team")
-	}
-	if !multiEnvTierAllowed(team.PlanTier) {
-		return respondPauseUpgradeRequired(c, team.PlanTier)
-	}
+	// No tier gate on resume: a team that owns a paused resource must always be
+	// able to un-pause it regardless of their current plan tier. The Pro+ gate
+	// is enforced at Pause time (the creation of a paused state). Blocking resume
+	// on plan tier creates an unrecoverable trap for terminated-then-reinstated
+	// hobby teams whose resources were paused by the payment-grace terminator and
+	// whose tier was restored to 'hobby' on re-subscription — they would be
+	// permanently locked out of resources they legitimately own.
 
 	// Provider-side grant FIRST. Iron-rule mirror of Pause: if the grant
 	// fails, the DB row stays 'paused' and the caller gets a 503.
@@ -1287,15 +1288,29 @@ func emitConnectionURLDecryptedAudit(db *sql.DB, teamID uuid.UUID, userID string
 
 // resourceTypeToProto maps a resource_type string to the corresponding protobuf enum.
 // Returns RESOURCE_TYPE_UNSPECIFIED for unknown/unsupported types (caller skips provisioner call).
-// queue/NATS has no provisioner deprovision RPC yet — it returns UNSPECIFIED so the caller skips it.
+//
+// Mapping rationale:
+//   - "queue": The provisioner's DeprovisionResource switch handles RESOURCE_TYPE_QUEUE
+//     (provisioner/internal/server/server.go). For shared/local NATS the backend deprovision
+//     is a no-op; for k8s dedicated NATS it deletes the pod namespace. Previously this
+//     returned UNSPECIFIED (stale comment said "no RPC yet") — that left k8s NATS namespaces
+//     orphaned on explicit user delete (expiry worker already sent RESOURCE_TYPE_QUEUE correctly).
+//   - "vector": pgvector resources share the Postgres backend (db_<token> / usr_<token>).
+//     Mapping to RESOURCE_TYPE_POSTGRES causes the provisioner to DROP DATABASE / DROP USER,
+//     which is exactly the same cleanup path as a plain postgres resource.
 func resourceTypeToProto(resourceType string) commonv1.ResourceType {
 	switch resourceType {
-	case "postgres":
+	case models.ResourceTypePostgres:
 		return commonv1.ResourceType_RESOURCE_TYPE_POSTGRES
-	case "redis":
+	case models.ResourceTypeRedis:
 		return commonv1.ResourceType_RESOURCE_TYPE_REDIS
-	case "mongodb":
+	case models.ResourceTypeMongoDB:
 		return commonv1.ResourceType_RESOURCE_TYPE_MONGODB
+	case models.ResourceTypeQueue:
+		return commonv1.ResourceType_RESOURCE_TYPE_QUEUE
+	case models.ResourceTypeVector:
+		// Vector is pgvector-on-Postgres; underlying DB/user cleanup is identical to postgres.
+		return commonv1.ResourceType_RESOURCE_TYPE_POSTGRES
 	default:
 		return commonv1.ResourceType_RESOURCE_TYPE_UNSPECIFIED
 	}
