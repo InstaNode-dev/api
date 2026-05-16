@@ -145,6 +145,16 @@ jobs:
             psql -h localhost -U postgres -d instant_dev_test -f "$f" >/dev/null
           done
           echo "all migrations applied to instant_dev_test"
+          # The db provider's local backend (internal/providers/db/local.go)
+          # CREATEs a customer database per /db/new. In tests it connects to
+          # TEST_POSTGRES_CUSTOMERS_URL — which testhelpers defaults to a
+          # localhost:5434 instance that does NOT exist on the CI runner, so
+          # every postgres provision (TestDBNew_*, TestBulkTwin_*) 503'd.
+          # Create that database on the same service container and point the
+          # env var at it below. It needs no migrations — it is only the
+          # admin connection target for CREATE DATABASE / CREATE USER.
+          psql -h localhost -U postgres -d postgres -c "CREATE DATABASE instant_customers" >/dev/null
+          echo "created instant_customers (db-provider admin target)"
 
       - name: Run unit tests (short, no integration deps)
         working-directory: api
@@ -154,6 +164,10 @@ jobs:
           # explicitly survives any future default-URL drift.
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/instant_dev_test?sslmode=disable
           TEST_REDIS_URL: redis://localhost:6379/15
+          # db-provider admin target (see the migrations step above). Without
+          # this the default is an unreachable localhost:5434 and every
+          # postgres-provisioning test fails with 503.
+          TEST_POSTGRES_CUSTOMERS_URL: postgres://postgres:postgres@localhost:5432/instant_customers?sslmode=disable
         # 2026-05-16: the previous -skip list (TestOpenAPI_CoversAll-
         # RegisteredRoutes | TestCrossTeam_ | TestCustomDomainCreate_) was
         # removed once their real causes were fixed: the OpenAPI test had a
