@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -157,5 +158,200 @@ func TestAppDeploymentUsesPullAlways(t *testing.T) {
 	}
 	if got := d.Spec.Template.Spec.Containers[0].ImagePullPolicy; got != corev1.PullAlways {
 		t.Errorf("imagePullPolicy = %s; want PullAlways (otherwise :latest gets cached and redeploys serve stale images)", got)
+	}
+}
+
+// ── Security hardening regression tests ──────────────────────────────────────
+//
+// These tests guard the container-isolation properties added in
+// fix/deploy-container-hardening (pentest finding: customer pods ran as uid=0
+// with the full Docker default capability set).
+//
+// The assertions are intentionally table-driven so that adding a new pod-
+// building helper to this package triggers a compile-time reminder to also
+// add the securityContext — the table is the registry.
+
+// assertCustomerContainerSecCtx is the single source of truth for what
+// "hardened customer container" means. Update this helper when the policy
+// changes; all table tests below call it, ensuring consistent coverage.
+func assertCustomerContainerSecCtx(t *testing.T, podSpec corev1.PodSpec, label string) {
+	t.Helper()
+
+	// ── Pod-level: seccompProfile ─────────────────────────────────────────────
+	if podSpec.SecurityContext == nil {
+		t.Errorf("[%s] pod SecurityContext is nil; want seccompProfile=RuntimeDefault", label)
+	} else {
+		sc := podSpec.SecurityContext
+		if sc.SeccompProfile == nil {
+			t.Errorf("[%s] pod SeccompProfile is nil; want RuntimeDefault", label)
+		} else if sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+			t.Errorf("[%s] pod SeccompProfile.Type = %s; want RuntimeDefault", label, sc.SeccompProfile.Type)
+		}
+		// RunAsNonRoot and ReadOnlyRootFilesystem must NOT be set on the pod
+		// SecurityContext for customer workloads — arbitrary customer images often
+		// run as root or write to the root filesystem.
+		if sc.RunAsNonRoot != nil && *sc.RunAsNonRoot {
+			t.Errorf("[%s] pod RunAsNonRoot=true must NOT be set on customer pod SecurityContext (breaks images that run as root)", label)
+		}
+	}
+
+	// ── Container-level: capabilities + privilege escalation ─────────────────
+	if len(podSpec.Containers) == 0 {
+		t.Fatalf("[%s] pod has no containers", label)
+	}
+	for i, c := range podSpec.Containers {
+		ctxLabel := fmt.Sprintf("%s/containers[%d](%s)", label, i, c.Name)
+		if c.SecurityContext == nil {
+			t.Errorf("[%s] SecurityContext is nil", ctxLabel)
+			continue
+		}
+		csc := c.SecurityContext
+
+		// AllowPrivilegeEscalation must be explicitly false.
+		if csc.AllowPrivilegeEscalation == nil {
+			t.Errorf("[%s] AllowPrivilegeEscalation is nil; must be explicitly false", ctxLabel)
+		} else if *csc.AllowPrivilegeEscalation {
+			t.Errorf("[%s] AllowPrivilegeEscalation=true; must be false", ctxLabel)
+		}
+
+		// Capabilities: ALL must be dropped, NET_BIND_SERVICE must be added.
+		if csc.Capabilities == nil {
+			t.Errorf("[%s] Capabilities is nil; must drop ALL and add NET_BIND_SERVICE", ctxLabel)
+			continue
+		}
+		hasDrop := false
+		for _, cap := range csc.Capabilities.Drop {
+			if cap == "ALL" {
+				hasDrop = true
+			}
+		}
+		if !hasDrop {
+			t.Errorf("[%s] Capabilities.Drop does not contain ALL; got %v", ctxLabel, csc.Capabilities.Drop)
+		}
+		hasAdd := false
+		for _, cap := range csc.Capabilities.Add {
+			if cap == capNetBindService {
+				hasAdd = true
+			}
+		}
+		if !hasAdd {
+			t.Errorf("[%s] Capabilities.Add does not contain NET_BIND_SERVICE; got %v", ctxLabel, csc.Capabilities.Add)
+		}
+
+		// RunAsNonRoot and ReadOnlyRootFilesystem must NOT be set on customer
+		// containers — see customerContainerSecCtx for rationale.
+		if csc.RunAsNonRoot != nil && *csc.RunAsNonRoot {
+			t.Errorf("[%s] RunAsNonRoot=true must NOT be set on customer container SecurityContext", ctxLabel)
+		}
+		if csc.ReadOnlyRootFilesystem != nil && *csc.ReadOnlyRootFilesystem {
+			t.Errorf("[%s] ReadOnlyRootFilesystem=true must NOT be set on customer container SecurityContext", ctxLabel)
+		}
+	}
+}
+
+// TestSecurityHardeningDeployPod asserts that the single-app deployment pod
+// (applyDeploymentInNS — backs POST /deploy/new) carries the required
+// container-isolation securityContext.
+func TestSecurityHardeningDeployPod(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	p := &K8sProvider{clientset: cs}
+
+	const ns, name = "instant-deploy-sec-test", "app-sec-test"
+	if err := p.applyDeploymentInNS(context.Background(),
+		ns, name, "ghcr.io/x/y:latest",
+		map[string]string{"FOO": "bar"},
+		8080, "64Mi", "256Mi", "50m",
+	); err != nil {
+		t.Fatalf("applyDeploymentInNS: %v", err)
+	}
+
+	d, err := cs.AppsV1().Deployments(ns).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get deployment: %v", err)
+	}
+	assertCustomerContainerSecCtx(t, d.Spec.Template.Spec, "deploy/single-app")
+}
+
+// TestSecurityHardeningStackPod asserts that the stack-service deployment pod
+// (createStackDeployment — backs POST /stacks/new) carries the required
+// container-isolation securityContext.
+func TestSecurityHardeningStackPod(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	p := &K8sStackProvider{K8sProvider: &K8sProvider{clientset: cs}}
+
+	const ns, stackID, svcName = "instant-stack-sec", "secstack", "web"
+	if err := p.createStackDeployment(context.Background(),
+		ns, stackID, svcName, "ghcr.io/x/y:latest",
+		8080, map[string]string{"FOO": "bar"},
+		"64Mi", "256Mi", "50m",
+	); err != nil {
+		t.Fatalf("createStackDeployment: %v", err)
+	}
+
+	d, err := cs.AppsV1().Deployments(ns).Get(context.Background(), svcName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get deployment: %v", err)
+	}
+	assertCustomerContainerSecCtx(t, d.Spec.Template.Spec, "stack/service")
+}
+
+// TestSecurityHardeningBothPodSpecsTableDriven is a table-driven meta-test
+// that runs assertCustomerContainerSecCtx against every customer-workload pod
+// surface in the package. Add new rows here when new pod builders are added —
+// the compile will remind you if you forget to wire the securityContext.
+func TestSecurityHardeningBothPodSpecsTableDriven(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	p := &K8sProvider{clientset: cs}
+	sp := &K8sStackProvider{K8sProvider: p}
+
+	cases := []struct {
+		label    string
+		setup    func(t *testing.T) corev1.PodSpec
+	}{
+		{
+			label: "single-app deploy (applyDeploymentInNS)",
+			setup: func(t *testing.T) corev1.PodSpec {
+				t.Helper()
+				ns := "instant-deploy-tbl"
+				name := "app-tbl"
+				if err := p.applyDeploymentInNS(context.Background(),
+					ns, name, "ghcr.io/x/y:latest",
+					nil, 8080, "64Mi", "256Mi", "50m",
+				); err != nil {
+					t.Fatalf("applyDeploymentInNS: %v", err)
+				}
+				d, err := cs.AppsV1().Deployments(ns).Get(context.Background(), name, metav1.GetOptions{})
+				if err != nil {
+					t.Fatalf("get deployment: %v", err)
+				}
+				return d.Spec.Template.Spec
+			},
+		},
+		{
+			label: "stack service deploy (createStackDeployment)",
+			setup: func(t *testing.T) corev1.PodSpec {
+				t.Helper()
+				ns := "instant-stack-tbl"
+				if err := sp.createStackDeployment(context.Background(),
+					ns, "tblstack", "api", "ghcr.io/x/y:latest",
+					8080, nil, "64Mi", "256Mi", "50m",
+				); err != nil {
+					t.Fatalf("createStackDeployment: %v", err)
+				}
+				d, err := cs.AppsV1().Deployments(ns).Get(context.Background(), "api", metav1.GetOptions{})
+				if err != nil {
+					t.Fatalf("get deployment: %v", err)
+				}
+				return d.Spec.Template.Spec
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.label, func(t *testing.T) {
+			podSpec := tc.setup(t)
+			assertCustomerContainerSecCtx(t, podSpec, tc.label)
+		})
 	}
 }

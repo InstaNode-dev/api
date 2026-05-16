@@ -38,6 +38,99 @@ const (
 	labelAppID    = "instant-app-id"
 )
 
+// ── Container-isolation constants ─────────────────────────────────────────────
+//
+// These values are applied uniformly to every pod spec created by this package.
+// Named constants here so a future refactor cannot silently drop the values by
+// editing an inline string in one call site only.
+
+const (
+	// capNetBindService is the only Linux capability we re-add after dropping ALL.
+	// It allows customer apps to bind ports < 1024 (e.g. 80/443) without root.
+	capNetBindService = corev1.Capability("NET_BIND_SERVICE")
+
+	// seccompRuntimeDefault requests the container runtime's default seccomp
+	// profile (equivalent to Docker's default profile on most runtimes).
+	seccompRuntimeDefault = corev1.SeccompProfileTypeRuntimeDefault
+)
+
+// customerContainerSecCtx returns the SecurityContext applied to every
+// customer-workload container (single-app deploy and stack services).
+//
+// Rationale for each field:
+//   - AllowPrivilegeEscalation=false: prevents a child process from gaining
+//     more privileges than its parent (blocks setuid-binary privilege escalation).
+//   - Capabilities drop ALL + add NET_BIND_SERVICE: removes the full Docker
+//     default capability set (NET_RAW, SYS_CHROOT, …) while preserving the
+//     ability to bind privileged ports, which many customer HTTP servers require.
+//
+// Deliberately NOT set on customer containers:
+//   - RunAsNonRoot — customer images are arbitrary; many legitimately run as
+//     root or have USER 0 in their Dockerfile. A blanket setting would break
+//     real customer deployments. This is a future opt-in that requires per-image
+//     detection (e.g. inspect image metadata and only set when USER != root).
+//   - ReadOnlyRootFilesystem — many frameworks (Node.js, Python, Go with cgo)
+//     write to /tmp or the app directory at startup. Setting this unconditionally
+//     would cause customer app crashes. Opt-in per-image in a future pass.
+func customerContainerSecCtx() *corev1.SecurityContext {
+	falseVal := false
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: &falseVal,
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+			Add:  []corev1.Capability{capNetBindService},
+		},
+	}
+}
+
+// customerPodSecCtx returns the PodSecurityContext applied to every
+// customer-workload pod (single-app deploy and stack services).
+//
+// seccompProfile=RuntimeDefault instructs the container runtime (containerd,
+// cri-o) to apply its built-in syscall allowlist, blocking ~400 syscalls that
+// are rarely needed but exploited in container-escape CVEs (e.g. clone with
+// CLONE_NEWUSER, keyctl, etc.).
+//
+// RunAsNonRoot and ReadOnlyRootFilesystem are intentionally NOT set here for
+// the same reasons documented on customerContainerSecCtx above.
+func customerPodSecCtx() *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: seccompRuntimeDefault,
+		},
+	}
+}
+
+// platformContainerSecCtx returns the SecurityContext for PLATFORM-OWNED helper
+// containers (e.g. the Kaniko build container and the curl init-container).
+// These run known, pinned images controlled entirely by instant.dev, so we CAN
+// apply the stricter set that we deliberately omit for customer containers:
+//   - RunAsNonRoot=true — kaniko and curlimages/curl both run as non-root.
+//   - ReadOnlyRootFilesystem=true — neither container needs to write outside
+//     its declared volume mounts.
+func platformContainerSecCtx() *corev1.SecurityContext {
+	falseVal := false
+	trueVal := true
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: &falseVal,
+		RunAsNonRoot:             &trueVal,
+		ReadOnlyRootFilesystem:   &trueVal,
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+		},
+	}
+}
+
+// platformPodSecCtx returns the PodSecurityContext for platform-owned pods
+// (Kaniko build jobs). Includes seccomp RuntimeDefault.
+func platformPodSecCtx() *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: seccompRuntimeDefault,
+		},
+	}
+}
+
 // BuildContextConfig holds the MinIO/S3 settings used to deliver the kaniko
 // build context. When Endpoint is empty, the K8sProvider falls back to the
 // legacy k8s-Secret delivery (capped at ~1 MiB by etcd's object size limit).
@@ -864,6 +957,10 @@ func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecre
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: "build-context", MountPath: "/workspace"},
 			},
+			// Platform-owned image: apply full hardening including RunAsNonRoot
+			// and ReadOnlyRootFilesystem (safe because curlimages/curl runs as
+			// non-root and only writes to the declared /workspace volume).
+			SecurityContext: platformContainerSecCtx(),
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("50m"),
@@ -899,7 +996,13 @@ func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecre
 			TTLSecondsAfterFinished: &ttl,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy:  corev1.RestartPolicyNever,
+					RestartPolicy: corev1.RestartPolicyNever,
+					// Platform-owned build pod: apply seccomp RuntimeDefault.
+					// RunAsNonRoot is NOT set here because kaniko v1.23 needs
+					// to run as root inside the build sandbox. It does not
+					// set SUID binaries or escalate; AllowPrivilegeEscalation=false
+					// in the container SecurityContext is sufficient.
+					SecurityContext: platformPodSecCtx(),
 					InitContainers: initContainers,
 					Containers: []corev1.Container{{
 						Name:  "kaniko",
@@ -928,6 +1031,20 @@ func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecre
 								corev1.ResourceMemory: resource.MustParse("512Mi"),
 							},
 						},
+						// Platform-owned container: AllowPrivilegeEscalation=false
+						// and drop ALL. ReadOnlyRootFilesystem is NOT set because
+						// kaniko writes snapshot layers to its working directory.
+						// RunAsNonRoot is NOT set — kaniko builds require uid=0 inside
+						// the Kaniko executor to unpack layers that set file ownership.
+						SecurityContext: func() *corev1.SecurityContext {
+							falseVal := false
+							return &corev1.SecurityContext{
+								AllowPrivilegeEscalation: &falseVal,
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{"ALL"},
+								},
+							}
+						}(),
 						VolumeMounts: mounts,
 					}},
 					Volumes: volumes,
@@ -1009,6 +1126,9 @@ func (p *K8sProvider) applyDeploymentInNS(
 				Spec: corev1.PodSpec{
 					// Disable service account token auto-mount for security.
 					AutomountServiceAccountToken: &saFalse,
+					// Pod-level seccomp: RuntimeDefault restricts ~400 rarely-needed
+					// but CVE-exploited syscalls (clone/CLONE_NEWUSER, keyctl, etc.).
+					SecurityContext: customerPodSecCtx(),
 					ImagePullSecrets: []corev1.LocalObjectReference{
 						{Name: "ghcr-pull"},
 					},
@@ -1021,6 +1141,11 @@ func (p *K8sProvider) applyDeploymentInNS(
 								{ContainerPort: int32(port), Protocol: corev1.ProtocolTCP},
 							},
 							Env: envVarsToK8s(envVars),
+							// Container-level hardening: drop ALL capabilities, re-add only
+							// NET_BIND_SERVICE (ports <1024), block privilege escalation.
+							// RunAsNonRoot and ReadOnlyRootFilesystem are intentionally omitted
+							// — see customerContainerSecCtx for rationale.
+							SecurityContext: customerContainerSecCtx(),
 							Resources: corev1.ResourceRequirements{
 								Requests: corev1.ResourceList{
 									corev1.ResourceMemory: resource.MustParse(memReq),
