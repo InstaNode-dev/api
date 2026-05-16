@@ -673,7 +673,9 @@ func TestStackList(t *testing.T) {
 	defer cleanDB()
 	ensureStackTables(t, db)
 
-	teamID := testhelpers.MustCreateTeamDB(t, db, "hobby")
+	// Pro tier: deployments_apps=10 in plans.yaml. The test creates two
+	// stacks; hobby (deployments_apps=1) would 402 the second create.
+	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
 	sessionJWT := testhelpers.MustSignSessionJWT(t, "user-stack-list", teamID, "stacklist@example.com")
 
 	app := newStackTestApp(t, db)

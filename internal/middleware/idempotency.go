@@ -174,6 +174,16 @@ type idemEntry struct {
 // empty body never share a cache slot.
 func Idempotency(rdb *redis.Client, endpoint string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		// Fail open when Redis is unavailable. A nil client (a
+		// misconfigured deploy) would otherwise SIGSEGV inside go-redis
+		// on the first request to reach idempotencyExplicit/Fingerprint —
+		// crashing the whole API instead of degrading gracefully.
+		// Idempotency is a best-effort dedupe layer, never a correctness
+		// gate, so skipping it on no-Redis is safe (CLAUDE.md convention #1).
+		if rdb == nil {
+			return c.Next()
+		}
+
 		rawKey := c.Get(idempotencyHeader)
 
 		// Compute the scope used to namespace cache keys. team_id when

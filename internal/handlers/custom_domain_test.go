@@ -70,11 +70,25 @@ func customDomainTestApp(t *testing.T, db *sql.DB, teamID uuid.UUID) *fiber.App 
 	return app
 }
 
+// defaultDeploymentTTLPolicy is the auto_24h policy value GetTeamByID's
+// COALESCE falls back to; the test mock supplies it directly so the column
+// set matches the real query.
+const defaultDeploymentTTLPolicy = "auto_24h"
+
 // expectTeamRowForCustomDomain stubs the GetTeamByID query that requireTeam runs first.
 // The plan_tier dictates which branch of the cap logic fires.
+//
+// The column set must match models.GetTeamByID's SELECT exactly. The
+// default_deployment_ttl_policy column (migration 045) is the 6th — a stale
+// 5-column mock makes Scan fail with "expected 5 destination arguments in
+// Scan, not 6".
 func expectTeamRowForCustomDomain(mock sqlmock.Sqlmock, teamID uuid.UUID, planTier string) {
-	rows := sqlmock.NewRows([]string{"id", "name", "plan_tier", "stripe_customer_id", "created_at"}).
-		AddRow(teamID, sql.NullString{String: "Acme", Valid: true}, planTier, sql.NullString{}, time.Now())
+	rows := sqlmock.NewRows([]string{
+		"id", "name", "plan_tier", "stripe_customer_id", "created_at",
+		"default_deployment_ttl_policy",
+	}).
+		AddRow(teamID, sql.NullString{String: "Acme", Valid: true}, planTier, sql.NullString{}, time.Now(),
+			defaultDeploymentTTLPolicy)
 	mock.ExpectQuery(`SELECT.*FROM teams WHERE id`).
 		WithArgs(teamID).WillReturnRows(rows)
 }

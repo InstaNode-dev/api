@@ -615,6 +615,12 @@ func TestOpenAPI_CoversAllRegisteredRoutes(t *testing.T) {
 		// this directly. Exposing it in the public OpenAPI would
 		// mislead agents into thinking it's a customer-facing surface.
 		"POST /internal/email/resend-magic-link": true,
+		// Worker-only manual-backup quota refund (FIX-H #65/#Q47). Same
+		// WORKER_INTERNAL_JWT_SECRET HS256 M2M auth as the two /internal
+		// routes above — the worker's customer_backup_runner calls it
+		// when a manual backup fails terminally. Not a customer-facing
+		// surface, so it stays out of the agent-facing OpenAPI spec.
+		"POST /internal/teams/{id}/backup-quota/refund": true,
 		"GET /api/v1/usage/wall":              true,
 		"POST /api/v1/experiments/converted":  true,
 	}

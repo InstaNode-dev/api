@@ -467,11 +467,17 @@ func makeChargedWithNotes(t *testing.T, subscriptionID, planID string, notes map
 	return payload
 }
 
-// TestBillingWebhook_SubscriptionCharged_AdminPromoCodeID_MarksUsed —
-// the redemption-on-activation contract. Notes carry the
-// admin_promo_code_id stamped by CreateCheckoutAPI; the webhook must
-// flip used_at = now() best-effort.
-func TestBillingWebhook_SubscriptionCharged_AdminPromoCodeID_MarksUsed(t *testing.T) {
+// TestBillingWebhook_SubscriptionCharged_AdminPromoCodeID_NotRedeemedYet —
+// the deferred-redemption contract (DESIGN-P1-B-billing-resilience.md §5
+// Option B). The current checkout flow stamps admin_promo_code_id into the
+// Razorpay subscription notes but does NOT attach a Razorpay Offer, so no
+// discount is actually applied. handleSubscriptionCharged therefore must
+// NOT mark the code used — burning a single-use code while the customer
+// paid full price is a financial broken promise. This test is the
+// regression guard for the explicit "do not re-add maybeMarkAdminPromoCodeUsed"
+// comment in billing.go; redemption is re-enabled only once real Razorpay
+// Offer wiring lands (Slice 5).
+func TestBillingWebhook_SubscriptionCharged_AdminPromoCodeID_NotRedeemedYet(t *testing.T) {
 	db, cleanup := adminRedeemNeedsDB(t)
 	defer cleanup()
 
@@ -496,13 +502,14 @@ func TestBillingWebhook_SubscriptionCharged_AdminPromoCodeID_MarksUsed(t *testin
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	// Assert the admin code row is now marked used.
+	// Assert the admin code row is NOT marked used — redemption is deferred
+	// until Razorpay Offer wiring is in place.
 	var usedAt sql.NullTime
 	err = db.QueryRow(`SELECT used_at FROM admin_promo_codes WHERE id = $1`, promoID).Scan(&usedAt)
 	require.NoError(t, err)
-	assert.True(t, usedAt.Valid, "used_at must be set after subscription.charged with notes.admin_promo_code_id")
-	assert.WithinDuration(t, time.Now(), usedAt.Time, 30*time.Second,
-		"used_at should be set to ~now() (clock-skew tolerance: 30s)")
+	assert.False(t, usedAt.Valid,
+		"used_at must stay NULL — subscription.charged must NOT redeem the code "+
+			"until a real Razorpay Offer applies the discount (DESIGN-P1-B Option B)")
 }
 
 // TestBillingWebhook_SubscriptionCharged_NoAdminPromoCodeID_NoSideEffect —

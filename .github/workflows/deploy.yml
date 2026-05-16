@@ -126,6 +126,26 @@ jobs:
         # in the workspace root — which is already correct. No mv needed.
         run: ls -la
 
+      - name: Apply DB migrations to the test database
+        # 2026-05-16: before this step CI ran tests against a BARE Postgres
+        # whose schema came ONLY from testhelpers.runMigrations — a
+        # hand-maintained mirror of the prod schema. Every migration that
+        # added a table/column without a matching mirror edit silently broke
+        # this gate (email_events, pending_deletions, deployment_events,
+        # deployments.private, …). This step applies the REAL migration
+        # files, exactly like `make test-db-up` does locally, so CI runs
+        # against the same schema developers do. runMigrations still runs
+        # (all IF NOT EXISTS) as a harmless backstop. The TestRunMigrations-
+        # MirrorsEveryMigrationTable guard keeps the mirror itself honest.
+        env:
+          PGPASSWORD: postgres
+        run: |
+          for f in $(ls api/internal/db/migrations/*.sql | sort); do
+            echo "→ applying $(basename "$f")"
+            psql -h localhost -U postgres -d instant_dev_test -f "$f" >/dev/null
+          done
+          echo "all migrations applied to instant_dev_test"
+
       - name: Run unit tests (short, no integration deps)
         working-directory: api
         env:
@@ -134,19 +154,15 @@ jobs:
           # explicitly survives any future default-URL drift.
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/instant_dev_test?sslmode=disable
           TEST_REDIS_URL: redis://localhost:6379/15
-        # 2026-05-15: temporary skip for pre-existing test failures
-        # already documented in BUG-HUNT-2026-05-14.md:
-        #   * TestOpenAPI_CoversAllRegisteredRoutes — bug-hunt #49,
-        #     OpenAPI spec drift, fix is a separate doc-sync PR
-        #   * TestCrossTeam_* + TestCustomDomainCreate_* — need the
-        #     customers-DB (port 5434) which we haven't provisioned
-        #     as a second service container yet. Investigate which
-        #     subset truly needs it vs. just expects a second user;
-        #     these have been failing locally for the user too per the
-        #     bug-hunt audit, so they don't represent NEW regressions.
-        # TODO(2026-05-16): fix or move to integration-tagged build.
+        # 2026-05-16: the previous -skip list (TestOpenAPI_CoversAll-
+        # RegisteredRoutes | TestCrossTeam_ | TestCustomDomainCreate_) was
+        # removed once their real causes were fixed: the OpenAPI test had a
+        # stale internal-route whitelist, TestCrossTeam_ never needed a
+        # second DB at all, and TestCustomDomainCreate_ had a stale 5-column
+        # sqlmock row. The whole `./...` suite now passes here against the
+        # migrated DB — keep it that way; do not re-add a -skip list.
         run: |
-          go test ./... -short -count=1 -skip 'TestOpenAPI_CoversAllRegisteredRoutes|TestCrossTeam_|TestCustomDomainCreate_'
+          go test ./... -short -count=1
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

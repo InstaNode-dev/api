@@ -189,11 +189,14 @@ func TestElevate_OtherTeam_Untouched(t *testing.T) {
 func insertDeploymentForTest(t *testing.T, db *sql.DB, teamID uuid.UUID, tier string, expiresAt sql.NullTime, ttlPolicy string) uuid.UUID {
 	t.Helper()
 	var id uuid.UUID
+	// app_id is NOT NULL in the real schema; a random value keeps the row
+	// valid (and unique) without going through the provision flow.
+	appID := "app-" + uuid.NewString()[:12]
 	err := db.QueryRowContext(context.Background(), `
-		INSERT INTO deployments (team_id, tier, expires_at, ttl_policy, status, env)
-		VALUES ($1, $2, $3, $4, 'healthy', 'development')
+		INSERT INTO deployments (team_id, tier, expires_at, ttl_policy, status, env, app_id)
+		VALUES ($1, $2, $3, $4, 'healthy', 'development', $5)
 		RETURNING id
-	`, teamID, tier, expiresAt, ttlPolicy).Scan(&id)
+	`, teamID, tier, expiresAt, ttlPolicy, appID).Scan(&id)
 	require.NoError(t, err)
 	t.Cleanup(func() { db.Exec(`DELETE FROM deployments WHERE id = $1`, id) })
 	return id
@@ -266,12 +269,15 @@ func TestElevateDeployments_TerminalStatuses_Skipped(t *testing.T) {
 func insertStackForTest(t *testing.T, db *sql.DB, teamID uuid.UUID, tier string, expiresAt sql.NullTime) uuid.UUID {
 	t.Helper()
 	slug := uuid.NewString()[:8] // short random slug to avoid unique-index collisions
+	// namespace is NOT NULL + UNIQUE in the real schema; derive it from the
+	// already-unique slug per the "instant-stack-{slug}" production convention.
+	namespace := "instant-stack-" + slug
 	var id uuid.UUID
 	err := db.QueryRowContext(context.Background(), `
-		INSERT INTO stacks (team_id, slug, tier, expires_at, status, env)
-		VALUES ($1, $2, $3, $4, 'healthy', 'development')
+		INSERT INTO stacks (team_id, slug, namespace, tier, expires_at, status, env)
+		VALUES ($1, $2, $3, $4, $5, 'healthy', 'development')
 		RETURNING id
-	`, teamID, slug, tier, expiresAt).Scan(&id)
+	`, teamID, slug, namespace, tier, expiresAt).Scan(&id)
 	require.NoError(t, err)
 	t.Cleanup(func() { db.Exec(`DELETE FROM stacks WHERE id = $1`, id) })
 	return id

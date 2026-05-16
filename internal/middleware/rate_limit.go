@@ -114,7 +114,17 @@ func GetRateLimitCount(c *fiber.Ctx) int64 {
 }
 
 // incrementWithExpiry performs an atomic INCR + EXPIRE (only sets expiry on first increment).
+//
+// A nil rdb is treated as a Redis error, not a panic: RateLimit's caller
+// fails open on any error returned here (CLAUDE.md convention #1 — a Redis
+// outage, or here a missing client, must never block or crash the request).
+// Before this guard a nil client SIGSEGV'd inside go-redis (*Client).Pipeline
+// on the very first request — a misconfigured deploy would crash the whole
+// API rather than degrade gracefully.
 func incrementWithExpiry(ctx context.Context, rdb *redis.Client, key string, ttl time.Duration) (int64, error) {
+	if rdb == nil {
+		return 0, fmt.Errorf("redis client is nil")
+	}
 	pipe := rdb.Pipeline()
 	incrCmd := pipe.Incr(ctx, key)
 	pipe.Expire(ctx, key, ttl)
