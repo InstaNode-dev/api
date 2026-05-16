@@ -282,11 +282,16 @@ func deploymentToMapWithDB(d *models.Deployment, db *sql.DB) fiber.Map {
 
 // ── captureAutopsy — best-effort build failure snapshot ──────────────────────
 
-// fetchBuildLogsForAutopsy attempts to retrieve the kaniko build logs for appID
-// by type-asserting the compute provider to compute.BuildLogFetcher. Returns
-// nil when the provider does not support log fetching (noop, test doubles) or
-// when the build pod is already gone — the caller then writes the autopsy with
-// an empty last_lines slice (fail-soft).
+// fetchBuildLogsForAutopsy snapshots the kaniko build logs for appID at the
+// moment of build failure so they can be persisted into the autopsy row.
+// It is called only from runDeploy (a server-side goroutine) — it is NOT an
+// HTTP handler and the cluster is never exposed to the caller. The user only
+// ever sees the stored snapshot served from the platform DB via GET /deploy/:id.
+//
+// It type-asserts the compute provider to compute.BuildLogFetcher. Returns nil
+// when the provider does not support log fetching (noop, test doubles) or when
+// the build pod is already gone — the caller then writes the autopsy with an
+// empty last_lines slice (fail-soft).
 //
 // A short timeout (30 s) is applied so a slow k8s API server never blocks the
 // autopsy write indefinitely.
