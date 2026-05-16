@@ -101,9 +101,10 @@ func NewVectorHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, provCli
 // can apply it inside its own admin connection (cleaner: fewer round-trips,
 // no api-side superuser credential exposure when extensions land that need
 // elevated privileges).
-func (h *VectorHandler) provisionVectorDB(ctx context.Context, token, tier string) (*dbprovider.Credentials, error) {
+// teamID scopes the dedicated namespace label — pass empty for anonymous provisions.
+func (h *VectorHandler) provisionVectorDB(ctx context.Context, token, tier, teamID string) (*dbprovider.Credentials, error) {
 	if h.provClient != nil {
-		creds, err := h.provClient.ProvisionPostgres(ctx, token, tier)
+		creds, err := h.provClient.ProvisionPostgres(ctx, token, tier, teamID)
 		if err != nil {
 			return nil, err
 		}
@@ -328,7 +329,7 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, models.ResourceTypeVector, "anonymous", "", fp, tokenStr)
-	creds, err := h.provisionVectorDB(provCtx, tokenStr, "anonymous")
+	creds, err := h.provisionVectorDB(provCtx, tokenStr, "anonymous", "") // no teamID for anonymous
 	finishProvisionSpan(span, err)
 	metrics.ProvisionDuration.WithLabelValues(models.ResourceTypeVector, "anonymous").Observe(time.Since(provStart).Seconds())
 	if err != nil {
@@ -485,7 +486,7 @@ func (h *VectorHandler) newVectorAuthenticated(
 
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, models.ResourceTypeVector, tier, teamIDStr, fp, tokenStr)
-	creds, err := h.provisionVectorDB(provCtx, tokenStr, tier)
+	creds, err := h.provisionVectorDB(provCtx, tokenStr, tier, teamIDStr)
 	finishProvisionSpan(span, err)
 	metrics.ProvisionDuration.WithLabelValues(models.ResourceTypeVector, tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {

@@ -65,9 +65,10 @@ func NewQueueHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, provClie
 // When the gRPC provisioner is configured, every tier uses it — the provisioner
 // chooses local vs k8s-dedicated backend based on QUEUE_PROVISION_BACKEND.
 // Falls back to the local provider only when no provisioner client is wired.
-func (h *QueueHandler) provisionQueue(ctx context.Context, token, tier string) (*queueprovider.Credentials, error) {
+// teamID scopes the dedicated namespace label — pass empty for anonymous provisions.
+func (h *QueueHandler) provisionQueue(ctx context.Context, token, tier, teamID string) (*queueprovider.Credentials, error) {
 	if h.provClient != nil {
-		creds, err := h.provClient.ProvisionQueue(ctx, token, tier)
+		creds, err := h.provClient.ProvisionQueue(ctx, token, tier, teamID)
 		if err != nil {
 			return nil, err
 		}
@@ -200,7 +201,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 	// Provision NATS credentials.
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, "queue", "anonymous", "", fp, tokenStr)
-	creds, err := h.provisionQueue(provCtx, tokenStr, "anonymous")
+	creds, err := h.provisionQueue(provCtx, tokenStr, "anonymous", "") // no teamID for anonymous
 	finishProvisionSpan(span, err)
 	metrics.ProvisionDuration.WithLabelValues("queue", "anonymous").Observe(time.Since(provStart).Seconds())
 	if err != nil {
@@ -362,7 +363,7 @@ func (h *QueueHandler) newQueueAuthenticated(
 	// Provision NATS credentials.
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, "queue", tier, teamIDStr, fp, tokenStr)
-	creds, err := h.provisionQueue(provCtx, tokenStr, tier)
+	creds, err := h.provisionQueue(provCtx, tokenStr, tier, teamIDStr)
 	finishProvisionSpan(span, err)
 	metrics.ProvisionDuration.WithLabelValues("queue", tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {

@@ -59,9 +59,12 @@ func NewDBHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, provClient 
 
 // provisionDB provisions a Postgres database, using gRPC provisioner if available,
 // falling back to local provider otherwise.
-func (h *DBHandler) provisionDB(ctx context.Context, token, tier string) (*dbprovider.Credentials, error) {
+// teamID is the owning team UUID string passed to the provisioner so it can
+// label the dedicated namespace with instant.dev/owner-team for NetworkPolicy
+// scoping. Pass empty string for anonymous provisions.
+func (h *DBHandler) provisionDB(ctx context.Context, token, tier, teamID string) (*dbprovider.Credentials, error) {
 	if h.provClient != nil {
-		creds, err := h.provClient.ProvisionPostgres(ctx, token, tier)
+		creds, err := h.provClient.ProvisionPostgres(ctx, token, tier, teamID)
 		if err != nil {
 			return nil, err
 		}
@@ -210,7 +213,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 	// Provision the real Postgres database.
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, "postgres", "anonymous", "", fp, tokenStr)
-	creds, err := h.provisionDB(provCtx, tokenStr, "anonymous")
+	creds, err := h.provisionDB(provCtx, tokenStr, "anonymous", "") // no teamID for anonymous
 	finishProvisionSpan(span, err)
 	metrics.ProvisionDuration.WithLabelValues("postgres", "anonymous").Observe(time.Since(provStart).Seconds())
 	if err != nil {
@@ -378,7 +381,7 @@ func (h *DBHandler) newDBAuthenticated(
 	// Provision the real Postgres database.
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, "postgres", tier, teamIDStr, fp, tokenStr)
-	creds, err := h.provisionDB(provCtx, tokenStr, tier)
+	creds, err := h.provisionDB(provCtx, tokenStr, tier, teamIDStr)
 	finishProvisionSpan(span, err)
 	metrics.ProvisionDuration.WithLabelValues("postgres", tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {
@@ -571,7 +574,7 @@ func (h *DBHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionForTwi
 	tokenStr := resource.Token.String()
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, models.ResourceTypePostgres, in.Tier, in.TeamID.String(), in.Fingerprint, tokenStr)
-	creds, err := h.provisionDB(provCtx, tokenStr, in.Tier)
+	creds, err := h.provisionDB(provCtx, tokenStr, in.Tier, in.TeamID.String())
 	finishProvisionSpan(span, err)
 	metrics.ProvisionDuration.WithLabelValues(models.ResourceTypePostgres, in.Tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {

@@ -130,14 +130,25 @@ func provisionTimeout(tier string) time.Duration {
 	return 4 * time.Minute
 }
 
+// ctxWithTeamID attaches the team ID to outgoing gRPC metadata so the
+// provisioner can label dedicated namespaces with instant.dev/owner-team.
+// This is separate from ctxWithAuth so callers that do not have a team ID
+// (anonymous provisioning) do not need to pass an empty string.
+func (c *Client) ctxWithTeamID(ctx context.Context, teamID string) context.Context {
+	if teamID == "" {
+		return ctx
+	}
+	return metadata.AppendToOutgoingContext(ctx, "x-instant-team-id", teamID)
+}
+
 // ProvisionPostgres provisions a new Postgres database. Wrapped by the
 // shared circuit breaker — when open, returns circuit.ErrOpen in <1ms
 // instead of waiting on the gRPC timeout. Handlers branch on
 // errors.Is(err, circuit.ErrOpen).
-func (c *Client) ProvisionPostgres(ctx context.Context, token, tier string) (*Credentials, error) {
+func (c *Client) ProvisionPostgres(ctx context.Context, token, tier, teamID string) (*Credentials, error) {
 	return callWithBreaker(c.breaker, func() (*Credentials, error) {
 		start := time.Now()
-		ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), provisionTimeout(tier))
+		ctx, cancel := context.WithTimeout(c.ctxWithTeamID(c.ctxWithAuth(ctx), teamID), provisionTimeout(tier))
 		defer cancel()
 		resp, err := c.grpc.ProvisionResource(ctx, &provisionerv1.ProvisionRequest{
 			Token:        token,
@@ -161,10 +172,10 @@ func (c *Client) ProvisionPostgres(ctx context.Context, token, tier string) (*Cr
 
 // ProvisionCache provisions a new Redis cache. Wrapped by the shared
 // circuit breaker (see ProvisionPostgres).
-func (c *Client) ProvisionCache(ctx context.Context, token, tier string) (*Credentials, error) {
+func (c *Client) ProvisionCache(ctx context.Context, token, tier, teamID string) (*Credentials, error) {
 	return callWithBreaker(c.breaker, func() (*Credentials, error) {
 		start := time.Now()
-		ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), provisionTimeout(tier))
+		ctx, cancel := context.WithTimeout(c.ctxWithTeamID(c.ctxWithAuth(ctx), teamID), provisionTimeout(tier))
 		defer cancel()
 		resp, err := c.grpc.ProvisionResource(ctx, &provisionerv1.ProvisionRequest{
 			Token:        token,
@@ -187,10 +198,10 @@ func (c *Client) ProvisionCache(ctx context.Context, token, tier string) (*Crede
 
 // ProvisionNoSQL provisions a new MongoDB database. Wrapped by the
 // shared circuit breaker (see ProvisionPostgres).
-func (c *Client) ProvisionNoSQL(ctx context.Context, token, tier string) (*Credentials, error) {
+func (c *Client) ProvisionNoSQL(ctx context.Context, token, tier, teamID string) (*Credentials, error) {
 	return callWithBreaker(c.breaker, func() (*Credentials, error) {
 		start := time.Now()
-		ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), provisionTimeout(tier))
+		ctx, cancel := context.WithTimeout(c.ctxWithTeamID(c.ctxWithAuth(ctx), teamID), provisionTimeout(tier))
 		defer cancel()
 		resp, err := c.grpc.ProvisionResource(ctx, &provisionerv1.ProvisionRequest{
 			Token:        token,
@@ -215,10 +226,10 @@ func (c *Client) ProvisionNoSQL(ctx context.Context, token, tier string) (*Crede
 // ProvisionQueue provisions a new NATS JetStream queue.
 // For pro/team tiers this creates a dedicated NATS pod; for others it uses the shared cluster.
 // Wrapped by the shared circuit breaker.
-func (c *Client) ProvisionQueue(ctx context.Context, token, tier string) (*Credentials, error) {
+func (c *Client) ProvisionQueue(ctx context.Context, token, tier, teamID string) (*Credentials, error) {
 	return callWithBreaker(c.breaker, func() (*Credentials, error) {
 		start := time.Now()
-		ctx, cancel := context.WithTimeout(c.ctxWithAuth(ctx), provisionTimeout(tier))
+		ctx, cancel := context.WithTimeout(c.ctxWithTeamID(c.ctxWithAuth(ctx), teamID), provisionTimeout(tier))
 		defer cancel()
 		resp, err := c.grpc.ProvisionResource(ctx, &provisionerv1.ProvisionRequest{
 			Token:        token,

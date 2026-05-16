@@ -26,6 +26,7 @@ type StackServiceDef struct {
 // StackDeployOptions carries everything needed to deploy a multi-service stack.
 type StackDeployOptions struct {
 	StackID  string            // stack slug, used to derive namespace: "instant-stack-"+StackID
+	TeamID   string            // owning team UUID — used to scope the NetworkPolicy DB-port egress rule to the team's own customer-resource namespaces (pentest fix 2026-05-16)
 	Tier     string            // "hobby"|"pro"|"team"
 	Services []StackServiceDef // must be non-empty
 }
