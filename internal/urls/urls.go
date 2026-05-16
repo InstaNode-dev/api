@@ -26,13 +26,17 @@ const (
 	// response that needs to point a caller back at us.
 	PublicAPIBase = "https://api.instanode.dev"
 
-	// PublicMarketingBase is the customer-facing marketing site. /start lives
-	// here and is the entry point for the claim flow.
+	// PublicMarketingBase is the customer-facing marketing site. The claim
+	// landing page (/claim) lives here.
 	PublicMarketingBase = "https://instanode.dev"
 
 	// StartURLPrefix is the bare path that anonymous resources point users at
 	// to claim — append "?t=<onboarding-jwt>" to produce the upgrade URL.
-	StartURLPrefix = PublicMarketingBase + "/start"
+	// Points at api.instanode.dev/start (not instanode.dev/start) because the
+	// GitHub Pages SPA has no /start route; the catch-all discards the JWT.
+	// api.instanode.dev/start validates the JWT and 302-redirects to
+	// instanode.dev/claim?t=<jwt>, which ClaimPage reads via useSearchParams.
+	StartURLPrefix = PublicAPIBase + "/start"
 
 	// DeploymentWildcard is the suffix every /deploy/new and /stacks/new
 	// service URL gets prefixed by its app-id slug.

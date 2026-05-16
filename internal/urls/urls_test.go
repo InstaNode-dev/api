@@ -16,7 +16,7 @@ func TestPublicHostnames_MatchExpectedShape(t *testing.T) {
 	}{
 		{"PublicAPIBase has scheme + api subdomain", PublicAPIBase, "https://api.instanode.dev"},
 		{"PublicMarketingBase has scheme + apex", PublicMarketingBase, "https://instanode.dev"},
-		{"StartURLPrefix is marketing + /start", StartURLPrefix, "https://instanode.dev/start"},
+		{"StartURLPrefix is api + /start", StartURLPrefix, "https://api.instanode.dev/start"},
 		{"DeploymentWildcard is bare host", DeploymentWildcard, "deployment.instanode.dev"},
 		{"StoragePublicHost is bare host", StoragePublicHost, "s3.instanode.dev"},
 	}
@@ -57,8 +57,8 @@ func TestUpgradeStartURL_Composition(t *testing.T) {
 	cases := []struct {
 		name, token, want string
 	}{
-		{"with token", "ey.abc.def", "https://instanode.dev/start?t=ey.abc.def"},
-		{"empty token returns bare /start", "", "https://instanode.dev/start"},
+		{"with token", "ey.abc.def", "https://api.instanode.dev/start?t=ey.abc.def"},
+		{"empty token returns bare /start", "", "https://api.instanode.dev/start"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

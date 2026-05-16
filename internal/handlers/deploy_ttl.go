@@ -65,7 +65,7 @@ func (h *DeployHandler) MakePermanent(c *fiber.Ctx) error {
 			"upgrade_required",
 			"Anonymous deploys cannot be made permanent — they always expire in 24h. Claim the account to keep deploys.",
 			AgentActionDeployMakePermanentAnonymous,
-			"https://instanode.dev/start")
+			"https://api.instanode.dev/start")
 	}
 
 	previousPolicy := d.TTLPolicy
@@ -139,7 +139,7 @@ func (h *DeployHandler) SetTTL(c *fiber.Ctx) error {
 			"upgrade_required",
 			"Anonymous deploys have a fixed 24h TTL — custom TTL requires a claimed account.",
 			AgentActionDeployMakePermanentAnonymous,
-			"https://instanode.dev/start")
+			"https://api.instanode.dev/start")
 	}
 
 	var body SetTTLRequest

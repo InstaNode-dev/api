@@ -15,7 +15,7 @@ func TestUpgradeNote_DoesNotMentionTrial(t *testing.T) {
 	cases := []struct {
 		name, in string
 	}{
-		{"with url", "https://instanode.dev/start?t=jwt"},
+		{"with url", "https://api.instanode.dev/start?t=jwt"},
 		{"empty url falls back to bare link", ""},
 	}
 	for _, c := range cases {
@@ -46,8 +46,8 @@ func TestLimitExceededNote_DoesNotMentionTrial(t *testing.T) {
 		name, url string
 		expires   time.Time
 	}{
-		{"with url and expiry", "https://instanode.dev/start?t=jwt", exp},
-		{"with url no expiry", "https://instanode.dev/start?t=jwt", time.Time{}},
+		{"with url and expiry", "https://api.instanode.dev/start?t=jwt", exp},
+		{"with url no expiry", "https://api.instanode.dev/start?t=jwt", time.Time{}},
 		{"empty url with expiry", "", exp},
 		{"empty url no expiry", "", time.Time{}},
 	}
