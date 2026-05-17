@@ -93,8 +93,38 @@ func isCredentialURL(value string) bool {
 	return credentialURLRe.MatchString(value)
 }
 
+// internalEnvKeys is the set of env_vars JSONB keys that are PLATFORM
+// METADATA, not application env vars. They must never be (a) injected into a
+// customer container's environment or (b) echoed in an outbound API response.
+//
+// P1-N (bug hunt 2026-05-17 round 2): "_name" (the deployment's display name,
+// stashed in env_vars because there is no dedicated column) leaked on both
+// surfaces. Add future internal keys here — both stripInternalEnvKeys callers
+// (compute injection + outbound JSON) pick them up automatically.
+var internalEnvKeys = map[string]bool{
+	deployNameEnvKey: true, // "_name"
+}
+
+// stripInternalEnvKeys returns a copy of env with every internalEnvKeys entry
+// removed. Used on the compute-injection path so customer containers never
+// see platform metadata. The original map is never mutated.
+func stripInternalEnvKeys(env map[string]string) map[string]string {
+	if len(env) == 0 {
+		return env
+	}
+	out := make(map[string]string, len(env))
+	for k, v := range env {
+		if internalEnvKeys[k] {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
 // redactEnvVars returns a copy of the env map with sensitive values replaced
-// by envRedactedMask. vault:// refs are always left untouched.
+// by envRedactedMask. vault:// refs are always left untouched. Internal
+// platform keys (internalEnvKeys, e.g. "_name") are dropped entirely — P1-N.
 //
 // The original map is never mutated — a new map is always returned.
 func redactEnvVars(env map[string]string) map[string]string {
@@ -104,6 +134,9 @@ func redactEnvVars(env map[string]string) map[string]string {
 	out := make(map[string]string, len(env))
 	for k, v := range env {
 		switch {
+		case internalEnvKeys[k]:
+			// Internal platform metadata — never surface it. P1-N.
+			continue
 		case vaultRefRe.MatchString(v):
 			// vault refs are safe — pass through unchanged.
 			out[k] = v
