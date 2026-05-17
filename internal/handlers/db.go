@@ -175,7 +175,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 					"connection_url": connectionURL,
 					"tier":           existing.Tier,
 					"env":            existing.Env,
-					"limits":         dbAnonymousLimits(),
+					"limits":         h.dbAnonymousLimits(),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
@@ -314,7 +314,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 		"connection_url": creds.URL,
 		"tier":           "anonymous",
 		"env":            resource.Env,
-		"limits":         dbAnonymousLimits(),
+		"limits":         h.dbAnonymousLimits(),
 		"note":           upgradeNote(upgradeURL),
 		"upgrade":        upgradeURL,
 		"upgrade_jwt":    jwtToken,
@@ -482,10 +482,14 @@ func (h *DBHandler) decryptConnectionURL(encrypted, requestID string) string {
 	return plain
 }
 
-func dbAnonymousLimits() fiber.Map {
+// dbAnonymousLimits returns the limits map for anonymous Postgres resources.
+// Values are read from plans.Registry (convention #3) so a plans.yaml edit to
+// the anonymous tier flows through automatically instead of drifting against
+// a hardcoded literal.
+func (h *DBHandler) dbAnonymousLimits() fiber.Map {
 	return fiber.Map{
-		"storage_mb":  10,
-		"connections": 2,
+		"storage_mb":  h.plans.StorageLimitMB(tierAnonymous, models.ResourceTypePostgres),
+		"connections": h.plans.ConnectionsLimit(tierAnonymous, models.ResourceTypePostgres),
 		"expires_in":  "24h",
 	}
 }

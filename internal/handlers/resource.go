@@ -1080,12 +1080,12 @@ func resourceToMap(r *models.Resource, reg *plans.Registry) fiber.Map {
 	// rather than "/ -1 MB".
 	if reg != nil {
 		storageLimitMB := reg.StorageLimitMB(r.Tier, r.ResourceType)
-		var storageLimitBytes int64
-		if storageLimitMB == -1 {
-			storageLimitBytes = unlimitedSentinel
-		} else {
-			storageLimitBytes = int64(storageLimitMB) * 1_000_000
-		}
+		// quota.LimitBytes is the single MB→bytes conversion point: MiB
+		// (1024*1024), matching quota.CheckStorageQuota's enforcement. The
+		// old *1_000_000 here under-stated the ceiling ~4.8% vs the wall.
+		// quota.LimitBytes returns -1 (== unlimitedSentinel) for the
+		// unlimited tier, which the TypeScript side renders as "unlimited".
+		storageLimitBytes := quota.LimitBytes(storageLimitMB)
 		m["storage_limit_bytes"] = storageLimitBytes
 		m["connections_limit"] = reg.ConnectionsLimit(r.Tier, r.ResourceType)
 

@@ -174,6 +174,10 @@ func (h *AdminImpersonateHandler) Impersonate(c *fiber.Ctx) error {
 			ID:        uuid.New().String(),
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(expiresAt),
+			// RFC 8707 — bind the impersonation token to this API's
+			// canonical resource URL, same as signSessionJWT. Without
+			// it the middleware's opt-in audience check stays dead.
+			Audience: jwt.ClaimStrings{sessionAudience()},
 		},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)

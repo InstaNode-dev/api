@@ -1412,6 +1412,20 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 	if _, ok := planIDs[target]; !ok {
 		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "target_plan must be hobby, hobby_plus, pro, or team")
 	}
+	// No self-serve downgrade — see project memory
+	// project_no_self_serve_cancel_downgrade.md. A target whose plan rank is
+	// at or below the current tier's rank is a downgrade (or lateral move);
+	// those are support-only. Reject with a mailto agent_action so the
+	// dashboard/agent routes the user to support instead of silently
+	// dropping them to a cheaper tier.
+	currentRank := plans.Rank(strings.ToLower(strings.TrimSpace(planTier)))
+	targetRank := plans.Rank(target)
+	if currentRank >= 0 && targetRank >= 0 && targetRank <= currentRank {
+		return respondErrorWithAgentAction(c, fiber.StatusBadRequest, "downgrade_not_self_serve",
+			"Plan downgrades are handled by support, not self-serve. Email support@instanode.dev to change to a lower tier.",
+			"Tell the user that downgrading to a lower plan is support-assisted. Have them email support@instanode.dev with their team and the target plan.",
+			"mailto:support@instanode.dev")
+	}
 	// Team tier is under development — block customer-initiated upgrades to
 	// team via the public API. The internal /internal/set-tier endpoint
 	// still works for ops use. Drop this guard when team launches.

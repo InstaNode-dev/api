@@ -33,6 +33,30 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// BytesPerMB is the byte multiplier used everywhere the platform converts a
+// plan's *_storage_mb limit into a byte ceiling. Storage limits are quoted in
+// MiB (1 MB == 1024*1024 bytes) — NOT the SI 1_000_000. Enforcement
+// (CheckStorageQuota) and every UI/serialiser path MUST use this constant so
+// the number the dashboard shows is the number that actually trips the wall.
+// P2 (2026-05-17): resourceToMap previously multiplied by 1_000_000, so a
+// resource at exactly its MiB limit looked ~4.8% under the wall in the UI.
+const BytesPerMB int64 = 1024 * 1024
+
+// UnlimitedLimitBytes is the sentinel LimitBytes returns for an unlimited
+// (-1 MB) tier. Callers render it as "unlimited" rather than a byte count.
+const UnlimitedLimitBytes int64 = -1
+
+// LimitBytes converts a plan storage limit in MiB to a byte ceiling.
+// Returns UnlimitedLimitBytes (-1) for the unlimited sentinel; otherwise
+// limitMB * BytesPerMB. The single conversion point for MB→bytes so the
+// enforcement path and the serialisation path can never drift again.
+func LimitBytes(limitMB int) int64 {
+	if limitMB == -1 {
+		return UnlimitedLimitBytes
+	}
+	return int64(limitMB) * BytesPerMB
+}
+
 // CheckAndIncrementToken atomically increments the daily throughput counter for
 // the given token+service pair and reports whether the limit is exceeded.
 //
@@ -114,7 +138,7 @@ func CheckStorageQuota(ctx context.Context, db *sql.DB, resourceID uuid.UUID, li
 		return 0, false, fmt.Errorf("quota.CheckStorageQuota: %w", err)
 	}
 
-	limitBytes := int64(limitMB) * 1024 * 1024
+	limitBytes := LimitBytes(limitMB)
 	return bytesUsed, bytesUsed >= limitBytes, nil
 }
 

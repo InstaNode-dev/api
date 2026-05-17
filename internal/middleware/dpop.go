@@ -326,20 +326,21 @@ func jwkThumbprintBase64URL(key jwk.Key) (string, error) {
 
 // requestCanonicalURL builds the htu canonical form (RFC 9449 §4.2):
 // scheme://host{:port}/path with no query string and no fragment.
+//
+// P2 (2026-05-17): the scheme+host are taken from the canonical resource URL
+// (API_PUBLIC_URL / compiled default), NOT from client-settable headers
+// (X-Forwarded-Host / X-Forwarded-Proto). htu is a security check — an
+// attacker who can spoof the forwarded host could otherwise forge a proof
+// whose htu matches a request to a different host. Only the path comes from
+// the live request.
 func requestCanonicalURL(c *fiber.Ctx) string {
-	host := c.Get("X-Forwarded-Host")
-	if host == "" {
-		host = c.Hostname()
+	base, err := url.Parse(CanonicalResourceURLFor(c))
+	if err != nil || base.Host == "" {
+		// Defensive fallback — CanonicalResourceURLFor never returns an
+		// unparseable value in practice, but never panic on the auth path.
+		base = &url.URL{Scheme: "https", Host: c.Hostname()}
 	}
-	scheme := c.Get("X-Forwarded-Proto")
-	if scheme == "" {
-		if p := c.Protocol(); p != "" {
-			scheme = p
-		} else {
-			scheme = "https"
-		}
-	}
-	u := url.URL{Scheme: scheme, Host: host, Path: c.Path()}
+	u := url.URL{Scheme: base.Scheme, Host: base.Host, Path: c.Path()}
 	return u.String()
 }
 

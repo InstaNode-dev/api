@@ -299,34 +299,52 @@ func resolveEmailConfirmedDeletion(
 	// math even if the underlying provider didn't tear down. We log at
 	// ERROR so on-call can chase the provider asynchronously without
 	// blocking the user.
+	//
+	// P2 (2026-05-17): a teardown failure no longer reports a flat
+	// "confirmed / Resource torn down" success. The response distinguishes
+	// confirmed_teardown_pending (provider cleanup deferred to the worker
+	// reconciler) from confirmed (cleanly torn down) so the caller is not
+	// told something was destroyed when only the row was flipped.
+	teardownOK := true
 	if err := deprovisionFn(c.Context(), pending); err != nil {
+		teardownOK = false
 		slog.Error("deletion_confirm.deprovision_failed",
 			"pending_id", pending.ID,
 			"resource_id", pending.ResourceID,
 			"resource_type", pending.ResourceType,
 			"error", err,
 			"request_id", middleware.GetRequestID(c))
-		// Still return 200 — the user's intent succeeded from the
-		// platform's POV (row is gone, slot is freed). The provider
-		// cleanup is a background concern the worker reconciler
-		// already handles for orphaned compute.
+		// Still return 200 — the user's intent is recorded and the slot is
+		// freed by quota math. The provider cleanup is retried by the
+		// worker reconciler, which sweeps confirmed rows whose backing
+		// infra still exists. The response below makes the deferred state
+		// explicit rather than claiming the resource is gone.
 	}
 
 	freedAt := time.Now().UTC()
 	emitDeletionAudit(deps.DB, deletionAuditKindConfirmed(pending.ResourceType),
 		team.ID, pending.ResourceID, pending.ID, map[string]any{
-			"freed_at":                  freedAt.Format(time.RFC3339),
-			"age_seconds_in_pending":    int64(freedAt.Sub(pending.RequestedAt).Seconds()),
+			"freed_at":               freedAt.Format(time.RFC3339),
+			"age_seconds_in_pending": int64(freedAt.Sub(pending.RequestedAt).Seconds()),
+			"teardown_ok":            teardownOK,
 		})
+
+	deletionStatus := "confirmed"
+	note := "Resource torn down. The slot is now free — your next provision call will succeed."
+	if !teardownOK {
+		deletionStatus = "confirmed_teardown_pending"
+		note = "Deletion confirmed and the slot is freed, but provider teardown did not complete. " +
+			"The platform reconciler will retry teardown automatically — no further action is needed."
+	}
 
 	return c.Status(http.StatusOK).JSON(fiber.Map{
 		"ok":              true,
 		"id":              pending.ResourceID.String(),
 		"resource_type":   pending.ResourceType,
-		"deletion_status": "confirmed",
+		"deletion_status": deletionStatus,
 		"freed_at":        freedAt.Format(time.RFC3339),
 		"agent_action":    AgentActionDeletionConfirmed,
-		"note":            "Resource torn down. The slot is now free — your next provision call will succeed.",
+		"note":            note,
 	})
 }
 

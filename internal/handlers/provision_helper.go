@@ -251,14 +251,10 @@ func (h *provisionHelper) recycleGate(c *fiber.Ctx, fp, resourceType string) boo
 	metrics.RecycleGateBlocked.WithLabelValues(resourceType).Inc()
 	slog.Info("provision.recycle_gate.blocked",
 		"fingerprint", fp, "resource_type", resourceType)
-	_ = c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
-		"ok":           false,
-		"error":        RecycleGateErrorCode,
-		"message":      RecycleGateMessage,
-		"agent_action": RecycleGateAgentAction,
-		"upgrade_url":  RecycleGateClaimURL,
-		"claim_url":    RecycleGateClaimURL,
-	})
+	// Route through the canonical ErrorResponse envelope (request_id +
+	// retry_after_seconds + claim_url) instead of a hand-built fiber.Map.
+	_ = respondRecycleGate(c, RecycleGateErrorCode, RecycleGateMessage,
+		RecycleGateAgentAction, RecycleGateClaimURL)
 	return true
 }
 

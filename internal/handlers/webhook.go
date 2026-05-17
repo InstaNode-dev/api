@@ -159,9 +159,12 @@ func webhookListKey(token string) string {
 }
 
 // webhookAnonLimits returns the limits map for anonymous webhook resources.
-func webhookAnonLimits() fiber.Map {
+// requests_stored is read from plans.Registry (convention #3) — the webhook
+// service maps to the webhook_requests_stored YAML field — so a plans.yaml
+// edit flows through instead of drifting against a hardcoded literal.
+func (h *WebhookHandler) webhookAnonLimits() fiber.Map {
 	return fiber.Map{
-		"requests_stored": 100,
+		"requests_stored": h.plans.StorageLimitMB(tierAnonymous, "webhook"),
 		"expires_in":      "24h",
 	}
 }
@@ -242,7 +245,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 				"receive_url": url,
 				"tier":        existing.Tier,
 				"env":         existing.Env,
-				"limits":      webhookAnonLimits(),
+				"limits":      h.webhookAnonLimits(),
 				"note":        limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 				"upgrade":     upgradeURL,
 				"upgrade_jwt": jwtToken,
@@ -331,7 +334,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 		"receive_url": rURL,
 		"tier":        "anonymous",
 		"env":         resource.Env,
-		"limits":      webhookAnonLimits(),
+		"limits":      h.webhookAnonLimits(),
 		"note":        upgradeNote(upgradeURL),
 		"upgrade":     upgradeURL,
 		"upgrade_jwt": jwtToken,

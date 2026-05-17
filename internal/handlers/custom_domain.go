@@ -10,7 +10,15 @@ package handlers
 //   DELETE /api/v1/stacks/:slug/domains/:id          remove ingress + DB row
 //
 // The verification flow advances the row through:
-//   pending_verification → verified → ingress_ready → cert_ready (→ live)
+//   pending_verification → verified → ingress_ready → cert_ready
+//
+// cert_ready is the TERMINAL state. There is no automated cert_ready → live
+// transition: once the TLS certificate is issued the hostname is serving and
+// the domain is done. The "live" status constant is retained in the model
+// only for backward compatibility with any historical rows; no code path
+// writes it. (P2 2026-05-17: the documented cert_ready → live transition was
+// never implemented — confirming it would require an outbound HTTP probe to
+// a customer-controlled hostname, which is deferred as out of scope here.)
 //
 // Verify is intentionally idempotent — the dashboard polls it once a few
 // seconds while DNS propagates and again while Let's Encrypt issues. Each

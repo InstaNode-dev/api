@@ -2367,14 +2367,18 @@ const openAPISpec = `{
         "type": "object",
         "properties": {
           "ok": { "type": "boolean" },
+          "id": { "type": "string", "format": "uuid", "description": "Resource row id." },
           "token": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "description": "Human-readable label supplied on the request (or the generated default)." },
           "connection_url": { "type": "string", "description": "postgres:// connection string with pgvector pre-installed. Use this from external callers." },
           "internal_url": { "type": "string", "description": "Cluster-internal postgres:// URL routed via instant-pg-proxy. Use this when calling from a workload deployed inside the instanode cluster (e.g. an app started by /deploy/new) — the public hostname does not hairpin reliably." },
           "tier": { "type": "string" },
+          "env": { "type": "string", "description": "Resolved environment bucket the resource landed in (defaults to 'development' when env was omitted — see migration 026)." },
+          "env_override_reason": { "type": "string", "description": "Present only when the request omitted env and the API defaulted it (value 'default_no_env_specified'). Absent when env was sent explicitly." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email to convert the anonymous resource into a claimed (authenticated) one — no need to string-parse the upgrade URL. Absent on authenticated provisions." },
-          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL the agent can hand to the user to drive the dashboard claim flow." }
+          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL the agent can hand to the user to drive the dashboard claim flow." }
         }
       },
       "VectorProvisionRequest": {
@@ -2391,73 +2395,92 @@ const openAPISpec = `{
         "type": "object",
         "properties": {
           "ok": { "type": "boolean" },
+          "id": { "type": "string", "format": "uuid", "description": "Resource row id." },
           "token": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "description": "Human-readable label supplied on the request (or the generated default)." },
           "connection_url": { "type": "string", "description": "postgres:// connection string with the pgvector extension already installed (CREATE EXTENSION vector ran during provisioning). Use this from external callers." },
           "internal_url": { "type": "string", "description": "Cluster-internal postgres:// URL routed via instant-pg-proxy. Use this when calling from a workload deployed inside the instanode cluster." },
           "tier": { "type": "string" },
-          "env": { "type": "string" },
+          "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
+          "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
           "extension": { "type": "string", "enum": ["pgvector"], "description": "Always 'pgvector' for /vector/new. Declared so clients can confirm the extension is present without querying pg_extension." },
           "dimensions": { "type": "integer", "description": "Echo of the requested dimensions hint (defaults to 1536). Informational only — pgvector enforces dimensions per column, not per database." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
-          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
+          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "CacheProvisionResponse": {
         "type": "object",
         "properties": {
           "ok": { "type": "boolean" },
+          "id": { "type": "string", "format": "uuid", "description": "Resource row id." },
           "token": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "description": "Human-readable label supplied on the request (or the generated default)." },
           "connection_url": { "type": "string", "description": "redis:// connection string with ACL namespace isolation. Use this from external callers." },
           "internal_url": { "type": "string", "description": "Cluster-internal redis:// URL routed via instant-redis-proxy. Use this when calling from a workload deployed inside the instanode cluster." },
           "key_prefix": { "type": "string", "description": "All keys must use this prefix for namespace isolation" },
           "tier": { "type": "string" },
+          "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
+          "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
           "limits": { "type": "object", "properties": { "memory_mb": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
-          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
+          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "NoSQLProvisionResponse": {
         "type": "object",
         "properties": {
           "ok": { "type": "boolean" },
+          "id": { "type": "string", "format": "uuid", "description": "Resource row id." },
           "token": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "description": "Human-readable label supplied on the request (or the generated default)." },
           "connection_url": { "type": "string", "description": "mongodb:// connection string scoped to a per-token database. Use this from external callers." },
           "internal_url": { "type": "string", "description": "Cluster-internal mongodb:// URL routed via instant-mongo-proxy. Use this when calling from a workload deployed inside the instanode cluster." },
           "tier": { "type": "string" },
+          "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
+          "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
-          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
+          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "QueueProvisionResponse": {
         "type": "object",
         "properties": {
           "ok": { "type": "boolean" },
+          "id": { "type": "string", "format": "uuid", "description": "Resource row id." },
           "token": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "description": "Human-readable label supplied on the request (or the generated default)." },
           "connection_url": { "type": "string", "description": "nats:// connection string with per-account subject isolation. Use this from external callers." },
           "internal_url": { "type": "string", "description": "Cluster-internal nats:// URL routed via instant-nats-proxy. Use this when calling from a workload deployed inside the instanode cluster." },
           "tier": { "type": "string" },
+          "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
+          "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
           "limits": { "type": "object" },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
-          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
+          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "WebhookProvisionResponse": {
         "type": "object",
         "properties": {
           "ok": { "type": "boolean" },
+          "id": { "type": "string", "format": "uuid", "description": "Resource row id." },
           "token": { "type": "string", "format": "uuid" },
           "receive_url": { "type": "string", "description": "Public URL that accepts any HTTP method and stores the payload" },
           "tier": { "type": "string" },
+          "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
+          "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
+          "limits": { "type": "object", "properties": { "requests_stored": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "expires_at": { "type": "string", "format": "date-time" },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
-          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
+          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "StorageProvisionResponse": {
@@ -2473,10 +2496,11 @@ const openAPISpec = `{
           "secret_access_key": { "type": "string", "description": "Shown ONCE — store now; rotation requires re-provisioning" },
           "prefix": { "type": "string", "description": "Object-key prefix all writes must use for isolation" },
           "tier": { "type": "string" },
-          "env": { "type": "string" },
+          "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
+          "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "expires_in": { "type": "string", "description": "Anonymous-only" } } },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
-          "upgrade_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
+          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
       },
       "DeployItem": {

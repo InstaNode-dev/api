@@ -162,8 +162,8 @@ func newAgentActionMetricsWindowTooLarge(currentTier, currentCap string) string 
 //	400 invalid_window      — ?window= unparseable, non-positive, or > 7d
 //	401 unauthorized        — no session
 //	402 upgrade_required    — anonymous / free tier OR window > tier cap
-//	403 forbidden           — caller's team doesn't own the resource
-//	404 not_found           — resource doesn't exist
+//	404 not_found           — resource doesn't exist OR caller's team
+//	                          doesn't own it (cross-team existence stays opaque)
 //	503 fetch_failed        — DB lookup failed
 func (h *ResourceHandler) Metrics(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)

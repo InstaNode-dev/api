@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -370,6 +371,21 @@ func (h *AuthHandler) issueSessionJWT(user *models.User, team *models.Team) (str
 	return signSessionJWT(h.cfg.JWTSecret, user, team)
 }
 
+// sessionAudience returns the canonical resource URL stamped into the `aud`
+// claim of every session JWT this package mints. RFC 8707 §3: a token MUST
+// declare the resource server it is bound to. The middleware's opt-in
+// audience check (middleware.audienceMatches) only fires once a token carries
+// an `aud` — so without this every dashboard/CLI session was unbound and the
+// check was dead code. Resolution mirrors middleware.CanonicalResourceURLFor:
+// API_PUBLIC_URL when set, else the compiled-in public API base. Never a
+// client-settable value — see middleware/auth.go for the rationale.
+func sessionAudience() string {
+	if v := strings.TrimRight(os.Getenv("API_PUBLIC_URL"), "/"); v != "" {
+		return v
+	}
+	return urls.PublicAPIBase
+}
+
 // signSessionJWT is the package-level helper used by any handler that needs to
 // issue a session token (AuthHandler after OAuth, OnboardingHandler after /claim).
 func signSessionJWT(jwtSecret string, user *models.User, team *models.Team) (string, error) {
@@ -382,6 +398,7 @@ func signSessionJWT(jwtSecret string, user *models.User, team *models.Team) (str
 			ID:        uuid.New().String(),
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(24 * time.Hour)),
+			Audience:  jwt.ClaimStrings{sessionAudience()},
 		},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
