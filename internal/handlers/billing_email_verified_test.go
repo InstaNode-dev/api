@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -48,6 +49,13 @@ func checkoutGateApp(t *testing.T, bh *handlers.BillingHandler, teamID, userID s
 	t.Helper()
 	app := fiber.New(fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			// Mirror the production + testhelpers ErrorHandler: respond*
+			// helpers write the response and return the ErrResponseWritten
+			// sentinel — it MUST NOT be turned into a 500, the real status
+			// (e.g. the gate's 403) was already written.
+			if errors.Is(err, handlers.ErrResponseWritten) {
+				return nil
+			}
 			return c.Status(fiber.StatusInternalServerError).
 				JSON(fiber.Map{"ok": false, "error": "internal_error", "message": err.Error()})
 		},
