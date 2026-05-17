@@ -28,24 +28,24 @@ import (
 // The model surfaces the ENCRYPTED form — the worker decrypts at dispatch
 // time so plaintext never lands in the deployments row.
 type Deployment struct {
-	ID                   uuid.UUID
-	TeamID               uuid.UUID
-	ResourceID           uuid.NullUUID
-	AppID                string
-	ProviderID           string // k8s Deployment name, e.g. "app-{app_id}"
-	Status               string // building | deploying | healthy | failed | stopped
-	AppURL               string
-	EnvVars              map[string]string
-	Port                 int
-	Tier                 string
-	Env                  string // dev | staging | production | <custom>; defaults to "production"
-	Private              bool
-	AllowedIPs           []string // parsed from the comma-joined `allowed_ips` column
-	NotifyWebhook        string   // user-supplied https:// URL; empty when unset
-	NotifyWebhookSecret  string   // AES-256-GCM ciphertext of the HMAC key; empty when unset
-	NotifyState          string   // 'unset' | 'pending' | 'sent' | 'failed'
-	NotifyAttempts       int      // dispatch retry counter (worker bumps on 5xx/network)
-	ErrorMessage         string
+	ID                  uuid.UUID
+	TeamID              uuid.UUID
+	ResourceID          uuid.NullUUID
+	AppID               string
+	ProviderID          string // k8s Deployment name, e.g. "app-{app_id}"
+	Status              string // building | deploying | healthy | failed | stopped
+	AppURL              string
+	EnvVars             map[string]string
+	Port                int
+	Tier                string
+	Env                 string // dev | staging | production | <custom>; defaults to "production"
+	Private             bool
+	AllowedIPs          []string // parsed from the comma-joined `allowed_ips` column
+	NotifyWebhook       string   // user-supplied https:// URL; empty when unset
+	NotifyWebhookSecret string   // AES-256-GCM ciphertext of the HMAC key; empty when unset
+	NotifyState         string   // 'unset' | 'pending' | 'sent' | 'failed'
+	NotifyAttempts      int      // dispatch retry counter (worker bumps on 5xx/network)
+	ErrorMessage        string
 	// TTL fields (Wave FIX-J — migration 045).
 	//
 	// ExpiresAt: when the deploy auto-expires. Zero (sql NULL) means
@@ -65,12 +65,12 @@ type Deployment struct {
 	// LastReminderAt: wall-clock of the most recent reminder dispatched.
 	// Combined with RemindersSent forms the CAS guard that prevents
 	// duplicate sends inside the 60s tick window.
-	ExpiresAt        sql.NullTime
-	TTLPolicy        string
-	RemindersSent    int
-	LastReminderAt   sql.NullTime
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	ExpiresAt      sql.NullTime
+	TTLPolicy      string
+	RemindersSent  int
+	LastReminderAt sql.NullTime
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // CreateDeploymentParams holds fields for inserting a new deployment row.
@@ -708,6 +708,23 @@ const DeployStatusExpired = "expired"
 // and is never re-processed by the teardown reconciler.
 const DeployStatusDeleted = "deleted"
 
+// Live deployment statuses — the only states in which a deployment runs a
+// pod and therefore occupies a billable tier slot. Any status NOT in this
+// set (failed / stopped / expired / deleted) consumes no compute and frees
+// the slot. P1-E (bug hunt 2026-05-17 round 2): the tier-cap counter and the
+// dashboard usage counter disagreed because each used a different negative
+// filter; both now share activeDeploymentStatusesSQL so they can never drift.
+const (
+	DeployStatusBuilding  = "building"
+	DeployStatusDeploying = "deploying"
+	DeployStatusHealthy   = "healthy"
+)
+
+// activeDeploymentStatusesSQL is the SQL IN-list of deployment statuses that
+// occupy a tier slot. Used verbatim by CountActiveDeploymentsByTeam and the
+// dashboard-facing usage counter so the two counts are always identical.
+const activeDeploymentStatusesSQL = `('building', 'deploying', 'healthy')`
+
 // GetExpiredDeploymentsAwaitingTeardown returns deployments stuck in
 // status='expired' that still have a provider_id — i.e. the worker's
 // DeploymentExpirer flipped the row but the compute (namespace / pod /
@@ -771,25 +788,28 @@ func MarkDeploymentTornDown(ctx context.Context, db *sql.DB, id uuid.UUID) (int6
 	return n, nil
 }
 
-// CountActiveDeploymentsByTeam counts deployments for a team that have not been
-// torn down. Used by POST /deploy/new to enforce the per-tier deployments_apps
-// cap from plans.yaml.
+// CountActiveDeploymentsByTeam counts deployments for a team that occupy a
+// billable tier slot. Used by POST /deploy/new to enforce the per-tier
+// deployments_apps cap from plans.yaml.
 //
-// "Active" here means anything that still consumes a slot — that is, every
-// row in the deployments table whose status is not "deleted". Hard-deleted
-// rows (via DeleteDeployment) drop out naturally because the row is gone.
-// A soft-deleted "deleted" status is treated as freeing the slot, mirroring
-// the behaviour callers expect when they DELETE then re-create.
+// "Active" means the deployment is running a pod — status is one of
+// building / deploying / healthy (activeDeploymentStatusesSQL). Every other
+// status frees the slot:
+//   - deleted  — compute torn down (hard DeleteDeployment drops the row too)
+//   - expired  — 24h TTL elapsed; teardown reconciler will reap it
+//   - failed   — build/rollout failed; runs no pod, no compute consumed
+//   - stopped  — user-paused; pod scaled to zero, no compute consumed
 //
-// 'failed' is also excluded: a failed deployment runs no pod and consumes no
-// compute, so it must not occupy a billable tier slot. Without this exclusion
-// a single failed build on a hobby team (deployments_apps=1) would 402 every
-// future /deploy/new permanently.
+// P1-E (bug hunt 2026-05-17 round 2): the previous negative filter
+// (NOT IN deleted/expired/failed) still counted 'stopped' deployments, so a
+// team that stopped a deploy could not create a new one within its tier cap —
+// and the count disagreed with the dashboard usage counter. Both now share
+// activeDeploymentStatusesSQL.
 func CountActiveDeploymentsByTeam(ctx context.Context, db dbExecutor, teamID uuid.UUID) (int, error) {
 	var n int
 	err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM deployments
-		WHERE team_id = $1 AND status NOT IN ('deleted', 'expired', 'failed')
+		WHERE team_id = $1 AND status IN `+activeDeploymentStatusesSQL+`
 	`, teamID).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("models.CountActiveDeploymentsByTeam: %w", err)

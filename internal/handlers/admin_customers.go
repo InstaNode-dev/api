@@ -71,8 +71,8 @@ var adminAllowedTiers = map[string]bool{
 // models.AuditKindSubscriptionCanceledByAdmin. Aliased here as a local name
 // for symmetry with the other admin-handler-emitted kinds.
 const (
-	AuditKindAdminTierChanged           = "admin.tier_changed"
-	AuditKindAdminPromoIssued           = "admin.promo_issued"
+	AuditKindAdminTierChanged            = "admin.tier_changed"
+	AuditKindAdminPromoIssued            = "admin.promo_issued"
 	AuditKindSubscriptionCanceledByAdmin = models.AuditKindSubscriptionCanceledByAdmin
 )
 
@@ -112,9 +112,9 @@ const (
 // router replaces it with a portal-backed call. Tests substitute their own
 // fake here to assert call-shape + drive the failure path.
 type AdminCustomersHandler struct {
-	db                  *sql.DB
-	plans               *plans.Registry
-	CancelSubscription  func(subscriptionID string) error
+	db                 *sql.DB
+	plans              *plans.Registry
+	CancelSubscription func(subscriptionID string) error
 }
 
 // errBillingNotConfigured is the sentinel returned by the default
@@ -279,14 +279,16 @@ func (h *AdminCustomersHandler) List(c *fiber.Ctx) error {
 			GROUP BY team_id
 		),
 		deploy_agg AS (
-			-- The deployments table has no deleted_at column — soft-deletion
-			-- is tracked via status ('deleted'/'expired'), the same predicate
-			-- models.CountActiveDeployments and the worker expirer use. The
-			-- earlier deleted_at IS NULL clause referenced a nonexistent
-			-- column and failed the whole List query with db_failed (503).
+			-- "active" = a deployment running a pod (building/deploying/healthy),
+			-- the same definition models.CountActiveDeploymentsByTeam uses.
+			-- P1-E (bug hunt 2026-05-17 round 2): the previous
+			-- NOT IN ('deleted','expired') filter counted 'failed' and
+			-- 'stopped' deployments too, so this admin column disagreed with
+			-- the tier-cap and dashboard counters. The deployments table has no
+			-- deleted_at column — lifecycle is tracked entirely via status.
 			SELECT team_id, COUNT(*) AS active_deployments, MAX(created_at) AS last_deploy_at
 			FROM deployments
-			WHERE team_id IS NOT NULL AND status NOT IN ('deleted', 'expired')
+			WHERE team_id IS NOT NULL AND status IN ('building', 'deploying', 'healthy')
 			GROUP BY team_id
 		),
 		audit_agg AS (
@@ -574,20 +576,20 @@ type adminTierChangeMetadata struct {
 // Brevo / Loops template ID is operator-defined and keyed on the audit
 // `kind`, not on this metadata. Fields:
 //
-//   FromTier / ToTier      — the demote transition (e.g. pro → hobby).
-//   ByAdminEmail           — who pushed the button (same as the tier-change row).
-//   Reason                 — the admin-supplied reason string.
-//   SubscriptionID         — the Razorpay sub id that was canceled (or
-//                            empty when the team had no active sub).
-//   CancelAttempted        — true iff we made the Razorpay API call. False
-//                            when SubscriptionID was empty (nothing to cancel).
-//   CancelSucceeded        — true iff the Razorpay call returned no error.
-//                            When false + CancelAttempted true, the operator
-//                            must manually reconcile in the Razorpay dashboard;
-//                            Brevo must NOT send a "we canceled" email.
-//   CancelError            — short error string for the operator (only set
-//                            when CancelSucceeded is false). Not surfaced to
-//                            the customer — internal-only.
+//	FromTier / ToTier      — the demote transition (e.g. pro → hobby).
+//	ByAdminEmail           — who pushed the button (same as the tier-change row).
+//	Reason                 — the admin-supplied reason string.
+//	SubscriptionID         — the Razorpay sub id that was canceled (or
+//	                         empty when the team had no active sub).
+//	CancelAttempted        — true iff we made the Razorpay API call. False
+//	                         when SubscriptionID was empty (nothing to cancel).
+//	CancelSucceeded        — true iff the Razorpay call returned no error.
+//	                         When false + CancelAttempted true, the operator
+//	                         must manually reconcile in the Razorpay dashboard;
+//	                         Brevo must NOT send a "we canceled" email.
+//	CancelError            — short error string for the operator (only set
+//	                         when CancelSucceeded is false). Not surfaced to
+//	                         the customer — internal-only.
 type adminSubscriptionCanceledByAdminMetadata struct {
 	FromTier        string `json:"from_tier"`
 	ToTier          string `json:"to_tier"`
@@ -1033,4 +1035,3 @@ func adminOrderClause(sortBy string) (string, error) {
 	}
 	return "", fmt.Errorf("invalid sort_by: %s", sortBy)
 }
-
