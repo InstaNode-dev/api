@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"log/slog"
@@ -214,6 +215,16 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// back to immediate destruction.
 	deployH.SetEmailClient(emailClient)
 	stackH.SetEmailClient(emailClient)
+
+	// P3: start the background teardown reconciler. The worker's
+	// DeploymentExpirer only flips expired deploys to status='expired' —
+	// the api owns the compute provider and is the only service that can
+	// actually destroy the namespace / pod / Ingress / cert. Without this
+	// sweep every auto-expired deployment leaked live, billed infra
+	// forever. context.Background() is intentional: the sweep should run
+	// for the whole process lifetime (the api has no graceful-shutdown
+	// context to thread through here).
+	deployH.StartTeardownReconciler(context.Background())
 
 	// Custom-domain handler shares the k8s stack provider so EnsureCustomDomainIngress
 	// can update the same Ingress namespace the stack lives in. We construct a
