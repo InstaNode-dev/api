@@ -208,7 +208,12 @@ func (h *ResourceHandler) Delete(c *fiber.Ctx) error {
 	switch resource.ResourceType {
 	case "storage":
 		if h.storageProvider != nil {
-			deprovErr := h.storageProvider.Deprovision(c.Context(), token.String())
+			// Pass provider_resource_id (the canonical object prefix stamped
+			// at provision time) so the IAM user/policy names resolve from
+			// the stored value rather than re-deriving — closes the token-
+			// truncation class. Empty for legacy rows; Deprovision then probes
+			// the legacy token[:8] form too.
+			deprovErr := h.storageProvider.Deprovision(c.Context(), token.String(), resource.ProviderResourceID.String)
 			if deprovErr != nil {
 				slog.Warn("resource.delete.storage_deprovision_failed",
 					"error", deprovErr,

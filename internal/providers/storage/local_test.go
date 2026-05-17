@@ -115,7 +115,7 @@ func TestSharedKeyDeprovision_NoOp(t *testing.T) {
 		true,
 	)
 	require.NoError(t, err)
-	require.NoError(t, p.Deprovision(context.Background(), "tokenXYZ"))
+	require.NoError(t, p.Deprovision(context.Background(), "tokenXYZ", ""))
 }
 
 // mockMinIOAdmin captures the path of each admin call so a test can assert
@@ -190,20 +190,25 @@ func TestAdminProvision_MintsPerTenantUser(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	creds, err := p.Provision(context.Background(), "abcdef1234567890", "hobby")
+	const token = "abcdef1234567890" // 16-char token
+	creds, err := p.Provision(context.Background(), token, "hobby")
 	require.NoError(t, err, "Provision must succeed against a stub that returns 200 for every admin verb")
 	require.NotNil(t, creds)
 
-	// Per-tenant key naming: "key_<8-hex-prefix>".
-	assert.Equal(t, "key_abcdef12", creds.AccessKeyID, "AccessKeyID must be derived from the token prefix, not the master")
+	// Per-tenant key naming: "key_<FULL-token>" (token-truncation fix — the
+	// old scheme truncated to token[:8] and let two tokens collide on one
+	// IAM user).
+	assert.Equal(t, "key_"+token, creds.AccessKeyID, "AccessKeyID must embed the full token, not an 8-char prefix")
 	assert.NotEqual(t, "minioadmin", creds.AccessKeyID, "must not surface the master access key")
 
 	// Secret is a freshly generated 32-char hex string (16 random bytes).
 	assert.Len(t, creds.SecretAccessKey, 32, "SecretAccessKey is 16 bytes encoded as hex = 32 chars")
 	assert.NotEqual(t, "minioadmin123", creds.SecretAccessKey, "must not surface the master secret")
 
-	// Prefix is the same 8-char slice used in AccessKeyID.
-	assert.Equal(t, "abcdef12/", creds.Prefix)
+	// Prefix is the FULL token, slash-terminated; ProviderResourceID is the
+	// same value slash-free (what the api persists on provider_resource_id).
+	assert.Equal(t, token+"/", creds.Prefix)
+	assert.Equal(t, token, creds.ProviderResourceID, "ProviderResourceID must be the canonical slash-free prefix")
 
 	// All three admin verbs ran (AddUser, AddCannedPolicy, SetPolicy).
 	assert.True(t, mock.callsContain(t, "/add-user"), "Provision must call AddUser")
@@ -256,7 +261,10 @@ func TestAdminDeprovision_RemovesUserAndPolicy(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	require.NoError(t, p.Deprovision(context.Background(), "abcdef1234567890"))
+	// Provide the canonical provider_resource_id (full-token prefix) so
+	// Deprovision targets the same IAM identifiers Provision created.
+	const token = "abcdef1234567890"
+	require.NoError(t, p.Deprovision(context.Background(), token, token))
 	assert.True(t, mock.callsContain(t, "/remove-user"), "Deprovision must call RemoveUser")
 	assert.True(t, mock.callsContain(t, "/remove-canned-policy"), "Deprovision must call RemoveCannedPolicy")
 }

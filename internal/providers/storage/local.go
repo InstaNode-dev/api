@@ -106,9 +106,19 @@ type Credentials struct {
 	// shared-key mode: the platform's master secret (same value for every customer).
 	SecretAccessKey string
 
-	// Prefix is the object key prefix for this resource (e.g. "a1b2c3d4/").
-	// The customer is expected to scope all reads/writes to this prefix.
+	// Prefix is the object key prefix for this resource, slash-terminated
+	// (e.g. "a1b2c3d4e5f6.../"). The customer is expected to scope all
+	// reads/writes to this prefix. Token-truncation fix: this is now the FULL
+	// token, never an 8-char truncation — see prefixident.go.
 	Prefix string
+
+	// ProviderResourceID is the canonical object-key prefix WITHOUT the
+	// trailing slash — the value the api persists on resources.provider_
+	// resource_id. Deprovision and the worker's storage scanner resolve the
+	// prefix from this stored value instead of re-deriving it from the token,
+	// which kills the token-truncation class. Equal to strings.TrimSuffix(
+	// Prefix, "/").
+	ProviderResourceID string
 
 	// Endpoint is the S3-compatible endpoint URL
 	// (e.g. "http://minio.instant-data.svc.cluster.local:9000" or
@@ -238,11 +248,15 @@ func (p *Provider) customerScheme() string {
 // policy. In shared-key mode, this is a constant-time call that just
 // computes the prefix and returns the master key (no remote calls).
 func (p *Provider) Provision(ctx context.Context, token, tier string) (*Credentials, error) {
-	prefix := token
-	if len(prefix) > 8 {
-		prefix = prefix[:8]
-	}
-	objectPrefix := prefix + "/" // e.g. "a1b2c3d4/"
+	// Token-truncation fix (P1, BUGHUNT-REPORT-2026-05-17-round2): the object
+	// prefix uses the FULL token via objectPrefixForToken — never the old
+	// token[:8] truncation, which let two tenants sharing 8 hex chars share an
+	// object namespace (cross-tenant read in shared-key mode). The canonical
+	// prefix is also returned as ProviderResourceID so Deprovision / the
+	// worker scanner resolve it from the stored value, never re-derive. See
+	// prefixident.go.
+	prefix := objectPrefixForToken(token)
+	objectPrefix := prefix + "/" // e.g. "a1b2c3d4e5f6.../"
 
 	customerHost := p.customerEndpoint()
 	scheme := p.customerScheme()
@@ -267,12 +281,16 @@ func (p *Provider) Provision(ctx context.Context, token, tier string) (*Credenti
 			AccessKeyID:     p.masterAccessKey,
 			SecretAccessKey: p.masterSecretKey,
 			Prefix:          objectPrefix,
-			Endpoint:        endpoint,
+			// The canonical, slash-free object prefix the api persists on the
+			// resource row so Deprovision / the worker scanner never re-derive
+			// it from the token.
+			ProviderResourceID: prefix,
+			Endpoint:           endpoint,
 		}, nil
 
 	case BackendMinIOAdmin:
-		accessKeyID := "key_" + prefix // e.g. "key_a1b2c3d4"
-		policyName := "pol_" + prefix  // e.g. "pol_a1b2c3d4"
+		accessKeyID := minioAccessKeyID(prefix) // e.g. "key_<full-token>"
+		policyName := minioPolicyName(prefix)   // e.g. "pol_<full-token>"
 
 		// Generate 32-char hex (16-byte) secret access key.
 		secretBytes := make([]byte, 16)
@@ -326,7 +344,12 @@ func (p *Provider) Provision(ctx context.Context, token, tier string) (*Credenti
 			AccessKeyID:     accessKeyID,
 			SecretAccessKey: secretAccessKey,
 			Prefix:          objectPrefix,
-			Endpoint:        endpoint,
+			// The canonical, slash-free object prefix the api persists on the
+			// resource row. Deprovision resolves the IAM user/policy names
+			// from this stored value so they never drift from what was
+			// created here.
+			ProviderResourceID: prefix,
+			Endpoint:           endpoint,
 		}, nil
 
 	default:
@@ -338,9 +361,16 @@ func (p *Provider) Provision(ctx context.Context, token, tier string) (*Credenti
 // In minio-admin mode this removes the IAM user + policy. In shared-key mode
 // this is a no-op because no per-token resources were created.
 //
+// providerResourceID is the canonical object prefix stamped on the resource
+// row at provision time (see prefixident.go). The IAM user / policy names are
+// resolved from it via resolveObjectPrefix so they cannot drift from what
+// Provision created. The legacy token[:8] form is ALSO probed so an IAM
+// user/policy created before the token-truncation fix shipped (a row with an
+// empty provider_resource_id) is still cleaned up.
+//
 // Errors are logged but not fatal — the resource record will be soft-deleted
 // by the caller regardless.
-func (p *Provider) Deprovision(ctx context.Context, token string) error {
+func (p *Provider) Deprovision(ctx context.Context, token, providerResourceID string) error {
 	if p.backend == BackendSharedKey {
 		// No per-customer IAM resources were created; nothing to release.
 		// Object cleanup (deleting the customer's prefix) is the caller's
@@ -354,36 +384,43 @@ func (p *Provider) Deprovision(ctx context.Context, token string) error {
 		return nil
 	}
 
-	prefix := token
-	if len(prefix) > 8 {
-		prefix = prefix[:8]
-	}
-	accessKeyID := "key_" + prefix
-	policyName := "pol_" + prefix
-
 	if p.madmClient == nil {
 		return ErrAdminUnavailable
 	}
 
-	var failed bool
-	if err := p.madmClient.RemoveUser(ctx, accessKeyID); err != nil {
-		failed = true
-		metrics.StorageIAMUsersFailed.WithLabelValues("delete", "remove_user").Inc()
-		slog.Warn("storage.Deprovision: RemoveUser failed",
-			"access_key_id", accessKeyID, "error", err)
+	// Canonical prefix from the stored provider_resource_id (full-token form);
+	// plus the legacy token[:8] prefix for IAM users created before the fix.
+	canonicalPrefix := resolveObjectPrefix(token, providerResourceID)
+	prefixes := []string{canonicalPrefix}
+	if legacy := legacyObjectPrefixForToken(token); legacy != "" && legacy != canonicalPrefix {
+		prefixes = append(prefixes, legacy)
 	}
-	if err := p.madmClient.RemoveCannedPolicy(ctx, policyName); err != nil {
-		failed = true
-		metrics.StorageIAMUsersFailed.WithLabelValues("delete", "remove_policy").Inc()
-		slog.Warn("storage.Deprovision: RemoveCannedPolicy failed",
-			"policy_name", policyName, "error", err)
+
+	var failed bool
+	for _, prefix := range prefixes {
+		accessKeyID := minioAccessKeyID(prefix)
+		policyName := minioPolicyName(prefix)
+		// RemoveUser / RemoveCannedPolicy on a non-existent identifier is a
+		// MinIO no-op, so probing both the canonical and legacy names is safe.
+		if err := p.madmClient.RemoveUser(ctx, accessKeyID); err != nil {
+			failed = true
+			metrics.StorageIAMUsersFailed.WithLabelValues("delete", "remove_user").Inc()
+			slog.Warn("storage.Deprovision: RemoveUser failed",
+				"access_key_id", accessKeyID, "error", err)
+		}
+		if err := p.madmClient.RemoveCannedPolicy(ctx, policyName); err != nil {
+			failed = true
+			metrics.StorageIAMUsersFailed.WithLabelValues("delete", "remove_policy").Inc()
+			slog.Warn("storage.Deprovision: RemoveCannedPolicy failed",
+				"policy_name", policyName, "error", err)
+		}
 	}
 	if !failed {
 		metrics.StorageIAMUsersDeleted.Inc()
 	}
 
 	slog.Info("storage.Deprovision: MinIO user and policy removed",
-		"token", token, "access_key_id", accessKeyID)
+		"token", token, "access_key_id", minioAccessKeyID(canonicalPrefix))
 	return nil
 }
 
