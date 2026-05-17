@@ -48,6 +48,7 @@ import (
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
+	"instant.dev/internal/safego"
 )
 
 // BackupHandler bundles the four endpoints above. Held as a struct (rather
@@ -694,7 +695,8 @@ func parseUserIDFromCtx(c *fiber.Ctx) uuid.UUID {
 // backupToMap converts a ResourceBackup row to the JSON shape returned by
 // the list endpoint. Mirrors the contract documented in OpenAPI:
 // {backup_id, status, started_at, finished_at, size_bytes, backup_kind,
-//  tier_at_backup, error_summary}.
+//
+//	tier_at_backup, error_summary}.
 func backupToMap(b *models.ResourceBackup) fiber.Map {
 	m := fiber.Map{
 		"backup_id":   b.ID,
@@ -751,7 +753,7 @@ func restoreToMap(r *models.ResourceRestore) fiber.Map {
 // emitBackupAudit fires an AuditKindBackupRequested row in a goroutine.
 // Best-effort — audit failure must never block the response.
 func emitBackupAudit(db *sql.DB, teamID, userID uuid.UUID, resource *models.Resource, row *models.ResourceBackup, requestID string) {
-	go func() {
+	safego.Go("backup.bg", func() {
 		metadata, _ := json.Marshal(map[string]any{
 			"resource_id":  resource.ID.String(),
 			"backup_id":    row.ID.String(),
@@ -773,7 +775,7 @@ func emitBackupAudit(db *sql.DB, teamID, userID uuid.UUID, resource *models.Reso
 			Summary:      "queued backup of <strong>" + resource.ResourceType + "</strong> <code>" + resource.Token.String()[:8] + "</code>",
 			Metadata:     metadata,
 		})
-	}()
+	})
 }
 
 // emitRestoreAuditWithTarget fires an AuditKindRestoreRequested row in a
@@ -789,7 +791,7 @@ func emitRestoreAuditWithTarget(
 	row *models.ResourceRestore,
 	requestID, idempotencyKey string,
 ) {
-	go func() {
+	safego.Go("backup.bg", func() {
 		meta := map[string]any{
 			"resource_id":        sourceResource.ID.String(),
 			"target_resource_id": targetResource.ID.String(),
@@ -813,6 +815,5 @@ func emitRestoreAuditWithTarget(
 			Summary:      "restored <strong>" + sourceResource.ResourceType + "</strong> <code>" + sourceResource.Token.String()[:8] + "</code> from backup",
 			Metadata:     metadata,
 		})
-	}()
+	})
 }
-

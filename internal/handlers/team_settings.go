@@ -29,6 +29,7 @@ import (
 
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
+	"instant.dev/internal/safego"
 )
 
 // TeamSettingsHandler — GET / PATCH /api/v1/team/settings.
@@ -187,12 +188,12 @@ func (h *TeamSettingsHandler) Update(c *fiber.Ctx) error {
 // up to the request handler. Mirrors emitTeamUpdatedAudit pattern.
 func emitTeamSettingsChangedAudit(db *sql.DB, teamID uuid.UUID, userID, field, oldValue, newValue string) {
 	meta, _ := json.Marshal(map[string]any{
-		"field":               field,
-		"old_value":           oldValue,
-		"new_value":           newValue,
-		"changed_by_user_id":  userID,
+		"field":              field,
+		"old_value":          oldValue,
+		"new_value":          newValue,
+		"changed_by_user_id": userID,
 	})
-	go func() {
+	safego.Go("team_settings.bg", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		ev := models.AuditEvent{
@@ -205,5 +206,5 @@ func emitTeamSettingsChangedAudit(db *sql.DB, teamID uuid.UUID, userID, field, o
 			slog.Warn("audit.team_settings_changed.insert_failed",
 				"error", err, "team_id", teamID, "field", field)
 		}
-	}()
+	})
 }

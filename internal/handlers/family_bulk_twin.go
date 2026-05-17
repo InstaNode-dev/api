@@ -74,6 +74,7 @@ import (
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
+	"instant.dev/internal/safego"
 )
 
 // bulkTwinSemaphoreSize caps in-flight provision calls per bulk-twin request.
@@ -353,7 +354,7 @@ func (h *BulkTwinHandler) BulkTwin(c *fiber.Ctx) error {
 			// limit (the SELECT touches the same DB the provisioner does;
 			// not literally I/O-free).
 			wg.Add(1)
-			go func() {
+			safego.Go("family_bulk_twin.bg", func() {
 				defer wg.Done()
 				if err := sem.Acquire(ctx, 1); err != nil {
 					itemsMu.Lock()
@@ -376,7 +377,7 @@ func (h *BulkTwinHandler) BulkTwin(c *fiber.Ctx) error {
 					return
 				}
 				items = append(items, *item)
-			}()
+			})
 		}
 	}
 
@@ -523,7 +524,7 @@ func (h *BulkTwinHandler) twinOneParent(
 	}
 
 	var (
-		result TwinProvisionResult
+		result  TwinProvisionResult
 		provErr error
 	)
 	switch parent.ResourceType {
@@ -587,8 +588,8 @@ func (h *BulkTwinHandler) emitBulkTwinAudit(
 	twinned, skipped, failures int,
 ) error {
 	meta, _ := json.Marshal(map[string]any{
-		"source_env":     sourceEnv,
-		"target_env":     targetEnv,
+		"source_env":    sourceEnv,
+		"target_env":    targetEnv,
 		"twinned_count": twinned,
 		"skipped_count": skipped,
 		"failure_count": failures,
@@ -597,7 +598,7 @@ func (h *BulkTwinHandler) emitBulkTwinAudit(
 		"agent bulk-twinned <code>%s</code> → <code>%s</code>: %d twinned, %d skipped, %d failed",
 		sourceEnv, targetEnv, twinned, skipped, failures,
 	)
-	go func() {
+	safego.Go("family_bulk_twin.bg", func() {
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:   teamID,
 			Actor:    "agent",
@@ -605,7 +606,7 @@ func (h *BulkTwinHandler) emitBulkTwinAudit(
 			Summary:  summary,
 			Metadata: meta,
 		})
-	}()
+	})
 	return nil
 }
 

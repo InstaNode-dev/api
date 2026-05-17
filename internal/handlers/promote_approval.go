@@ -48,6 +48,7 @@ import (
 
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
+	"instant.dev/internal/safego"
 )
 
 // PromoteApprovalDashboardURL is the dashboard route the GET /approve
@@ -84,12 +85,12 @@ func NewPromoteApprovalHandler(db *sql.DB, rdb *redis.Client) *PromoteApprovalHa
 // Approve renders the click-through page for the email approval link.
 // Four branches:
 //
-//   1. Token doesn't exist → 404 "this link is invalid" HTML.
-//   2. Token exists but expires_at < now() → flips row to 'expired',
-//      returns 410 "this link expired" HTML.
-//   3. Token exists, status != 'pending' → 410 "already used" HTML.
-//   4. Token valid + pending + unexpired → atomic ApprovePromoteApproval,
-//      audit-log row, 302 redirect to the dashboard.
+//  1. Token doesn't exist → 404 "this link is invalid" HTML.
+//  2. Token exists but expires_at < now() → flips row to 'expired',
+//     returns 410 "this link expired" HTML.
+//  3. Token exists, status != 'pending' → 410 "already used" HTML.
+//  4. Token valid + pending + unexpired → atomic ApprovePromoteApproval,
+//     audit-log row, 302 redirect to the dashboard.
 //
 // The handler NEVER reveals which branch it took to a probing attacker
 // who pings random tokens — they all yield "invalid or expired" pages.
@@ -166,14 +167,16 @@ func (h *PromoteApprovalHandler) Approve(c *fiber.Ctx) error {
 
 	// Audit row — best-effort, never blocks the redirect. The forwarder
 	// turns this into the optional "approved" confirmation email.
-	go emitPromoteAuditEvent(context.Background(), h.db, row, models.AuditKindPromoteApproved,
-		"Promote approval clicked for "+row.FromEnv+" → "+row.ToEnv,
-		map[string]any{
-			"approval_id": row.ID.String(),
-			"from_env":    row.FromEnv,
-			"to_env":      row.ToEnv,
-			"kind":        row.PromoteKind,
-		})
+	safego.Go("promote_approval.approved_audit", func() {
+		emitPromoteAuditEvent(context.Background(), h.db, row, models.AuditKindPromoteApproved,
+			"Promote approval clicked for "+row.FromEnv+" → "+row.ToEnv,
+			map[string]any{
+				"approval_id": row.ID.String(),
+				"from_env":    row.FromEnv,
+				"to_env":      row.ToEnv,
+				"kind":        row.PromoteKind,
+			})
+	})
 
 	// Redirect to the dashboard. The dashboard reads ?approved=1 from
 	// the query string to render a success toast on first paint.
@@ -259,15 +262,17 @@ func (h *PromoteApprovalHandler) Reject(c *fiber.Ctx) error {
 	}
 
 	// Audit row — best-effort.
-	go emitPromoteAuditEvent(context.Background(), h.db, row, models.AuditKindPromoteRejected,
-		"Promote approval rejected by admin for "+row.FromEnv+" → "+row.ToEnv,
-		map[string]any{
-			"approval_id":     row.ID.String(),
-			"from_env":        row.FromEnv,
-			"to_env":          row.ToEnv,
-			"kind":            row.PromoteKind,
-			"rejected_by":     middleware.GetEmail(c),
-		})
+	safego.Go("promote_approval.rejected_audit", func() {
+		emitPromoteAuditEvent(context.Background(), h.db, row, models.AuditKindPromoteRejected,
+			"Promote approval rejected by admin for "+row.FromEnv+" → "+row.ToEnv,
+			map[string]any{
+				"approval_id": row.ID.String(),
+				"from_env":    row.FromEnv,
+				"to_env":      row.ToEnv,
+				"kind":        row.PromoteKind,
+				"rejected_by": middleware.GetEmail(c),
+			})
+	})
 
 	return c.JSON(RejectResponse{
 		OK:     true,
@@ -462,20 +467,22 @@ func CreatePromoteApprovalAndEmit(
 
 	// Emit the audit event in a goroutine — best-effort. The forwarder
 	// picks the row up downstream and sends the actual email.
-	go func(teamID uuid.UUID, kind, summary string, metadata []byte) {
-		bgCtx := context.Background()
-		ev := models.AuditEvent{
-			TeamID:   teamID,
-			Actor:    "agent",
-			Kind:     kind,
-			Summary:  summary,
-			Metadata: metadata,
-		}
-		if aErr := models.InsertAuditEvent(bgCtx, db, ev); aErr != nil {
-			slog.Warn("promote_approval.audit_emit_failed",
-				"error", aErr, "kind", kind, "team_id", teamID)
-		}
-	}(req.TeamID, models.AuditKindPromoteApprovalRequested, summary, metaJSON)
+	safego.Go("promote_approval.audit", func() {
+		(func(teamID uuid.UUID, kind, summary string, metadata []byte) {
+			bgCtx := context.Background()
+			ev := models.AuditEvent{
+				TeamID:   teamID,
+				Actor:    "agent",
+				Kind:     kind,
+				Summary:  summary,
+				Metadata: metadata,
+			}
+			if aErr := models.InsertAuditEvent(bgCtx, db, ev); aErr != nil {
+				slog.Warn("promote_approval.audit_emit_failed",
+					"error", aErr, "kind", kind, "team_id", teamID)
+			}
+		})(req.TeamID, models.AuditKindPromoteApprovalRequested, summary, metaJSON)
+	})
 
 	return row, nil
 }

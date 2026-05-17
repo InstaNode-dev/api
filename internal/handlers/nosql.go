@@ -18,12 +18,13 @@ import (
 	"instant.dev/internal/crypto"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
-	"instant.dev/internal/urls"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
-	"instant.dev/internal/provisioner"
 	nosqlprovider "instant.dev/internal/providers/nosql"
+	"instant.dev/internal/provisioner"
 	"instant.dev/internal/quota"
+	"instant.dev/internal/safego"
+	"instant.dev/internal/urls"
 )
 
 // NoSQLHandler handles POST /nosql/new — MongoDB provisioning.
@@ -342,7 +343,7 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 	}
 
 	// Best-effort audit event; failures must never block the provision.
-	go func() {
+	safego.Go("nosql.bg", func() {
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:       teamUUID,
 			Actor:        "agent",
@@ -351,7 +352,7 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
 			Summary:      "agent provisioned <strong>mongodb</strong> <code>" + resource.Token.String()[:8] + "</code>",
 		})
-	}()
+	})
 
 	tokenStr := resource.Token.String()
 
@@ -534,7 +535,7 @@ func (h *NoSQLHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 		return TwinProvisionResult{}, twinCoreErr("Failed to record twin resource")
 	}
 
-	go func() {
+	safego.Go("nosql.bg", func() {
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:       in.TeamID,
 			Actor:        "agent",
@@ -544,7 +545,7 @@ func (h *NoSQLHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 			Summary: "agent provisioned <strong>mongodb</strong> twin <code>" +
 				resource.Token.String()[:8] + "</code> in env=<code>" + in.Env + "</code>",
 		})
-	}()
+	})
 
 	tokenStr := resource.Token.String()
 	provStart := time.Now()

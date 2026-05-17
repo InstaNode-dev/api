@@ -11,6 +11,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"instant.dev/internal/models"
+	"instant.dev/internal/safego"
 )
 
 // LocalKeyAPIKey marks requests authenticated via Personal Access Token rather
@@ -77,13 +78,14 @@ func AuthenticateAPIKey(c *fiber.Ctx, plaintext string) (bool, error) {
 	c.Locals(LocalKeyAPIKeyScopes, key.Scopes)
 
 	// Best-effort touch — never block the request.
-	go func(id string) {
+	keyID := key.ID
+	safego.Go("api_key.touch", func() {
 		bgCtx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
 		defer cancel()
-		if err := models.TouchAPIKey(bgCtx, db, key.ID); err != nil {
-			slog.Debug("api_key.touch_failed", "error", err, "id", id)
+		if err := models.TouchAPIKey(bgCtx, db, keyID); err != nil {
+			slog.Debug("api_key.touch_failed", "error", err, "id", keyID.String())
 		}
-	}(key.ID.String())
+	})
 
 	return true, nil
 }

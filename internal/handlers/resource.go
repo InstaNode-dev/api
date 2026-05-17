@@ -8,9 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
-	"net/url"
-	"time"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -22,10 +19,14 @@ import (
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
+	storageprovider "instant.dev/internal/providers/storage"
 	"instant.dev/internal/provisioner"
 	"instant.dev/internal/quota"
-	storageprovider "instant.dev/internal/providers/storage"
+	"instant.dev/internal/safego"
 	commonv1 "instant.dev/proto/common/v1"
+	"log/slog"
+	"net/url"
+	"time"
 )
 
 // ResourceHandler handles /api/v1/resources/* endpoints.
@@ -87,7 +88,8 @@ func (h *ResourceHandler) List(c *fiber.Ctx) error {
 	// row per *member* of the list would flood the audit_log on teams with
 	// hundreds of resources, without giving compliance-buyers materially
 	// more signal. Best-effort: a failure here MUST NOT shape the response.
-	go emitResourceListByTeamAudit(h.db, teamID, middleware.GetUserID(c), len(items), envFilter)
+	auditUserID := middleware.GetUserID(c) // capture before goroutine — c is recycled
+	safego.Go("resource.list_audit", func() { emitResourceListByTeamAudit(h.db, teamID, auditUserID, len(items), envFilter) })
 
 	return c.JSON(fiber.Map{
 		"ok":    true,
@@ -145,7 +147,10 @@ func (h *ResourceHandler) Get(c *fiber.Ctx) error {
 	// W7-C: per-resource read audit row. Best-effort goroutine — failures
 	// MUST NOT block the response (matches the A3 emit pattern in
 	// auth.go / onboarding.go).
-	go emitResourceReadAudit(h.db, teamID, middleware.GetUserID(c), resource.ID, resource.ResourceType)
+	auditUserID := middleware.GetUserID(c) // capture before goroutine — c is recycled
+	safego.Go("resource.read_audit", func() {
+		emitResourceReadAudit(h.db, teamID, auditUserID, resource.ID, resource.ResourceType)
+	})
 
 	return c.JSON(fiber.Map{
 		"ok":   true,
@@ -216,16 +221,18 @@ func (h *ResourceHandler) Delete(c *fiber.Ctx) error {
 			// pair brackets exactly how long the key existed. Only meaningful
 			// in admin mode — shared-key mode has no per-tenant key to remove.
 			if deprovErr == nil && h.storageProvider.Backend() == storageprovider.BackendMinIOAdmin {
-				go func(rid uuid.UUID, tid uuid.UUID, tok string) {
-					_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
-						TeamID:       tid,
-						Actor:        "system",
-						Kind:         models.AuditKindStorageIAMUserDeleted,
-						ResourceType: "storage",
-						ResourceID:   uuid.NullUUID{UUID: rid, Valid: true},
-						Summary:      "removed per-tenant storage key <code>key_" + tok[:8] + "</code>",
-					})
-				}(resource.ID, teamID, token.String())
+				safego.Go("resource.iam_audit", func() {
+					(func(rid uuid.UUID, tid uuid.UUID, tok string) {
+						_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+							TeamID:       tid,
+							Actor:        "system",
+							Kind:         models.AuditKindStorageIAMUserDeleted,
+							ResourceType: "storage",
+							ResourceID:   uuid.NullUUID{UUID: rid, Valid: true},
+							Summary:      "removed per-tenant storage key <code>key_" + tok[:8] + "</code>",
+						})
+					})(resource.ID, teamID, token.String())
+				})
 			}
 		}
 	default:
@@ -323,7 +330,10 @@ func (h *ResourceHandler) GetCredentials(c *fiber.Ctx) error {
 	// path; the rotation handler also fires the same kind because it
 	// returns plaintext too. Internal decrypts (pause/resume's
 	// extractURLUsername, scan/probe paths) do NOT fire.
-	go emitConnectionURLDecryptedAudit(h.db, teamID, middleware.GetUserID(c), resource.ID, "customer_reveal")
+	auditUserID := middleware.GetUserID(c) // capture before goroutine — c is recycled
+	safego.Go("resource.url_decrypt_audit", func() {
+		emitConnectionURLDecryptedAudit(h.db, teamID, auditUserID, resource.ID, "customer_reveal")
+	})
 
 	return c.JSON(fiber.Map{
 		"ok":             true,
@@ -598,7 +608,7 @@ func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
 	h.rdb.Del(ctx, fmt.Sprintf("res:%s", token.String()))
 
 	// Best-effort audit event. Failure must not block the response.
-	go func() {
+	safego.Go("resource.bg", func() {
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:       teamID,
 			Actor:        "agent",
@@ -607,7 +617,7 @@ func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
 			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
 			Summary:      "paused <strong>" + resource.ResourceType + "</strong> <code>" + token.String()[:8] + "</code>",
 		})
-	}()
+	})
 
 	slog.Info("resource.paused",
 		"resource_id", resource.ID,
@@ -716,7 +726,7 @@ func (h *ResourceHandler) Resume(c *fiber.Ctx) error {
 
 	h.rdb.Del(ctx, fmt.Sprintf("res:%s", token.String()))
 
-	go func() {
+	safego.Go("resource.bg", func() {
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:       teamID,
 			Actor:        "agent",
@@ -725,7 +735,7 @@ func (h *ResourceHandler) Resume(c *fiber.Ctx) error {
 			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
 			Summary:      "resumed <strong>" + resource.ResourceType + "</strong> <code>" + token.String()[:8] + "</code>",
 		})
-	}()
+	})
 
 	slog.Info("resource.resumed",
 		"resource_id", resource.ID,
@@ -1315,4 +1325,3 @@ func resourceTypeToProto(resourceType string) commonv1.ResourceType {
 		return commonv1.ResourceType_RESOURCE_TYPE_UNSPECIFIED
 	}
 }
-
