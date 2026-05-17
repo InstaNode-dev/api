@@ -872,8 +872,15 @@ func (h *StackHandler) Logs(c *fiber.Ctx) error {
 	// Tail logs for alive stacks; read-only for stopped/failed.
 	follow := stack.Status != "stopped" && stack.Status != "failed"
 
-	logStream, err := h.stackProv.ServiceLogs(c.Context(), stack.Namespace, svcName, follow)
+	// FIX-2: open the log stream with a background-derived context, NOT
+	// c.Context(). The SetBodyStreamWriter callback runs after this handler
+	// returns, by which point fasthttp may have recycled/cancelled the
+	// request context — cutting the stream early or leaking it. cancel is
+	// invoked by streamLogsSSE when the pump ends.
+	streamCtx, cancel := context.WithCancel(context.Background())
+	logStream, err := h.stackProv.ServiceLogs(streamCtx, stack.Namespace, svcName, follow)
 	if err != nil {
+		cancel()
 		slog.Error("stack.logs.stream_failed",
 			"slug", slug, "service", svcName, "error", err)
 		return respondError(c, fiber.StatusServiceUnavailable, "logs_failed",
@@ -885,18 +892,13 @@ func (h *StackHandler) Logs(c *fiber.Ctx) error {
 	c.Set("Connection", "keep-alive")
 	c.Set("X-Accel-Buffering", "no")
 
-	// logStream.Close() deferred inside callback — defers in the outer handler run
-	// before SetBodyStreamWriter's callback executes, which would close the stream early.
+	// streamLogsSSE pumps lines, breaks on client disconnect (FIX-1: a
+	// fasthttp mid-stream disconnect is observable only as a write/flush
+	// error), and Close()s the stream + cancels streamCtx (FIX-2) when
+	// streaming ends. The pump runs inside SetBodyStreamWriter — after this
+	// handler returns.
 	c.Context().Response.SetBodyStreamWriter(func(w *bufio.Writer) {
-		defer logStream.Close()
-		scanner := bufio.NewScanner(logStream)
-		for scanner.Scan() {
-			line := scanner.Text()
-			fmt.Fprintf(w, "data: %s\n\n", line)
-			_ = w.Flush()
-		}
-		fmt.Fprint(w, "data: [end]\n\n")
-		_ = w.Flush()
+		streamLogsSSE(w, logStream, cancel)
 	})
 
 	return nil

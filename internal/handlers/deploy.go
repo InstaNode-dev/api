@@ -841,8 +841,15 @@ func (h *DeployHandler) Logs(c *fiber.Ctx) error {
 	// Tail logs only if deployment is alive; use follow=false for stopped/failed.
 	follow := d.Status != "stopped" && d.Status != "failed"
 
-	logStream, err := h.compute.Logs(c.Context(), d.ProviderID, follow)
+	// FIX-2: open the log stream with a background-derived context, NOT
+	// c.Context(). The SetBodyStreamWriter callback runs after this handler
+	// returns, by which point fasthttp may have recycled/cancelled the
+	// request context — cutting the stream early or leaking it. cancel is
+	// called by streamLogsSSE when the pump ends (drain or disconnect).
+	streamCtx, cancel := context.WithCancel(context.Background())
+	logStream, err := h.compute.Logs(streamCtx, d.ProviderID, follow)
 	if err != nil {
+		cancel()
 		slog.Error("deploy.logs.stream_failed",
 			"app_id", appID, "provider_id", d.ProviderID, "error", err)
 		return respondError(c, fiber.StatusServiceUnavailable, "logs_failed",
@@ -854,21 +861,11 @@ func (h *DeployHandler) Logs(c *fiber.Ctx) error {
 	c.Set("Connection", "keep-alive")
 	c.Set("X-Accel-Buffering", "no")
 
-	// Stream lines. Fiber writes the response via fasthttp which buffers internally,
-	// but we flush per-line for a real-time feel via c.Context().Response.SetBodyStreamWriter.
-	// logStream.Close() must be deferred inside the callback — defers in the outer
-	// handler run when ResourceLogs returns nil (before the callback executes).
+	// streamLogsSSE pumps lines, breaks on client disconnect (FIX-1), and
+	// Close()s the stream + cancels streamCtx (FIX-2) when streaming ends.
+	// The pump runs inside SetBodyStreamWriter — after this handler returns.
 	c.Context().Response.SetBodyStreamWriter(func(w *bufio.Writer) {
-		defer logStream.Close()
-		scanner := bufio.NewScanner(logStream)
-		for scanner.Scan() {
-			line := scanner.Text()
-			fmt.Fprintf(w, "data: %s\n\n", line)
-			_ = w.Flush()
-		}
-		// Signal end of stream.
-		fmt.Fprint(w, "data: [end]\n\n")
-		_ = w.Flush()
+		streamLogsSSE(w, logStream, cancel)
 	})
 
 	return nil
