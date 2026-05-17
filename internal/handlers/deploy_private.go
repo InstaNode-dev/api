@@ -8,6 +8,7 @@ package handlers
 // deploy.go calls parsePrivateDeployFields once before persisting the row.
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -310,15 +311,47 @@ func parseTruthy(s string) bool {
 	return false
 }
 
-// splitAllowedIPsField parses the multipart `allowed_ips` value. Accepts the
-// canonical comma-joined form ("1.2.3.4,10.0.0.0/8") and trims whitespace per
-// entry. Empty entries (e.g. trailing commas) are skipped — they're a common
-// concatenation typo and not worth a 400 on their own. Returns nil on empty.
+// splitAllowedIPsField parses the multipart `allowed_ips` value.
+//
+// P1-I (bug hunt 2026-05-17 round 2): the MCP client serialises allowed_ips
+// as a JSON array string (`["1.2.3.4","10.0.0.0/8"]`) while this helper only
+// understood the comma-joined form — so every MCP `create_deploy --private`
+// 400'd with "invalid_allowed_ip". The parser now accepts BOTH:
+//
+//   - a JSON array of strings  → ["1.2.3.4", "10.0.0.0/8"]
+//   - the canonical CSV form   → 1.2.3.4,10.0.0.0/8
+//
+// Fixing the backend covers every client (MCP, CLI, curl, dashboard) without
+// shipping an MCP release. JSON detection is by leading-bracket sniff; a
+// malformed JSON array falls through to CSV so a stray '[' never hard-fails.
+// Whitespace is trimmed per entry and empty entries (trailing commas) skipped.
+// Returns nil on empty.
 func splitAllowedIPsField(raw string) []string {
-	if strings.TrimSpace(raw) == "" {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
 		return nil
 	}
-	parts := strings.Split(raw, ",")
+
+	// JSON-array form — what the MCP client sends.
+	if strings.HasPrefix(trimmed, "[") {
+		var arr []string
+		if err := json.Unmarshal([]byte(trimmed), &arr); err == nil {
+			out := make([]string, 0, len(arr))
+			for _, p := range arr {
+				if t := strings.TrimSpace(p); t != "" {
+					out = append(out, t)
+				}
+			}
+			if len(out) == 0 {
+				return nil
+			}
+			return out
+		}
+		// Not valid JSON — fall through to CSV parsing rather than hard-fail.
+	}
+
+	// Canonical comma-joined form.
+	parts := strings.Split(trimmed, ",")
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
 		if t := strings.TrimSpace(p); t != "" {
