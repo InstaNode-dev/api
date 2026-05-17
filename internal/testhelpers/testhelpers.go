@@ -912,6 +912,13 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	// flows reach the handler instead of 405-ing. See router.go for the
 	// full rationale (BugBash #Q29).
 	app.All("/webhook/receive/:token", webhookH.Receive)
+	// Public webhook request listing — the URL token IS the credential, no
+	// session required. Mirrors the STANDALONE OptionalAuth route in
+	// internal/router/router.go (registered before the /api/v1 RequireAuth
+	// group). Must register here, before the `api` group below, or an
+	// anonymous token read 401s at the group middleware instead of reaching
+	// the handler's own token/resource-type checks.
+	app.Get("/api/v1/webhooks/:token/requests", middleware.OptionalAuth(cfg), webhookH.ListRequests)
 
 	// /queue/new and /auth/cli are wired so handler-level tests can hit
 	// every body-parsing surface Wave FIX-D introduced. Both endpoints
@@ -987,7 +994,8 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	api.Get("/resources/:id/backups", backupH.ListBackups)
 	api.Post("/resources/:id/restore", backupH.CreateRestore)
 	api.Get("/resources/:id/restores", backupH.ListRestores)
-	api.Get("/webhooks/:token/requests", webhookH.ListRequests)
+	// /api/v1/webhooks/:token/requests is registered above as a standalone
+	// public route (mirrors router.go) — NOT here under the RequireAuth group.
 	api.Get("/deployments", deployH.List)
 	api.Get("/deployments/:id", deployH.Get)
 	api.Delete("/deployments/:id", deployH.Delete)
