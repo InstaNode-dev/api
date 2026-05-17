@@ -2505,18 +2505,46 @@ const openAPISpec = `{
       },
       "DeployItem": {
         "type": "object",
-        "description": "Deployment row as returned in the list endpoint. Shape matches DeployResponse.item.",
+        "description": "Deployment row as returned by GET /deploy/{id} and the list endpoint. Shape matches handlers.deploymentToMap. The env field is redaction-filtered: credential-bearing values are masked '***' and the internal _name key is stripped.",
         "properties": {
           "id": { "type": "string", "format": "uuid" },
+          "token": { "type": "string", "description": "Public-facing alias for app_id (same 8-char value)." },
           "app_id": { "type": "string", "description": "8-char public identifier used in the URL" },
+          "provider_id": { "type": "string", "description": "Opaque compute-backend handle (k8s namespace/deployment ref)." },
           "name": { "type": "string", "description": "Human-readable label supplied at creation time (stored in env_vars._name; emitted as a top-level field for convenience). Empty string when created before mandatory-naming was enforced." },
           "url": { "type": "string" },
           "status": { "type": "string", "enum": ["building", "deploying", "healthy", "failed", "stopped", "expired"] },
           "tier": { "type": "string" },
-          "environment": { "type": "string" },
-          "env": { "type": "object", "additionalProperties": { "type": "string" } },
+          "environment": { "type": "string", "description": "Environment scope (production / staging / dev / ...)." },
+          "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Application env vars. Credential values are masked '***'; the internal _name key is never present." },
           "port": { "type": "integer" },
-          "team_id": { "type": "string", "format": "uuid" }
+          "private": { "type": "boolean", "description": "True when the deployment is IP-allowlist gated (Pro+ feature)." },
+          "allowed_ips": { "type": "array", "items": { "type": "string" }, "description": "IP/CIDR allowlist for a private deployment. Always present (empty [] for public deploys)." },
+          "team_id": { "type": "string", "format": "uuid" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" },
+          "error": { "type": "string", "description": "Present only when the deployment carries a non-empty error_message." },
+          "resource_id": { "type": "string", "format": "uuid", "description": "Present only when the deployment is linked to a provisioned resource." },
+          "notify_webhook": { "type": "string", "description": "Caller-supplied status webhook URL (echoed back; the plaintext secret is never returned)." },
+          "notify_state": { "type": "string", "description": "Lifecycle state of the notify webhook." },
+          "notify_attempts": { "type": "integer", "description": "Notify-webhook delivery attempt count. Present only when notify_webhook is configured." },
+          "notify_secret_set": { "type": "boolean", "description": "Whether a notify-webhook signing secret is configured. Present only when notify_webhook is configured." },
+          "ttl_policy": { "type": "string", "description": "Either 'permanent' or an auto-expiry policy. Always present so callers can branch on permanence." },
+          "expires_at": { "type": "string", "format": "date-time", "description": "Auto-expiry timestamp. Omitted entirely when ttl_policy is permanent." },
+          "reminders_sent": { "type": "integer", "description": "Count of TTL-expiry reminder emails sent. Present only when expires_at is set." },
+          "make_permanent_url": { "type": "string", "description": "Absolute URL to convert an auto-expiring deploy to permanent. Present only when expires_at is set." },
+          "extend_ttl_url": { "type": "string", "description": "Absolute URL to extend the auto-expiry window. Present only when expires_at is set." },
+          "failure": {
+            "type": "object",
+            "description": "Structured failure autopsy. Present only when status is 'failed' and an autopsy row exists.",
+            "properties": {
+              "reason": { "type": "string", "description": "Failure classification (e.g. build_failed, deadline_exceeded)." },
+              "event": { "type": "string", "description": "Raw error string from the failed stage." },
+              "last_lines": { "type": "array", "items": { "type": "string" }, "description": "Tail of the kaniko build log captured at failure time." },
+              "hint": { "type": "string", "description": "Human-readable remediation hint." },
+              "occurred_at": { "type": "string", "format": "date-time" }
+            }
+          }
         }
       },
       "ClaimRequest": {
@@ -2552,12 +2580,19 @@ const openAPISpec = `{
       },
       "AuthMeResponse": {
         "type": "object",
+        "description": "Current user + team info. Shape matches handlers.GetCurrentUser. Several fields are emitted only conditionally — their absence is itself signal (e.g. is_platform_admin is never sent empty).",
         "properties": {
           "ok": { "type": "boolean" },
           "user_id": { "type": "string", "format": "uuid" },
           "team_id": { "type": "string", "format": "uuid" },
           "email": { "type": "string" },
-          "tier": { "type": "string", "enum": ["hobby", "hobby_plus", "pro", "team", "growth"] }
+          "tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "hobby_plus", "pro", "team", "growth"], "description": "The team's current plan tier." },
+          "plan_display_name": { "type": "string", "description": "Human-readable plan name for the current tier (from plans.Registry)." },
+          "experiments": { "type": "object", "additionalProperties": { "type": "string" }, "description": "A/B experiment variant assignments keyed by experiment name, bucketed by team_id." },
+          "is_platform_admin": { "type": "boolean", "description": "Present (always true) only when the caller's email is on the ADMIN_EMAILS allowlist. Absent for every non-admin caller." },
+          "admin_path_prefix": { "type": "string", "description": "Unguessable URL segment for the admin customer-management endpoints. Present only for admins when ADMIN_PATH_PREFIX is configured." },
+          "read_only": { "type": "boolean", "description": "Present (always true) only when the session JWT carries read_only=true — i.e. an admin impersonation session. Absent for normal sessions." },
+          "impersonated_by": { "type": "string", "description": "Email of the admin who started an impersonation session. Present only on impersonated sessions." }
         }
       },
       "StackRequest": {
@@ -2616,16 +2651,24 @@ const openAPISpec = `{
       },
       "ResourceItem": {
         "type": "object",
+        "description": "Provisioned resource row. Shape matches handlers.resourceToMap. connection_url is NEVER included. Several fields are emitted only when their backing column is non-NULL.",
         "properties": {
           "id": { "type": "string", "format": "uuid" },
           "token": { "type": "string", "format": "uuid" },
           "resource_type": { "type": "string", "enum": ["postgres", "redis", "mongodb", "queue", "storage", "webhook", "vector"] },
-          "name": { "type": "string" },
+          "name": { "type": "string", "description": "Caller-supplied resource name. Present only when set." },
           "env": { "type": "string", "description": "Environment scope (production / staging / dev / ...)" },
           "tier": { "type": "string" },
           "status": { "type": "string" },
-          "storage_bytes": { "type": "integer" },
-          "expires_at": { "type": "string", "format": "date-time", "nullable": true },
+          "cloud_vendor": { "type": "string", "description": "Backing cloud vendor. Present only when known." },
+          "country_code": { "type": "string", "description": "ISO country code of the resource region. Present only when known." },
+          "storage_bytes": { "type": "integer", "description": "Current storage usage in bytes (scanner-updated)." },
+          "storage_limit_bytes": { "type": "integer", "description": "Tier storage ceiling in bytes (MiB-based). -1 means unlimited. From plans.Registry." },
+          "connections_limit": { "type": "integer", "description": "Tier connection ceiling. -1 means unlimited. From plans.Registry." },
+          "storage_exceeded": { "type": "boolean", "description": "True when storage_bytes has reached storage_limit_bytes." },
+          "expires_at": { "type": "string", "format": "date-time", "nullable": true, "description": "Auto-expiry timestamp. Present only for anonymous/TTL'd resources." },
+          "paused_at": { "type": "string", "format": "date-time", "description": "When the resource was paused. Present only when paused." },
+          "team_id": { "type": "string", "format": "uuid", "description": "Owning team. Present only for claimed (non-anonymous) resources." },
           "created_at": { "type": "string", "format": "date-time" }
         }
       },

@@ -607,8 +607,8 @@ func TestOpenAPI_CoversAllRegisteredRoutes(t *testing.T) {
 	//      (A/B click sink). Agents shouldn't drive these and adding them
 	//      to the agent-facing spec would muddy the contract.
 	intentionallyHidden := map[string]bool{
-		"POST /api/v1/email/webhook/brevo":   true,
-		"POST /api/v1/email/webhook/ses":     true,
+		"POST /api/v1/email/webhook/brevo":    true,
+		"POST /api/v1/email/webhook/ses":      true,
 		"POST /internal/teams/{id}/terminate": true,
 		// Worker-only resend driver. Auth is the shared
 		// WORKER_INTERNAL_JWT_SECRET HS256 token; agents must never call
@@ -621,8 +621,8 @@ func TestOpenAPI_CoversAllRegisteredRoutes(t *testing.T) {
 		// when a manual backup fails terminally. Not a customer-facing
 		// surface, so it stays out of the agent-facing OpenAPI spec.
 		"POST /internal/teams/{id}/backup-quota/refund": true,
-		"GET /api/v1/usage/wall":              true,
-		"POST /api/v1/experiments/converted":  true,
+		"GET /api/v1/usage/wall":                        true,
+		"POST /api/v1/experiments/converted":            true,
 	}
 
 	var missing []string
@@ -720,4 +720,77 @@ func fiberParamsToOpenAPI(path string) string {
 		}
 	}
 	return strings.Join(segments, "/")
+}
+
+// TestOpenAPI_DeployItemSchemaMatchesHandler is the P1-H regression guard
+// (bug hunt 2026-05-17 round 2). The DeployItem schema had drifted ~15 fields
+// behind deploymentToMap. Every field the handler can emit must be documented.
+func TestOpenAPI_DeployItemSchemaMatchesHandler(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	props, ok := digMap(v, "components", "schemas", "DeployItem", "properties")
+	if !ok {
+		t.Fatal("could not navigate to DeployItem.properties")
+	}
+	// Every key handlers.deploymentToMap can put in the fiber.Map.
+	want := []string{
+		"id", "token", "app_id", "provider_id", "name", "url", "status", "tier",
+		"environment", "env", "port", "private", "allowed_ips", "team_id",
+		"created_at", "updated_at", "error", "resource_id", "notify_webhook",
+		"notify_state", "notify_attempts", "notify_secret_set", "ttl_policy",
+		"expires_at", "reminders_sent", "make_permanent_url", "extend_ttl_url",
+		"failure",
+	}
+	for _, f := range want {
+		if _, ok := props[f]; !ok {
+			t.Errorf("DeployItem schema missing field %q that deploymentToMap emits", f)
+		}
+	}
+}
+
+// TestOpenAPI_AuthMeResponseSchemaMatchesHandler — P1-H guard for AuthMeResponse.
+func TestOpenAPI_AuthMeResponseSchemaMatchesHandler(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	props, ok := digMap(v, "components", "schemas", "AuthMeResponse", "properties")
+	if !ok {
+		t.Fatal("could not navigate to AuthMeResponse.properties")
+	}
+	want := []string{
+		"ok", "user_id", "team_id", "email", "tier", "plan_display_name",
+		"experiments", "is_platform_admin", "admin_path_prefix", "read_only",
+		"impersonated_by",
+	}
+	for _, f := range want {
+		if _, ok := props[f]; !ok {
+			t.Errorf("AuthMeResponse schema missing field %q that GetCurrentUser emits", f)
+		}
+	}
+}
+
+// TestOpenAPI_ResourceItemSchemaMatchesHandler — P1-H guard for ResourceItem.
+func TestOpenAPI_ResourceItemSchemaMatchesHandler(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	props, ok := digMap(v, "components", "schemas", "ResourceItem", "properties")
+	if !ok {
+		t.Fatal("could not navigate to ResourceItem.properties")
+	}
+	want := []string{
+		"id", "token", "resource_type", "name", "env", "tier", "status",
+		"cloud_vendor", "country_code", "storage_bytes", "storage_limit_bytes",
+		"connections_limit", "storage_exceeded", "expires_at", "paused_at",
+		"team_id", "created_at",
+	}
+	for _, f := range want {
+		if _, ok := props[f]; !ok {
+			t.Errorf("ResourceItem schema missing field %q that resourceToMap emits", f)
+		}
+	}
 }
