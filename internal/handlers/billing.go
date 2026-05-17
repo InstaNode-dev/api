@@ -588,33 +588,53 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 	// Razorpay, but signed payloads can be re-POSTed N times — each replay
 	// would re-fire the state machine.
 	//
-	// The dedup row is recorded AFTER the handler dispatch succeeds, not
-	// before. subscription.activated/charged deliberately return HTTP 500
-	// on failure so Razorpay retries — if the dedup row were committed
-	// before dispatch, the retry would short-circuit on RowsAffected()==0
-	// and report {"deduped":true} without ever processing the upgrade. A
-	// transient DB error during UpgradeTeamAllTiers would then permanently
-	// lose a paying customer's upgrade. Recording dedup post-success means
-	// a failed event leaves no row, so the retry is processed normally;
-	// a successfully-processed event leaves a row, so genuine replays are
-	// still suppressed (checked below before dispatch).
+	// P4 (bug-hunt 2026-05-17): the dedup is an ATOMIC CLAIM at the START,
+	// not a SELECT-EXISTS-then-INSERT-post-dispatch. The earlier Wave-3
+	// shape had a TOCTOU window: two concurrent deliveries of the same
+	// event both passed the EXISTS read and both dispatched → double
+	// upgrade-audit / double dunning email. We now `INSERT … ON CONFLICT
+	// DO NOTHING` up-front and inspect RowsAffected:
+	//   - 1 row  → THIS request owns the event; proceed to dispatch.
+	//   - 0 rows → another concurrent delivery (or an earlier successful
+	//              one) already owns it → 200 {"deduped":true}, no dispatch.
+	// event_id is the PRIMARY KEY of razorpay_webhook_events, so the
+	// INSERT is the single serialization point — the database, not the
+	// handler, decides the winner.
+	//
+	// Wave-3's retry intent is PRESERVED: if THIS request claimed the row
+	// but processing then fails (a 500-return path), we DELETE the claim
+	// row before returning 500 (see deleteRazorpayWebhookClaim) so
+	// Razorpay's retry re-claims and re-processes the event normally.
+	// A successful dispatch leaves the claim row in place, so genuine
+	// replays stay suppressed.
 	eventID := c.Get("X-Razorpay-Event-Id")
 	if eventID == "" {
 		eventID = event.ID
 	}
+	// claimedHere tracks whether THIS request inserted the dedup row, so
+	// the 500-return paths below know they own the row and must delete it
+	// to keep Razorpay's retry working.
+	claimedHere := false
 	if eventID != "" && h.db != nil {
-		var alreadyProcessed bool
-		if err := h.db.QueryRowContext(ctx,
-			`SELECT EXISTS (SELECT 1 FROM razorpay_webhook_events WHERE event_id = $1)`,
-			eventID,
-		).Scan(&alreadyProcessed); err != nil {
-			// Fail open — log and continue. A dedup read failure is far
-			// less bad than swallowing a real subscription state change.
-			slog.Warn("billing.webhook.dedup_lookup_failed", "error", err, "event_id", eventID)
-		} else if alreadyProcessed {
+		res, err := h.db.ExecContext(ctx,
+			`INSERT INTO razorpay_webhook_events (event_id, event_type) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING`,
+			eventID, event.Event,
+		)
+		if err != nil {
+			// Fail open — log and continue WITHOUT a claim. A dedup write
+			// failure is far less bad than swallowing a real subscription
+			// state change. claimedHere stays false: a later failure will
+			// not try to delete a row we never inserted.
+			slog.Warn("billing.webhook.dedup_claim_failed", "error", err, "event_id", eventID)
+		} else if n, _ := res.RowsAffected(); n == 0 {
+			// Another concurrent delivery (or an earlier successful one)
+			// already owns this event. Return 200 without dispatching so
+			// the state machine fires exactly once.
 			span.SetAttributes(attribute.Bool("rzp.replay_blocked", true))
 			slog.Info("billing.webhook.replay_blocked", "event_id", eventID, "event_type", event.Event)
 			return c.Status(fiber.StatusOK).JSON(fiber.Map{"ok": true, "deduped": true})
+		} else {
+			claimedHere = true
 		}
 	} else if eventID == "" {
 		// No event_id available — log and proceed. Razorpay always sends
@@ -637,6 +657,10 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 		if upgradeErr := h.handleSubscriptionCharged(ctx, c, event); upgradeErr != nil {
 			slog.Error("billing.webhook.subscription_activated.upgrade_failed",
 				"error", upgradeErr, "event_id", eventID)
+			// P4: processing failed — release the claim so Razorpay's
+			// retry re-claims and re-processes this event. Without this
+			// the up-front claim would permanently swallow the retry.
+			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"ok":    false,
 				"error": "upgrade_failed",
@@ -646,6 +670,8 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 		if upgradeErr := h.handleSubscriptionCharged(ctx, c, event); upgradeErr != nil {
 			slog.Error("billing.webhook.subscription_charged.upgrade_failed",
 				"error", upgradeErr, "event_id", eventID)
+			// P4: release the claim on failure — see the activated branch.
+			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"ok":    false,
 				"error": "upgrade_failed",
@@ -668,23 +694,45 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 		span.SetAttributes(attribute.String("rzp.event.unhandled", "true"))
 	}
 
-	// Dispatch succeeded (no 500-return path was taken). Record the dedup
-	// row durably now so genuine replays of this same event are suppressed
-	// on subsequent deliveries. ON CONFLICT DO NOTHING keeps this safe under
-	// concurrent duplicate deliveries. A write failure here is fail-open —
-	// at worst a duplicate is re-processed, and the state machine is
-	// idempotent — which is strictly better than swallowing a real event.
-	if eventID != "" && h.db != nil {
-		if _, err := h.db.ExecContext(ctx,
-			`INSERT INTO razorpay_webhook_events (event_id, event_type) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING`,
-			eventID, event.Event,
-		); err != nil {
-			slog.Warn("billing.webhook.dedup_insert_failed", "error", err, "event_id", eventID)
-		}
-	}
+	// Dispatch succeeded (no 500-return path was taken). The dedup claim
+	// row inserted up-front (P4) is left in place so genuine replays of
+	// this same event are suppressed on subsequent deliveries. Nothing to
+	// write here — the claim already happened at the start of the handler.
 
 	// Always return 200 to Razorpay.
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{"ok": true})
+}
+
+// deleteRazorpayWebhookClaim releases the dedup claim row for eventID when
+// webhook processing failed and the handler is about to return HTTP 500.
+//
+// P4: the dedup row is now claimed ATOMICALLY at the start of
+// RazorpayWebhook (INSERT … ON CONFLICT DO NOTHING). If processing then
+// fails, the claim must be released so Razorpay's retry can re-claim and
+// re-process the event — otherwise the up-front claim would permanently
+// swallow a paying customer's upgrade. This is the mechanism that
+// preserves Wave-3's "a failed event retries" intent under the new
+// race-free claim model.
+//
+// Only deletes when claimedHere is true — i.e. THIS request actually
+// inserted the row. If the claim INSERT itself failed (fail-open) or a
+// concurrent delivery owned the row, claimedHere is false and we must NOT
+// delete: that row belongs to another in-flight delivery, and deleting it
+// would re-open the very TOCTOU window this fix closes.
+//
+// Best-effort: a delete failure is logged at WARN. Worst case the event is
+// not retried until Razorpay's own redelivery schedule or the billing
+// reconciler corrects the tier — strictly better than a wrong delete.
+func (h *BillingHandler) deleteRazorpayWebhookClaim(ctx context.Context, eventID string, claimedHere bool) {
+	if !claimedHere || eventID == "" || h.db == nil {
+		return
+	}
+	if _, err := h.db.ExecContext(ctx,
+		`DELETE FROM razorpay_webhook_events WHERE event_id = $1`,
+		eventID,
+	); err != nil {
+		slog.Warn("billing.webhook.dedup_claim_release_failed", "error", err, "event_id", eventID)
+	}
 }
 
 // verifyRazorpaySignature checks HMAC-SHA256(key=secret, msg=rawBody) == signature.
