@@ -209,7 +209,15 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 	}
 
 	if limitExceeded {
-		existing, err := models.GetActiveResourceByFingerprintType(ctx, h.db, fp, "webhook")
+		existing, err := models.GetActiveResourceByFingerprintType(ctx, h.db, fp, "webhook", env)
+		if err != nil {
+			// P1-A: cross-service daily-cap fallback — see db.go for rationale.
+			if _, anyErr := models.GetActiveResourceByFingerprint(ctx, h.db, fp, env); anyErr == nil {
+				metrics.FingerprintAbuseBlocked.Inc()
+				return respondError(c, fiber.StatusTooManyRequests, "provision_limit_reached",
+					"Daily anonymous provisioning limit reached for this network. Sign up at "+urls.StartURLPrefix)
+			}
+		}
 		if err == nil {
 			jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "webhook", []string{existing.Token.String()})
 			if jwtErr == nil && jti != "" {
@@ -469,6 +477,16 @@ func (h *WebhookHandler) Receive(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusGone, "webhook_inactive", "This webhook token is no longer active")
 	}
 
+	// P1-C: reject an expired webhook. The status check above only catches
+	// rows the worker has already swept; an anonymous webhook past its 24h TTL
+	// can still be status='active' until the next worker tick. Each Receive
+	// re-extends the Redis-list TTL, so without this check an expired webhook
+	// keeps accepting (and persisting) payloads indefinitely.
+	if resource.ExpiresAt.Valid && resource.ExpiresAt.Time.Before(time.Now()) {
+		return respondError(c, fiber.StatusGone, "webhook_expired",
+			"This webhook token has expired. Sign up to keep your webhook alive.")
+	}
+
 	// ── Body size enforcement ───────────────────────────────────────────────
 	// c.Body() returns the buffered body from fasthttp. We check length BEFORE
 	// reading further so a 1.5MiB body is rejected with 413 instead of being
@@ -717,6 +735,14 @@ func (h *WebhookHandler) ListRequests(c *fiber.Ctx) error {
 		slog.Error("webhook.list_requests.lookup_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
 		return respondError(c, fiber.StatusServiceUnavailable, "lookup_failed", "Failed to look up webhook")
+	}
+
+	// P1-C: reject an expired webhook for consistency with Receive — an expired
+	// anonymous webhook's stored requests are about to be swept by the worker;
+	// don't serve them as if the resource were still live.
+	if resource.ExpiresAt.Valid && resource.ExpiresAt.Time.Before(time.Now()) {
+		return respondError(c, fiber.StatusGone, "webhook_expired",
+			"This webhook token has expired. Sign up to keep your webhook alive.")
 	}
 
 	// Authorization: token in the URL IS the credential (token == resource.Token).

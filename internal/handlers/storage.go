@@ -120,7 +120,15 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 	}
 
 	if limitExceeded {
-		existing, err := models.GetActiveResourceByFingerprintType(ctx, h.db, fp, "storage")
+		existing, err := models.GetActiveResourceByFingerprintType(ctx, h.db, fp, "storage", env)
+		if err != nil {
+			// P1-A: cross-service daily-cap fallback — see db.go for rationale.
+			if _, anyErr := models.GetActiveResourceByFingerprint(ctx, h.db, fp, env); anyErr == nil {
+				metrics.FingerprintAbuseBlocked.Inc()
+				return respondError(c, fiber.StatusTooManyRequests, "provision_limit_reached",
+					"Daily anonymous provisioning limit reached for this network. Sign up at "+urls.StartURLPrefix)
+			}
+		}
 		if err == nil {
 			jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "storage", []string{existing.Token.String()})
 			if jwtErr == nil && jti != "" {
@@ -157,6 +165,27 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 	// Free-tier recycle gate (see provision_helper.go for rationale).
 	if h.recycleGate(c, fp, "storage") {
 		return nil
+	}
+
+	// P1-B: enforce the anonymous-tier storage byte cap. The authenticated path
+	// (newStorageAuthenticated) sums SumStorageBytesByTeamAndType vs the tier
+	// limit; the anonymous path previously had NO byte check, so the advertised
+	// anonymous cap (e.g. 10MB) was unenforced. Scope the sum to the fingerprint
+	// (anonymous rows have no team). storage_bytes is worker-populated, so this
+	// cap lags real usage by one scanner tick — acceptable for the abuse-defense
+	// goal. Fails open on a sum error (CLAUDE.md #1).
+	anonStorageLimitMB := h.plans.StorageLimitMB("anonymous", "storage")
+	if anonStorageLimitMB > 0 {
+		usedBytes, quotaErr := models.SumStorageBytesByFingerprintAndType(ctx, h.db, fp, "storage")
+		if quotaErr != nil {
+			slog.Error("storage.new.anon_quota_check_failed", "error", quotaErr, "fingerprint", fp, "request_id", requestID)
+			// Fail open — quota check error never blocks provisioning.
+		} else if usedBytes >= int64(anonStorageLimitMB)*1024*1024 {
+			return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired, "storage_limit_reached",
+				fmt.Sprintf("Anonymous storage limit reached (%dMB). Sign up for a paid plan to continue.", anonStorageLimitMB),
+				newAgentActionStorageLimitReached("anonymous", anonStorageLimitMB),
+				DefaultPricingURL)
+		}
 	}
 
 	expiresAt := time.Now().UTC().Add(24 * time.Hour)

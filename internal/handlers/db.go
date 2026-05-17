@@ -135,7 +135,19 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 	}
 
 	if limitExceeded {
-		existing, err := models.GetActiveResourceByFingerprintType(ctx, h.db, fp, "postgres")
+		existing, err := models.GetActiveResourceByFingerprintType(ctx, h.db, fp, "postgres", env)
+		if err != nil {
+			// P1-A: no same-type resource for this fingerprint+env. Before
+			// provisioning fresh — which would let an abuser mint 5/day per
+			// service type and bypass the daily cap (CLAUDE.md #6) — fall
+			// back to a cross-service check. If ANY anonymous resource exists
+			// for this fingerprint+env, the cap is genuinely spent: reject 429.
+			if _, anyErr := models.GetActiveResourceByFingerprint(ctx, h.db, fp, env); anyErr == nil {
+				metrics.FingerprintAbuseBlocked.Inc()
+				return respondError(c, fiber.StatusTooManyRequests, "provision_limit_reached",
+					"Daily anonymous provisioning limit reached for this network. Sign up at "+urls.StartURLPrefix)
+			}
+		}
 		if err == nil {
 			jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "postgres", []string{existing.Token.String()})
 			if jwtErr == nil && jti != "" {

@@ -102,11 +102,8 @@ func TestACLAllowlist_NoPlusAtAll(t *testing.T) {
 	require.NoError(t, err)
 
 	// Inspect the ACL entry for the provisioned user via ACL GETUSER.
-	short := token
-	if len(short) > 8 {
-		short = short[:8]
-	}
-	username := "usr_" + short
+	// P1-E: the username uses the FULL token (no 8-char truncation).
+	username := "usr_" + token
 
 	result, aclErr := rdb.Do(context.Background(), "ACL", "GETUSER", username).Result()
 	if aclErr != nil {

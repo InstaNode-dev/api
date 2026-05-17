@@ -119,7 +119,15 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 	}
 
 	if limitExceeded {
-		existing, err := models.GetActiveResourceByFingerprintType(ctx, h.db, fp, "mongodb")
+		existing, err := models.GetActiveResourceByFingerprintType(ctx, h.db, fp, "mongodb", env)
+		if err != nil {
+			// P1-A: cross-service daily-cap fallback — see db.go for rationale.
+			if _, anyErr := models.GetActiveResourceByFingerprint(ctx, h.db, fp, env); anyErr == nil {
+				metrics.FingerprintAbuseBlocked.Inc()
+				return respondError(c, fiber.StatusTooManyRequests, "provision_limit_reached",
+					"Daily anonymous provisioning limit reached for this network. Sign up at "+urls.StartURLPrefix)
+			}
+		}
 		if err == nil {
 			jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "mongodb", []string{existing.Token.String()})
 			if jwtErr == nil && jti != "" {
@@ -408,8 +416,16 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 		"tier":           tier,
 		"env":            resource.Env,
 		"limits": fiber.Map{
-			"storage_mb":  nosqlAuthStorageLimitMB,
-			"connections": h.plans.ConnectionsLimit(tier, "mongodb"),
+			"storage_mb": nosqlAuthStorageLimitMB,
+			// P1-D (2026-05-17): MongoDB has no per-user connection cap and the
+			// platform enforces none — advertising connections as a per-token
+			// guarantee was a false promise. Surface it as informational only,
+			// mirroring nosqlAnonymousLimits' connections_note: the figure is the
+			// nominal tier allowance, but the underlying MongoDB pod is
+			// shared-tenant, so the real ceiling is your share of the pod's
+			// pool, not an enforced per-token limit.
+			"connections_informational": h.plans.ConnectionsLimit(tier, "mongodb"),
+			"connections_note":          "informational only — MongoDB connections are a shared pod-wide pool, not an enforced per-token cap",
 		},
 	}
 	setInternalURL(nosqlAuthResp, tier, creds.URL, "mongodb")

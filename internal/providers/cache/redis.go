@@ -60,10 +60,37 @@ var aclAllowlist = []interface{}{
 	"-keys",         // KEYS — O(N) cross-tenant key scan; tenants must use SCAN
 }
 
+// aclUsernamePrefix is the fixed prefix for every ACL user this backend creates.
+const aclUsernamePrefix = "usr_"
+
+// legacyACLUsernameTokenLen is the 8-char token slice the OLD (pre-P1-E)
+// implementation used to derive the ACL username. Retained only so a Redis
+// user created under the old scheme can still be located and deleted.
+const legacyACLUsernameTokenLen = 8
+
+// aclUsername derives the ACL username for a resource token. It uses the FULL
+// token (P1-E) so two tokens sharing a common prefix never collide on one ACL
+// user — the key-prefix already uses the full token, and the username now
+// matches it.
+func aclUsername(token string) string {
+	return aclUsernamePrefix + token
+}
+
+// legacyACLUsername reproduces the pre-P1-E username derivation (token[:8]).
+// A Deprovision path should try aclUsername(token) first, then fall back to
+// this so a user created under the old truncated scheme is still deletable.
+func legacyACLUsername(token string) string {
+	short := token
+	if len(short) > legacyACLUsernameTokenLen {
+		short = short[:legacyACLUsernameTokenLen]
+	}
+	return aclUsernamePrefix + short
+}
+
 // Credentials holds the Redis connection details returned after provisioning.
 type Credentials struct {
 	// URL is the redis:// connection string the caller can use immediately.
-	// For local backend with ACL: redis://usr_{short}:{password}@{host}:6379/0
+	// For local backend with ACL: redis://usr_{token}:{password}@{host}:6379/0
 	// For local backend without ACL: redis://{host}:6379/0
 	URL string
 
@@ -119,11 +146,12 @@ func (p *Provider) provisionLocal(ctx context.Context, token string) (*Credentia
 	if p.rdb == nil {
 		return nil, fmt.Errorf("cache.provisionLocal: %w", errNilRedisClient)
 	}
-	short := token
-	if len(short) > 8 {
-		short = short[:8]
-	}
-	username := fmt.Sprintf("usr_%s", short)
+	// P1-E (2026-05-17): the ACL username must use the FULL token. A previous
+	// implementation truncated to token[:8], so two tokens sharing 8 hex
+	// characters collided on one ACL user — the second SETUSER silently
+	// overwrote the first's password/keyspace grant. The key-prefix already
+	// uses the full token; the username now matches it for true isolation.
+	username := aclUsername(token)
 	keyPrefix := fmt.Sprintf("%s:", token)
 
 	// Generate a random password for the ACL user.

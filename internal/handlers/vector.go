@@ -258,7 +258,15 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 	}
 
 	if limitExceeded {
-		existing, lookupErr := models.GetActiveResourceByFingerprintType(ctx, h.db, fp, models.ResourceTypeVector)
+		existing, lookupErr := models.GetActiveResourceByFingerprintType(ctx, h.db, fp, models.ResourceTypeVector, env)
+		if lookupErr != nil {
+			// P1-A: cross-service daily-cap fallback — see db.go for rationale.
+			if _, anyErr := models.GetActiveResourceByFingerprint(ctx, h.db, fp, env); anyErr == nil {
+				metrics.FingerprintAbuseBlocked.Inc()
+				return respondError(c, fiber.StatusTooManyRequests, "provision_limit_reached",
+					"Daily anonymous provisioning limit reached for this network. Sign up at "+urls.StartURLPrefix)
+			}
+		}
 		if lookupErr == nil {
 			jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, models.ResourceTypeVector, []string{existing.Token.String()})
 			if jwtErr == nil && jti != "" {

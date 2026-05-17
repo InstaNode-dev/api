@@ -241,21 +241,29 @@ func GetResourceByToken(ctx context.Context, db *sql.DB, token uuid.UUID) (*Reso
 }
 
 // GetActiveResourceByFingerprintType finds the most recent active anonymous resource
-// of a specific type (e.g. "postgres", "redis", "mongodb") for a fingerprint.
-// Used by Phase 2+ handlers when the rate-limit is hit to return the existing resource.
-// Anonymous resources are always env=production — there is no env switch on the
-// dedup path, since anonymous callers don't pick an env.
-func GetActiveResourceByFingerprintType(ctx context.Context, db *sql.DB, fingerprint, resourceType string) (*Resource, error) {
+// of a specific type (e.g. "postgres", "redis", "mongodb") for a fingerprint AND
+// environment. Used by Phase 2+ handlers when the rate-limit is hit to return the
+// existing resource.
+//
+// The env filter (added P1-A 2026-05-17) prevents the dedup path from leaking a
+// `production` resource to a caller that resolved to `development` — defeats
+// migration 026 / CLAUDE.md convention #11 if omitted. Empty env is normalised to
+// EnvDefault so callers stay consistent with CreateResource.
+func GetActiveResourceByFingerprintType(ctx context.Context, db *sql.DB, fingerprint, resourceType, env string) (*Resource, error) {
+	if env == "" {
+		env = EnvDefault
+	}
 	row := db.QueryRowContext(ctx, `
 		SELECT `+resourceColumns+`
 		FROM resources
 		WHERE fingerprint = $1
 		  AND team_id IS NULL
 		  AND resource_type = $2
+		  AND env = $3
 		  AND status = 'active'
 		ORDER BY created_at DESC
 		LIMIT 1
-	`, fingerprint, resourceType)
+	`, fingerprint, resourceType, env)
 
 	r, err := scanResource(row)
 	if err == sql.ErrNoRows {
@@ -263,6 +271,37 @@ func GetActiveResourceByFingerprintType(ctx context.Context, db *sql.DB, fingerp
 	}
 	if err != nil {
 		return nil, fmt.Errorf("models.GetActiveResourceByFingerprintType: %w", err)
+	}
+	return r, nil
+}
+
+// GetActiveResourceByFingerprint finds the most recent active anonymous resource of
+// ANY type for a fingerprint+env. This is the cross-service fallback for the
+// daily-cap dedup path (P1-A 2026-05-17): when the per-fingerprint provision cap
+// (CLAUDE.md convention #6) is hit and no same-type resource exists, returning the
+// most recent resource of any type keeps the abuser from minting a fresh resource
+// for every new service type. Empty env is normalised to EnvDefault.
+func GetActiveResourceByFingerprint(ctx context.Context, db *sql.DB, fingerprint, env string) (*Resource, error) {
+	if env == "" {
+		env = EnvDefault
+	}
+	row := db.QueryRowContext(ctx, `
+		SELECT `+resourceColumns+`
+		FROM resources
+		WHERE fingerprint = $1
+		  AND team_id IS NULL
+		  AND env = $2
+		  AND status = 'active'
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, fingerprint, env)
+
+	r, err := scanResource(row)
+	if err == sql.ErrNoRows {
+		return nil, &ErrResourceNotFound{Token: fingerprint}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("models.GetActiveResourceByFingerprint: %w", err)
 	}
 	return r, nil
 }
@@ -592,6 +631,30 @@ func SumStorageBytesByTeamAndType(ctx context.Context, db *sql.DB, teamID uuid.U
 	).Scan(&total)
 	if err != nil {
 		return 0, fmt.Errorf("models.SumStorageBytesByTeamAndType: %w", err)
+	}
+	return total, nil
+}
+
+// SumStorageBytesByFingerprintAndType returns total storage_bytes for active or
+// paused anonymous resources (team_id IS NULL) of a given type for a fingerprint.
+// This is the anonymous-tier analogue of SumStorageBytesByTeamAndType (P1-B
+// 2026-05-17): the anonymous storage byte cap (e.g. 10MB) has to be summed across
+// a fingerprint's rows since there is no team to scope to. storage_bytes is
+// populated by the worker's object-store scanner; on a brand-new bucket it is 0
+// until the first scan, so this cap lags real usage by one worker tick.
+func SumStorageBytesByFingerprintAndType(ctx context.Context, db *sql.DB, fingerprint, resourceType string) (int64, error) {
+	var total int64
+	err := db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(storage_bytes), 0)
+		   FROM resources
+		  WHERE fingerprint = $1
+		    AND team_id IS NULL
+		    AND resource_type = $2
+		    AND status IN ('active', 'paused')`,
+		fingerprint, resourceType,
+	).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("models.SumStorageBytesByFingerprintAndType: %w", err)
 	}
 	return total, nil
 }
