@@ -143,10 +143,30 @@ func NewWebhookHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, p *pla
 }
 
 // receiveURL builds the public receive URL for a given token.
-// baseURL should be c.BaseURL() so local dev gets http://localhost:30080 and
-// production gets https://instant.dev automatically.
+// baseURL must be a fixed, server-controlled value — see webhookReceiveBaseURL.
 func receiveURL(baseURL, token string) string {
 	return fmt.Sprintf("%s/webhook/receive/%s", baseURL, token)
+}
+
+// webhookReceiveBaseURL returns the canonical base URL for receive URLs.
+//
+// The receive URL is encrypted and persisted (connection_url), so it MUST NOT
+// be derived from the client-controllable Host / X-Forwarded-* headers —
+// middleware/auth.go documents the same rule for the audience canonical URL.
+// An attacker who controls those headers on the provisioning request could
+// otherwise pin every future receiver to a host they own.
+//
+// Resolution: API_PUBLIC_URL when configured (production), else the compiled-in
+// public API base. Only in non-production environments do we fall back to
+// c.BaseURL() so local dev (http://localhost:8080) keeps working.
+func (h *WebhookHandler) webhookReceiveBaseURL(c *fiber.Ctx) string {
+	if h.cfg != nil && h.cfg.APIPublicURL != "" {
+		return h.cfg.APIPublicURL
+	}
+	if h.cfg != nil && h.cfg.Environment != "production" {
+		return c.BaseURL()
+	}
+	return urls.PublicAPIBase
 }
 
 // webhookRedisKey returns the per-request Redis key.
@@ -284,8 +304,9 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 	}
 	tokenStr = resource.Token.String()
 
-	// Build the receive URL and encrypt it for storage.
-	rURL := receiveURL(c.BaseURL(), tokenStr)
+	// Build the receive URL and encrypt it for storage. The base is a fixed
+	// server-controlled value — never the client Host header.
+	rURL := receiveURL(h.webhookReceiveBaseURL(c), tokenStr)
 	provCtx, span := h.startProvisionSpan(ctx, "webhook", "anonymous", "", fp, tokenStr)
 	keyErr := h.storeEncryptedURL(provCtx, resource.ID, rURL, requestID)
 	finishProvisionSpan(span, keyErr)
@@ -389,7 +410,7 @@ func (h *WebhookHandler) newWebhookAuthenticated(
 	})
 
 	tokenStr := resource.Token.String()
-	rURL := receiveURL(c.BaseURL(), tokenStr)
+	rURL := receiveURL(h.webhookReceiveBaseURL(c), tokenStr)
 
 	provCtx, span := h.startProvisionSpan(ctx, "webhook", team.PlanTier, teamIDStr, fp, tokenStr)
 	keyErr := h.storeEncryptedURL(provCtx, resource.ID, rURL, requestID)
@@ -475,6 +496,15 @@ func (h *WebhookHandler) Receive(c *fiber.Ctx) error {
 		slog.Error("webhook.receive.lookup_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
 		return respondError(c, fiber.StatusServiceUnavailable, "lookup_failed", "Failed to look up webhook")
+	}
+
+	// GetResourceByToken selects by token only — a postgres/redis/queue/etc
+	// token would pass. Reject anything that is not a webhook so the receiver
+	// can never be addressed with another service's token (404, same as a
+	// genuinely missing token — never confirm the token belongs to a
+	// different resource type).
+	if resource.ResourceType != models.ResourceTypeWebhook {
+		return respondError(c, fiber.StatusNotFound, "not_found", "Webhook token not found")
 	}
 
 	if resource.Status != "active" {
@@ -739,6 +769,13 @@ func (h *WebhookHandler) ListRequests(c *fiber.Ctx) error {
 		slog.Error("webhook.list_requests.lookup_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
 		return respondError(c, fiber.StatusServiceUnavailable, "lookup_failed", "Failed to look up webhook")
+	}
+
+	// GetResourceByToken selects by token only — reject any non-webhook
+	// resource so a postgres/redis/etc token cannot read this endpoint
+	// (404, mirroring Receive).
+	if resource.ResourceType != models.ResourceTypeWebhook {
+		return respondError(c, fiber.StatusNotFound, "not_found", "Webhook token not found")
 	}
 
 	// P1-C: reject an expired webhook for consistency with Receive — an expired

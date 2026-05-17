@@ -239,6 +239,53 @@ func TestWebhookReceive_Returns200AndStoresRequest(t *testing.T) {
 	assert.NotEmpty(t, recvBody.ID, "receive response must include request id")
 }
 
+// TestWebhookReceive_WrongResourceType_Returns404 is P2 bug-hunt coverage
+// (Fix #8, 2026-05-17 round 3). GetResourceByToken selects by token only —
+// before the fix a postgres/redis/etc token would pass the webhook receive +
+// list-requests handlers. Both must reject any non-webhook resource token
+// with 404 (same as a genuinely missing token — never confirm the token
+// belongs to a different resource type).
+func TestWebhookReceive_WrongResourceType_Returns404(t *testing.T) {
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
+	defer cleanRedis()
+
+	app, cleanApp := testhelpers.NewTestAppWithServices(t, db, rdb, "postgres,redis,mongodb,queue,webhook,storage")
+	defer cleanApp()
+
+	// Create a POSTGRES resource directly — its token is a valid UUID but
+	// the resource is not a webhook.
+	pgRes, err := models.CreateResource(context.Background(), db, models.CreateResourceParams{
+		ResourceType: models.ResourceTypePostgres,
+		Name:         "wrong-type-pg",
+		Tier:         "anonymous",
+		Fingerprint:  "fp-wrong-type-" + uuid.NewString(),
+	})
+	require.NoError(t, err)
+	token := pgRes.Token.String()
+
+	// POST /webhook/receive/:token with a postgres token must 404.
+	recvReq := httptest.NewRequest(http.MethodPost, "/webhook/receive/"+token,
+		strings.NewReader(`{"x":1}`))
+	recvReq.Header.Set("Content-Type", "application/json")
+	recvResp, err := app.Test(recvReq, 5000)
+	require.NoError(t, err)
+	io.Copy(io.Discard, recvResp.Body)
+	recvResp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, recvResp.StatusCode,
+		"receive must reject a non-webhook token with 404")
+
+	// GET /api/v1/webhooks/:token/requests with a postgres token must 404.
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/webhooks/"+token+"/requests", nil)
+	listResp, err := app.Test(listReq, 5000)
+	require.NoError(t, err)
+	io.Copy(io.Discard, listResp.Body)
+	listResp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, listResp.StatusCode,
+		"list-requests must reject a non-webhook token with 404")
+}
+
 // TestWebhookReceive_UnknownToken_Returns404 verifies that posting to an unknown token
 // returns 404, not a 500.
 func TestWebhookReceive_UnknownToken_Returns404(t *testing.T) {

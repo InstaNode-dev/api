@@ -135,6 +135,16 @@ var (
 		Help: "Queue provision attempts rejected by per-tier queue_count cap",
 	}, []string{"team_tier"})
 
+	// DeployTeardownMarkFailed counts teardown-reconciler sweeps where the
+	// compute was destroyed but MarkDeploymentTornDown failed to flip the
+	// row to 'deleted'. The row is then retried forever — a persistently
+	// non-zero rate() means a deployment is stuck and on-call must
+	// investigate (DB connectivity / constraint rejection).
+	DeployTeardownMarkFailed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_deploy_teardown_mark_failed_total",
+		Help: "Teardown sweeps where compute was destroyed but the row could not be marked 'deleted'",
+	})
+
 	// GoroutinePanics counts panics recovered inside fire-and-forget
 	// goroutines by the safego helper. Any non-zero value means a background
 	// task crashed but the pod survived — alert on rate() > 0. The `task`

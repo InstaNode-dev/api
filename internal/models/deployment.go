@@ -708,6 +708,24 @@ const DeployStatusExpired = "expired"
 // and is never re-processed by the teardown reconciler.
 const DeployStatusDeleted = "deleted"
 
+// DeployStatusStopped is the status of a user-paused deployment — the pod is
+// scaled to zero so it consumes no compute and occupies no tier slot.
+const DeployStatusStopped = "stopped"
+
+// IsDeploymentTerminal reports whether a deployment status is one a redeploy
+// must not resurrect: expired (24h TTL elapsed — teardown reconciler will reap
+// it), deleted (compute torn down), or stopped (user-paused). Redeploying any
+// of these would resurrect an over-TTL / over-cap workload, so POST
+// /deploy/:id/redeploy rejects them with 409.
+func IsDeploymentTerminal(status string) bool {
+	switch status {
+	case DeployStatusExpired, DeployStatusDeleted, DeployStatusStopped:
+		return true
+	default:
+		return false
+	}
+}
+
 // Live deployment statuses — the only states in which a deployment runs a
 // pod and therefore occupies a billable tier slot. Any status NOT in this
 // set (failed / stopped / expired / deleted) consumes no compute and frees

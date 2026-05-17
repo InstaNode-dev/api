@@ -47,6 +47,7 @@ import (
 	"log/slog"
 	"time"
 
+	"instant.dev/internal/metrics"
 	"instant.dev/internal/models"
 	"instant.dev/internal/safego"
 )
@@ -134,6 +135,11 @@ func (h *DeployHandler) RunTeardownSweep(ctx context.Context) {
 		if markErr != nil {
 			slog.Error("deploy.teardown_reconciler.mark_failed",
 				"deploy_id", d.ID, "app_id", d.AppID, "error", markErr)
+			// The compute is already gone but the row is still 'expired',
+			// so the next sweep re-selects it and retries forever. Surface
+			// that on a counter so a stuck row is alertable in NR instead
+			// of being a silent log line.
+			metrics.DeployTeardownMarkFailed.Inc()
 			failed++
 			continue
 		}

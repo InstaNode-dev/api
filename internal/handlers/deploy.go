@@ -50,6 +50,12 @@ import (
 // "agent locks the staging app to the office IP", not corporate networking.
 const maxAllowedIPs = 32
 
+// errCodeDeploymentNotRedeployable is the error code returned by POST
+// /deploy/:id/redeploy when the deployment is in a terminal status
+// (expired / deleted / stopped). Redeploying such a row would resurrect an
+// over-TTL or over-cap workload — mirrors the stackStatusDeleting 409 guard.
+const errCodeDeploymentNotRedeployable = "deployment_not_redeployable"
+
 // deployNameEnvKey is the env_vars JSONB key under which a deployment's
 // human-readable name is stashed (there is no dedicated DB column). It is
 // PLATFORM METADATA, not an application env var.
@@ -1164,6 +1170,16 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 	if d.ProviderID == "" {
 		return respondError(c, fiber.StatusConflict, "not_ready",
 			"Deployment has no provider ID yet — initial deploy may still be building")
+	}
+
+	// A deployment in a terminal status (expired / deleted / stopped) must
+	// not be redeployed — flipping it back to 'building' would resurrect an
+	// over-TTL or over-cap workload. 409 mirrors the stackStatusDeleting
+	// guard in stack.go: the request is valid but the resource is no longer
+	// in a redeployable state.
+	if models.IsDeploymentTerminal(d.Status) {
+		return respondError(c, fiber.StatusConflict, errCodeDeploymentNotRedeployable,
+			"This deployment is "+d.Status+" and can no longer be redeployed. Create a new deployment instead.")
 	}
 
 	// Parse multipart form (max 50 MB).
