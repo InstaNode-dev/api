@@ -86,7 +86,7 @@ func callCapabilities(t *testing.T, app *fiber.App) (int, capabilitiesResp) {
 
 // TestCapabilities_IteratesPlansYAML — the core W12 contract. Loads a
 // fixture registry containing 7 known monthly tiers (anonymous, free,
-// hobby, hobby_plus, growth, pro, team) PLUS one synthetic unranked tier.
+// hobby, hobby_plus, pro, growth, team) PLUS one synthetic unranked tier.
 // The handler must:
 //
 //  1. Surface all 7 known tiers (zero-config — no hardcoded slice).
@@ -111,7 +111,7 @@ func TestCapabilities_IteratesPlansYAML(t *testing.T) {
 
 	// Expected: 7 known monthly tiers in rank order. The unranked
 	// "test_tier" entry in the fixture must be dropped.
-	wantOrder := []string{"anonymous", "free", "hobby", "hobby_plus", "growth", "pro", "team"}
+	wantOrder := []string{"anonymous", "free", "hobby", "hobby_plus", "pro", "growth", "team"}
 	require.Len(t, body.Tiers, len(wantOrder),
 		"expected %d tiers (unranked test_tier should be dropped), got %d: %v",
 		len(wantOrder), len(body.Tiers), tierNames(body.Tiers))
@@ -228,7 +228,7 @@ func TestCapabilities_SkipsYearlyVariants(t *testing.T) {
 	}
 
 	// And the canonical tiers ARE present in the expected rank order.
-	wantOrder := []string{"anonymous", "free", "hobby", "hobby_plus", "growth", "pro", "team"}
+	wantOrder := []string{"anonymous", "free", "hobby", "hobby_plus", "pro", "growth", "team"}
 	require.Len(t, body.Tiers, len(wantOrder),
 		"plans.Default() should produce %d monthly tiers, got %d (%v)",
 		len(wantOrder), len(body.Tiers), tierNames(body.Tiers))
