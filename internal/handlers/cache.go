@@ -19,12 +19,13 @@ import (
 	"instant.dev/internal/crypto"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
-	"instant.dev/internal/urls"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
-	"instant.dev/internal/provisioner"
 	cacheprovider "instant.dev/internal/providers/cache"
+	"instant.dev/internal/provisioner"
 	"instant.dev/internal/quota"
+	"instant.dev/internal/safego"
+	"instant.dev/internal/urls"
 )
 
 // CacheHandler handles POST /cache/new — Redis provisioning.
@@ -356,7 +357,7 @@ func (h *CacheHandler) newCacheAuthenticated(
 	}
 
 	// Best-effort audit event; failures must never block the provision.
-	go func() {
+	safego.Go("cache.bg", func() {
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:       teamUUID,
 			Actor:        "agent",
@@ -365,7 +366,7 @@ func (h *CacheHandler) newCacheAuthenticated(
 			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
 			Summary:      "agent provisioned <strong>redis</strong> <code>" + resource.Token.String()[:8] + "</code>",
 		})
-	}()
+	})
 
 	tokenStr := resource.Token.String()
 
@@ -541,7 +542,7 @@ func (h *CacheHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 		return TwinProvisionResult{}, twinCoreErr("Failed to record twin resource")
 	}
 
-	go func() {
+	safego.Go("cache.bg", func() {
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:       in.TeamID,
 			Actor:        "agent",
@@ -551,7 +552,7 @@ func (h *CacheHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 			Summary: "agent provisioned <strong>redis</strong> twin <code>" +
 				resource.Token.String()[:8] + "</code> in env=<code>" + in.Env + "</code>",
 		})
-	}()
+	})
 
 	tokenStr := resource.Token.String()
 	provStart := time.Now()

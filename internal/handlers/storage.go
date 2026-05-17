@@ -38,10 +38,11 @@ import (
 	"instant.dev/internal/crypto"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
-	"instant.dev/internal/urls"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
 	storageprovider "instant.dev/internal/providers/storage"
+	"instant.dev/internal/safego"
+	"instant.dev/internal/urls"
 )
 
 // StorageHandler handles POST /storage/new — R2 storage provisioning.
@@ -346,7 +347,7 @@ func (h *StorageHandler) newStorageAuthenticated(
 	}
 
 	// Best-effort audit event; failures must never block the provision.
-	go func() {
+	safego.Go("storage.bg", func() {
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:       teamUUID,
 			Actor:        "agent",
@@ -355,7 +356,7 @@ func (h *StorageHandler) newStorageAuthenticated(
 			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
 			Summary:      "agent provisioned <strong>storage</strong> <code>" + resource.Token.String()[:8] + "</code>",
 		})
-	}()
+	})
 
 	tokenStr := resource.Token.String()
 
@@ -409,17 +410,19 @@ func (h *StorageHandler) newStorageAuthenticated(
 	// per-tenant keys; shared-key mode reuses the master across all
 	// customers and the kind would be misleading.
 	if h.storageProvider != nil && h.storageProvider.Backend() == storageprovider.BackendMinIOAdmin {
-		go func(rid uuid.UUID, accessKey string) {
-			_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
-				TeamID:       teamUUID,
-				Actor:        "system",
-				Kind:         models.AuditKindStorageIAMUserCreated,
-				ResourceType: "storage",
-				ResourceID:   uuid.NullUUID{UUID: rid, Valid: true},
-				Summary: "minted per-tenant storage key <code>" +
-					accessKey + "</code> for prefix <code>" + creds.Prefix + "</code>",
-			})
-		}(resource.ID, creds.AccessKeyID)
+		safego.Go("storage.iam_audit", func() {
+			(func(rid uuid.UUID, accessKey string) {
+				_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+					TeamID:       teamUUID,
+					Actor:        "system",
+					Kind:         models.AuditKindStorageIAMUserCreated,
+					ResourceType: "storage",
+					ResourceID:   uuid.NullUUID{UUID: rid, Valid: true},
+					Summary: "minted per-tenant storage key <code>" +
+						accessKey + "</code> for prefix <code>" + creds.Prefix + "</code>",
+				})
+			})(resource.ID, creds.AccessKeyID)
+		})
 	}
 
 	return respondCreated(c, fiber.Map{

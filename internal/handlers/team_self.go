@@ -15,6 +15,7 @@ import (
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
+	"instant.dev/internal/safego"
 )
 
 // TeamSelfHandler — GET / PATCH /api/v1/team.
@@ -38,11 +39,11 @@ func NewTeamSelfHandler(db *sql.DB, p *plans.Registry) *TeamSelfHandler {
 
 // teamSelfResponse is the public shape returned from GET / PATCH.
 type teamSelfResponse struct {
-	ID                     string `json:"id"`
-	Name                   string `json:"name"`
-	PlanTier               string `json:"plan_tier"`
-	HasActiveSubscription  bool   `json:"has_active_subscription"`
-	CreatedAt              string `json:"created_at"`
+	ID                    string `json:"id"`
+	Name                  string `json:"name"`
+	PlanTier              string `json:"plan_tier"`
+	HasActiveSubscription bool   `json:"has_active_subscription"`
+	CreatedAt             string `json:"created_at"`
 }
 
 func toTeamSelfResponse(t *models.Team) teamSelfResponse {
@@ -127,7 +128,7 @@ func updateTeamName(ctx context.Context, db *sql.DB, teamID uuid.UUID, name stri
 
 func emitTeamUpdatedAudit(c *fiber.Ctx, db *sql.DB, teamID uuid.UUID, newName string) {
 	meta, _ := json.Marshal(map[string]any{"field": "name", "new_value": newName})
-	go func() {
+	safego.Go("team_self.bg", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		if err := models.InsertAuditEvent(ctx, db, models.AuditEvent{
@@ -138,5 +139,5 @@ func emitTeamUpdatedAudit(c *fiber.Ctx, db *sql.DB, teamID uuid.UUID, newName st
 		}); err != nil {
 			slog.Warn("audit.team_updated.insert_failed", "error", err, "team_id", teamID)
 		}
-	}()
+	})
 }

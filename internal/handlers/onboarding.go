@@ -20,6 +20,7 @@ import (
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
+	"instant.dev/internal/safego"
 )
 
 // OnboardingHandler handles the anonymous-to-registered conversion flow.
@@ -449,7 +450,7 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 	// Best-effort audit emit — feeds the Loops forwarder for the welcome
 	// email. Fails open: a Loops miss must NEVER fail an otherwise-successful
 	// claim. Detached context so the goroutine outlives the request cycle.
-	go emitOnboardingClaimedAudit(h.db, team.ID, newUser.ID, len(claimedIDs), body.Email)
+	safego.Go("onboarding.claimed_audit", func() { emitOnboardingClaimedAudit(h.db, team.ID, newUser.ID, len(claimedIDs), body.Email) })
 
 	resp := fiber.Map{
 		"ok":      true,

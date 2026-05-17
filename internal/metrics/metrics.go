@@ -134,6 +134,15 @@ var (
 		Name: "instant_queue_provision_limit_blocked_total",
 		Help: "Queue provision attempts rejected by per-tier queue_count cap",
 	}, []string{"team_tier"})
+
+	// GoroutinePanics counts panics recovered inside fire-and-forget
+	// goroutines by the safego helper. Any non-zero value means a background
+	// task crashed but the pod survived — alert on rate() > 0. The `task`
+	// label is the caller-supplied name of the goroutine (e.g. "runDeploy").
+	GoroutinePanics = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_goroutine_panics_total",
+		Help: "Panics recovered in fire-and-forget goroutines by the safego helper",
+	}, []string{"task"})
 )
 
 // StatusClass converts an HTTP status code to a label-safe class string.

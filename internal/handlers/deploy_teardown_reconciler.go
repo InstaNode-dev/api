@@ -48,6 +48,7 @@ import (
 	"time"
 
 	"instant.dev/internal/models"
+	"instant.dev/internal/safego"
 )
 
 // deployTeardownInterval is how often the api sweeps for expired-but-not-
@@ -70,7 +71,7 @@ const deployTeardownBatchLimit = 100
 // advance to 'deleted' — the sweep degrades gracefully rather than
 // blocking startup.
 func (h *DeployHandler) StartTeardownReconciler(ctx context.Context) {
-	go func() {
+	safego.Go("deploy.teardown_reconciler", func() {
 		// Recover so a panic in one sweep can never crash the api pod —
 		// fire-and-forget background goroutines must be panic-isolated
 		// (reliability rule: no unguarded fire-and-forget goroutines).
@@ -95,7 +96,7 @@ func (h *DeployHandler) StartTeardownReconciler(ctx context.Context) {
 				h.RunTeardownSweep(ctx)
 			}
 		}
-	}()
+	})
 }
 
 // RunTeardownSweep executes one teardown pass. Errors on individual rows are

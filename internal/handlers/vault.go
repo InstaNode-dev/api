@@ -43,6 +43,7 @@ import (
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
+	"instant.dev/internal/safego"
 )
 
 // vaultDefaultEnv is the env path segment treated as the default production environment.
@@ -59,17 +60,17 @@ const vaultMaxValueBytes = 1 << 20 // 1 MiB
 // vaultErrInternal / vaultErrInvalidBody / etc. — keep error codes as named consts
 // so callers can match on them and we don't sprinkle string literals through handlers.
 const (
-	vaultErrInvalidBody    = "invalid_body"
-	vaultErrInvalidKey     = "invalid_key"
-	vaultErrInvalidEnv     = "invalid_env"
-	vaultErrInvalidValue   = "invalid_value"
-	vaultErrUnauthorized   = "unauthorized"
-	vaultErrNotFound       = "not_found"
-	vaultErrInternal       = "internal_error"
-	vaultErrPersist        = "persist_failed"
-	vaultErrNotAvailable   = "vault_not_available"
-	vaultErrQuotaExceeded  = "vault_quota_exceeded"
-	vaultErrEnvNotAllowed  = "vault_env_not_allowed"
+	vaultErrInvalidBody   = "invalid_body"
+	vaultErrInvalidKey    = "invalid_key"
+	vaultErrInvalidEnv    = "invalid_env"
+	vaultErrInvalidValue  = "invalid_value"
+	vaultErrUnauthorized  = "unauthorized"
+	vaultErrNotFound      = "not_found"
+	vaultErrInternal      = "internal_error"
+	vaultErrPersist       = "persist_failed"
+	vaultErrNotAvailable  = "vault_not_available"
+	vaultErrQuotaExceeded = "vault_quota_exceeded"
+	vaultErrEnvNotAllowed = "vault_env_not_allowed"
 )
 
 // VaultHandler serves vault endpoints. All endpoints require an authenticated team.
@@ -204,7 +205,7 @@ func (h *VaultHandler) audit(c *fiber.Ctx, teamID uuid.UUID, userID uuid.NullUUI
 // kind is one of models.AuditKindVaultRead / AuditKindVaultWrite. operation
 // is one of "create" | "update" | "delete" | "" — empty for reads.
 func (h *VaultHandler) emitAuditEvent(teamID uuid.UUID, userID uuid.NullUUID, kind, env, key, operation string) {
-	go func() {
+	safego.Go("vault.bg", func() {
 		meta := map[string]string{
 			"env":      env,
 			"key_name": key,
@@ -236,7 +237,7 @@ func (h *VaultHandler) emitAuditEvent(teamID uuid.UUID, userID uuid.NullUUID, ki
 				"error", err,
 			)
 		}
-	}()
+	})
 }
 
 // PutSecret handles PUT /api/v1/vault/:env/:key.
@@ -396,7 +397,7 @@ func (h *VaultHandler) GetSecret(c *fiber.Ctx) error {
 	}
 
 	var (
-		secret *models.VaultSecret
+		secret   *models.VaultSecret
 		fetchErr error
 	)
 	if v := strings.TrimSpace(c.Query("version")); v != "" {

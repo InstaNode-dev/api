@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
+	"instant.dev/internal/safego"
 )
 
 // EnvPolicyHandler serves GET/PUT /api/v1/team/env-policy.
@@ -127,15 +128,17 @@ func (h *EnvPolicyHandler) Put(c *fiber.Ctx) error {
 	// detach from the request context (which the Fiber ctx pool recycles
 	// after Put returns) and use a fresh context.Background() so the
 	// goroutine doesn't dereference a stale ctx pointer.
-	go func(tid, uid uuid.UUID, actor string) {
-		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
-			TeamID:  tid,
-			UserID:  uuid.NullUUID{UUID: uid, Valid: true},
-			Actor:   actor,
-			Kind:    "env_policy.updated",
-			Summary: "Team env-policy updated",
-		})
-	}(teamID, userID, role)
+	safego.Go("env_policy.audit", func() {
+		(func(tid, uid uuid.UUID, actor string) {
+			_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+				TeamID:  tid,
+				UserID:  uuid.NullUUID{UUID: uid, Valid: true},
+				Actor:   actor,
+				Kind:    "env_policy.updated",
+				Summary: "Team env-policy updated",
+			})
+		})(teamID, userID, role)
+	})
 
 	return c.Status(http.StatusOK).JSON(fiber.Map{
 		"ok":     true,

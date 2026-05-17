@@ -56,6 +56,7 @@ import (
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
+	"instant.dev/internal/safego"
 )
 
 // githubMaxDeploysPerHour is the per-repo rate-limit cap. A connection that
@@ -119,9 +120,9 @@ type connectGitHubBody struct {
 //
 // Response: { ok, connection: {...}, webhook_url, webhook_secret }.
 //   - webhook_url    is "https://<host>/webhooks/github/<connection_id>"
-//                    — the customer pastes this into GitHub.
+//     — the customer pastes this into GitHub.
 //   - webhook_secret is the plaintext HMAC key — returned ONCE here, never
-//                    surfaced again. The customer pastes it into GitHub.
+//     surfaced again. The customer pastes it into GitHub.
 //
 // Idempotency: a deployment can have AT MOST one connection (unique index
 // on app_id). A second POST returns 409 with a clear agent_action telling
@@ -356,9 +357,9 @@ func (h *GitHubDeployHandler) Disconnect(c *fiber.Ctx) error {
 // githubPushEvent is the slice of the GitHub `push` event we actually care
 // about. The full event is much larger; we ignore the rest.
 type githubPushEvent struct {
-	Ref    string `json:"ref"`     // "refs/heads/main"
-	After  string `json:"after"`   // commit SHA after the push
-	Before string `json:"before"`  // commit SHA before the push (unused but kept for logging)
+	Ref    string `json:"ref"`    // "refs/heads/main"
+	After  string `json:"after"`  // commit SHA after the push
+	Before string `json:"before"` // commit SHA before the push (unused but kept for logging)
 	Pusher struct {
 		Name string `json:"name"`
 	} `json:"pusher"`
@@ -370,15 +371,15 @@ type githubPushEvent struct {
 // Receive handles POST /webhooks/github/:webhook_id (PUBLIC, signed).
 //
 // Steps:
-//   1. Parse :webhook_id → uuid.
-//   2. Look up the connection row.
-//   3. Read body (raw bytes — needed for HMAC).
-//   4. Decrypt secret, verify X-Hub-Signature-256.
-//   5. Branch on X-GitHub-Event header: ping → 200 OK; push → continue.
-//   6. Parse the push event, check ref matches branch.
-//   7. Idempotency: if last_commit_sha == push.after → no-op.
-//   8. Rate-limit: count recent rows in the window.
-//   9. Insert pending_github_deploys row, bump last_deploy_at.
+//  1. Parse :webhook_id → uuid.
+//  2. Look up the connection row.
+//  3. Read body (raw bytes — needed for HMAC).
+//  4. Decrypt secret, verify X-Hub-Signature-256.
+//  5. Branch on X-GitHub-Event header: ping → 200 OK; push → continue.
+//  6. Parse the push event, check ref matches branch.
+//  7. Idempotency: if last_commit_sha == push.after → no-op.
+//  8. Rate-limit: count recent rows in the window.
+//  9. Insert pending_github_deploys row, bump last_deploy_at.
 //  10. Emit github.push_received + github.deploy_triggered audit rows.
 //
 // On signature failure we emit github.signature_failed and return 401.
@@ -544,12 +545,12 @@ func (h *GitHubDeployHandler) Receive(c *fiber.Ctx) error {
 		"request_id", middleware.GetRequestID(c))
 
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
-		"ok":             true,
-		"deploy_queued":  true,
-		"pending_id":     pendingID.String(),
-		"commit_sha":     ev.After,
-		"connection_id":  conn.ID.String(),
-		"note":           "Deploy will be picked up by the worker shortly. Poll GET /deploy/<app_id> for status.",
+		"ok":            true,
+		"deploy_queued": true,
+		"pending_id":    pendingID.String(),
+		"commit_sha":    ev.After,
+		"connection_id": conn.ID.String(),
+		"note":          "Deploy will be picked up by the worker shortly. Poll GET /deploy/<app_id> for status.",
 	})
 }
 
@@ -635,7 +636,7 @@ func githubConnectionToMap(conn *models.AppGitHubConnection, appID string) fiber
 // emitDeployAudit's best-effort contract: failures are logged but never
 // surface to the caller.
 func (h *GitHubDeployHandler) emitAudit(kind string, teamID uuid.UUID, meta fiber.Map) {
-	go func() {
+	safego.Go("github_deploy.bg", func() {
 		blob, _ := json.Marshal(meta)
 		ev := models.AuditEvent{
 			TeamID:       teamID,
@@ -650,7 +651,7 @@ func (h *GitHubDeployHandler) emitAudit(kind string, teamID uuid.UUID, meta fibe
 		if err := models.InsertAuditEvent(ctx, h.db, ev); err != nil {
 			slog.Warn("github.audit.emit_failed", "kind", kind, "error", err)
 		}
-	}()
+	})
 }
 
 // contextWithTimeout is a thin alias so the audit goroutine doesn't import

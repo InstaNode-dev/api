@@ -48,6 +48,7 @@ import (
 	dbprovider "instant.dev/internal/providers/db"
 	"instant.dev/internal/provisioner"
 	"instant.dev/internal/quota"
+	"instant.dev/internal/safego"
 	"instant.dev/internal/urls"
 )
 
@@ -193,9 +194,9 @@ func (h *VectorHandler) vectorAnonymousLimits() fiber.Map {
 // Provisioning pipeline is identical to /db/new — same fingerprint dedup,
 // same recycle gate, same family-link validation — with three deltas:
 //
-//	1. resource_type = "vector"   (audit feed + storage scanner can split)
-//	2. CREATE EXTENSION vector    (run inside the local provider's pipeline)
-//	3. dimensions + extension     (echoed in the response for documentation)
+//  1. resource_type = "vector"   (audit feed + storage scanner can split)
+//  2. CREATE EXTENSION vector    (run inside the local provider's pipeline)
+//  3. dimensions + extension     (echoed in the response for documentation)
 //
 // The service-enabled gate accepts BOTH "vector" and "postgres" — operators
 // who want to expose vector without bumping configmaps can rely on the
@@ -479,7 +480,7 @@ func (h *VectorHandler) newVectorAuthenticated(
 	}
 
 	// Best-effort audit event.
-	go func() {
+	safego.Go("vector.bg", func() {
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:       teamUUID,
 			Actor:        "agent",
@@ -488,7 +489,7 @@ func (h *VectorHandler) newVectorAuthenticated(
 			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
 			Summary:      "agent provisioned <strong>vector</strong> <code>" + resource.Token.String()[:8] + "</code>",
 		})
-	}()
+	})
 
 	tokenStr := resource.Token.String()
 

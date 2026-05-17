@@ -29,12 +29,13 @@ import (
 	"instant.dev/internal/crypto"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
-	"instant.dev/internal/urls"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
 	dbprovider "instant.dev/internal/providers/db"
 	"instant.dev/internal/provisioner"
 	"instant.dev/internal/quota"
+	"instant.dev/internal/safego"
+	"instant.dev/internal/urls"
 )
 
 // DBHandler handles POST /db/new — Postgres provisioning.
@@ -377,7 +378,7 @@ func (h *DBHandler) newDBAuthenticated(
 	}
 
 	// Best-effort audit event; failures must never block the provision.
-	go func() {
+	safego.Go("db.bg", func() {
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:       teamUUID,
 			Actor:        "agent",
@@ -386,7 +387,7 @@ func (h *DBHandler) newDBAuthenticated(
 			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
 			Summary:      "agent provisioned <strong>postgres</strong> <code>" + resource.Token.String()[:8] + "</code>",
 		})
-	}()
+	})
 
 	tokenStr := resource.Token.String()
 
@@ -575,7 +576,7 @@ func (h *DBHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionForTwi
 		return TwinProvisionResult{}, twinCoreErr("Failed to record twin resource")
 	}
 
-	go func() {
+	safego.Go("db.bg", func() {
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:       in.TeamID,
 			Actor:        "agent",
@@ -585,7 +586,7 @@ func (h *DBHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionForTwi
 			Summary: "agent provisioned <strong>postgres</strong> twin <code>" +
 				resource.Token.String()[:8] + "</code> in env=<code>" + in.Env + "</code>",
 		})
-	}()
+	})
 
 	tokenStr := resource.Token.String()
 	provStart := time.Now()

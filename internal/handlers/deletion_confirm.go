@@ -36,6 +36,7 @@ import (
 	"instant.dev/internal/email"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
+	"instant.dev/internal/safego"
 )
 
 // SkipEmailConfirmationHeader is the request header an agent can set to
@@ -123,13 +124,13 @@ type requestDeletionDeps struct {
 // pendingDeletionResponse is the 202 envelope returned to the caller
 // when a fresh pending_deletions row is created.
 type pendingDeletionResponse struct {
-	OK                     bool   `json:"ok"`
-	ID                     string `json:"id"`
-	DeletionStatus         string `json:"deletion_status"`
-	ConfirmationSentTo     string `json:"confirmation_sent_to"`
-	ConfirmationExpiresAt  string `json:"confirmation_expires_at"`
-	AgentAction            string `json:"agent_action"`
-	CancellationNote       string `json:"cancellation_note"`
+	OK                    bool   `json:"ok"`
+	ID                    string `json:"id"`
+	DeletionStatus        string `json:"deletion_status"`
+	ConfirmationSentTo    string `json:"confirmation_sent_to"`
+	ConfirmationExpiresAt string `json:"confirmation_expires_at"`
+	AgentAction           string `json:"agent_action"`
+	CancellationNote      string `json:"cancellation_note"`
 }
 
 // requestEmailConfirmedDeletion is the shared "Step 1" implementation.
@@ -439,7 +440,7 @@ func emitDeletionAudit(
 	teamID, resourceID, pendingID uuid.UUID,
 	extra map[string]any,
 ) {
-	go func() {
+	safego.Go("deletion_confirm.bg", func() {
 		meta := map[string]any{
 			"team_id":             teamID.String(),
 			"resource_id":         resourceID.String(),
@@ -462,7 +463,7 @@ func emitDeletionAudit(
 			slog.Warn("audit.emit.failed",
 				"kind", kind, "team_id", teamID, "error", err)
 		}
-	}()
+	})
 }
 
 // deletionAuditResourceType maps a deletion audit kind back to the

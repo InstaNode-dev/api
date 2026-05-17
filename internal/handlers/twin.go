@@ -41,6 +41,7 @@ import (
 
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
+	"instant.dev/internal/safego"
 )
 
 // TwinHandler orchestrates POST /api/v1/resources/:id/provision-twin.
@@ -503,11 +504,14 @@ func (h *TwinHandler) consumeApprovedTwin(
 		return respondError(c, fiber.StatusConflict, "approval_already_executed",
 			"approval row has already been executed")
 	}
-	go emitPromoteAuditEvent(context.Background(), h.dbH.db, row, models.AuditKindPromoteExecuted,
-		"Twin executed via approval "+row.ID.String()+" ("+from+" → "+to+")",
-		map[string]any{
-			"approval_id": row.ID.String(),
-			"executed_by": middleware.GetEmail(c),
-		})
+	executedBy := middleware.GetEmail(c) // capture before goroutine — c is recycled
+	safego.Go("twin.promote_audit", func() {
+		emitPromoteAuditEvent(context.Background(), h.dbH.db, row, models.AuditKindPromoteExecuted,
+			"Twin executed via approval "+row.ID.String()+" ("+from+" → "+to+")",
+			map[string]any{
+				"approval_id": row.ID.String(),
+				"executed_by": executedBy,
+			})
+	})
 	return nil
 }

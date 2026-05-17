@@ -40,6 +40,7 @@ import (
 	"instant.dev/internal/experiments"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
+	"instant.dev/internal/safego"
 )
 
 // ExperimentsHandler serves POST /api/v1/experiments/converted.
@@ -150,19 +151,21 @@ func (h *ExperimentsHandler) Converted(c *fiber.Ctx) error {
 	// Best-effort audit write — detached context so the goroutine
 	// outlives the request cycle. A failure here logs but doesn't
 	// surface to the user.
-	go func(tid uuid.UUID, uid uuid.NullUUID, meta []byte, expName string) {
-		if err := models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
-			TeamID:   tid,
-			UserID:   uid,
-			Actor:    actor,
-			Kind:     "experiment.conversion",
-			Summary:  "user converted on experiment <code>" + expName + "</code>",
-			Metadata: meta,
-		}); err != nil {
-			slog.Error("experiments.converted.audit_write_failed",
-				"team_id", tid, "experiment", expName, "error", err)
-		}
-	}(teamID, userID, metaBlob, body.Experiment)
+	safego.Go("experiments.audit", func() {
+		(func(tid uuid.UUID, uid uuid.NullUUID, meta []byte, expName string) {
+			if err := models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+				TeamID:   tid,
+				UserID:   uid,
+				Actor:    actor,
+				Kind:     "experiment.conversion",
+				Summary:  "user converted on experiment <code>" + expName + "</code>",
+				Metadata: meta,
+			}); err != nil {
+				slog.Error("experiments.converted.audit_write_failed",
+					"team_id", tid, "experiment", expName, "error", err)
+			}
+		})(teamID, userID, metaBlob, body.Experiment)
+	})
 
 	return c.JSON(fiber.Map{"ok": true})
 }

@@ -59,6 +59,7 @@ import (
 
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
+	"instant.dev/internal/safego"
 )
 
 // metricsDefaultWindow is the window the dashboard requests when the user
@@ -254,7 +255,7 @@ func (h *ResourceHandler) Metrics(c *fiber.Ctx) error {
 		"samples_count":  samples.count,
 		"data_source":    dataSource,
 	})
-	go func() {
+	safego.Go("resource_metrics.bg", func() {
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:       teamID,
 			Actor:        "user",
@@ -264,7 +265,7 @@ func (h *ResourceHandler) Metrics(c *fiber.Ctx) error {
 			Summary:      "queried metrics for <strong>" + resource.ResourceType + "</strong> <code>" + token.String()[:8] + "</code>",
 			Metadata:     auditMeta,
 		})
-	}()
+	})
 
 	return c.JSON(fiber.Map{
 		"ok":                      true,

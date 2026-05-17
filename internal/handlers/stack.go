@@ -43,12 +43,13 @@ import (
 	"instant.dev/internal/manifest"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
-	"instant.dev/internal/urls"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
 	compute "instant.dev/internal/providers/compute"
 	"instant.dev/internal/providers/compute/k8s"
 	"instant.dev/internal/providers/compute/noop"
+	"instant.dev/internal/safego"
+	"instant.dev/internal/urls"
 )
 
 // stackStatusDeleting is the status a stack carries while the teardown
@@ -59,11 +60,11 @@ const stackStatusDeleting = "deleting"
 
 // StackHandler handles all /stacks endpoints.
 type StackHandler struct {
-	db          *sql.DB
-	rdb         *redis.Client
-	cfg         *config.Config
-	stackProv   compute.StackProvider
-	plans       *plans.Registry
+	db        *sql.DB
+	rdb       *redis.Client
+	cfg       *config.Config
+	stackProv compute.StackProvider
+	plans     *plans.Registry
 	// emailClient is wired by SetEmailClient. Left nil = email-confirmed
 	// deletion falls back to immediate destruction (same pattern as
 	// DeployHandler; see deletion_confirm.go).
@@ -769,7 +770,7 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 	}
 
 	// Step 8: Launch async deploy goroutine.
-	go h.runStackDeploy(context.Background(), stack, serviceRows, opts)
+	safego.Go("stack.runStackDeploy", func() { h.runStackDeploy(context.Background(), stack, serviceRows, opts) })
 
 	logAttrs := []any{
 		"slug", slug,
@@ -788,7 +789,7 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 	// Step 9: Return 202.
 	noteMsg := "Stack is building. Poll GET /stacks/" + slug + " for status."
 	if anon {
-		noteMsg += " Anonymous stacks expire in 24h. Upgrade at "+urls.StartURLPrefix+""
+		noteMsg += " Anonymous stacks expire in 24h. Upgrade at " + urls.StartURLPrefix + ""
 	}
 	if len(warnings) > 0 {
 		noteMsg = fmt.Sprintf("%d warning(s) from manifest parsing. %s", len(warnings), noteMsg)
@@ -801,11 +802,11 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 	// explicitly means a no-env caller sees "env":"development" and can
 	// react (e.g. promote later, or re-create with an explicit env).
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
-		"ok":         true,
-		"stack_id":   stack.Slug,
-		"env":        stack.Env,
-		"status":     "building",
-		"tier":       stackTier,
+		"ok":       true,
+		"stack_id": stack.Slug,
+		"env":      stack.Env,
+		"status":   "building",
+		"tier":     stackTier,
 		"expires_in": func() string {
 			if anon {
 				return "24h"
@@ -1255,7 +1256,7 @@ func (h *StackHandler) Redeploy(c *fiber.Ctx) error {
 		slog.Warn("stack.redeploy.status_update_failed", "slug", slug, "error", updErr)
 	}
 
-	go h.runStackRedeploy(context.Background(), stack, serviceRows, stack.Namespace, services)
+	safego.Go("stack.runStackRedeploy", func() { h.runStackRedeploy(context.Background(), stack, serviceRows, stack.Namespace, services) })
 
 	slog.Info("stack.redeploy.accepted",
 		"slug", slug, "team_id", team.ID,
@@ -1471,10 +1472,10 @@ const envDevelopment = "development"
 //	           Pointer-typed so we can distinguish "field omitted" (= true)
 //	           from "explicitly false".
 type promoteBody struct {
-	From       string `json:"from"`
-	To         string `json:"to"`
-	Name       string `json:"name"`
-	CopyVault  *bool  `json:"copy_vault,omitempty"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Name      string `json:"name"`
+	CopyVault *bool  `json:"copy_vault,omitempty"`
 	// ApprovalID is the manual-trigger escape for the email-link approval
 	// workflow (migration 026). When the operator has clicked the approval
 	// link OUTSIDE the worker poll loop, they can pass approval_id here to
@@ -2066,7 +2067,7 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 		Tier:     target.Tier,
 		Services: services,
 	}
-	go h.runStackDeploy(context.Background(), target, targetSvcs, opts)
+	safego.Go("stack.runStackDeploy", func() { h.runStackDeploy(context.Background(), target, targetSvcs, opts) })
 
 	slog.Info("stack.promote."+action,
 		"source_slug", slug, "target_slug", target.Slug,
@@ -2227,12 +2228,15 @@ func (h *StackHandler) consumeApprovedPromote(
 			"approval row has already been executed")
 	}
 	// Audit the executed transition. Best-effort, never blocks.
-	go emitPromoteAuditEvent(context.Background(), h.db, row, models.AuditKindPromoteExecuted,
-		"Promote executed via approval "+row.ID.String()+" ("+from+" → "+to+")",
-		map[string]any{
-			"approval_id": row.ID.String(),
-			"executed_by": middleware.GetEmail(c),
-		})
+	executedBy := middleware.GetEmail(c) // capture before goroutine — c is recycled
+	safego.Go("stack.promote_audit", func() {
+		emitPromoteAuditEvent(context.Background(), h.db, row, models.AuditKindPromoteExecuted,
+			"Promote executed via approval "+row.ID.String()+" ("+from+" → "+to+")",
+			map[string]any{
+				"approval_id": row.ID.String(),
+				"executed_by": executedBy,
+			})
+	})
 	return nil
 }
 
