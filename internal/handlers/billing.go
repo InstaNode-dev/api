@@ -679,6 +679,29 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 		}
 	case "subscription.cancelled":
 		h.handleSubscriptionCancelled(ctx, c, event)
+	case "subscription.halted":
+		// P1-F: Razorpay halts a subscription once all charge retries are
+		// exhausted. It is terminal — there will be no further charge —
+		// so the team is downgraded immediately, identical to a cancel.
+		// Without this case a halted subscription kept paid-tier limits
+		// until the 15-minute reconciler caught up.
+		h.handleSubscriptionCancelled(ctx, c, event)
+	case "subscription.completed":
+		// P1-F: the subscription reached the end of its agreed term
+		// (total_count of billing cycles consumed). No renewal — downgrade
+		// per the same policy as a cancellation.
+		h.handleSubscriptionCancelled(ctx, c, event)
+	case "subscription.paused":
+		// P1-F: a paused subscription is not billing. Treat it like a
+		// failed charge — open a grace period so the team keeps its tier
+		// for the grace window, and the dunning emails / reconciler take
+		// over. subscription.resumed reverses this.
+		h.handleSubscriptionPaused(ctx, c, event)
+	case "subscription.resumed":
+		// P1-F: a previously paused subscription resumed billing. Recover
+		// any active grace row so the dunning state machine stops, mirroring
+		// the grace recovery handleSubscriptionCharged does on a good charge.
+		h.handleSubscriptionResumed(ctx, c, event)
 	case "subscription.charged_failed":
 		// Razorpay's documented event name for a failed subscription
 		// charge. Triggers the dunning state machine — see
@@ -972,15 +995,15 @@ func (h *BillingHandler) handlePaymentFailed(ctx context.Context, c *fiber.Ctx, 
 // events — the start of the dunning state machine.
 //
 // Flow:
-//   1. Resolve the team from the subscription's notes (or fall back to
-//      the DB lookup by subscription_id).
-//   2. Attempt to INSERT a new active grace row. The partial-unique
-//      index uq_payment_grace_team_active makes the call idempotent:
-//      a redelivery of the same charge_failed event hits the constraint
-//      and the model returns ErrPaymentGraceAlreadyActive, which we
-//      treat as a silent no-op (the grace clock is already running).
-//   3. Emit the payment.grace_started audit row so the worker's Brevo
-//      forwarder kicks off the first reminder email. Best-effort.
+//  1. Resolve the team from the subscription's notes (or fall back to
+//     the DB lookup by subscription_id).
+//  2. Attempt to INSERT a new active grace row. The partial-unique
+//     index uq_payment_grace_team_active makes the call idempotent:
+//     a redelivery of the same charge_failed event hits the constraint
+//     and the model returns ErrPaymentGraceAlreadyActive, which we
+//     treat as a silent no-op (the grace clock is already running).
+//  3. Emit the payment.grace_started audit row so the worker's Brevo
+//     forwarder kicks off the first reminder email. Best-effort.
 //
 // Fail-open everywhere: the webhook always returns 200 to Razorpay even
 // when team resolution / INSERT / audit emit fails. Razorpay re-fires
@@ -1013,6 +1036,60 @@ func (h *BillingHandler) handleSubscriptionChargeFailed(ctx context.Context, c *
 	}
 
 	startGracePeriodForTeam(ctx, h.db, teamID, sub.ID, attemptedAmount)
+}
+
+// handleSubscriptionPaused processes subscription.paused events (P1-F).
+//
+// A paused Razorpay subscription is not actively billing. Rather than
+// downgrade immediately we open a grace period — identical to a failed
+// charge — so the team keeps its current tier for the grace window and the
+// dunning state machine drives the reminder emails. subscription.resumed
+// reverses this. Fully idempotent: startGracePeriodForTeam swallows a
+// redelivery via the partial-unique index on the active grace row.
+func (h *BillingHandler) handleSubscriptionPaused(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) {
+	sub, ok := parseSubscriptionEntity(event)
+	if !ok {
+		slog.Error("billing.subscription.paused.parse_failed")
+		return
+	}
+
+	teamID, err := resolveTeamFromNotes(ctx, h, sub)
+	if err != nil {
+		slog.Error("billing.subscription.paused.team_resolve_failed",
+			"error", err, "sub_id", sub.ID)
+		return
+	}
+
+	slog.Info("billing.subscription.paused", "team_id", teamID, "subscription_id", sub.ID)
+	// attemptedAmount is unknown for a pause (no failed charge) — pass 0.
+	startGracePeriodForTeam(ctx, h.db, teamID, sub.ID, 0)
+}
+
+// handleSubscriptionResumed processes subscription.resumed events (P1-F).
+//
+// A resumed subscription is billing again, so any grace period opened by
+// the matching subscription.paused must be closed. maybeRecoverPaymentGrace
+// flips the active grace row to 'recovered' and emits the recovery audit
+// row — identical to the recovery handleSubscriptionCharged performs on a
+// good charge. Fully idempotent: a redelivery finds no active grace row
+// and is a silent no-op. The tier itself is not re-elevated here — the
+// next subscription.charged does that; resume only stops the dunning clock.
+func (h *BillingHandler) handleSubscriptionResumed(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) {
+	sub, ok := parseSubscriptionEntity(event)
+	if !ok {
+		slog.Error("billing.subscription.resumed.parse_failed")
+		return
+	}
+
+	teamID, err := resolveTeamFromNotes(ctx, h, sub)
+	if err != nil {
+		slog.Error("billing.subscription.resumed.team_resolve_failed",
+			"error", err, "sub_id", sub.ID)
+		return
+	}
+
+	slog.Info("billing.subscription.resumed", "team_id", teamID, "subscription_id", sub.ID)
+	maybeRecoverPaymentGrace(ctx, h.db, teamID, sub.ID)
 }
 
 // startGracePeriodForTeam centralises the grace-start logic so both
