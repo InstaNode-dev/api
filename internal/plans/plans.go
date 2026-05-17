@@ -25,7 +25,8 @@ func Default() *Registry { return commonplans.Default() }
 func CanonicalTier(tier string) string { return commonplans.CanonicalTier(tier) }
 
 // Rank returns the totally-ordered rank of the given plan tier. Higher rank
-// = more capacity (anonymous=0, free=1, hobby=2, growth=3, pro=4, team=5).
+// = more capacity (anonymous=0, free=1, hobby=2, hobby_plus=3, pro=4,
+// growth=5, team=6 — anchored to plans.yaml pricing, pro $49 < growth $99).
 // Unknown tiers return -1 — callers MUST guard against the sentinel when
 // comparing two ranks (a negative rank means "no transition direction").
 //
