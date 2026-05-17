@@ -130,7 +130,15 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 	}
 
 	if limitExceeded {
-		existing, err := models.GetActiveResourceByFingerprintType(ctx, h.db, fp, "queue")
+		existing, err := models.GetActiveResourceByFingerprintType(ctx, h.db, fp, "queue", env)
+		if err != nil {
+			// P1-A: cross-service daily-cap fallback — see db.go for rationale.
+			if _, anyErr := models.GetActiveResourceByFingerprint(ctx, h.db, fp, env); anyErr == nil {
+				metrics.FingerprintAbuseBlocked.Inc()
+				return respondError(c, fiber.StatusTooManyRequests, "provision_limit_reached",
+					"Daily anonymous provisioning limit reached for this network. Sign up at "+urls.StartURLPrefix)
+			}
+		}
 		if err == nil {
 			jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "queue", []string{existing.Token.String()})
 			if jwtErr == nil && jti != "" {
