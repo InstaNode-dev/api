@@ -257,8 +257,8 @@ func TestCapabilities_AnnualDiscountFromYAML(t *testing.T) {
 	assert.Equal(t, 0, byTier["anonymous"].AnnualDiscountPercent, "anonymous discount")
 	assert.Equal(t, 0, byTier["free"].AnnualDiscountPercent, "free discount")
 
-	// Hobby: $9 x 12 = $108, yearly = $99. saved = $9. pct = 9/108 ≈ 8%.
-	assert.Equal(t, 8, byTier["hobby"].AnnualDiscountPercent, "hobby discount")
+	// Hobby: $9 x 12 = $108, yearly = $90. saved = $18. pct = 18/108 ≈ 17%.
+	assert.Equal(t, 17, byTier["hobby"].AnnualDiscountPercent, "hobby discount")
 	// Pro: $49 x 12 = $588, yearly = $490. saved = $98. pct = 98/588 ≈ 17%.
 	assert.Equal(t, 17, byTier["pro"].AnnualDiscountPercent, "pro discount")
 	// Team: $199 x 12 = $2388, yearly = $1990. saved = $398. pct ≈ 17%.
