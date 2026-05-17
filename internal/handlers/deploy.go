@@ -104,6 +104,15 @@ func (h *DeployHandler) SetEmailClient(c *email.Client) {
 	h.emailClient = c
 }
 
+// SetComputeProvider swaps the compute backend. Production code never calls
+// this — NewDeployHandler selects the backend from config. It exists so the
+// P3 teardown-reconciler test can inject a compute.Provider double and
+// assert Teardown is invoked, without an import cycle through testhelpers.
+// Mirrors the SetEmailClient setter rationale (keep the constructor stable).
+func (h *DeployHandler) SetComputeProvider(p compute.Provider) {
+	h.compute = p
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // truncateForAudit caps an error summary so a multi-paragraph build log
@@ -650,27 +659,19 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 
 	// ── Tier-limit enforcement (plans.yaml: deployments_apps) ────────────────
 	//
-	// Count the team's currently-active deployments and reject when over the
-	// per-tier cap. A limit of -1 means unlimited (team tier). A limit of 0
-	// means the tier cannot deploy at all (anonymous / free) — natural
-	// fall-through because existing (≥ 0) is always ≥ 0.
+	// P5: the count-check and the CreateDeployment INSERT must be ONE
+	// atomic, team-row-locked transaction. The old shape (CountActive…
+	// then a separate CreateDeployment) let two concurrent /deploy/new
+	// calls for the same team both read a stale count and both create —
+	// a paid-tier cap bypass. models.CreateDeploymentWithCap takes a
+	// SELECT … FOR UPDATE on the team row, so concurrent provisions for
+	// that team serialise and the second sees the first's insert.
+	//
+	// limit < 0 means unlimited (team tier). limit == 0 means the tier
+	// cannot deploy at all (anonymous / free) — a 402 wall.
+	deployLimit := -1
 	if h.planRegistry != nil {
-		existing, err := models.CountActiveDeploymentsByTeam(c.Context(), h.db, team.ID)
-		if err != nil {
-			slog.Error("deploy.new.count_failed",
-				"error", err, "team_id", team.ID,
-				"request_id", middleware.GetRequestID(c))
-			return respondError(c, fiber.StatusServiceUnavailable, "count_failed",
-				"Failed to check deployment quota")
-		}
-		limit := h.planRegistry.DeploymentsAppsLimit(team.PlanTier)
-		if limit >= 0 && existing >= limit {
-			return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired,
-				"deployment_limit_reached",
-				fmt.Sprintf("Your %s tier allows %d deployment(s).", team.PlanTier, limit),
-				newAgentActionDeploymentLimitReached(team.PlanTier, limit),
-				"https://instanode.dev/pricing")
-		}
+		deployLimit = h.planRegistry.DeploymentsAppsLimit(team.PlanTier)
 	}
 
 	// ── TTL policy resolution (Wave FIX-J — migration 045) ──────────────────
@@ -706,7 +707,7 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		ttlPolicy = models.DeployTTLPolicyAuto24h
 	}
 
-	saved, err := models.CreateDeployment(c.Context(), h.db, models.CreateDeploymentParams{
+	saved, err := models.CreateDeploymentWithCap(c.Context(), h.db, deployLimit, models.CreateDeploymentParams{
 		TeamID:              team.ID,
 		AppID:               appID,
 		Port:                port,
@@ -719,6 +720,15 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		NotifyWebhookSecret: notifySecret,
 		TTLPolicy:           ttlPolicy,
 	})
+	if errors.Is(err, models.ErrDeploymentCapReached) {
+		// Over the per-tier cap — surfaced atomically inside the
+		// team-locked transaction, so this is race-free (P5).
+		return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired,
+			"deployment_limit_reached",
+			fmt.Sprintf("Your %s tier allows %d deployment(s).", team.PlanTier, deployLimit),
+			newAgentActionDeploymentLimitReached(team.PlanTier, deployLimit),
+			"https://instanode.dev/pricing")
+	}
 	if err != nil {
 		slog.Error("deploy.new.db_create_failed",
 			"error", err, "team_id", team.ID,

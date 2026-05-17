@@ -637,7 +637,28 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		stackTier = team.PlanTier
 	}
 
-	stack, err := models.CreateStack(c.Context(), h.db, models.CreateStackParams{
+	// P5: the stack count-check + CreateStack + service inserts run as ONE
+	// atomic, team-row-locked transaction via CreateStackWithCap. The
+	// early A5 count check above stays as a fast-fail for UX, but the
+	// AUTHORITATIVE race-free enforcement is here — two concurrent
+	// /stacks/new for the same team both passing the early stale count
+	// would still be caught at create time because CreateStackWithCap
+	// takes a SELECT … FOR UPDATE on the team row. Anonymous stacks pass
+	// stackCapLimit < 0 (no team to lock, no per-tier cap — they are
+	// fingerprint-rate-limited above).
+	stackCapLimit := -1
+	if !anon && h.plans != nil {
+		stackCapLimit = h.plans.DeploymentsAppsLimit(team.PlanTier)
+	}
+	svcParams := make([]models.CreateStackServiceParams, 0, len(m.Services))
+	for svcName, svc := range m.Services {
+		svcParams = append(svcParams, models.CreateStackServiceParams{
+			Name:   svcName,
+			Expose: svc.Expose,
+			Port:   svc.Port,
+		})
+	}
+	created, err := models.CreateStackWithCap(c.Context(), h.db, stackCapLimit, models.CreateStackParams{
 		TeamID:      stackTeamID,
 		Name:        name,
 		Slug:        slug,
@@ -645,7 +666,16 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		Env:         stackEnv,
 		ExpiresAt:   stackExpiresAt,
 		Fingerprint: stackFingerprint,
-	})
+	}, svcParams)
+	if errors.Is(err, models.ErrStackCapReached) {
+		metrics.StackProvisionLimitBlocked.WithLabelValues(team.PlanTier).Inc()
+		return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired,
+			"deployment_limit_reached",
+			fmt.Sprintf("Your %s tier allows %d deployment(s). Upgrade at %s", team.PlanTier, stackCapLimit, urls.StartURLPrefix),
+			newAgentActionDeploymentLimitReached(team.PlanTier, stackCapLimit),
+			"https://instanode.dev/pricing",
+		)
+	}
 	if err != nil {
 		logAttrs := []any{"error", err, "request_id", middleware.GetRequestID(c)}
 		if anon {
@@ -657,23 +687,12 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed",
 			"Failed to create stack record")
 	}
+	stack := created.Stack
 
-	serviceRows := make(map[string]*models.StackService, len(m.Services))
-	for svcName, svc := range m.Services {
-		ss, svcErr := models.CreateStackService(c.Context(), h.db, models.CreateStackServiceParams{
-			StackID: stack.ID,
-			Name:    svcName,
-			Expose:  svc.Expose,
-			Port:    svc.Port,
-		})
-		if svcErr != nil {
-			slog.Error("stack.new.service_create_failed",
-				"error", svcErr, "service", svcName,
-				"request_id", middleware.GetRequestID(c))
-			return respondError(c, fiber.StatusServiceUnavailable, "provision_failed",
-				"Failed to create service record for: "+svcName)
-		}
-		serviceRows[svcName] = ss
+	// Re-key the created service rows by service name for the build step.
+	serviceRows := make(map[string]*models.StackService, len(created.Services))
+	for _, ss := range created.Services {
+		serviceRows[ss.Name] = ss
 	}
 
 	// Step 7: Build StackDeployOptions.
@@ -1879,32 +1898,19 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 	} else {
 		// Fresh target: new stack row + matching service rows.
 		//
-		// A5 tier gate (P1-E fix): a fresh-target promote creates a brand-new
-		// billable stack, exactly like POST /stacks/new. Without this check a
-		// caller could POST /stacks/:slug/promote repeatedly with distinct
-		// `to` envs and create unlimited stacks, bypassing the
-		// deployments_apps cap that New enforces. The in-place re-promote
-		// branch above is exempt — it reuses an existing target row.
+		// A5 tier gate (P1-E fix + P5): a fresh-target promote creates a
+		// brand-new billable stack, exactly like POST /stacks/new. Without
+		// this check a caller could POST /stacks/:slug/promote repeatedly
+		// with distinct `to` envs and create unlimited stacks, bypassing the
+		// deployments_apps cap. The in-place re-promote branch above is
+		// exempt — it reuses an existing target row.
+		//
+		// P5: the count-check + create are now ONE atomic, team-row-locked
+		// transaction via CreateStackWithCap — two concurrent promotes for
+		// the same team can no longer both pass a stale count.
+		promoteCapLimit := -1
 		if h.plans != nil {
-			limit := h.plans.DeploymentsAppsLimit(team.PlanTier)
-			if limit >= 0 {
-				existingCount, countErr := models.CountActiveStacksByTeam(c.Context(), h.db, team.ID)
-				if countErr != nil {
-					slog.Error("stack.promote.count_failed", "error", countErr,
-						"team_id", team.ID, "team_tier", team.PlanTier)
-					return respondError(c, fiber.StatusServiceUnavailable, "quota_check_failed",
-						"Failed to check deployment quota")
-				}
-				if existingCount >= limit {
-					metrics.StackProvisionLimitBlocked.WithLabelValues(team.PlanTier).Inc()
-					return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired,
-						"deployment_limit_reached",
-						fmt.Sprintf("Your %s tier allows %d deployment(s). Upgrade at %s", team.PlanTier, limit, urls.StartURLPrefix),
-						newAgentActionDeploymentLimitReached(team.PlanTier, limit),
-						"https://instanode.dev/pricing",
-					)
-				}
-			}
+			promoteCapLimit = h.plans.DeploymentsAppsLimit(team.PlanTier)
 		}
 
 		// Family root: the source itself if it has no parent, else the
@@ -1928,14 +1934,32 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 		if name == "" {
 			name = source.Name
 		}
-		created, createErr := models.CreateStack(c.Context(), h.db, models.CreateStackParams{
+		promoteSvcParams := make([]models.CreateStackServiceParams, 0, len(sourceSvcs))
+		for _, src := range sourceSvcs {
+			promoteSvcParams = append(promoteSvcParams, models.CreateStackServiceParams{
+				Name:     src.Name,
+				Expose:   src.Expose,
+				Port:     src.Port,
+				ImageRef: src.ImageRef,
+			})
+		}
+		createdStack, createErr := models.CreateStackWithCap(c.Context(), h.db, promoteCapLimit, models.CreateStackParams{
 			TeamID:        &team.ID,
 			Name:          name,
 			Slug:          newSlug,
 			Tier:          source.Tier,
 			Env:           to,
 			ParentStackID: &rootID,
-		})
+		}, promoteSvcParams)
+		if errors.Is(createErr, models.ErrStackCapReached) {
+			metrics.StackProvisionLimitBlocked.WithLabelValues(team.PlanTier).Inc()
+			return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired,
+				"deployment_limit_reached",
+				fmt.Sprintf("Your %s tier allows %d deployment(s). Upgrade at %s", team.PlanTier, promoteCapLimit, urls.StartURLPrefix),
+				newAgentActionDeploymentLimitReached(team.PlanTier, promoteCapLimit),
+				"https://instanode.dev/pricing",
+			)
+		}
 		if createErr != nil {
 			slog.Error("stack.promote.create_failed",
 				"error", createErr, "team_id", team.ID, "source_slug", slug, "to", to,
@@ -1943,23 +1967,10 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 			return respondError(c, fiber.StatusServiceUnavailable, "create_failed",
 				"Failed to create promoted stack record")
 		}
-		target = created
-		targetSvcs = make(map[string]*models.StackService, len(sourceSvcs))
-		for _, src := range sourceSvcs {
-			ss, ssErr := models.CreateStackService(c.Context(), h.db, models.CreateStackServiceParams{
-				StackID:  target.ID,
-				Name:     src.Name,
-				Expose:   src.Expose,
-				Port:     src.Port,
-				ImageRef: src.ImageRef,
-			})
-			if ssErr != nil {
-				slog.Error("stack.promote.target_service_create_failed",
-					"error", ssErr, "service", src.Name, "target", target.Slug)
-				return respondError(c, fiber.StatusServiceUnavailable, "create_failed",
-					"Failed to create target service "+src.Name)
-			}
-			targetSvcs[src.Name] = ss
+		target = createdStack.Stack
+		targetSvcs = make(map[string]*models.StackService, len(createdStack.Services))
+		for _, ss := range createdStack.Services {
+			targetSvcs[ss.Name] = ss
 		}
 	}
 
