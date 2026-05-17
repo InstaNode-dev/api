@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/redis/go-redis/v9"
@@ -193,16 +194,35 @@ func (p *Provider) provisionUpstash(ctx context.Context, token, tier string) (*C
 	return nil, fmt.Errorf("cache.provisionUpstash: Upstash backend not yet implemented")
 }
 
+const (
+	// storageScanBatch is the SCAN COUNT hint per iteration. Larger batches
+	// mean fewer round-trips; 500 keeps each SCAN well under a millisecond
+	// of Redis CPU while cutting the round-trip count 5× versus the old 100.
+	storageScanBatch = 500
+
+	// storageMaxKeys is the hard ceiling on keys inspected per StorageBytes
+	// call. The old cap was 1000 — a tenant with 1001+ keys had every key
+	// past the first 1000 silently excluded from their quota total, i.e.
+	// free storage past the cap. Raised to 200k: at storageScanBatch=500
+	// that is at most ~400 SCAN round-trips plus 200k pipelined MEMORY USAGE
+	// reads, which is bounded work, not an O(keyspace) blocking scan. A
+	// tenant who genuinely exceeds 200k keys is flagged via the truncation
+	// log below so an operator can investigate rather than the platform
+	// silently giving away quota.
+	storageMaxKeys = 200_000
+)
+
 // StorageBytes returns the estimated memory used by keys with the token prefix.
 // Used by UpdateStorageBytesWorker to populate resources.storage_bytes.
-// Iterates with SCAN MATCH "{token}:*" COUNT 100, sums MEMORY USAGE for each key.
-// Capped at 1000 keys to avoid blocking the Redis event loop.
+// Iterates with SCAN MATCH "{token}:*" COUNT storageScanBatch, summing
+// MEMORY USAGE for each key. Bounded at storageMaxKeys keys; if a tenant
+// exceeds that the count is under-reported and a warning is logged so an
+// operator notices instead of the platform silently leaking quota.
 func (p *Provider) StorageBytes(ctx context.Context, token string) (int64, error) {
 	if p.rdb == nil {
 		return 0, fmt.Errorf("cache.StorageBytes: %w", errNilRedisClient)
 	}
 	prefix := token + ":*"
-	const maxKeys = 1000
 
 	var (
 		cursor     uint64
@@ -211,13 +231,13 @@ func (p *Provider) StorageBytes(ctx context.Context, token string) (int64, error
 	)
 
 	for {
-		keys, nextCursor, err := p.rdb.Scan(ctx, cursor, prefix, 100).Result()
+		keys, nextCursor, err := p.rdb.Scan(ctx, cursor, prefix, storageScanBatch).Result()
 		if err != nil {
 			return 0, fmt.Errorf("cache.StorageBytes scan: %w", err)
 		}
 
 		for _, key := range keys {
-			if totalKeys >= maxKeys {
+			if totalKeys >= storageMaxKeys {
 				break
 			}
 			totalKeys++
@@ -236,9 +256,18 @@ func (p *Provider) StorageBytes(ctx context.Context, token string) (int64, error
 		}
 
 		cursor = nextCursor
-		if cursor == 0 || totalKeys >= maxKeys {
+		if cursor == 0 || totalKeys >= storageMaxKeys {
 			break
 		}
+	}
+
+	if totalKeys >= storageMaxKeys {
+		slog.Warn("cache.StorageBytes.truncated",
+			"token", token,
+			"keys_scanned", totalKeys,
+			"max_keys", storageMaxKeys,
+			"impact", "storage_bytes under-reported — tenant exceeds the per-call key ceiling",
+		)
 	}
 
 	return totalBytes, nil

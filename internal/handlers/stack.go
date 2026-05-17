@@ -51,6 +51,12 @@ import (
 	"instant.dev/internal/providers/compute/noop"
 )
 
+// stackStatusDeleting is the status a stack carries while the teardown
+// worker is removing it. Redeploy / UpdateEnv reject this status (409) —
+// mutating a stack that is about to be deleted is a lost race, not a
+// legitimate request.
+const stackStatusDeleting = "deleting"
+
 // StackHandler handles all /stacks endpoints.
 type StackHandler struct {
 	db          *sql.DB
@@ -594,6 +600,26 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		return nameErr
 	}
 
+	// Optional `env` multipart form field — brings /stacks/new in line with
+	// the /db/new and /deploy/new env contract. Empty → EnvDefault
+	// ("development", migration 026) so a no-env create lands in the
+	// lowest-stakes bucket. Validated with the same [A-Za-z0-9_-]{1,64}
+	// rule the vault env uses; an invalid value is a 400, not a silent
+	// default.
+	rawEnv := ""
+	if envs := form.Value["env"]; len(envs) > 0 {
+		rawEnv = strings.TrimSpace(envs[0])
+	}
+	stackEnv := models.EnvDefault
+	if rawEnv != "" {
+		validated, ok := validateEnv(rawEnv)
+		if !ok {
+			return respondError(c, fiber.StatusBadRequest, "invalid_env",
+				"env must be 1-64 chars [A-Za-z0-9_-]")
+		}
+		stackEnv = validated
+	}
+
 	// Anonymous stacks: nil TeamID + 24h TTL + fingerprint (same model as /db/new).
 	// Authenticated stacks: real TeamID + plan tier from the team record.
 	var (
@@ -616,6 +642,7 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		Name:        name,
 		Slug:        slug,
 		Tier:        stackTier,
+		Env:         stackEnv,
 		ExpiresAt:   stackExpiresAt,
 		Fingerprint: stackFingerprint,
 	})
@@ -653,12 +680,11 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 	//
 	// Per-service env vars may include "vault://KEY" references. We resolve
 	// them here against the team's vault scoped to the STACK'S env (post-
-	// §10.17 — was hardcoded "production"). Today the /stacks/new path does
-	// not accept an `env` form field so freshly created stacks default to
-	// production, but promoted stacks inherit their target env and any
-	// future endpoint that creates a non-production stack will get the
-	// right vault scoping for free. Anonymous stacks cannot use vault refs
-	// because there is no team to look up.
+	// §10.17 — was hardcoded "production"). /stacks/new now accepts an
+	// optional `env` form field (validated above, defaulting to EnvDefault),
+	// so a stack created in staging resolves vault refs against the staging
+	// namespace. Anonymous stacks cannot use vault refs because there is no
+	// team to look up.
 	services := make([]compute.StackServiceDef, 0, len(m.Services))
 	for svcName, svc := range m.Services {
 		// Merge: needs env first (low priority), then service-defined env (high priority).
@@ -1054,6 +1080,14 @@ func (h *StackHandler) UpdateEnv(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusNotFound, "not_found", "Stack not found")
 	}
 
+	// A stack mid-teardown cannot accept an env change — the teardown
+	// worker will delete the row. 409 so the caller knows the request was
+	// valid but lost the race, not malformed.
+	if stack.Status == stackStatusDeleting {
+		return respondError(c, fiber.StatusConflict, "stack_deleting",
+			"This stack is being deleted and can no longer be modified.")
+	}
+
 	var body updateStackEnvBody
 	if err := c.BodyParser(&body); err != nil {
 		return respondError(c, fiber.StatusBadRequest, "invalid_body",
@@ -1097,6 +1131,13 @@ func (h *StackHandler) Redeploy(c *fiber.Ctx) error {
 	// RequireAuth means team is guaranteed non-nil here.
 	if stack.TeamID == nil || *stack.TeamID != team.ID {
 		return respondError(c, fiber.StatusNotFound, "not_found", "Stack not found")
+	}
+
+	// A stack mid-teardown cannot be redeployed — the teardown worker will
+	// delete the row. 409 so the caller knows the request lost the race.
+	if stack.Status == stackStatusDeleting {
+		return respondError(c, fiber.StatusConflict, "stack_deleting",
+			"This stack is being deleted and can no longer be redeployed.")
 	}
 
 	// Parse multipart form.

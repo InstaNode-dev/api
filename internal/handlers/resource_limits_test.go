@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"instant.dev/internal/plans"
+	"instant.dev/internal/quota"
 	"instant.dev/internal/testhelpers"
 )
 
@@ -105,14 +106,16 @@ func TestResourceToMap_EmitsLimitFields(t *testing.T) {
 	require.True(t, ok, "each item must be a JSON object")
 
 	// storage_limit_bytes must be present and equal to the plans.Registry
-	// value for hobby/postgres (never hardcoded — pulled from the live registry).
+	// value for hobby/postgres (never hardcoded — pulled from the live
+	// registry). P2 2026-05-17: bytes are MiB (1024*1024) via quota.LimitBytes,
+	// matching quota.CheckStorageQuota's enforcement — NOT SI 1_000_000.
 	expectedLimitMB := reg.StorageLimitMB("hobby", "postgres")
-	expectedLimitBytes := float64(expectedLimitMB) * 1_000_000
+	expectedLimitBytes := float64(quota.LimitBytes(expectedLimitMB))
 
 	storageLimitBytes, hasField := item["storage_limit_bytes"]
 	assert.True(t, hasField, "list item must contain storage_limit_bytes")
 	assert.Equal(t, expectedLimitBytes, storageLimitBytes,
-		"storage_limit_bytes must equal plans.Registry.StorageLimitMB(%q, %q) * 1_000_000", "hobby", "postgres")
+		"storage_limit_bytes must equal quota.LimitBytes(plans.Registry.StorageLimitMB(%q, %q))", "hobby", "postgres")
 
 	// connections_limit must be present.
 	expectedConns := float64(reg.ConnectionsLimit("hobby", "postgres"))
@@ -211,9 +214,10 @@ func TestResourceToMap_StorageExceeded_OnListPath(t *testing.T) {
 	jwt := testhelpers.MustSignSessionJWT(t, userID, teamID, email)
 
 	// Set storage_bytes to 1 more than the limit so the resource is "exceeded".
+	// Limit is MiB (quota.LimitBytes) — matches resourceToMap + enforcement.
 	limitMB := reg.StorageLimitMB("hobby", "postgres")
 	require.Greater(t, limitMB, 0, "hobby postgres limit must be positive for this test")
-	exceededBytes := int64(limitMB)*1_000_000 + 1
+	exceededBytes := quota.LimitBytes(limitMB) + 1
 
 	require.NoError(t, db.QueryRowContext(context.Background(), `
 		INSERT INTO resources (team_id, resource_type, tier, status, storage_bytes)

@@ -261,6 +261,10 @@ type ErrorResponse struct {
 	RetryAfterSeconds *int   `json:"retry_after_seconds"`
 	AgentAction       string `json:"agent_action,omitempty"`
 	UpgradeURL        string `json:"upgrade_url,omitempty"`
+	// ClaimURL is populated only on the free-tier recycle gate
+	// (error=free_tier_recycle_requires_claim). omitempty keeps the wire
+	// shape unchanged for every other error envelope.
+	ClaimURL string `json:"claim_url,omitempty"`
 }
 
 // defaultRetryAfterSeconds returns the retry-after value that the standard
@@ -388,6 +392,28 @@ func respondErrorWithAgentAction(c *fiber.Ctx, status int, code, message, agentA
 	}
 	if resp.RetryAfterSeconds != nil && shouldSetRetryAfterHeader(status) {
 		c.Set(fiber.HeaderRetryAfter, strconv.Itoa(*resp.RetryAfterSeconds))
+	}
+	_ = c.Status(status).JSON(resp)
+	return ErrResponseWritten
+}
+
+// respondRecycleGate writes the canonical 402 envelope for the free-tier
+// recycle gate. It goes through the same ErrorResponse path as every other
+// error so the envelope carries request_id + retry_after_seconds (previously
+// the gate hand-built a fiber.Map and dropped both — P2 finding 2026-05-17).
+// claim_url is the recycle-gate-specific field; upgrade_url points at the
+// same claim URL because re-claiming clears the gate.
+func respondRecycleGate(c *fiber.Ctx, code, message, agentAction, claimURL string) error {
+	status := fiber.StatusPaymentRequired
+	resp := ErrorResponse{
+		OK:                false,
+		Error:             code,
+		Message:           message,
+		RequestID:         requestIDFromCtx(c),
+		RetryAfterSeconds: defaultRetryAfterSeconds(status),
+		AgentAction:       agentAction,
+		UpgradeURL:        claimURL,
+		ClaimURL:          claimURL,
 	}
 	_ = c.Status(status).JSON(resp)
 	return ErrResponseWritten

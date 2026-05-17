@@ -8,9 +8,9 @@ package handlers
 //       Returns the env-twin family for the given resource — root + every
 //       sibling in any env. Caller's id can be the root or any child; the
 //       model layer walks parent_resource_id up to the root, then back
-//       down. Cross-team callers get 403 (not 404) so an honest mistake
-//       — passing the wrong UUID — is debuggable. Sensitive fields
-//       (connection_url) are never returned here.
+//       down. Cross-team callers get 404 (not 403) so cross-tenant row
+//       existence stays opaque — see the ownership check below. Sensitive
+//       fields (connection_url) are never returned here.
 //
 //   GET /api/v1/resources/families
 //       Returns one entry per family root the caller's team owns. Each

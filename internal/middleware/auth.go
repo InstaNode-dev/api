@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"errors"
-	"net/url"
 	"os"
 	"strings"
 
@@ -165,32 +164,22 @@ func (c sessionClaims) Valid() error {
 //
 // Resolution order:
 //  1. API_PUBLIC_URL env var (when set and non-empty)
-//  2. X-Forwarded-Proto + Host headers from the live request
-//  3. defaultCanonicalResourceURL constant
+//  2. defaultCanonicalResourceURL constant
+//
+// P2 (2026-05-17): the canonical URL is used for the RFC 8707 audience check
+// and RFC 9449 DPoP htu check — both are security boundaries. It MUST NOT be
+// derived from client-settable headers (X-Forwarded-Host / X-Forwarded-Proto):
+// behind an ingress that does not strip those headers, an attacker could spoof
+// the host so a token minted for a different audience validates here. The
+// canonical host is therefore a fixed config value (API_PUBLIC_URL) or the
+// compiled-in default — never the request. The `*fiber.Ctx` parameter is
+// retained for call-site compatibility but intentionally unused.
 //
 // Exposed as a package-level variable so individual tests can override the
 // resolution without threading a dependency through call sites.
-var CanonicalResourceURLFor = func(c *fiber.Ctx) string {
+var CanonicalResourceURLFor = func(_ *fiber.Ctx) string {
 	if v := strings.TrimRight(os.Getenv("API_PUBLIC_URL"), "/"); v != "" {
 		return v
-	}
-	if c != nil {
-		host := c.Get("X-Forwarded-Host")
-		if host == "" {
-			host = c.Hostname()
-		}
-		scheme := c.Get("X-Forwarded-Proto")
-		if scheme == "" {
-			if p := c.Protocol(); p != "" {
-				scheme = p
-			} else {
-				scheme = "https"
-			}
-		}
-		if host != "" {
-			u := url.URL{Scheme: scheme, Host: host}
-			return strings.TrimRight(u.String(), "/")
-		}
 	}
 	return defaultCanonicalResourceURL
 }
@@ -427,6 +416,20 @@ func OptionalAuth(cfg *config.Config) fiber.Handler {
 		// drop the credential and continue as anonymous.
 		if len(claims.Audience) > 0 && !audienceMatches(claims.Audience, CanonicalResourceURLFor(c)) {
 			return c.Next()
+		}
+
+		// A03 (P1) — JTI revocation check, mirrored from RequireAuth. A token
+		// revoked via POST /auth/logout must not grant elevated behaviour on
+		// an OptionalAuth route either. As elsewhere in OptionalAuth, a
+		// revoked JTI drops the credential and continues anonymous rather
+		// than 401-ing. Redis errors fail-open (convention 1) — IsJTIRevoked
+		// logs and returns (false, err), so the credential is kept.
+		if jti := claims.ID; jti != "" {
+			if revoked, err := IsJTIRevoked(c.UserContext(), jti); err != nil {
+				_ = err // logged inside IsJTIRevoked; fail-open per convention 1
+			} else if revoked {
+				return c.Next()
+			}
 		}
 
 		c.Locals(LocalKeyUserID, claims.UserID)

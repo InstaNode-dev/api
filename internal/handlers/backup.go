@@ -213,7 +213,8 @@ func (h *BackupHandler) CreateBackup(c *fiber.Ctx) error {
 //
 // Returns {ok, items[], total}. Cursor pagination via ?before=<RFC3339>
 // (rows strictly older than the cursor), capped at ?limit=50 (max 200).
-// 403 on cross-team access.
+// 404 on cross-team access (cross-tenant existence stays opaque — see
+// requireOwnedResource).
 func (h *BackupHandler) ListBackups(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 	ctx := c.UserContext()
@@ -371,7 +372,7 @@ func (h *BackupHandler) CreateRestore(c *fiber.Ctx) error {
 		}
 		// Look up the target by token (matches the URL-path token shape).
 		// Reuse requireOwnedResource semantics so cross-team targets return
-		// the same 403 envelope as cross-team source attempts.
+		// the same 404 envelope as cross-team source attempts.
 		tgt, lookupErr := models.GetResourceByToken(ctx, h.db, targetID)
 		if lookupErr != nil {
 			var notFound *models.ErrResourceNotFound

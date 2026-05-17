@@ -7,7 +7,8 @@ package models
 // `instanode-verify-<token>`). Once we observe the TXT record, the row advances
 // from "pending_verification" → "verified". The handler then creates an
 // Ingress + cert-manager Certificate; status moves to "ingress_ready" and
-// finally "cert_ready" / "live" once the cert is issued.
+// finally "cert_ready" once the cert is issued. "cert_ready" is the terminal
+// state — see CustomDomainStatusLive below.
 
 import (
 	"context"
@@ -29,8 +30,13 @@ const (
 	CustomDomainStatusVerified     = "verified"
 	CustomDomainStatusIngressReady = "ingress_ready"
 	CustomDomainStatusCertReady    = "cert_ready"
-	CustomDomainStatusLive         = "live"
-	CustomDomainStatusFailed       = "failed"
+	// CustomDomainStatusLive is retained for backward compatibility only.
+	// No code path writes it — cert_ready is the terminal state of the
+	// verification flow. A documented cert_ready → live transition was
+	// never implemented; serializeDomain still treats a "live" row as
+	// certificate-ready so any historical row keeps rendering correctly.
+	CustomDomainStatusLive   = "live"
+	CustomDomainStatusFailed = "failed"
 )
 
 // VerificationTokenPrefix is the literal prefix the customer must include in

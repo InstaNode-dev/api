@@ -177,13 +177,13 @@ func parseDimensions(c *fiber.Ctx) (int, error) {
 }
 
 // vectorAnonymousLimits mirrors dbAnonymousLimits exactly — pgvector storage
-// is just Postgres rows, so the anonymous quota is identical. Kept as its
-// own helper so a future per-resource-type tweak (e.g. dimension-aware
-// quota) lands in one place.
-func vectorAnonymousLimits() fiber.Map {
+// is just Postgres rows, so the anonymous quota is identical. Values are read
+// from plans.Registry (convention #3) so a plans.yaml edit flows through
+// instead of drifting against a hardcoded literal.
+func (h *VectorHandler) vectorAnonymousLimits() fiber.Map {
 	return fiber.Map{
-		"storage_mb":  10,
-		"connections": 2,
+		"storage_mb":  h.plans.StorageLimitMB(tierAnonymous, models.ResourceTypeVector),
+		"connections": h.plans.ConnectionsLimit(tierAnonymous, models.ResourceTypeVector),
 		"expires_in":  "24h",
 	}
 }
@@ -294,7 +294,7 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 					"env":            existing.Env,
 					"extension":      "pgvector",
 					"dimensions":     dimensions,
-					"limits":         vectorAnonymousLimits(),
+					"limits":         h.vectorAnonymousLimits(),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
@@ -419,7 +419,7 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 		"env":            resource.Env,
 		"extension":      "pgvector",
 		"dimensions":     dimensions,
-		"limits":         vectorAnonymousLimits(),
+		"limits":         h.vectorAnonymousLimits(),
 		"note":           upgradeNote(upgradeURL),
 		"upgrade":        upgradeURL,
 		"upgrade_jwt":    jwtToken,

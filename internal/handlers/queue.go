@@ -165,7 +165,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 					"connection_url": connectionURL,
 					"tier":           existing.Tier,
 					"env":            existing.Env,
-					"limits":         queueAnonymousLimits(),
+					"limits":         h.queueAnonymousLimits(),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
@@ -284,7 +284,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		"subject_prefix": creds.SubjectPrefix,
 		"tier":           "anonymous",
 		"env":            resource.Env,
-		"limits":         queueAnonymousLimits(),
+		"limits":         h.queueAnonymousLimits(),
 		"note":           upgradeNote(upgradeURL),
 		"upgrade":        upgradeURL,
 		"upgrade_jwt":    jwtToken,
@@ -455,9 +455,12 @@ func (h *QueueHandler) decryptConnectionURL(encrypted, requestID string) string 
 	return plain
 }
 
-func queueAnonymousLimits() fiber.Map {
+// queueAnonymousLimits returns the limits map for anonymous queue resources.
+// storage_mb is read from plans.Registry (convention #3) so a plans.yaml edit
+// to queue_storage_mb flows through instead of drifting against a literal.
+func (h *QueueHandler) queueAnonymousLimits() fiber.Map {
 	return fiber.Map{
-		"storage_mb": 1024,
+		"storage_mb": h.plans.StorageLimitMB(tierAnonymous, "queue"),
 		"expires_in": "24h",
 	}
 }
