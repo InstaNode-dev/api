@@ -218,7 +218,7 @@ func JoinAllowedIPs(ips []string) string {
 }
 
 // CreateDeployment inserts a new deployment row and returns it.
-func CreateDeployment(ctx context.Context, db *sql.DB, p CreateDeploymentParams) (*Deployment, error) {
+func CreateDeployment(ctx context.Context, db dbExecutor, p CreateDeploymentParams) (*Deployment, error) {
 	var resourceID interface{}
 	if p.ResourceID != nil {
 		resourceID = *p.ResourceID
@@ -696,6 +696,81 @@ func MarkDeploymentExpired(ctx context.Context, db *sql.DB, id uuid.UUID) error 
 	return nil
 }
 
+// DeployStatusExpired is the status the worker's DeploymentExpirer sets on a
+// deploy whose 24h TTL elapsed. It is NOT terminal at the infra layer — the
+// k8s namespace / pod / Ingress / cert are still live. The api's
+// teardown reconciler (P3) picks these up, tears down the compute, then
+// flips the row to DeployStatusDeleted.
+const DeployStatusExpired = "expired"
+
+// DeployStatusDeleted is the terminal status set once the compute backing a
+// deployment has actually been torn down. A 'deleted' row consumes no slot
+// and is never re-processed by the teardown reconciler.
+const DeployStatusDeleted = "deleted"
+
+// GetExpiredDeploymentsAwaitingTeardown returns deployments stuck in
+// status='expired' that still have a provider_id — i.e. the worker's
+// DeploymentExpirer flipped the row but the compute (namespace / pod /
+// Ingress / cert) was never destroyed.
+//
+// P3 (bug-hunt 2026-05-17): DeploymentExpirer only set status='expired';
+// its comment claimed "the api reconciler tears down" but no api reconciler
+// ever called Teardown — every auto-expired deploy leaked live, billed
+// infra forever. This query is the input to the api teardown reconciler
+// that closes that gap.
+//
+// Rows with an empty provider_id are skipped: runDeploy never reached
+// UpdateDeploymentProviderID for them, so there is no k8s object to tear
+// down. The reconciler marks those terminal directly without a Teardown
+// call — this query only returns rows that genuinely need a compute call.
+func GetExpiredDeploymentsAwaitingTeardown(ctx context.Context, db *sql.DB, limit int) ([]*Deployment, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT `+deploymentColumns+`
+		FROM deployments
+		WHERE status = $1
+		  AND provider_id IS NOT NULL
+		  AND provider_id != ''
+		ORDER BY updated_at ASC
+		LIMIT $2
+	`, DeployStatusExpired, limit)
+	if err != nil {
+		return nil, fmt.Errorf("models.GetExpiredDeploymentsAwaitingTeardown: %w", err)
+	}
+	defer rows.Close()
+	var results []*Deployment
+	for rows.Next() {
+		d, err := scanDeployment(rows)
+		if err != nil {
+			return nil, fmt.Errorf("models.GetExpiredDeploymentsAwaitingTeardown scan: %w", err)
+		}
+		results = append(results, d)
+	}
+	return results, rows.Err()
+}
+
+// MarkDeploymentTornDown flips an expired deployment to the terminal
+// 'deleted' status after its compute has been destroyed by the teardown
+// reconciler (P3). The guarded WHERE status = 'expired' makes this safe to
+// call concurrently / repeatedly: a row already advanced past 'expired'
+// (e.g. a DELETE /deploy/:id raced the reconciler) is left untouched and
+// RowsAffected reports 0, so the caller can tell a real teardown from a
+// no-op.
+func MarkDeploymentTornDown(ctx context.Context, db *sql.DB, id uuid.UUID) (int64, error) {
+	res, err := db.ExecContext(ctx, `
+		UPDATE deployments
+		SET status = $1, updated_at = now()
+		WHERE id = $2 AND status = $3
+	`, DeployStatusDeleted, id, DeployStatusExpired)
+	if err != nil {
+		return 0, fmt.Errorf("models.MarkDeploymentTornDown: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // CountActiveDeploymentsByTeam counts deployments for a team that have not been
 // torn down. Used by POST /deploy/new to enforce the per-tier deployments_apps
 // cap from plans.yaml.
@@ -710,7 +785,7 @@ func MarkDeploymentExpired(ctx context.Context, db *sql.DB, id uuid.UUID) error 
 // compute, so it must not occupy a billable tier slot. Without this exclusion
 // a single failed build on a hobby team (deployments_apps=1) would 402 every
 // future /deploy/new permanently.
-func CountActiveDeploymentsByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) (int, error) {
+func CountActiveDeploymentsByTeam(ctx context.Context, db dbExecutor, teamID uuid.UUID) (int, error) {
 	var n int
 	err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM deployments

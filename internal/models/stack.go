@@ -174,7 +174,7 @@ func scanStackService(row interface {
 // — flipped from "production" by migration 026 so accidental no-env creates land
 // in the lowest-stakes bucket. ParentStackID is nullable — set only when the
 // row is created by the promote endpoint.
-func CreateStack(ctx context.Context, db *sql.DB, p CreateStackParams) (*Stack, error) {
+func CreateStack(ctx context.Context, db dbExecutor, p CreateStackParams) (*Stack, error) {
 	tier := p.Tier
 	if tier == "" {
 		tier = "hobby"
@@ -444,7 +444,7 @@ func DeleteStack(ctx context.Context, db *sql.DB, id uuid.UUID) error {
 // so the deploy goroutine can skip the build step. The standard /stacks/new
 // path leaves it NULL and the build pipeline back-fills it via
 // UpdateStackServiceImageRef.
-func CreateStackService(ctx context.Context, db *sql.DB, p CreateStackServiceParams) (*StackService, error) {
+func CreateStackService(ctx context.Context, db dbExecutor, p CreateStackServiceParams) (*StackService, error) {
 	port := p.Port
 	if port == 0 {
 		port = 8080
@@ -558,7 +558,7 @@ func UpdateStackServiceImageRef(ctx context.Context, db *sql.DB, id uuid.UUID, i
 // Stack statuses are: building | deploying | healthy | failed | stopped |
 // deleting (see migration 004_stacks.sql). Only building/deploying/healthy
 // run a pod and therefore occupy a slot.
-func CountActiveStacksByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) (int, error) {
+func CountActiveStacksByTeam(ctx context.Context, db dbExecutor, teamID uuid.UUID) (int, error) {
 	var n int
 	err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM stacks
