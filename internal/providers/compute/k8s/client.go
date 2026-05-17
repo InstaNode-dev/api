@@ -152,6 +152,68 @@ const (
 	curlImageGID int64 = 100
 )
 
+const (
+	// envClusterPodCIDR / envClusterServiceCIDR override the cluster-internal
+	// CIDR ranges excepted from the customer-deploy internet-egress
+	// NetworkPolicy. Both accept a comma-separated list of CIDRs.
+	envClusterPodCIDR     = "CLUSTER_POD_CIDR"
+	envClusterServiceCIDR = "CLUSTER_SERVICE_CIDR"
+
+	// metadataCIDR is the link-local range covering the cloud instance
+	// metadata endpoint (169.254.169.254 on DO / AWS / GCP). It is ALWAYS
+	// in the egress Except list — customer workloads must never reach it.
+	metadataCIDR = "169.254.0.0/16"
+)
+
+// defaultClusterPodCIDRs / defaultClusterServiceCIDRs are the union of the
+// CIDR ranges used by the two clusters this platform runs on:
+//   - k3s / Rancher Desktop (local dev): pods 10.42.0.0/16, services 10.43.0.0/16
+//   - DOKS (production):                 pods 10.244.0.0/16, services 10.245.0.0/16
+//
+// Excepting the union keeps customer containers off other tenants' DB pods
+// and the kube-apiserver on BOTH clusters without per-environment config.
+// Override via CLUSTER_POD_CIDR / CLUSTER_SERVICE_CIDR when the cluster uses
+// a non-standard range.
+var (
+	defaultClusterPodCIDRs     = []string{"10.42.0.0/16", "10.244.0.0/16"}
+	defaultClusterServiceCIDRs = []string{"10.43.0.0/16", "10.245.0.0/16"}
+)
+
+// egressExceptCIDRs returns the IPBlock.Except list for the customer-deploy
+// internet-egress NetworkPolicy: the cluster pod + service ranges (so customer
+// apps cannot reach internal cluster IPs) plus the cloud metadata link-local
+// range. CLUSTER_POD_CIDR / CLUSTER_SERVICE_CIDR override the cluster ranges
+// (comma-separated); metadataCIDR is always included.
+func egressExceptCIDRs() []string {
+	pods := defaultClusterPodCIDRs
+	if v := strings.TrimSpace(os.Getenv(envClusterPodCIDR)); v != "" {
+		pods = splitCIDRList(v)
+	}
+	svcs := defaultClusterServiceCIDRs
+	if v := strings.TrimSpace(os.Getenv(envClusterServiceCIDR)); v != "" {
+		svcs = splitCIDRList(v)
+	}
+
+	except := make([]string, 0, len(pods)+len(svcs)+1)
+	except = append(except, pods...)
+	except = append(except, svcs...)
+	except = append(except, metadataCIDR)
+	return except
+}
+
+// splitCIDRList parses a comma-separated CIDR list, trimming whitespace and
+// dropping empty entries.
+func splitCIDRList(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // platformContainerSecCtx returns the SecurityContext for the PLATFORM-OWNED
 // curl init-container (`fetch-context`). It runs a known, pinned image
 // controlled by instant.dev, so we apply the stricter set:
@@ -511,20 +573,19 @@ func (p *K8sProvider) createNetworkPolicyInNS(ctx context.Context, ns, teamID st
 					// SECURITY FIX (pentest 2026-05-16 gap b): 169.254.0.0/16 (link-local)
 					// added to Except so the DO droplet metadata endpoint at
 					// 169.254.169.254 is unreachable from customer workloads.
+					//
+					// SECURITY FIX (P0-2, 2026-05-17): the Except list previously
+					// hardcoded ONLY the k3s ranges (10.42/16, 10.43/16). Production
+					// runs on DOKS (pods 10.244.0.0/16, services 10.245.0.0/16),
+					// which were NOT excepted — so customer containers could reach
+					// other tenants' DB pods and the kube-apiserver. egressExceptCIDRs
+					// returns the union of both clusters' ranges plus the metadata
+					// CIDR, and is overridable via CLUSTER_POD_CIDR / CLUSTER_SERVICE_CIDR.
 					To: []networkingv1.NetworkPolicyPeer{
 						{
 							IPBlock: &networkingv1.IPBlock{
-								CIDR: "0.0.0.0/0",
-								Except: []string{
-									// k3s default pod CIDR — adjust if cluster uses different range.
-									// This prevents user apps from reaching internal cluster IPs
-									// (postgres-platform, redis, instant-infra, instant-data).
-									"10.42.0.0/16",
-									"10.43.0.0/16",
-									// Link-local: blocks the cloud instance metadata endpoint
-									// (169.254.169.254 on DO / AWS / GCP).
-									"169.254.0.0/16",
-								},
+								CIDR:   "0.0.0.0/0",
+								Except: egressExceptCIDRs(),
 							},
 						},
 					},

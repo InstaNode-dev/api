@@ -188,6 +188,17 @@ type ClaimRequest struct {
 	Email    string `json:"email"`
 }
 
+const (
+	// claimLoginPath is the dashboard route an existing-account caller is sent
+	// to so they can authenticate before claiming. Appended to DashboardBaseURL.
+	claimLoginPath = "/login"
+	// errCodeAccountExists is the error code returned by POST /claim when the
+	// supplied email already belongs to a registered account. The claim is
+	// refused (no resource attach, no session token) because the request
+	// carries no proof the caller owns that account — see P0-1.
+	errCodeAccountExists = "account_exists"
+)
+
 // Claim handles POST /claim — converts an anonymous session to a registered team.
 func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 	ctx, span := otel.Tracer("instant.dev/handlers").Start(c.UserContext(), "onboarding.claim")
@@ -230,6 +241,37 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusConflict, "already_claimed", "This upgrade token has already been used")
 	}
 
+	// P0-1: account-takeover guard — checked BEFORE the JWT is consumed.
+	//
+	// POST /claim accepts an attacker-controlled body.Email and is an
+	// unauthenticated route (no RequireAuth — see router.go). The original
+	// code, on finding an EXISTING account for that email, silently reused
+	// that team+user, grafted the anonymous resources into the victim's team,
+	// and minted a session JWT for the victim's account — with no proof the
+	// caller owns the email. That let any caller hijack any email-only
+	// account and exfiltrate a session for it.
+	//
+	// Fix: refuse the existing-account branch entirely. The caller must first
+	// authenticate to that account (magic-link / OAuth) and claim from within
+	// an authenticated session via the dashboard. We perform this lookup
+	// BEFORE MarkOnboardingConvertedPreliminary so a refused claim does NOT
+	// burn the JWT — the caller can log in and retry with the same token.
+	//
+	// The brand-new-email path (GetUserByEmail returns not-found) is
+	// unchanged: it falls through to the JWT-consume + create-fresh-team flow.
+	if existing, lookupErr := models.GetUserByEmail(ctx, h.db, body.Email); lookupErr == nil && existing != nil {
+		slog.Warn("onboarding.claim.existing_account_refused",
+			"email", body.Email,
+			"jti", claims.ID,
+			"request_id", requestID,
+		)
+		return respondErrorWithAgentAction(c, fiber.StatusConflict, errCodeAccountExists,
+			"An account already exists for this email. Log in to that account first, then claim your resources from the dashboard.",
+			"Sign in to the existing account via magic-link or OAuth at "+h.cfg.DashboardBaseURL+claimLoginPath+
+				", then open the claim page while authenticated to attach these resources.",
+			"")
+	}
+
 	// A01 (P1): Mark the JWT as consumed BEFORE creating team+user.
 	//
 	// Problem (original order): Create team → Create user → MarkConverted.
@@ -264,9 +306,10 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "mark_converted_failed", "Failed to mark upgrade token as used")
 	}
 
-	// Resolve team + user: if the email already has an account (e.g. created by
-	// dashboard-api during login before the claim page was loaded), reuse it.
-	// Otherwise create a fresh team + user as in the standalone onboarding flow.
+	// Resolve team + user. By this point the email is guaranteed NOT to belong
+	// to an existing account — the P0-1 guard above already refused (and did
+	// not consume the JWT) for any pre-existing email. So this is always the
+	// brand-new-user path: create a fresh team + user.
 	var team *models.Team
 	var newUser *models.User
 
@@ -275,45 +318,27 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 		teamName = body.Email
 	}
 
-	existingUser, lookupErr := models.GetUserByEmail(ctx, h.db, body.Email)
-	if lookupErr == nil {
-		// User already exists (e.g. created by dashboard-api during magic-link login
-		// before the user reached the claim page) — reuse existing team + user.
-		newUser = existingUser
-		existingTeam, teamErr := models.GetTeamByID(ctx, h.db, existingUser.TeamID.UUID)
-		if teamErr != nil {
-			slog.Error("onboarding.claim.get_team_failed",
-				"error", teamErr,
-				"email", body.Email,
-				"request_id", requestID,
-			)
-			return respondError(c, fiber.StatusServiceUnavailable, "team_lookup_failed", "Failed to look up existing team")
-		}
-		team = existingTeam
-	} else {
-		// New user — create team then user.
-		createdTeam, teamErr := models.CreateTeam(ctx, h.db, teamName)
-		if teamErr != nil {
-			slog.Error("onboarding.claim.create_team_failed",
-				"error", teamErr,
-				"email", body.Email,
-				"request_id", requestID,
-			)
-			return respondError(c, fiber.StatusServiceUnavailable, "team_creation_failed", "Failed to create team")
-		}
-		team = createdTeam
-
-		createdUser, userErr := models.CreateUser(ctx, h.db, team.ID, body.Email, "", "", "owner")
-		if userErr != nil {
-			slog.Error("onboarding.claim.create_user_failed",
-				"error", userErr,
-				"email", body.Email,
-				"request_id", requestID,
-			)
-			return respondError(c, fiber.StatusServiceUnavailable, "user_creation_failed", "Failed to create user")
-		}
-		newUser = createdUser
+	createdTeam, teamErr := models.CreateTeam(ctx, h.db, teamName)
+	if teamErr != nil {
+		slog.Error("onboarding.claim.create_team_failed",
+			"error", teamErr,
+			"email", body.Email,
+			"request_id", requestID,
+		)
+		return respondError(c, fiber.StatusServiceUnavailable, "team_creation_failed", "Failed to create team")
 	}
+	team = createdTeam
+
+	createdUser, userErr := models.CreateUser(ctx, h.db, team.ID, body.Email, "", "", "owner")
+	if userErr != nil {
+		slog.Error("onboarding.claim.create_user_failed",
+			"error", userErr,
+			"email", body.Email,
+			"request_id", requestID,
+		)
+		return respondError(c, fiber.StatusServiceUnavailable, "user_creation_failed", "Failed to create user")
+	}
+	newUser = createdUser
 
 	// Patch the real team_id onto the onboarding_event row now that we have it.
 	// This is best-effort: a failure here is non-fatal because the JWT is already
