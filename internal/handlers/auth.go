@@ -363,10 +363,10 @@ func (h *AuthHandler) GoogleAuthURL(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "missing_redirect_uri", "redirect_uri query parameter or GOOGLE_REDIRECT_URI is required")
 	}
 
-	u, err := url.Parse("https://accounts.google.com/o/oauth2/v2/auth")
-	if err != nil {
-		return respondError(c, fiber.StatusInternalServerError, "internal_error", "Failed to build authorization URL")
-	}
+	// url.Parse of a compile-time-constant string never errors — the err
+	// branch was dead code. GoogleStart handles the identical parse the same
+	// way (u, _ := url.Parse(...)).
+	u, _ := url.Parse("https://accounts.google.com/o/oauth2/v2/auth")
 	q := u.Query()
 	q.Set("client_id", h.cfg.GoogleClientID)
 	q.Set("redirect_uri", redirectURI)
@@ -487,12 +487,16 @@ func exchangeGitHubCode(ctx context.Context, clientID, clientSecret, code string
 			defer emailResp.Body.Close()
 			body, _ := io.ReadAll(emailResp.Body)
 			var emails []struct {
-				Email   string `json:"email"`
-				Primary bool   `json:"primary"`
+				Email    string `json:"email"`
+				Primary  bool   `json:"primary"`
+				Verified bool   `json:"verified"`
 			}
 			if json.Unmarshal(body, &emails) == nil {
 				for _, e := range emails {
-					if e.Primary {
+					// Only accept the primary AND verified address —
+					// an unverified email is attacker-controllable and
+					// must never seed a platform identity.
+					if e.Primary && e.Verified {
 						profile.Email = e.Email
 						break
 					}
@@ -523,6 +527,33 @@ func (h *AuthHandler) findOrCreateUserGitHub(ctx context.Context, gh *gitHubUser
 	if !errors.As(err, &notFound) {
 		// Unexpected DB error
 		return nil, nil, fmt.Errorf("findOrCreateUserGitHub lookup: %w", err)
+	}
+
+	// No GitHub-ID match. Before creating a brand-new team/user — which
+	// fragments the identity of someone who already signed up via magic-link
+	// or Google — try to match an existing account by email and attach the
+	// GitHub ID to it. Mirrors findOrCreateUserGoogle.
+	if gh.Email != "" {
+		byEmail, errEmail := models.GetUserByEmail(ctx, h.db, gh.Email)
+		if errEmail == nil {
+			if byEmail.GitHubID.Valid && byEmail.GitHubID.String != gh.ID {
+				return nil, nil, fmt.Errorf("findOrCreateUserGitHub: email already linked to another GitHub account")
+			}
+			if !byEmail.GitHubID.Valid {
+				if linkErr := models.LinkGitHubID(ctx, h.db, byEmail.ID, gh.ID); linkErr != nil {
+					return nil, nil, fmt.Errorf("findOrCreateUserGitHub link: %w", linkErr)
+				}
+				byEmail.GitHubID = sql.NullString{String: gh.ID, Valid: true}
+			}
+			team, teamErr := models.GetTeamByID(ctx, h.db, byEmail.TeamID.UUID)
+			if teamErr != nil {
+				return nil, nil, fmt.Errorf("findOrCreateUserGitHub: %w", teamErr)
+			}
+			return byEmail, team, nil
+		}
+		if !errors.As(errEmail, &notFound) {
+			return nil, nil, fmt.Errorf("findOrCreateUserGitHub email lookup: %w", errEmail)
+		}
 	}
 
 	// New user — create team + user

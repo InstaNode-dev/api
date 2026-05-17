@@ -558,6 +558,19 @@ func UpdateStackServiceImageRef(ctx context.Context, db *sql.DB, id uuid.UUID, i
 // Stack statuses are: building | deploying | healthy | failed | stopped |
 // deleting (see migration 004_stacks.sql). Only building/deploying/healthy
 // run a pod and therefore occupy a slot.
+// IsStackActive reports whether a stack status occupies a billable tier slot —
+// i.e. it runs a pod. Only building/deploying/healthy qualify; failed,
+// stopped, and deleting consume no compute. Mirrors the IN-list in
+// CountActiveStacksByTeam so the two can never drift.
+func IsStackActive(status string) bool {
+	switch status {
+	case "building", "deploying", "healthy":
+		return true
+	default:
+		return false
+	}
+}
+
 func CountActiveStacksByTeam(ctx context.Context, db dbExecutor, teamID uuid.UUID) (int, error) {
 	var n int
 	err := db.QueryRowContext(ctx, `

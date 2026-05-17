@@ -726,7 +726,11 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		if !anon {
 			vaultEnv := stack.Env
 			if vaultEnv == "" {
-				vaultEnv = "production"
+				// Legacy pre-migration-026 stacks have an empty env. Fall
+				// back to the lowest-stakes default (development), NOT
+				// production — convention #11: a no-env resource must never
+				// silently read production secrets.
+				vaultEnv = models.EnvDefault
 			}
 			resolved, vaultErr := ResolveVaultRefs(c.Context(), h.db, h.cfg.AESKey, team.ID, vaultEnv, envVars)
 			if vaultErr != nil {
@@ -1162,6 +1166,34 @@ func (h *StackHandler) Redeploy(c *fiber.Ctx) error {
 			"This stack is being deleted and can no longer be redeployed.")
 	}
 
+	// Tier-cap re-check. A 'failed'/'stopped' stack does NOT occupy a slot
+	// per CountActiveStacksByTeam — so redeploying one back to 'building'
+	// would silently take the team to cap+1. Only re-run the cap check when
+	// the stack is not already in an active (slot-occupying) status; an
+	// already-active stack is a no-net-change redeploy and must not be
+	// blocked by its own slot.
+	if !models.IsStackActive(stack.Status) && h.plans != nil {
+		limit := h.plans.DeploymentsAppsLimit(team.PlanTier)
+		if limit >= 0 {
+			active, countErr := models.CountActiveStacksByTeam(c.Context(), h.db, team.ID)
+			if countErr != nil {
+				slog.Error("stack.redeploy.count_failed", "error", countErr,
+					"team_id", team.ID, "team_tier", team.PlanTier)
+				return respondError(c, fiber.StatusServiceUnavailable, "quota_check_failed",
+					"Failed to check deployment quota")
+			}
+			if active >= limit {
+				metrics.StackProvisionLimitBlocked.WithLabelValues(team.PlanTier).Inc()
+				return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired,
+					"deployment_limit_reached",
+					fmt.Sprintf("Your %s tier allows %d deployment(s). Upgrade at %s", team.PlanTier, limit, urls.StartURLPrefix),
+					newAgentActionDeploymentLimitReached(team.PlanTier, limit),
+					"https://instanode.dev/pricing",
+				)
+			}
+		}
+	}
+
 	// Parse multipart form.
 	form, err := c.MultipartForm()
 	if err != nil {
@@ -1218,7 +1250,10 @@ func (h *StackHandler) Redeploy(c *fiber.Ctx) error {
 	// is the whole point of multi-env deployments.
 	vaultEnv := stack.Env
 	if vaultEnv == "" {
-		vaultEnv = "production"
+		// Legacy pre-migration-026 stacks have an empty env. Fall back to the
+		// lowest-stakes default (development), NOT production — convention
+		// #11: a no-env resource must never silently read production secrets.
+		vaultEnv = models.EnvDefault
 	}
 	services := make([]compute.StackServiceDef, 0, len(m.Services))
 	for svcName, svc := range m.Services {

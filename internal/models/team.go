@@ -407,6 +407,27 @@ func GetUserByTeamID(ctx context.Context, db *sql.DB, teamID uuid.UUID) (*User, 
 	return u, nil
 }
 
+// LinkGitHubID sets github_id on an existing user when it is currently NULL.
+// Used by the GitHub OAuth find-or-create path to attach a GitHub identity to
+// an account first created via magic-link or Google, preventing account
+// fragmentation. Mirrors LinkGoogleID.
+func LinkGitHubID(ctx context.Context, db *sql.DB, userID uuid.UUID, githubID string) error {
+	res, err := db.ExecContext(ctx, `
+		UPDATE users SET github_id = $1 WHERE id = $2 AND github_id IS NULL
+	`, githubID, userID)
+	if err != nil {
+		return fmt.Errorf("models.LinkGitHubID: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("models.LinkGitHubID rows: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("models.LinkGitHubID: user %s not updated (already has github_id?)", userID)
+	}
+	return nil
+}
+
 // LinkGoogleID sets google_id on an existing user when it is currently NULL.
 func LinkGoogleID(ctx context.Context, db *sql.DB, userID uuid.UUID, googleID string) error {
 	res, err := db.ExecContext(ctx, `
