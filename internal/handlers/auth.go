@@ -19,9 +19,11 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"instant.dev/internal/config"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
+	"instant.dev/internal/safego"
 	"instant.dev/internal/urls"
 )
 
@@ -106,6 +108,11 @@ func appendSessionToken(returnTo, sessionToken string) string {
 type AuthHandler struct {
 	db  *sql.DB
 	cfg *config.Config
+	// rdb backs the single-use OAuth `state` consume (P1-K). Optional: when
+	// nil (unit tests, local dev without Redis) the state check fails open to
+	// the pre-existing cookie-only comparison — a Redis outage must never
+	// block sign-in. Wired by SetRedis from the router.
+	rdb *redis.Client
 }
 
 // emitAuthLoginAudit writes the auth.login audit row best-effort. Provider is
@@ -114,7 +121,7 @@ type AuthHandler struct {
 // completing their sign-in. Called in a goroutine so the writer never blocks
 // the HTTP response.
 func emitAuthLoginAudit(db *sql.DB, teamID, userID uuid.UUID, email, provider, ip, userAgent string) {
-	go func() {
+	safego.Go("auth.bg", func() {
 		meta := map[string]string{
 			"provider":   provider,
 			"ip":         ip,
@@ -138,12 +145,21 @@ func emitAuthLoginAudit(db *sql.DB, teamID, userID uuid.UUID, email, provider, i
 				"error", err,
 			)
 		}
-	}()
+	})
 }
 
 // NewAuthHandler constructs an AuthHandler.
 func NewAuthHandler(db *sql.DB, cfg *config.Config) *AuthHandler {
 	return &AuthHandler{db: db, cfg: cfg}
+}
+
+// SetRedis wires the Redis client used for the single-use OAuth state consume
+// (P1-K). Separate setter rather than a constructor arg so every existing
+// NewAuthHandler caller (including unit tests) stays source-compatible —
+// matches the SetEmailClient pattern on DeployHandler. The router calls this
+// once after construction with the shared client.
+func (h *AuthHandler) SetRedis(rdb *redis.Client) {
+	h.rdb = rdb
 }
 
 // sessionClaims is the JWT payload issued after a successful OAuth login.
@@ -749,6 +765,53 @@ func clearOAuthStateCookie(c *fiber.Ctx) {
 	})
 }
 
+// oauthStateRedisPrefix namespaces the single-use OAuth state keys in Redis.
+const oauthStateRedisPrefix = "oauth_state:"
+
+// registerOAuthState records a freshly-minted OAuth `state` token in Redis so
+// the matching callback can consume it exactly once (P1-K). The key lives for
+// the same window as the state cookie. Best-effort: a Redis failure (or a nil
+// client in tests) just means the callback falls back to the cookie-only
+// check — a Redis outage must not block sign-in.
+func (h *AuthHandler) registerOAuthState(ctx context.Context, state string) {
+	if h.rdb == nil || state == "" {
+		return
+	}
+	if err := h.rdb.Set(ctx, oauthStateRedisPrefix+state, "1",
+		time.Duration(oauthStateMaxAge)*time.Second).Err(); err != nil {
+		slog.Warn("auth.oauth.state_register_failed", "error", err)
+	}
+}
+
+// consumeOAuthState atomically deletes the OAuth `state` key, returning true
+// only for the FIRST caller (P1-K — single-use). A replayed callback within
+// the 5-minute window finds the key already gone and gets false.
+//
+// Redis GETDEL is atomic, so two concurrent replays cannot both win.
+//
+// Fail-open contract: when the client is nil (tests / no-Redis dev) or Redis
+// errors, it returns true so the cookie-only comparison in the callers still
+// gates the request — exactly the pre-P1-K behaviour. The single-use
+// guarantee is a defence-in-depth hardening on top of the cookie check, never
+// a hard dependency that a Redis outage could turn into a sign-in outage.
+func (h *AuthHandler) consumeOAuthState(ctx context.Context, state string) bool {
+	if h.rdb == nil || state == "" {
+		return true
+	}
+	val, err := h.rdb.GetDel(ctx, oauthStateRedisPrefix+state).Result()
+	if err == redis.Nil {
+		// Key absent — either already consumed (replay) or never registered
+		// (e.g. minted before this fix deployed). Reject: a genuine first-use
+		// always has the key because GitHubStart/GoogleStart just wrote it.
+		return false
+	}
+	if err != nil {
+		slog.Warn("auth.oauth.state_consume_failed", "error", err)
+		return true // fail open — cookie check still gates
+	}
+	return val != ""
+}
+
 // renderAuthError sends a 400 with a small HTML page so a browser landing on
 // a broken callback URL gets a readable message instead of raw JSON.
 func renderAuthError(c *fiber.Ctx, status int, headline, detail string) error {
@@ -780,6 +843,8 @@ func (h *AuthHandler) GitHubStart(c *fiber.Ctx) error {
 	}
 	returnTo := validateReturnTo(c.Query("return_to"))
 	setOAuthStateCookie(c, h.cfg.Environment == "production", state, returnTo)
+	// P1-K: record the state in Redis so the callback can consume it once.
+	h.registerOAuthState(c.Context(), state)
 
 	authURL := fmt.Sprintf(
 		"https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&state=%s&scope=%s",
@@ -813,6 +878,14 @@ func (h *AuthHandler) GitHubCallback(c *fiber.Ctx) error {
 		return renderAuthError(c, fiber.StatusBadRequest, "Sign-in expired", "The sign-in link expired or was opened in a different browser. Please try again.")
 	}
 	clearOAuthStateCookie(c)
+
+	// P1-K: single-use consume. The cookie check above proves the state was
+	// minted by us, but a cookie can be replayed within its 5-minute window.
+	// consumeOAuthState atomically deletes the Redis key — only the FIRST
+	// callback wins; a replay finds it gone and is rejected.
+	if !h.consumeOAuthState(c.Context(), stateParam) {
+		return renderAuthError(c, fiber.StatusBadRequest, "Sign-in already used", "This sign-in link was already used. Please start sign-in again.")
+	}
 
 	// Re-validate returnTo as defence-in-depth; the cookie isn't user-supplied
 	// but a copy-paste of an old cookie shouldn't be able to redirect off-domain.
@@ -857,6 +930,8 @@ func (h *AuthHandler) GoogleStart(c *fiber.Ctx) error {
 	}
 	returnTo := validateReturnTo(c.Query("return_to"))
 	setOAuthStateCookie(c, h.cfg.Environment == "production", state, returnTo)
+	// P1-K: record the state in Redis so the callback can consume it once.
+	h.registerOAuthState(c.Context(), state)
 
 	u, _ := url.Parse("https://accounts.google.com/o/oauth2/v2/auth")
 	q := u.Query()
@@ -894,6 +969,11 @@ func (h *AuthHandler) GoogleCallbackBrowser(c *fiber.Ctx) error {
 		return renderAuthError(c, fiber.StatusBadRequest, "Sign-in expired", "The sign-in link expired or was opened in a different browser. Please try again.")
 	}
 	clearOAuthStateCookie(c)
+
+	// P1-K: single-use consume — see GitHubCallback for the rationale.
+	if !h.consumeOAuthState(c.Context(), stateParam) {
+		return renderAuthError(c, fiber.StatusBadRequest, "Sign-in already used", "This sign-in link was already used. Please start sign-in again.")
+	}
 
 	returnTo = validateReturnTo(returnTo)
 

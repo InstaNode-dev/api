@@ -143,6 +143,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// ── Handlers ─────────────────────────────────────────────────────────────
 	onboardH := handlers.NewOnboardingHandler(db, cfg, emailClient)
 	authH := handlers.NewAuthHandler(db, cfg)
+	authH.SetRedis(rdb) // P1-K: single-use OAuth state consume
 	cliAuthH := handlers.NewCLIAuthHandler(db, rdb, cfg, planRegistry)
 	// Build storage provider once and share it with both StorageHandler and ResourceHandler
 	// so that DELETE /api/v1/resources/:id can deprovision MinIO IAM users.
@@ -571,9 +572,9 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Post("/api/v1/email/webhook/ses", emailWebhookH.SES)
 
 	// Authenticated resource management
-	middleware.SetRoleLookupDB(db)  // populate auth_team_role on every RequireAuth
-	middleware.SetAPIKeyDB(db)      // enable PAT auth path in RequireAuth
-	middleware.SetEnvPolicyDB(db)   // RequireEnvAccess reads teams.env_policy
+	middleware.SetRoleLookupDB(db) // populate auth_team_role on every RequireAuth
+	middleware.SetAPIKeyDB(db)     // enable PAT auth path in RequireAuth
+	middleware.SetEnvPolicyDB(db)  // RequireEnvAccess reads teams.env_policy
 	// RequireWritable gates every mutating route under /api/v1/* against
 	// the read_only JWT flag minted by the admin-impersonation endpoint
 	// (POST /api/v1/admin/customers/:team_id/impersonate). GET/HEAD/OPTIONS
