@@ -62,6 +62,19 @@ func TestCountActiveDeploymentsByTeam_CountsRowsExcludingDeleted(t *testing.T) {
 	n, err = models.CountActiveDeploymentsByTeam(ctx, db, teamID)
 	require.NoError(t, err)
 	assert.Equal(t, 2, n, "soft-deleted (status='deleted') row must NOT count toward the cap")
+
+	// Mark another 'failed' — a failed build runs no pod and consumes no
+	// compute, so it must free the slot too (P1-B regression guard).
+	var failID uuid.UUID
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT id FROM deployments WHERE team_id = $1 AND status = 'building' LIMIT 1`, teamID,
+	).Scan(&failID))
+	_, err = db.ExecContext(ctx, `UPDATE deployments SET status = 'failed' WHERE id = $1`, failID)
+	require.NoError(t, err)
+
+	n, err = models.CountActiveDeploymentsByTeam(ctx, db, teamID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "failed deployment must NOT count toward the cap")
 }
 
 // TestCountActiveDeploymentsByTeam_IsolatesByTeam guards a /24-style

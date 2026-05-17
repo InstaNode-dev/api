@@ -586,8 +586,10 @@ func TestPlansRegistry_QueueCountLimit(t *testing.T) {
 }
 
 // TestCountActiveStacksByTeam_ExcludesDeleted verifies that the DB model
-// function used by the A5 check correctly excludes deleted/expired stacks
-// but counts every other status. This is the model-layer regression test.
+// function used by the A5 check counts only the stack statuses that actually
+// occupy a billable slot (building/deploying/healthy — those run a pod) and
+// excludes failed/stopped/deleting (no pod, no compute). This is the
+// model-layer regression test for the P1-B tier-slot-leak fix.
 func TestCountActiveStacksByTeam_ExcludesDeleted(t *testing.T) {
 	requireTestDB(t)
 	db, cleanDB := testhelpers.SetupTestDB(t)
@@ -600,7 +602,6 @@ func TestCountActiveStacksByTeam_ExcludesDeleted(t *testing.T) {
 	teamUUID, err := uuid.Parse(teamID)
 	require.NoError(t, err)
 
-	// Insert one building (active) + one deleted + one expired.
 	insertSlug := func(status string) string {
 		slug := fmt.Sprintf("stk-%s-%s", status, teamID[:6])
 		_, insertErr := db.ExecContext(ctx, `
@@ -611,17 +612,16 @@ func TestCountActiveStacksByTeam_ExcludesDeleted(t *testing.T) {
 		return slug
 	}
 
-	insertSlug("building")  // counts
-	insertSlug("deploying") // counts
-	insertSlug("healthy")   // counts
-	insertSlug("failed")    // counts (still occupies a slot)
-	insertSlug("deleted")   // must NOT count
-	insertSlug("expired")   // must NOT count
+	insertSlug("building")  // counts — running a pod
+	insertSlug("deploying") // counts — running a pod
+	insertSlug("healthy")   // counts — running a pod
+	insertSlug("failed")    // must NOT count — no pod, no compute
+	insertSlug("stopped")   // must NOT count — no pod, no compute
+	insertSlug("deleting")  // must NOT count — being torn down
 
-	// Use unique suffixes to avoid slug collisions when running multiple times
 	n, err := models.CountActiveStacksByTeam(ctx, db, teamUUID)
 	require.NoError(t, err)
-	assert.Equal(t, 4, n, "CountActiveStacksByTeam should count 4 non-deleted/expired stacks")
+	assert.Equal(t, 3, n, "CountActiveStacksByTeam should count only building/deploying/healthy stacks")
 }
 
 // requireTestDB skips the test if TEST_DATABASE_URL is not set.

@@ -586,23 +586,32 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 	// `X-Razorpay-Event-Id` header (canonical) and in the body `id` field
 	// (fallback). The signature check above proves the payload came from
 	// Razorpay, but signed payloads can be re-POSTed N times — each replay
-	// would re-fire the state machine. Atomic INSERT into the dedup table
-	// returns 0-rows-affected on conflict; treat that as "already
-	// processed" and return 200 OK without further side-effects.
+	// would re-fire the state machine.
+	//
+	// The dedup row is recorded AFTER the handler dispatch succeeds, not
+	// before. subscription.activated/charged deliberately return HTTP 500
+	// on failure so Razorpay retries — if the dedup row were committed
+	// before dispatch, the retry would short-circuit on RowsAffected()==0
+	// and report {"deduped":true} without ever processing the upgrade. A
+	// transient DB error during UpgradeTeamAllTiers would then permanently
+	// lose a paying customer's upgrade. Recording dedup post-success means
+	// a failed event leaves no row, so the retry is processed normally;
+	// a successfully-processed event leaves a row, so genuine replays are
+	// still suppressed (checked below before dispatch).
 	eventID := c.Get("X-Razorpay-Event-Id")
 	if eventID == "" {
 		eventID = event.ID
 	}
 	if eventID != "" && h.db != nil {
-		res, err := h.db.ExecContext(ctx,
-			`INSERT INTO razorpay_webhook_events (event_id, event_type) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING`,
-			eventID, event.Event,
-		)
-		if err != nil {
-			// Fail open — log and continue. A dedup write failure is far
+		var alreadyProcessed bool
+		if err := h.db.QueryRowContext(ctx,
+			`SELECT EXISTS (SELECT 1 FROM razorpay_webhook_events WHERE event_id = $1)`,
+			eventID,
+		).Scan(&alreadyProcessed); err != nil {
+			// Fail open — log and continue. A dedup read failure is far
 			// less bad than swallowing a real subscription state change.
-			slog.Warn("billing.webhook.dedup_insert_failed", "error", err, "event_id", eventID)
-		} else if n, _ := res.RowsAffected(); n == 0 {
+			slog.Warn("billing.webhook.dedup_lookup_failed", "error", err, "event_id", eventID)
+		} else if alreadyProcessed {
 			span.SetAttributes(attribute.Bool("rzp.replay_blocked", true))
 			slog.Info("billing.webhook.replay_blocked", "event_id", eventID, "event_type", event.Event)
 			return c.Status(fiber.StatusOK).JSON(fiber.Map{"ok": true, "deduped": true})
@@ -657,6 +666,21 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 		h.handlePaymentFailed(ctx, c, event)
 	default:
 		span.SetAttributes(attribute.String("rzp.event.unhandled", "true"))
+	}
+
+	// Dispatch succeeded (no 500-return path was taken). Record the dedup
+	// row durably now so genuine replays of this same event are suppressed
+	// on subsequent deliveries. ON CONFLICT DO NOTHING keeps this safe under
+	// concurrent duplicate deliveries. A write failure here is fail-open —
+	// at worst a duplicate is re-processed, and the state machine is
+	// idempotent — which is strictly better than swallowing a real event.
+	if eventID != "" && h.db != nil {
+		if _, err := h.db.ExecContext(ctx,
+			`INSERT INTO razorpay_webhook_events (event_id, event_type) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING`,
+			eventID, event.Event,
+		); err != nil {
+			slog.Warn("billing.webhook.dedup_insert_failed", "error", err, "event_id", eventID)
+		}
 	}
 
 	// Always return 200 to Razorpay.

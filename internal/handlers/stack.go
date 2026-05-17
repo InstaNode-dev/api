@@ -1835,6 +1835,35 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 		}
 	} else {
 		// Fresh target: new stack row + matching service rows.
+		//
+		// A5 tier gate (P1-E fix): a fresh-target promote creates a brand-new
+		// billable stack, exactly like POST /stacks/new. Without this check a
+		// caller could POST /stacks/:slug/promote repeatedly with distinct
+		// `to` envs and create unlimited stacks, bypassing the
+		// deployments_apps cap that New enforces. The in-place re-promote
+		// branch above is exempt — it reuses an existing target row.
+		if h.plans != nil {
+			limit := h.plans.DeploymentsAppsLimit(team.PlanTier)
+			if limit >= 0 {
+				existingCount, countErr := models.CountActiveStacksByTeam(c.Context(), h.db, team.ID)
+				if countErr != nil {
+					slog.Error("stack.promote.count_failed", "error", countErr,
+						"team_id", team.ID, "team_tier", team.PlanTier)
+					return respondError(c, fiber.StatusServiceUnavailable, "quota_check_failed",
+						"Failed to check deployment quota")
+				}
+				if existingCount >= limit {
+					metrics.StackProvisionLimitBlocked.WithLabelValues(team.PlanTier).Inc()
+					return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired,
+						"deployment_limit_reached",
+						fmt.Sprintf("Your %s tier allows %d deployment(s). Upgrade at %s", team.PlanTier, limit, urls.StartURLPrefix),
+						newAgentActionDeploymentLimitReached(team.PlanTier, limit),
+						"https://instanode.dev/pricing",
+					)
+				}
+			}
+		}
+
 		// Family root: the source itself if it has no parent, else the
 		// source's parent so all envs share one root.
 		rootID := source.ID

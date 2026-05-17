@@ -141,6 +141,69 @@ func customerPodSecCtx() *corev1.PodSecurityContext {
 	}
 }
 
+// Probe timing constants for customer-workload containers. A TCP-socket probe
+// is used everywhere — customer apps are arbitrary images, so we cannot assume
+// an HTTP health path exists. TCP-connect on the container port proves only
+// that the app is listening, which is the safe lowest-common-denominator
+// signal of reachability. Timings are deliberately generous because customer
+// apps vary wildly in boot time.
+const (
+	// probeStartupPeriodSec / probeStartupFailureThreshold gate the readiness
+	// and liveness probes until the app first listens. failureThreshold * period
+	// = 30 * 10s = 5 min of boot grace, so a slow-booting app (large JVM, big
+	// migration on start) is not killed before it comes up.
+	probeStartupPeriodSec        = 10
+	probeStartupFailureThreshold = 30
+	probeStartupTimeoutSec       = 3
+
+	// Readiness probe — drives the "healthy" signal: a pod is only Ready (and
+	// only receives Service traffic) once a TCP connect succeeds.
+	probeReadinessInitialDelaySec = 5
+	probeReadinessPeriodSec       = 10
+	probeReadinessTimeoutSec      = 3
+	probeReadinessFailureThresh   = 3
+
+	// Liveness probe — restarts a hung container. failureThreshold is higher
+	// than readiness so a brief stall (GC pause, transient overload) does not
+	// trigger a restart; 5 * 15s = 75s of unreachability before a kill.
+	probeLivenessPeriodSec     = 15
+	probeLivenessTimeoutSec    = 3
+	probeLivenessFailureThresh = 5
+)
+
+// customerContainerProbes returns the readiness/liveness/startup probe set for
+// a customer-workload container listening on the given port. All three are
+// TCP-socket probes (see the probe-constant block above for the rationale).
+// Shared by the single-app deploy path and stack services so probe behaviour
+// is identical across both.
+func customerContainerProbes(port int) (readiness, liveness, startup *corev1.Probe) {
+	tcpHandler := func() corev1.ProbeHandler {
+		return corev1.ProbeHandler{
+			TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(port)},
+		}
+	}
+	readiness = &corev1.Probe{
+		ProbeHandler:        tcpHandler(),
+		InitialDelaySeconds: probeReadinessInitialDelaySec,
+		PeriodSeconds:       probeReadinessPeriodSec,
+		TimeoutSeconds:      probeReadinessTimeoutSec,
+		FailureThreshold:    probeReadinessFailureThresh,
+	}
+	liveness = &corev1.Probe{
+		ProbeHandler:     tcpHandler(),
+		PeriodSeconds:    probeLivenessPeriodSec,
+		TimeoutSeconds:   probeLivenessTimeoutSec,
+		FailureThreshold: probeLivenessFailureThresh,
+	}
+	startup = &corev1.Probe{
+		ProbeHandler:     tcpHandler(),
+		PeriodSeconds:    probeStartupPeriodSec,
+		TimeoutSeconds:   probeStartupTimeoutSec,
+		FailureThreshold: probeStartupFailureThreshold,
+	}
+	return readiness, liveness, startup
+}
+
 // curlImageUID / curlImageGID are the numeric uid/gid of `curlimages/curl`
 // (the image's `curl_user`). RunAsNonRoot REQUIRES a numeric RunAsUser —
 // k8s cannot verify a non-numeric image user is non-root and refuses to
@@ -1351,6 +1414,7 @@ func (p *K8sProvider) applyDeploymentInNS(
 	pullPolicy := corev1.PullAlways
 	saFalse := false
 	appID := appIDFromDeployName(name)
+	readinessProbe, livenessProbe, startupProbe := customerContainerProbes(port)
 
 	desired := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1398,6 +1462,13 @@ func (p *K8sProvider) applyDeploymentInNS(
 							// RunAsNonRoot and ReadOnlyRootFilesystem are intentionally omitted
 							// — see customerContainerSecCtx for rationale.
 							SecurityContext: customerContainerSecCtx(),
+							// TCP probes: readiness gates the "healthy" signal on real
+							// reachability (a pod is Ready only once the app listens),
+							// liveness restarts a hung container, and startup gives a
+							// slow-booting app generous grace before the other two run.
+							ReadinessProbe: readinessProbe,
+							LivenessProbe:  livenessProbe,
+							StartupProbe:   startupProbe,
 							// Gap 1 fix: include ephemeral-storage so k8s evicts THIS pod
 							// when it fills its disk quota instead of filling the node
 							// disk and triggering cluster-wide DiskPressure eviction.
