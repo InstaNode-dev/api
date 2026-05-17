@@ -242,6 +242,16 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 		}
 	}
 
+	// Persist the canonical object prefix (provider_resource_id) so teardown
+	// and the worker's storage scanner resolve the prefix from the stored
+	// value, never re-derive it from the token. Closes the token-truncation
+	// class for storage (cross-tenant object access in shared-key mode).
+	if creds.ProviderResourceID != "" {
+		if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
+			slog.Error("storage.new.update_provider_resource_id_failed", "error", upErr, "request_id", requestID)
+		}
+	}
+
 	jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "storage", []string{tokenStr})
 	if jwtErr != nil {
 		slog.Error("storage.new.jwt_issue_failed", "error", jwtErr, "request_id", requestID)
@@ -388,6 +398,14 @@ func (h *StorageHandler) newStorageAuthenticated(
 			if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
 				slog.Error("storage.new.update_connection_url_failed_auth", "error", upErr, "request_id", requestID)
 			}
+		}
+	}
+
+	// Persist the canonical object prefix (provider_resource_id) — see the
+	// anonymous path above. Closes the token-truncation class for storage.
+	if creds.ProviderResourceID != "" {
+		if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
+			slog.Error("storage.new.update_provider_resource_id_failed_auth", "error", upErr, "request_id", requestID)
 		}
 	}
 
