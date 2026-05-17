@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -491,8 +492,11 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 	}
 	defer f.Close()
 
-	tarball := make([]byte, fh.Size)
-	if _, err := f.Read(tarball); err != nil {
+	// P0-3: io.ReadAll, not a single f.Read — a lone Read short-reads on
+	// disk-spilled multipart files (n is discarded), truncating large tarballs.
+	// Mirrors how stack.go reads its tarball field.
+	tarball, err := io.ReadAll(f)
+	if err != nil {
 		return respondError(c, fiber.StatusBadRequest, "tarball_read_failed",
 			"Failed to read tarball bytes")
 	}
@@ -1160,8 +1164,11 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 	}
 	defer f.Close()
 
-	tarball := make([]byte, fh.Size)
-	if _, err := f.Read(tarball); err != nil {
+	// P0-3: io.ReadAll, not a single f.Read — a lone Read short-reads on
+	// disk-spilled multipart files (n is discarded), truncating large tarballs.
+	// Mirrors how stack.go reads its tarball field.
+	tarball, err := io.ReadAll(f)
+	if err != nil {
 		return respondError(c, fiber.StatusBadRequest, "tarball_read_failed",
 			"Failed to read tarball bytes")
 	}
@@ -1177,7 +1184,27 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 		defer cancel()
 
 		startedAt := time.Now()
-		result, reErr := h.compute.Redeploy(ctx, d.ProviderID, tarball, d.EnvVars)
+
+		// P0-4: resolve vault:// refs before the compute call, mirroring
+		// runDeploy. Without this the redeployed container receives the
+		// literal string "vault://env/KEY" instead of the decrypted secret.
+		// The resolved plaintext is passed to the provider only — it is
+		// never written back to the deployments row, so vault rotations
+		// take effect on every redeploy.
+		resolvedEnv, vErr := ResolveVaultRefs(ctx, h.db, h.cfg.AESKey, d.TeamID, d.Env, d.EnvVars)
+		if vErr != nil {
+			slog.Error("deploy.redeploy.vault_resolve_failed",
+				"app_id", appID, "team_id", d.TeamID, "env", d.Env, "error", vErr)
+			_ = models.UpdateDeploymentStatus(ctx, h.db, d.ID, "failed", vErr.Error())
+			emitDeployAudit(h.db, models.AuditKindDeployFailed, d, map[string]any{
+				"failure_stage": "build",
+				"error_summary": truncateForAudit(vErr.Error(), 256),
+			})
+			captureAutopsy(ctx, h.db, d.ID, models.FailureReasonBuildFailed, vErr.Error(), nil)
+			return
+		}
+
+		result, reErr := h.compute.Redeploy(ctx, d.ProviderID, tarball, resolvedEnv)
 		if reErr != nil {
 			slog.Error("deploy.redeploy.failed", "app_id", appID, "error", reErr)
 			_ = models.UpdateDeploymentStatus(ctx, h.db, d.ID, "failed", reErr.Error())
