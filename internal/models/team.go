@@ -4,10 +4,23 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// NormalizeEmail canonicalises an email address for storage and lookup:
+// surrounding whitespace trimmed, then lower-cased. Every code path that
+// reads or writes users.email MUST funnel through this so that
+// "Victim@X.com", " victim@x.com " and "victim@x.com" all resolve to one
+// identity. This is the model-layer guarantee behind the unique index on
+// lower(email) (migration 052) and the /claim account-takeover guard
+// (P7, 2026-05-17): an exact-match GetUserByEmail with no normalisation
+// let a case/whitespace variant slip past the existing-account check.
+func NormalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
 
 // Team represents a billing/organizational unit.
 //
@@ -138,6 +151,12 @@ func CreateUser(ctx context.Context, db *sql.DB, teamID uuid.UUID, email, github
 	// inline NOT EXISTS check is the canonical owner-detection point.
 	// Subsequent inserts get false even if they're owners — primary
 	// transfer is a separate operation (todo: AdminTransferPrimary).
+	// Canonicalise the email at the write boundary so every stored row is
+	// already lower-cased + trimmed — the precondition for the unique
+	// lower(email) index and for GetUserByEmail's exact-match to be a
+	// reliable identity check (P7).
+	email = NormalizeEmail(email)
+
 	u := &User{}
 	err := db.QueryRowContext(ctx, `
 		INSERT INTO users (team_id, email, github_id, google_id, role, is_primary)
@@ -177,11 +196,21 @@ func GetUserByID(ctx context.Context, db *sql.DB, id uuid.UUID) (*User, error) {
 }
 
 // GetUserByEmail fetches a user by email address.
+//
+// The lookup is case/whitespace-insensitive: the input is normalised via
+// NormalizeEmail and matched against lower(email). This is what makes the
+// /claim account-takeover guard (P7) sound — without it "Victim@X.com"
+// would not match the stored "victim@x.com" row and the guard would let a
+// duplicate-identity account through. The WHERE clause uses lower(email)
+// (not = $1) so it is also robust against any legacy non-normalised rows
+// written before migration 052, and so the planner can use the
+// idx_users_email_lower functional index.
 func GetUserByEmail(ctx context.Context, db *sql.DB, email string) (*User, error) {
+	email = NormalizeEmail(email)
 	u := &User{}
 	err := db.QueryRowContext(ctx, `
 		SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, created_at
-		FROM users WHERE email = $1
+		FROM users WHERE lower(email) = $1
 	`, email).Scan(
 		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.CreatedAt,
 	)

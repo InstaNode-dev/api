@@ -217,6 +217,17 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 	if body.Email == "" {
 		return respondError(c, fiber.StatusBadRequest, "missing_email", "email field is required")
 	}
+	// P7: normalise the email (lower-case + trim) up-front so the
+	// account-takeover guard, the CreateUser write, the team name, and
+	// the audit row all operate on one canonical identity. Without this
+	// "Victim@X.com" would slip past the exact-match existing-account
+	// check below and mint a duplicate-identity account — defeating the
+	// Wave-1 P0-1 takeover fix. NormalizeEmail is the same canonicaliser
+	// the model layer applies to every users.email read/write.
+	body.Email = models.NormalizeEmail(body.Email)
+	if body.Email == "" {
+		return respondError(c, fiber.StatusBadRequest, "missing_email", "email field is required")
+	}
 
 	claims, err := crypto.VerifyOnboardingJWT([]byte(h.cfg.JWTSecret), body.JWT)
 	if err != nil {

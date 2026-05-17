@@ -111,6 +111,12 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			created_at  TIMESTAMPTZ DEFAULT now()
 		)`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member'`,
+		// 051_users_email_lower_unique — UNIQUE index on lower(email) so a
+		// case/whitespace-variant duplicate identity cannot be created
+		// (P7 account-takeover hardening). The prod migration is a
+		// defensive DO-block; the test DB is always fresh so a plain
+		// CREATE UNIQUE INDEX IF NOT EXISTS is the faithful mirror.
+		`CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email_lower ON users (lower(email))`,
 		`CREATE TABLE IF NOT EXISTS resources (
 			id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			team_id          UUID REFERENCES teams(id) ON DELETE SET NULL,
