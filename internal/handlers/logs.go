@@ -38,6 +38,7 @@ package handlers
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -170,16 +171,24 @@ func (h *LogsHandler) ResourceLogs(c *fiber.Ctx) error {
 		TailLines: &tail,
 	})
 
-	stream, err := req.Stream(c.Context())
+	// FIX-2: open the log stream with a background-derived context, NOT
+	// c.Context(). The SetBodyStreamWriter callback runs after this handler
+	// returns, by which point fasthttp may have recycled/cancelled the
+	// request context — closing the k8s stream out from under the callback.
+	// cancel is invoked by streamLogsSSE when the pump ends.
+	streamCtx, cancel := context.WithCancel(context.Background())
+	stream, err := req.Stream(streamCtx)
 	if err != nil {
+		cancel()
 		slog.Error("logs.resource.stream_failed",
 			"namespace", namespace, "pod", podName, "token", tokenStr, "error", err)
 		return respondError(c, fiber.StatusServiceUnavailable, "stream_failed",
 			"Failed to stream logs: "+err.Error())
 	}
-	// stream.Close() is called inside SetBodyStreamWriter — NOT via defer.
-	// Defers execute when the handler function returns, which is before
-	// SetBodyStreamWriter's callback runs. Closing here would give an empty stream.
+	// stream.Close() + cancel() are called inside SetBodyStreamWriter by
+	// streamLogsSSE — NOT via defer here. Defers execute when the handler
+	// returns, which is before the callback runs; closing here would give an
+	// empty stream.
 
 	slog.Info("logs.resource.stream",
 		"token", tokenStr,
@@ -193,15 +202,12 @@ func (h *LogsHandler) ResourceLogs(c *fiber.Ctx) error {
 	c.Set("Connection", "keep-alive")
 	c.Set("X-Accel-Buffering", "no")
 
+	// streamLogsSSE pumps lines, breaks on client disconnect (FIX-1: a
+	// fasthttp mid-stream disconnect is observable only as a write/flush
+	// error), and Close()s the stream + cancels streamCtx (FIX-2) when
+	// streaming ends.
 	c.Context().Response.SetBodyStreamWriter(func(w *bufio.Writer) {
-		defer stream.Close()
-		scanner := bufio.NewScanner(stream)
-		for scanner.Scan() {
-			fmt.Fprintf(w, "data: %s\n\n", scanner.Text())
-			_ = w.Flush()
-		}
-		fmt.Fprint(w, "data: [end]\n\n")
-		_ = w.Flush()
+		streamLogsSSE(w, stream, cancel)
 	})
 
 	return nil
