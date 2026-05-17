@@ -249,18 +249,21 @@ func AcceptRBACInvitationByToken(ctx context.Context, db *sql.DB, token string) 
 	// Look up an existing user by email; create one if none exists.
 	u := &User{}
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, created_at
+		SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, email_verified, created_at
 		FROM users WHERE lower(email) = lower($1)
 	`, inv.Email).Scan(
-		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.CreatedAt,
+		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.EmailVerified, &u.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		// Create the user attached to the team with the invited role.
+		// email_verified=true: accepting an invitation requires receiving it
+		// at the invited inbox, which proves the account holder controls
+		// that email — the same bar as a magic-link login.
 		err = tx.QueryRowContext(ctx, `
-			INSERT INTO users (team_id, email, role) VALUES ($1, $2, $3)
-			RETURNING id, team_id, email, role, github_id, google_id, created_at
+			INSERT INTO users (team_id, email, role, email_verified) VALUES ($1, $2, $3, true)
+			RETURNING id, team_id, email, role, github_id, google_id, email_verified, created_at
 		`, inv.TeamID, inv.Email, inv.Role).Scan(
-			&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.CreatedAt,
+			&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.EmailVerified, &u.CreatedAt,
 		)
 		if err != nil {
 			return nil, nil, fmt.Errorf("models.AcceptRBACInvitationByToken: insert user: %w", err)

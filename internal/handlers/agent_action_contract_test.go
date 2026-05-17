@@ -53,6 +53,7 @@ func agentActionContractCases() map[string]string {
 		"AgentActionRestoreTargetCrossTeam":            AgentActionRestoreTargetCrossTeam,
 		"AgentActionBackupIntegrityFailed":             AgentActionBackupIntegrityFailed,
 		"AgentActionMetricsRequiresUpgrade":            AgentActionMetricsRequiresUpgrade,
+		"AgentActionEmailNotVerified":                  AgentActionEmailNotVerified,
 		// Wave FIX-J deploy TTL walls. The long-form success-path
 		// newAgentActionDeployAutoExpire24h is documented in
 		// agent_action.go as the canonical exception to the 280-char

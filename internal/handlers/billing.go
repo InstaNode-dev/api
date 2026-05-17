@@ -241,6 +241,51 @@ func (h *BillingHandler) planIDToTier(planID string) string {
 	return planIDToTierFallback
 }
 
+// requireVerifiedEmail gates billing/upgrade actions on the acting user's
+// email_verified flag (migration 052). It returns (true, nil) when the caller
+// may proceed, and (false, errResponse) when they may not — the caller must
+// `return errResponse` immediately in the latter case.
+//
+// Gate semantics:
+//   - Unverified user → 403 email_not_verified + AgentActionEmailNotVerified.
+//     A /claim-created account can reach the dashboard but has not proven it
+//     controls the email on file; a magic-link sign-in flips the flag.
+//   - Verified user → proceed.
+//   - DEGRADED PATHS fail OPEN, by design: an empty user_id (the legacy
+//     /billing/checkout alias has no RequireAuth user context) or a user-row
+//     lookup error must not block a paying customer over an infra hiccup —
+//     the same fail-open principle as the Redis checkout dedup. The miss is
+//     logged at WARN so an operator can see it. The pre-052 grandfather
+//     backfill means existing users are verified=true regardless.
+func (h *BillingHandler) requireVerifiedEmail(c *fiber.Ctx, action string) (bool, error) {
+	userIDStr := middleware.GetUserID(c)
+	if userIDStr == "" {
+		slog.Warn("billing.email_verify_gate.no_user_id_failopen",
+			"action", action, "request_id", middleware.GetRequestID(c))
+		return true, nil
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		slog.Warn("billing.email_verify_gate.bad_user_id_failopen",
+			"action", action, "user_id", userIDStr, "error", err)
+		return true, nil
+	}
+	user, err := models.GetUserByID(c.Context(), h.db, userID)
+	if err != nil {
+		slog.Warn("billing.email_verify_gate.user_lookup_failopen",
+			"action", action, "user_id", userID, "error", err)
+		return true, nil
+	}
+	if user.EmailVerified {
+		return true, nil
+	}
+	slog.Info("billing.email_verify_gate.blocked",
+		"action", action, "user_id", userID, "team_id", user.TeamID.UUID)
+	return false, respondErrorWithAgentAction(c, fiber.StatusForbidden, "email_not_verified",
+		"Verify your email before changing plans. Sign in via the magic link sent to your email to verify it, then retry.",
+		AgentActionEmailNotVerified, "")
+}
+
 // CreateCheckoutAPI handles POST /api/v1/billing/checkout (and the legacy
 // alias POST /billing/checkout). Creates a Razorpay subscription and returns
 // the hosted payment short_url plus the subscription_id.
@@ -262,6 +307,13 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	teamID, err := uuid.Parse(teamIDStr)
 	if err != nil {
 		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Valid session token required")
+	}
+
+	// Email-verified gate (migration 052): a /claim-created account must
+	// verify its email before it can start a paid checkout. Checked before
+	// the Redis dedup so an unverified caller never consumes a dedup slot.
+	if ok, errResp := h.requireVerifiedEmail(c, "checkout"); !ok {
+		return errResp
 	}
 
 	// BB2-D5 server-side dedup belt. Two rapid concurrent POSTs (cross-tab
@@ -938,6 +990,16 @@ func (h *BillingHandler) handleSubscriptionCancelled(ctx context.Context, c *fib
 	// unpaid). 'anonymous' would be wrong — they still have a team_id. A
 	// cancellation after at least one paid invoice keeps Hobby as a courtesy
 	// floor; resources keep their existing tier (UpdatePlanTier only).
+	//
+	// DELIBERATE downgrade-cap asymmetry — DO NOT "fix" this by adding teardown.
+	// On cancel / halt / complete this handler calls ONLY models.UpdatePlanTier.
+	// Existing resources, deployments, and stacks are KEPT at their current tier
+	// as a customer courtesy — over-cap deployments and stacks are NOT torn down
+	// here. Only NEW provisions are gated at the lower cap: those hit a 402 from
+	// the per-service tier check (/db/new, /deploy/new, /stacks/new, ...). This
+	// mirrors the resources-keep-their-tier behaviour documented for
+	// ElevateResourceTiersByTeam. Do not add teardown of over-cap deployments or
+	// stacks in this handler.
 	tier := "hobby"
 	if sub.PaidCount != nil && *sub.PaidCount == 0 {
 		tier = "free"
@@ -1511,6 +1573,11 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 	teamID, err := uuid.Parse(teamIDStr)
 	if err != nil {
 		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Valid session token required")
+	}
+	// Email-verified gate (migration 052) — same gate as checkout: a
+	// /claim-created account must verify its email before changing plans.
+	if ok, errResp := h.requireVerifiedEmail(c, "change_plan"); !ok {
+		return errResp
 	}
 	if h.cfg.RazorpayKeyID == "" || h.cfg.RazorpayKeySecret == "" {
 		return respondError(c, fiber.StatusServiceUnavailable, "billing_not_configured", "Billing is not configured")

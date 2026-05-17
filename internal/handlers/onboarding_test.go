@@ -181,6 +181,47 @@ func TestOnboarding_PostClaim_ValidJWT_SetsConvertedAtAndTeamID(t *testing.T) {
 	db.Exec(`DELETE FROM teams WHERE id = (SELECT team_id FROM resources WHERE token = $1)`, res.Token)
 }
 
+// TestOnboarding_PostClaim_CreatesUnverifiedUser is the email-verified gate
+// regression (migration 052 / DECISION 2026-05-17): a /claim mints a session
+// for a brand-new-account email but does NOT prove inbox ownership, so the
+// created user row must have email_verified=false. Billing actions are gated
+// on this flag; a regression here would let a /claim account skip the gate.
+func TestOnboarding_PostClaim_CreatesUnverifiedUser(t *testing.T) {
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
+	defer cleanRedis()
+
+	app, cleanApp := testhelpers.NewTestApp(t, db, rdb)
+	defer cleanApp()
+
+	fp := testhelpers.UniqueFingerprint(t)
+	res := testhelpers.MustProvisionCacheFull(t, app, fp)
+	require.NotEmpty(t, res.JWT, "provision response must include an onboarding JWT")
+	defer db.Exec(`DELETE FROM resources WHERE token = $1`, res.Token)
+
+	email := testhelpers.UniqueEmail(t)
+	claimResp := testhelpers.PostJSON(t, app, "/claim", map[string]any{
+		"jwt":       res.JWT,
+		"email":     email,
+		"team_name": "verify-test-" + uuid.NewString()[:8],
+	})
+	defer claimResp.Body.Close()
+	require.Equal(t, http.StatusCreated, claimResp.StatusCode)
+
+	// The user the claim created must be email_verified=false.
+	var emailVerified bool
+	err := db.QueryRow(
+		`SELECT email_verified FROM users WHERE lower(email) = lower($1)`, email,
+	).Scan(&emailVerified)
+	require.NoError(t, err)
+	assert.False(t, emailVerified,
+		"a /claim-created user must have email_verified=false — the claim does not prove inbox ownership")
+
+	// Cleanup the team that was created.
+	db.Exec(`DELETE FROM teams WHERE id = (SELECT team_id FROM resources WHERE token = $1)`, res.Token)
+}
+
 func TestOnboarding_PostClaim_AlreadyClaimed_Returns409Conflict(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
