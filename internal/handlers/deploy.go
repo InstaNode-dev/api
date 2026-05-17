@@ -36,18 +36,32 @@ import (
 	"instant.dev/internal/config"
 	"instant.dev/internal/email"
 	"instant.dev/internal/middleware"
-	"instant.dev/internal/urls"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
 	"instant.dev/internal/providers/compute"
 	"instant.dev/internal/providers/compute/k8s"
 	"instant.dev/internal/providers/compute/noop"
+	"instant.dev/internal/safego"
+	"instant.dev/internal/urls"
 )
 
 // maxAllowedIPs caps the size of the allowed_ips list on a private deploy.
 // Anything bigger belongs in a real VPN / CF Access policy — the goal here is
 // "agent locks the staging app to the office IP", not corporate networking.
 const maxAllowedIPs = 32
+
+// deployNameEnvKey is the env_vars JSONB key under which a deployment's
+// human-readable name is stashed (there is no dedicated DB column). It is
+// PLATFORM METADATA, not an application env var.
+//
+// P1-N (bug hunt 2026-05-17 round 2): this key was injected verbatim into
+// the customer container's environment AND echoed in the `env` field of
+// GET /deploy/:id. Customer apps must never see "_name" in their env, and
+// the API must not leak an internal key. stripInternalEnvKeys removes it on
+// both the compute-injection path and the outbound-JSON path; the key is
+// still persisted in the row so deploymentToMap can surface it as the
+// top-level `name` field.
+const deployNameEnvKey = "_name"
 
 // privateDeployAllowedTiers is the set of tiers permitted to use private=true.
 // Hobby / anonymous / free fall through to the 402 wall.
@@ -130,7 +144,7 @@ func truncateForAudit(s string, max int) string {
 // just updated the row's terminal status. kind is one of
 // AuditKindDeployCreated / AuditKindDeployHealthy / AuditKindDeployFailed.
 func emitDeployAudit(db *sql.DB, kind string, d *models.Deployment, extra map[string]any) {
-	go func() {
+	safego.Go("deploy.audit.emit", func() {
 		meta := map[string]any{
 			"deploy_id": d.ID.String(),
 			"team_id":   d.TeamID.String(),
@@ -157,7 +171,7 @@ func emitDeployAudit(db *sql.DB, kind string, d *models.Deployment, extra map[st
 				"error", err,
 			)
 		}
-	}()
+	})
 }
 
 // generateAppID produces an 8-char lowercase hex string via crypto/rand.
@@ -199,7 +213,7 @@ func deploymentToMapWithDB(d *models.Deployment, db *sql.DB) fiber.Map {
 	// here so the dashboard and agents can read it as a top-level field without
 	// parsing the env map. Empty string for deploys created before mandatory
 	// naming was enforced (2026-05-16).
-	deployName := d.EnvVars["_name"]
+	deployName := d.EnvVars[deployNameEnvKey]
 	m := fiber.Map{
 		"id":          d.ID,
 		"token":       d.AppID, // public-facing alias
@@ -408,6 +422,11 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 		return
 	}
 
+	// P1-N: strip internal platform keys ("_name", …) before the env reaches
+	// the customer container. They are persisted in the row for metadata, but
+	// the running app must never see them in its environment.
+	resolvedEnv = stripInternalEnvKeys(resolvedEnv)
+
 	opts := compute.DeployOptions{
 		AppID:      d.AppID,
 		Token:      d.ID.String(),
@@ -555,7 +574,7 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 	// Persist the deployment record immediately (status = "building").
 	initEnv := make(map[string]string)
 	if name != "" {
-		initEnv["_name"] = name
+		initEnv[deployNameEnvKey] = name
 	}
 
 	// Optional env_vars multipart field: a JSON object {KEY:"value", ...} that
@@ -753,13 +772,13 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 	// "made permanent later via the endpoint".
 	if saved.TTLPolicy == models.DeployTTLPolicyPermanent {
 		emitDeployAudit(h.db, models.AuditKindDeployMadePermanent, saved, map[string]any{
-			"source":                "deploy_new",
-			"previous_ttl_policy":   "auto_24h",
+			"source":              "deploy_new",
+			"previous_ttl_policy": "auto_24h",
 		})
 	}
 
 	// Launch async provisioning; return 202 immediately.
-	go h.runDeploy(saved, tarball)
+	safego.Go("deploy.runDeploy", func() { h.runDeploy(saved, tarball) })
 
 	slog.Info("deploy.new.accepted",
 		"app_id", appID, "team_id", team.ID,
@@ -948,7 +967,7 @@ func (h *DeployHandler) UpdateEnv(c *fiber.Ctx) error {
 		"note": "Env vars updated. Run POST /deploy/" + appID + "/redeploy to apply changes.",
 		// Redact outbound env vars for consistency with GET /deploy/:id.
 		// The stored value is the unredacted merged map; only the response JSON is masked.
-		"env":  redactEnvVars(merged),
+		"env": redactEnvVars(merged),
 	})
 }
 
@@ -1186,7 +1205,7 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 	}
 
 	// Kick off async redeploy.
-	go func() {
+	safego.Go("deploy.redeploy", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 
@@ -1210,6 +1229,10 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 			captureAutopsy(ctx, h.db, d.ID, models.FailureReasonBuildFailed, vErr.Error(), nil)
 			return
 		}
+
+		// P1-N: strip internal platform keys ("_name", …) before the env
+		// reaches the customer container — mirrors runDeploy.
+		resolvedEnv = stripInternalEnvKeys(resolvedEnv)
 
 		result, reErr := h.compute.Redeploy(ctx, d.ProviderID, tarball, resolvedEnv)
 		if reErr != nil {
@@ -1241,7 +1264,7 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 		emitDeployAudit(h.db, models.AuditKindDeployHealthy, d, map[string]any{
 			"time_to_healthy_seconds": int(time.Since(startedAt).Round(time.Second).Seconds()),
 		})
-	}()
+	})
 
 	slog.Info("deploy.redeploy.accepted",
 		"app_id", appID, "provider_id", d.ProviderID, "team_id", team.ID)
