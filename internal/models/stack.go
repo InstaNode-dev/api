@@ -544,14 +544,25 @@ func UpdateStackServiceImageRef(ctx context.Context, db *sql.DB, id uuid.UUID, i
 	return nil
 }
 
-// CountActiveStacksByTeam returns the number of stacks owned by teamID that are
-// NOT in status 'deleted' or 'expired'. Used by the A5 tier-gate check in
+// CountActiveStacksByTeam returns the number of stacks owned by teamID that
+// still consume a billable tier slot. Used by the A5 tier-gate check in
 // stack.go to enforce the per-tier deployments_apps cap from plans.yaml.
+//
+// The previous filter (status NOT IN ('deleted', 'expired')) named two
+// statuses the stacks table never carries — stacks are hard-deleted by
+// DeleteStack and anonymous expiry deletes the row, so neither 'deleted'
+// nor 'expired' ever exists. The effect was that every row counted,
+// including 'failed' stacks (which run no pod) and 'stopped'/'deleting'
+// stacks (which consume no compute), permanently wedging the tier cap.
+//
+// Stack statuses are: building | deploying | healthy | failed | stopped |
+// deleting (see migration 004_stacks.sql). Only building/deploying/healthy
+// run a pod and therefore occupy a slot.
 func CountActiveStacksByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) (int, error) {
 	var n int
 	err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM stacks
-		WHERE team_id = $1 AND status NOT IN ('deleted', 'expired')
+		WHERE team_id = $1 AND status IN ('building', 'deploying', 'healthy')
 	`, teamID).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("models.CountActiveStacksByTeam: %w", err)

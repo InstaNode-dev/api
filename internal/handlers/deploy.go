@@ -1214,6 +1214,20 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 				"failure_stage": "rollout",
 				"error_summary": truncateForAudit(reErr.Error(), 256),
 			})
+			// Capture a structured failure_autopsy so GET /deploy/:id surfaces
+			// a "failure" object for a redeploy failure, mirroring runDeploy.
+			// Without this a redeploy failure shows only a raw error string.
+			// compute.Redeploy bundles the image build + rollout; classify a
+			// deadline as DeadlineExceeded and everything else as BuildFailed
+			// (kaniko build error is the modal case). Fetch the kaniko build
+			// pod logs (fail-soft: nil when the pod is gone) so the user sees
+			// the actual Dockerfile error.
+			reason := models.FailureReasonBuildFailed
+			if errors.Is(reErr, context.DeadlineExceeded) {
+				reason = models.FailureReasonDeadlineExceeded
+			}
+			buildLogs := fetchBuildLogsForAutopsy(ctx, h.compute, d.AppID)
+			captureAutopsy(ctx, h.db, d.ID, reason, reErr.Error(), buildLogs)
 			return
 		}
 		_ = models.UpdateDeploymentStatus(ctx, h.db, d.ID, result.Status, "")

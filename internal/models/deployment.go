@@ -705,11 +705,16 @@ func MarkDeploymentExpired(ctx context.Context, db *sql.DB, id uuid.UUID) error 
 // rows (via DeleteDeployment) drop out naturally because the row is gone.
 // A soft-deleted "deleted" status is treated as freeing the slot, mirroring
 // the behaviour callers expect when they DELETE then re-create.
+//
+// 'failed' is also excluded: a failed deployment runs no pod and consumes no
+// compute, so it must not occupy a billable tier slot. Without this exclusion
+// a single failed build on a hobby team (deployments_apps=1) would 402 every
+// future /deploy/new permanently.
 func CountActiveDeploymentsByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) (int, error) {
 	var n int
 	err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM deployments
-		WHERE team_id = $1 AND status NOT IN ('deleted', 'expired')
+		WHERE team_id = $1 AND status NOT IN ('deleted', 'expired', 'failed')
 	`, teamID).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("models.CountActiveDeploymentsByTeam: %w", err)

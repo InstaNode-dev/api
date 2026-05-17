@@ -385,6 +385,7 @@ func (p *K8sStackProvider) createStackDeployment(
 	// :latest, so without Always, redeploys silently serve cached old images.
 	pullPolicy := corev1.PullAlways
 	saFalse := false
+	readinessProbe, livenessProbe, startupProbe := customerContainerProbes(port)
 
 	desired := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -431,6 +432,13 @@ func (p *K8sStackProvider) createStackDeployment(
 							// RunAsNonRoot and ReadOnlyRootFilesystem are intentionally omitted
 							// — see customerContainerSecCtx in client.go for rationale.
 							SecurityContext: customerContainerSecCtx(),
+							// TCP probes shared with the single-app deploy path
+							// (customerContainerProbes in client.go): readiness gates
+							// "healthy" on real reachability, liveness restarts hangs,
+							// startup grants slow-booting services boot grace.
+							ReadinessProbe: readinessProbe,
+							LivenessProbe:  livenessProbe,
+							StartupProbe:   startupProbe,
 							// Gap 1 fix: ephemeral-storage bounds the writable layer + /tmp.
 							// k8s evicts THIS pod at ephLimit, not the whole node.
 							Resources: corev1.ResourceRequirements{
