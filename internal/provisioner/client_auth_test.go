@@ -169,3 +169,82 @@ func (r *requestIDSniffer) ProvisionResource(ctx context.Context, req *provision
 
 // silence unused — commonv1 import kept for future ResourceType assertions.
 var _ = commonv1.ResourceType_RESOURCE_TYPE_POSTGRES
+
+// TestClient_SurfacesProviderResourceID_FromPoolHit is the api-side P0-2
+// regression guard. When the provisioner serves a /db/new /cache/new /nosql/new
+// request FROM the hot pool, the backing infra is named from the synthetic
+// pool token, and the provisioner returns that canonical identifier in the
+// ProvisionResponse.provider_resource_id field (the provisioner repo encodes a
+// "pooltok:" marker into it). The api MUST surface that value into
+// Credentials.ProviderResourceID so the handler persists it on the resource
+// row — Deprovision / StorageBytes / Regrade then resolve the real backing-
+// infra name from it. If a refactor drops this mapping, the pool token never
+// reaches the resource row and the pool-claimed infra leaks forever again.
+func TestClient_SurfacesProviderResourceID_FromPoolHit(t *testing.T) {
+	const (
+		serverSecret = "poolident-contract-secret-bytes"
+		poolPRID     = "pooltok:pool-12345678-90ab-cdef-1234-567890abcdef"
+	)
+
+	lis := bufconn.Listen(1 << 20)
+	srv := grpc.NewServer(grpc.UnaryInterceptor(authInterceptor(serverSecret)))
+	provisionerv1.RegisterProvisionerServiceServer(srv, &poolPRIDStubServer{prid: poolPRID})
+	go srv.Serve(lis) //nolint:errcheck
+	defer srv.Stop()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	c := &Client{grpc: provisionerv1.NewProvisionerServiceClient(conn), secret: serverSecret}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Every provision path that can be served from the pool must surface the
+	// provider_resource_id. Postgres, Redis and Mongo all have warm pools.
+	calls := map[string]func() (*Credentials, error){
+		"ProvisionPostgres": func() (*Credentials, error) {
+			return c.ProvisionPostgres(ctx, "00000000-0000-0000-0000-0000000000a1", "anonymous", "")
+		},
+		"ProvisionCache": func() (*Credentials, error) {
+			return c.ProvisionCache(ctx, "00000000-0000-0000-0000-0000000000a2", "anonymous", "")
+		},
+		"ProvisionNoSQL": func() (*Credentials, error) {
+			return c.ProvisionNoSQL(ctx, "00000000-0000-0000-0000-0000000000a3", "anonymous", "")
+		},
+	}
+	for name, call := range calls {
+		creds, err := call()
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", name, err)
+		}
+		if creds.ProviderResourceID != poolPRID {
+			t.Errorf("%s: ProviderResourceID = %q, want %q — pool-claimed infra would leak (P0-2)",
+				name, creds.ProviderResourceID, poolPRID)
+		}
+	}
+}
+
+// poolPRIDStubServer answers every ProvisionResource RPC with a fixed
+// provider_resource_id, mimicking a provisioner pool hit.
+type poolPRIDStubServer struct {
+	provisionerv1.UnimplementedProvisionerServiceServer
+	prid string
+}
+
+func (s *poolPRIDStubServer) ProvisionResource(ctx context.Context, req *provisionerv1.ProvisionRequest) (*provisionerv1.ProvisionResponse, error) {
+	return &provisionerv1.ProvisionResponse{
+		ConnectionUrl:      "redis://usr_pool-x:pw@host:6379/0",
+		DatabaseName:       "db_pool-x",
+		Username:           "usr_pool-x",
+		KeyPrefix:          "pool-x:",
+		ProviderResourceId: s.prid,
+	}, nil
+}
