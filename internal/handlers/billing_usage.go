@@ -202,22 +202,16 @@ func (h *BillingUsageHandler) tierForTeam(ctx context.Context, teamID uuid.UUID)
 	return team.PlanTier, nil
 }
 
-// countDeployments counts a team's deployments across all envs. Status
-// values "deleted" / "stopped" are excluded so the count reflects what the
-// user can see — matches the dashboard's "active deployments" framing.
-// Implemented as a SELECT COUNT so we don't pull every row across the wire.
+// countDeployments counts a team's deployments across all envs that occupy a
+// billable tier slot (status building / deploying / healthy).
+//
+// P1-E (bug hunt 2026-05-17 round 2): this counter previously used its own
+// negative filter (NOT IN deleted/stopped) which still counted 'failed' and
+// 'expired' deployments, disagreeing with the tier-cap counter
+// (CountActiveDeploymentsByTeam). It now delegates to that single function so
+// the dashboard usage panel and the /deploy/new tier gate can never drift.
 func (h *BillingUsageHandler) countDeployments(ctx context.Context, teamID uuid.UUID) (int, error) {
-	var n int
-	err := h.db.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM deployments
-		WHERE team_id = $1
-		  AND status NOT IN ('deleted', 'stopped')
-	`, teamID).Scan(&n)
-	if err != nil {
-		return 0, err
-	}
-	return n, nil
+	return models.CountActiveDeploymentsByTeam(ctx, h.db, teamID)
 }
 
 // mbToBytes converts a plans.yaml megabyte value to bytes. -1 (unlimited)

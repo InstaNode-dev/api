@@ -77,6 +77,43 @@ func TestCountActiveDeploymentsByTeam_CountsRowsExcludingDeleted(t *testing.T) {
 	assert.Equal(t, 1, n, "failed deployment must NOT count toward the cap")
 }
 
+// TestCountActiveDeploymentsByTeam_ExcludesStoppedAndExpired is the P1-E
+// regression guard. A 'stopped' deployment is user-paused (pod scaled to
+// zero) and an 'expired' deployment's TTL elapsed — neither runs a pod, so
+// neither occupies a billable tier slot. The previous negative filter
+// (NOT IN deleted/expired/failed) still counted 'stopped', which both
+// wedged the tier cap and disagreed with the dashboard usage counter.
+func TestCountActiveDeploymentsByTeam_ExcludesStoppedAndExpired(t *testing.T) {
+	requireDB(t)
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+
+	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, "pro"))
+	defer db.Exec(`DELETE FROM teams WHERE id = $1`, teamID)
+
+	ctx := context.Background()
+
+	// Five deployments, one per status: building, deploying, healthy,
+	// stopped, expired. Only the first three occupy a slot.
+	statuses := []string{"building", "deploying", "healthy", "stopped", "expired"}
+	for _, st := range statuses {
+		d, err := models.CreateDeployment(ctx, db, models.CreateDeploymentParams{
+			TeamID: teamID,
+			AppID:  "app-st-" + uuid.NewString()[:8],
+			Tier:   "pro",
+		})
+		require.NoError(t, err)
+		defer db.Exec(`DELETE FROM deployments WHERE id = $1`, d.ID)
+		_, err = db.ExecContext(ctx, `UPDATE deployments SET status = $1 WHERE id = $2`, st, d.ID)
+		require.NoError(t, err)
+	}
+
+	n, err := models.CountActiveDeploymentsByTeam(ctx, db, teamID)
+	require.NoError(t, err)
+	assert.Equal(t, 3, n,
+		"only building/deploying/healthy occupy a slot — stopped + expired must be excluded")
+}
+
 // TestCountActiveDeploymentsByTeam_IsolatesByTeam guards a /24-style
 // cross-team mistake: counting another team's deployments would let one
 // tenant burn another tenant's quota.

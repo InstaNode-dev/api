@@ -30,12 +30,12 @@ import (
 // Order matters in sqlmock — expectations are satisfied in FIFO order.
 // computeUsage runs:
 //
-//	1) SELECT … FROM teams WHERE id = $1                     (tierForTeam)
-//	2-4) SELECT COALESCE(SUM(storage_bytes)…) (postgres, redis, mongodb)
-//	5) SELECT COUNT(*) FROM deployments                      (countDeployments)
-//	6) SELECT COUNT(*) FROM resources … resource_type='webhook'
-//	7) SELECT COUNT(*) FROM vault_secrets                    (CountVaultKeysByTeam)
-//	8) SELECT COUNT(*) FROM team_members                     (CountTeamMembers)
+//  1. SELECT … FROM teams WHERE id = $1                     (tierForTeam)
+//     2-4) SELECT COALESCE(SUM(storage_bytes)…) (postgres, redis, mongodb)
+//  5. SELECT COUNT(*) FROM deployments                      (countDeployments)
+//  6. SELECT COUNT(*) FROM resources … resource_type='webhook'
+//  7. SELECT COUNT(*) FROM vault_secrets                    (CountVaultKeysByTeam)
+//  8. SELECT COUNT(*) FROM team_members                     (CountTeamMembers)
 //
 // The team_members one differs slightly across schema versions; we use
 // QueryMatcherEqual=off (default) so substring matching catches both shapes.
@@ -56,8 +56,10 @@ func expectUsageQueries(mock sqlmock.Sqlmock, teamID uuid.UUID) {
 			WillReturnRows(sqlmock.NewRows([]string{"sum"}).AddRow(int64(0)))
 	}
 
-	// 5) deployments count
-	mock.ExpectQuery(`SELECT COUNT\(\*\)\s+FROM deployments`).
+	// 5) deployments count — P1-E: countDeployments now delegates to
+	// models.CountActiveDeploymentsByTeam, whose query uses lowercase
+	// count(*); regex made case-insensitive to match either form.
+	mock.ExpectQuery(`(?i)SELECT count\(\*\)\s+FROM deployments`).
 		WithArgs(teamID).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
