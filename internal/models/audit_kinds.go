@@ -333,4 +333,32 @@ const (
 	AuditKindStackDeletionConfirmed = "stack.deletion_confirmed"
 	AuditKindStackDeletionCancelled = "stack.deletion_cancelled"
 	AuditKindStackDeletionExpired   = "stack.deletion_expired"
+
+	// Storage-quota suspend/unsuspend lifecycle. Producer: the WORKER's
+	// storage-quota enforcement job (worker/internal/jobs) — NOT the api.
+	// The api side of this contract is twofold: (1) declare the canonical
+	// kind strings here so a downstream consumer never typo-drifts against
+	// the worker's emit site, and (2) the worker's event_email_mapping.go +
+	// lifecycle_emails.go register a builder + Go renderer keyed on these
+	// exact strings so each suspend/unsuspend produces a customer email and
+	// a dashboard Recent-Activity row. Adding either kind here WITHOUT the
+	// matching worker wiring means the audit row lands but no email is sent
+	// (see this file's header note and the worker repo's
+	// TestEveryEmailKindHasAGoRenderer / TestEventEmail_AllSupportedKindsHaveBuilder).
+	//
+	// AuditKindResourceQuotaSuspended fires when the worker suspends a
+	// customer resource for exceeding its storage-quota limit (the
+	// provider-side CONNECT/ACL revoke + resources.status='suspended'
+	// transition). Metadata carries resource_id, resource_type, and the
+	// resource name so the email body can name the affected resource and
+	// the renderer can tell the customer how to recover (delete data or
+	// upgrade the plan).
+	AuditKindResourceQuotaSuspended = "resource.quota_suspended"
+
+	// AuditKindResourceQuotaUnsuspended fires when the worker lifts a prior
+	// storage-quota suspension — the customer freed enough space (or
+	// upgraded) and the resource is back online. Metadata mirrors
+	// resource.quota_suspended (resource_id, resource_type, name) so the
+	// "your resource is back" email can name it.
+	AuditKindResourceQuotaUnsuspended = "resource.quota_unsuspended"
 )

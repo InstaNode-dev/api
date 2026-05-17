@@ -48,13 +48,20 @@ type Team struct {
 
 // User represents an authenticated user belonging to a team.
 type User struct {
-	ID        uuid.UUID
-	TeamID    uuid.NullUUID
-	Email     string
-	Role      string
-	GitHubID  sql.NullString
-	GoogleID  sql.NullString
-	CreatedAt time.Time
+	ID       uuid.UUID
+	TeamID   uuid.NullUUID
+	Email    string
+	Role     string
+	GitHubID sql.NullString
+	GoogleID sql.NullString
+	// EmailVerified records whether the account holder has demonstrated
+	// control of the email address (migration 052). New /claim accounts
+	// start false — the claim does not prove inbox ownership; magic-link
+	// and OAuth logins set it true. Billing/upgrade actions are gated on
+	// this flag (see handlers/billing.go). Pre-052 users were grandfathered
+	// to true by the migration backfill.
+	EmailVerified bool
+	CreatedAt     time.Time
 }
 
 // ErrTeamNotFound is returned when a team lookup yields no rows.
@@ -157,19 +164,26 @@ func CreateUser(ctx context.Context, db *sql.DB, teamID uuid.UUID, email, github
 	// reliable identity check (P7).
 	email = NormalizeEmail(email)
 
+	// email_verified always starts false here (the column default). This is
+	// correct for /claim (the caller has not proven inbox ownership) and is
+	// the safe default for OAuth/magic-link paths too — those flip it true
+	// via SetEmailVerified once inbox/identity control IS proven. Inserting
+	// the literal keeps this code path independent of the DB default, so a
+	// future default change is a visible diff rather than a silent shift.
 	u := &User{}
 	err := db.QueryRowContext(ctx, `
-		INSERT INTO users (team_id, email, github_id, google_id, role, is_primary)
+		INSERT INTO users (team_id, email, github_id, google_id, role, is_primary, email_verified)
 		VALUES (
 			$1, $2, $3, $4, $5,
 			NOT EXISTS (
 				SELECT 1 FROM users
 				 WHERE team_id = $1 AND is_primary = true
-			)
+			),
+			false
 		)
-		RETURNING id, team_id, email, role, github_id, google_id, created_at
+		RETURNING id, team_id, email, role, github_id, google_id, email_verified, created_at
 	`, teamID, email, ghID, gID, role).Scan(
-		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.CreatedAt,
+		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.EmailVerified, &u.CreatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("models.CreateUser: %w", err)
@@ -177,14 +191,34 @@ func CreateUser(ctx context.Context, db *sql.DB, teamID uuid.UUID, email, github
 	return u, nil
 }
 
+// SetEmailVerified marks a user's email address as verified. It is called by
+// every account path that proves inbox/identity control: magic-link login
+// (the user clicked a link delivered to that inbox), Google OAuth (Google
+// only returns verified addresses), and GitHub OAuth (the handler filters
+// /user/emails on the Verified flag). /claim does NOT call this — a claim
+// does not prove the caller owns the email.
+//
+// Idempotent: calling it on an already-verified user is a harmless no-op
+// UPDATE. The caller should treat a returned error as best-effort — a verify
+// flip failing must not break the login flow itself.
+func SetEmailVerified(ctx context.Context, db *sql.DB, userID uuid.UUID) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE users SET email_verified = true WHERE id = $1
+	`, userID)
+	if err != nil {
+		return fmt.Errorf("models.SetEmailVerified: %w", err)
+	}
+	return nil
+}
+
 // GetUserByID fetches a user by primary key UUID.
 func GetUserByID(ctx context.Context, db *sql.DB, id uuid.UUID) (*User, error) {
 	u := &User{}
 	err := db.QueryRowContext(ctx, `
-		SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, created_at
+		SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, email_verified, created_at
 		FROM users WHERE id = $1
 	`, id).Scan(
-		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.CreatedAt,
+		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.EmailVerified, &u.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, &ErrUserNotFound{Email: fmt.Sprintf("id:%s", id)}
@@ -209,10 +243,10 @@ func GetUserByEmail(ctx context.Context, db *sql.DB, email string) (*User, error
 	email = NormalizeEmail(email)
 	u := &User{}
 	err := db.QueryRowContext(ctx, `
-		SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, created_at
+		SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, email_verified, created_at
 		FROM users WHERE lower(email) = $1
 	`, email).Scan(
-		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.CreatedAt,
+		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.EmailVerified, &u.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, &ErrUserNotFound{Email: email}
@@ -227,10 +261,10 @@ func GetUserByEmail(ctx context.Context, db *sql.DB, email string) (*User, error
 func GetUserByGitHubID(ctx context.Context, db *sql.DB, githubID string) (*User, error) {
 	u := &User{}
 	err := db.QueryRowContext(ctx, `
-		SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, created_at
+		SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, email_verified, created_at
 		FROM users WHERE github_id = $1
 	`, githubID).Scan(
-		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.CreatedAt,
+		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.EmailVerified, &u.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, &ErrUserNotFound{Email: fmt.Sprintf("github:%s", githubID)}
@@ -384,18 +418,18 @@ func GetTeamByRazorpaySubscriptionID(ctx context.Context, db *sql.DB, subscripti
 func GetUserByTeamID(ctx context.Context, db *sql.DB, teamID uuid.UUID) (*User, error) {
 	u := &User{}
 	err := db.QueryRowContext(ctx, `
-		SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, created_at
+		SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, email_verified, created_at
 		FROM users WHERE team_id = $1 AND role = 'owner'
 		ORDER BY created_at ASC LIMIT 1
 	`, teamID).Scan(
-		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.CreatedAt,
+		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.EmailVerified, &u.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		err = db.QueryRowContext(ctx, `
-			SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, created_at
+			SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, email_verified, created_at
 			FROM users WHERE team_id = $1 ORDER BY created_at ASC LIMIT 1
 		`, teamID).Scan(
-			&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.CreatedAt,
+			&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.EmailVerified, &u.CreatedAt,
 		)
 	}
 	if err == sql.ErrNoRows {
@@ -450,10 +484,10 @@ func LinkGoogleID(ctx context.Context, db *sql.DB, userID uuid.UUID, googleID st
 func GetUserByGoogleID(ctx context.Context, db *sql.DB, googleID string) (*User, error) {
 	u := &User{}
 	err := db.QueryRowContext(ctx, `
-		SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, created_at
+		SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, email_verified, created_at
 		FROM users WHERE google_id = $1
 	`, googleID).Scan(
-		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.CreatedAt,
+		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.EmailVerified, &u.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, &ErrUserNotFound{Email: fmt.Sprintf("google:%s", googleID)}

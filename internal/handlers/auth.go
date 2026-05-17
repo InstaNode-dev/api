@@ -545,6 +545,12 @@ func (h *AuthHandler) findOrCreateUserGitHub(ctx context.Context, gh *gitHubUser
 				}
 				byEmail.GitHubID = sql.NullString{String: gh.ID, Valid: true}
 			}
+			// A successful GitHub OAuth proves identity control of a verified
+			// GitHub email (gitHubUser.Email is sourced only from a /user/emails
+			// entry whose Verified flag is true — see the P2 bug-hunt fix), so
+			// mark the linked account verified. Best-effort: a flip failure must
+			// not block the login.
+			markEmailVerified(ctx, h.db, byEmail)
 			team, teamErr := models.GetTeamByID(ctx, h.db, byEmail.TeamID.UUID)
 			if teamErr != nil {
 				return nil, nil, fmt.Errorf("findOrCreateUserGitHub: %w", teamErr)
@@ -565,7 +571,27 @@ func (h *AuthHandler) findOrCreateUserGitHub(ctx context.Context, gh *gitHubUser
 	if err != nil {
 		return nil, nil, fmt.Errorf("findOrCreateUserGitHub create user: %w", err)
 	}
+	// GitHub OAuth supplies a verified email (see the link-by-email branch
+	// above for the rationale) — flip the new account's flag true.
+	markEmailVerified(ctx, h.db, user)
 	return user, team, nil
+}
+
+// markEmailVerified flips a user's email_verified flag to true and reflects
+// the change on the in-memory User so the rest of the request sees it. It is
+// the shared best-effort helper for the OAuth find-or-create paths: a verify
+// flip failure is logged and swallowed — it must never break an otherwise
+// successful login. /claim deliberately does NOT call this (a claim does not
+// prove inbox ownership); magic-link uses models.SetEmailVerified directly.
+func markEmailVerified(ctx context.Context, db *sql.DB, user *models.User) {
+	if user == nil || user.EmailVerified {
+		return
+	}
+	if err := models.SetEmailVerified(ctx, db, user.ID); err != nil {
+		slog.Error("auth.set_email_verified_failed", "error", err, "user_id", user.ID)
+		return
+	}
+	user.EmailVerified = true
 }
 
 // --- Google OAuth helpers ---
@@ -1069,6 +1095,10 @@ func (h *AuthHandler) findOrCreateUserGoogle(ctx context.Context, g *googleUser)
 				}
 				byEmail.GoogleID = sql.NullString{String: g.Sub, Valid: true}
 			}
+			// Google only ever returns a verified email address, so a
+			// successful Google OAuth proves inbox control — mark the linked
+			// account verified. Best-effort: see markEmailVerified.
+			markEmailVerified(ctx, h.db, byEmail)
 			team, teamErr := models.GetTeamByID(ctx, h.db, byEmail.TeamID.UUID)
 			if teamErr != nil {
 				return nil, nil, fmt.Errorf("findOrCreateUserGoogle: %w", teamErr)
@@ -1092,5 +1122,7 @@ func (h *AuthHandler) findOrCreateUserGoogle(ctx context.Context, g *googleUser)
 	if err != nil {
 		return nil, nil, fmt.Errorf("findOrCreateUserGoogle create user: %w", err)
 	}
+	// Google supplies a verified email — flip the new account's flag true.
+	markEmailVerified(ctx, h.db, user)
 	return user, team, nil
 }

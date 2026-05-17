@@ -215,6 +215,16 @@ const AgentActionPromotionAlreadyUsed = "Tell the user this promo code has alrea
 // one" sentence because the remedy is different from "try another code."
 const AgentActionPromotionExpired = "Tell the user this promo code has expired. Ask the admin who issued it for a fresh code at https://instanode.dev/billing — admin codes have a fixed validity window."
 
+// AgentActionEmailNotVerified is returned on the 403 from the billing
+// checkout + change-plan handlers when the acting user's email_verified
+// flag is false (migration 052). A /claim-created account can reach the
+// dashboard but has not proven it controls the email on file, so billing
+// actions are gated until it does. The fix is a magic-link sign-in: that
+// delivers a link to the inbox and clicking it flips email_verified true.
+// The sentence names the reason and the exact next action with the full
+// sign-in URL so an MCP/CLI agent can relay it verbatim.
+const AgentActionEmailNotVerified = "Tell the user they must verify their email before changing plans. Have them sign in via the magic link sent to their email at https://instanode.dev/login — clicking that link verifies the address, then retry the upgrade."
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Storage / vault tier walls (called from respondErrorWithAgentAction)
 // ─────────────────────────────────────────────────────────────────────────────

@@ -291,6 +291,21 @@ func (h *MagicLinkHandler) Callback(c *fiber.Ctx) error {
 		return renderAuthError(c, fiber.StatusServiceUnavailable, "Sign-in failed", "Could not create your account. Please try again.")
 	}
 
+	// Completing a magic-link sign-in proves the user controls the inbox the
+	// link was delivered to — mark the email verified so it clears the
+	// billing/upgrade gate (see handlers/billing.go). Best-effort: a verify
+	// flip failure must not break an otherwise-successful login, so a non-nil
+	// error is logged and swallowed. user.EmailVerified is updated in memory
+	// too so the rest of this request sees the flipped state.
+	if !user.EmailVerified {
+		if verr := models.SetEmailVerified(c.Context(), h.db, user.ID); verr != nil {
+			slog.Error("magic_link.callback.set_email_verified_failed",
+				"error", verr, "user_id", user.ID, "request_id", requestID)
+		} else {
+			user.EmailVerified = true
+		}
+	}
+
 	sessionToken, err := h.auth.IssueSessionJWT(user, team)
 	if err != nil {
 		slog.Error("magic_link.callback.jwt_failed", "error", err, "request_id", requestID)

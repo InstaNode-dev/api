@@ -111,6 +111,14 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			created_at  TIMESTAMPTZ DEFAULT now()
 		)`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member'`,
+		// 052_users_email_verified — per-user flag recording whether the
+		// account holder proved control of the email. New /claim accounts
+		// start false; magic-link + OAuth flip it true. Billing/upgrade
+		// actions are gated on it. The prod migration also backfills every
+		// pre-existing user to true (grandfathering); the test DB is always
+		// fresh so the column DEFAULT + per-test inserts are the faithful
+		// mirror — no backfill needed here.
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT false`,
 		// 051_users_email_lower_unique — UNIQUE index on lower(email) so a
 		// case/whitespace-variant duplicate identity cannot be created
 		// (P7 account-takeover hardening). The prod migration is a
