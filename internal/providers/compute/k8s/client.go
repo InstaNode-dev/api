@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -79,7 +80,6 @@ const (
 	// 600 seconds (10 minutes) is generous for a real npm/pip/go install;
 	// reduce if the median real-world build time warrants it.
 	buildJobActiveDeadlineSecs = int64(600)
-
 )
 
 // customerContainerSecCtx returns the SecurityContext applied to every
@@ -283,6 +283,7 @@ func splitCIDRList(s string) []string {
 //   - RunAsNonRoot=true + an explicit numeric RunAsUser/RunAsGroup (100) so
 //     the kubelet can verify non-root and the container actually starts.
 //   - ReadOnlyRootFilesystem=true — curl writes only to its declared volume.
+//
 // NOTE: the Kaniko build container does NOT use this — it sets its own
 // SecurityContext without RunAsNonRoot (kaniko requires uid=0).
 func platformContainerSecCtx() *corev1.SecurityContext {
@@ -331,7 +332,30 @@ type K8sProvider struct {
 	clientset kubernetes.Interface // accepts both *Clientset and *fake.Clientset (tests)
 	namespace string               // shared namespace (legacy fallback); per-deploy namespaces are preferred
 	buildCtx  BuildContextConfig   // MinIO settings for kaniko build context delivery
+
+	// buildLogCache snapshots the kaniko pod logs of a FAILED build the moment
+	// waitForJobComplete reports JobFailed — while the pod is still guaranteed
+	// alive. P1-G (bug hunt 2026-05-17 round 2): the autopsy's
+	// fetchBuildLogsForAutopsy used to read logs live, racing the kaniko Job's
+	// 300s TTLSecondsAfterFinished; on a slow failure path the pod was already
+	// GC'd and failure.last_lines came back empty. FetchBuildLogs now consults
+	// this cache first so the autopsy always has the build output.
+	// Keyed by appID → *buildLogCacheEntry.
+	buildLogCache sync.Map
 }
+
+// buildLogCacheEntry is one cached build-log snapshot plus the time it was
+// captured, so stale entries can be evicted.
+type buildLogCacheEntry struct {
+	lines      []string
+	capturedAt time.Time
+}
+
+// buildLogCacheTTL bounds how long a captured build-log snapshot is retained.
+// Generously longer than the kaniko Job TTL (300s) and any plausible autopsy
+// delay, but finite so a long-lived api pod does not leak memory on every
+// failed build.
+const buildLogCacheTTL = 30 * time.Minute
 
 // New creates a K8sProvider targeting the given namespace.
 // buildCtx is optional — when unset, builds fall back to the 1 MiB Secret path.
@@ -415,9 +439,9 @@ func (p *K8sProvider) setupTenantNamespace(ctx context.Context, namespaceName, t
 				"pod-security.kubernetes.io/enforce": "baseline",
 				"pod-security.kubernetes.io/warn":    "restricted",
 				// Tenant labels for auditing and network policy selectors.
-				"instant.dev/tenant":  tenantID,
-				"instant.dev/tier":    tier,
-				"managed-by":          "instant.dev",
+				"instant.dev/tenant": tenantID,
+				"instant.dev/tier":   tier,
+				"managed-by":         "instant.dev",
 			},
 		},
 	}
@@ -456,7 +480,7 @@ func (p *K8sProvider) createDeployNamespace(ctx context.Context, appID, teamID, 
 // Avoids the "address of unaddressable value" compile error when building Protocol/Port
 // pointer fields without naming each one separately.
 func ptrProto(p corev1.Protocol) *corev1.Protocol { return &p }
-func ptrPort(p int) *intstr.IntOrString          { v := intstr.FromInt(p); return &v }
+func ptrPort(p int) *intstr.IntOrString           { v := intstr.FromInt(p); return &v }
 
 // createNetworkPolicyInNS installs a default-deny NetworkPolicy in the given namespace
 // and adds targeted allow rules:
@@ -734,13 +758,17 @@ func (p *K8sProvider) createResourceQuota(ctx context.Context, appID, tier strin
 // NOTE — per-pod PID limiting (fork-bomb defence):
 // Kubernetes does NOT support "pids" as a LimitRange resource. Attempts to add
 // it are rejected by the API server with:
-//   "pids: must be a standard resource for containers"
+//
+//	"pids: must be a standard resource for containers"
+//
 // This was verified in production (DOKS 1.32). The previous code attempted a
 // try-with-pids / fallback pattern, but the fallback always fired, making the
 // pids branch permanently dead code.
 //
 // Kubernetes per-pod PID limiting requires a node-level kubelet configuration:
-//   --pod-max-pids / podPidsLimit (kubelet config or DOKS node-pool kubelet arg).
+//
+//	--pod-max-pids / podPidsLimit (kubelet config or DOKS node-pool kubelet arg).
+//
 // This is an operator/infrastructure action, not something the API server or a
 // LimitRange can enforce per-namespace. The practical risk is contained: the
 // per-pod memory limit (256Mi for hobby) OOM-backstops naive fork bombs because
@@ -943,39 +971,103 @@ func (p *K8sProvider) Logs(ctx context.Context, providerID string, follow bool) 
 	return stream, nil
 }
 
+// buildLogMaxLines is the cap on tailed kaniko log lines for the autopsy.
+const buildLogMaxLines = 200
+
 // FetchBuildLogs implements compute.BuildLogFetcher.
 //
-// It locates the kaniko build pod for appID (job label "job-name=build-<appID>"
-// in namespace "instant-deploy-<appID>"), reads its "kaniko" container stdout,
-// and returns the last ≤200 lines. Null bytes are stripped for safety.
+// P1-G: it first consults buildLogCache, which buildImage populates with a
+// snapshot of the kaniko pod logs the instant a build fails — before the
+// 300s Job TTL can reap the pod. A cache hit is always returned because it
+// is the only source that survives the TTL race. On a cache miss (e.g. the
+// autopsy ran fast, or this is a fresh api pod) it falls back to reading the
+// live pod logs, locating the kaniko build pod for appID (job label
+// "job-name=build-<appID>" in namespace "instant-deploy-<appID>").
 //
 // Fail-soft contract: any error (pod gone, namespace deleted, logs unavailable)
 // is returned as (nil, err) so the caller writes the autopsy row with an empty
 // last_lines slice rather than panicking or blocking.
 func (p *K8sProvider) FetchBuildLogs(ctx context.Context, appID string) ([]string, error) {
-	const maxLines = 200
+	// Cache hit — the snapshot captured at failure time. Authoritative.
+	if v, ok := p.buildLogCache.Load(appID); ok {
+		if entry, ok := v.(*buildLogCacheEntry); ok {
+			if time.Since(entry.capturedAt) <= buildLogCacheTTL {
+				return entry.lines, nil
+			}
+			// Stale — drop it and fall through to a live read.
+			p.buildLogCache.Delete(appID)
+		}
+	}
+
 	ns := deployNamespace(appID)
 	jobName := "build-" + sanitizeName(appID)
+	lines, err := p.streamKanikoLogs(ctx, ns, jobName)
+	if err != nil {
+		return nil, fmt.Errorf("k8s.FetchBuildLogs: %w", err)
+	}
+	return lines, nil
+}
 
+// snapshotBuildLogs reads the kaniko pod logs for a just-failed build and
+// stores them in buildLogCache keyed by appID. Called from buildImage the
+// moment waitForJobComplete reports failure, while the pod is still alive.
+// Best-effort: a read failure here just means FetchBuildLogs falls back to a
+// (likely doomed) live read — strictly no worse than the pre-P1-G behaviour.
+//
+// It also opportunistically evicts cache entries older than buildLogCacheTTL
+// so a long-lived api pod does not accumulate snapshots indefinitely.
+func (p *K8sProvider) snapshotBuildLogs(ctx context.Context, ns, appID, jobName string) {
+	p.evictStaleBuildLogs()
+
+	lines, err := p.streamKanikoLogs(ctx, ns, jobName)
+	if err != nil {
+		slog.Warn("k8s.snapshotBuildLogs: could not capture failed build logs",
+			"app_id", appID, "job", jobName, "error", err)
+		return
+	}
+	p.buildLogCache.Store(appID, &buildLogCacheEntry{
+		lines:      lines,
+		capturedAt: time.Now(),
+	})
+	slog.Info("k8s.snapshotBuildLogs: captured failed build logs for autopsy",
+		"app_id", appID, "lines", len(lines))
+}
+
+// evictStaleBuildLogs drops buildLogCache entries older than buildLogCacheTTL.
+func (p *K8sProvider) evictStaleBuildLogs() {
+	now := time.Now()
+	p.buildLogCache.Range(func(k, v any) bool {
+		if entry, ok := v.(*buildLogCacheEntry); ok && now.Sub(entry.capturedAt) > buildLogCacheTTL {
+			p.buildLogCache.Delete(k)
+		}
+		return true
+	})
+}
+
+// streamKanikoLogs locates the kaniko build pod for jobName in ns, streams its
+// "kaniko" container stdout, and returns the last ≤buildLogMaxLines lines with
+// null bytes stripped. Shared by FetchBuildLogs (live read) and
+// snapshotBuildLogs (capture-at-failure).
+func (p *K8sProvider) streamKanikoLogs(ctx context.Context, ns, jobName string) ([]string, error) {
 	pods, err := p.clientset.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
 		LabelSelector: "job-name=" + jobName,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("k8s.FetchBuildLogs: list pods for job %q in %q: %w", jobName, ns, err)
+		return nil, fmt.Errorf("list pods for job %q in %q: %w", jobName, ns, err)
 	}
 	if len(pods.Items) == 0 {
-		return nil, fmt.Errorf("k8s.FetchBuildLogs: no pods found for job %q in %q (pod may have been GC'd)", jobName, ns)
+		return nil, fmt.Errorf("no pods found for job %q in %q (pod may have been GC'd)", jobName, ns)
 	}
 
 	// Use the first pod (there is exactly one per build Job).
 	podName := pods.Items[0].Name
 	req := p.clientset.CoreV1().Pods(ns).GetLogs(podName, &corev1.PodLogOptions{
 		Container: "kaniko",
-		TailLines: int64Ptr(maxLines),
+		TailLines: int64Ptr(buildLogMaxLines),
 	})
 	stream, err := req.Stream(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("k8s.FetchBuildLogs: stream logs for pod %q container kaniko: %w", podName, err)
+		return nil, fmt.Errorf("stream logs for pod %q container kaniko: %w", podName, err)
 	}
 	defer stream.Close()
 
@@ -987,13 +1079,13 @@ func (p *K8sProvider) FetchBuildLogs(ctx context.Context, appID string) ([]strin
 	}
 	if err := scanner.Err(); err != nil {
 		// Partial logs are still better than none — return what we have.
-		slog.Warn("k8s.FetchBuildLogs: scanner error reading kaniko logs",
-			"app_id", appID, "pod", podName, "lines_so_far", len(lines), "error", err)
+		slog.Warn("k8s.streamKanikoLogs: scanner error reading kaniko logs",
+			"pod", podName, "lines_so_far", len(lines), "error", err)
 	}
 
 	// Cap defensively (TailLines is advisory — some k8s implementations ignore it).
-	if len(lines) > maxLines {
-		lines = lines[len(lines)-maxLines:]
+	if len(lines) > buildLogMaxLines {
+		lines = lines[len(lines)-buildLogMaxLines:]
 	}
 
 	return lines, nil
@@ -1128,6 +1220,14 @@ func (p *K8sProvider) buildImage(ctx context.Context, ns, appID, imageTag string
 
 	// 4. Wait for Job completion (poll status).
 	if err := p.waitForJobComplete(ctx, ns, jobName, 10*time.Minute); err != nil {
+		// P1-G: the kaniko Job + its pod are reaped 300s after the Job
+		// terminates (TTLSecondsAfterFinished). The failure autopsy that
+		// reads these logs runs LATER, in the api handler, after Deploy
+		// returns — so on a slow path the pod is already gone and
+		// failure.last_lines comes back empty. Snapshot the logs NOW, while
+		// the failed pod is still guaranteed alive, into buildLogCache;
+		// FetchBuildLogs serves the snapshot when the live pod is gone.
+		p.snapshotBuildLogs(ctx, ns, appID, jobName)
 		return fmt.Errorf("k8s.buildImage: kaniko job: %w", err)
 	}
 
@@ -1305,7 +1405,7 @@ func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecre
 					// set SUID binaries or escalate; AllowPrivilegeEscalation=false
 					// in the container SecurityContext is sufficient.
 					SecurityContext: platformPodSecCtx(),
-					InitContainers: initContainers,
+					InitContainers:  initContainers,
 					Containers: []corev1.Container{{
 						Name:  "kaniko",
 						Image: "gcr.io/kaniko-project/executor:v1.23.2",
