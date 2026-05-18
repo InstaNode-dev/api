@@ -13,7 +13,8 @@ package handlers
 //      at 32KB to limit blast radius if the URL ever returns garbage).
 //   3. Builds the canonical signing string per AWS SNS docs, with the
 //      field order specific to the message Type.
-//   4. RSA-verifies. SignatureVersion=1 → SHA1 (legacy), =2 → SHA256.
+//   4. RSA-verifies with SignatureVersion=2 → SHA256. SignatureVersion=1
+//      (legacy RSA-SHA1) is rejected — configure the SNS topic for v2.
 //      Empty / unknown version → reject.
 //
 // The verifier is wired into the SES endpoint (email_webhooks.go) AFTER
@@ -28,7 +29,6 @@ package handlers
 import (
 	"crypto"
 	"crypto/rsa"
-	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -148,7 +148,7 @@ var errSNSVerification = errors.New("sns: signature verification failed")
 //   - SigningCertURL is HTTPS and host matches snsSigningCertHostRegex.
 //   - Cert fetches successfully and is parseable as x509.
 //   - Signature decodes from base64.
-//   - SignatureVersion is "1" (RSA-SHA1) or "2" (RSA-SHA256).
+//   - SignatureVersion is "2" (RSA-SHA256). "1" (legacy RSA-SHA1) is rejected.
 //   - The canonical signing string verifies against the cert's public key.
 //
 // Any other state → errSNSVerification with a wrapped cause.
@@ -194,14 +194,17 @@ func (v *snsVerifier) verify(msg snsMessage) error {
 	var hashAlgo crypto.Hash
 	var digest []byte
 	switch msg.SignatureVersion {
-	case "1":
-		h := sha1.Sum([]byte(signingString))
-		hashAlgo = crypto.SHA1
-		digest = h[:]
 	case "2":
 		h := sha256.Sum256([]byte(signingString))
 		hashAlgo = crypto.SHA256
 		digest = h[:]
+	case "1":
+		// P2 (BugBash 2026-05-18): SignatureVersion 1 is RSA-SHA1, which AWS
+		// has deprecated. SNS supports opting a topic into SignatureVersion 2
+		// (RSA-SHA256); the SES notification topic must be configured for v2.
+		// Rejecting v1 closes the SHA1-collision attack surface — a v1
+		// payload now fails closed instead of being RSA-SHA1-verified.
+		return fmt.Errorf("%w: SignatureVersion 1 (RSA-SHA1) is rejected — configure the SNS topic for SignatureVersion 2", errSNSVerification)
 	default:
 		return fmt.Errorf("%w: unsupported SignatureVersion %q", errSNSVerification, msg.SignatureVersion)
 	}

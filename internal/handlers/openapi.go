@@ -34,7 +34,7 @@ func ServeOpenAPI(c *fiber.Ctx) error {
 const openAPISpec = `{
   "openapi": "3.1.0",
   "info": {
-    "title": "instant.dev API",
+    "title": "InstaNode API",
     "version": "1.0.0",
     "description": "Zero-friction developer infrastructure. Provision real databases, caches, and queues with a single HTTP call — no account, no Docker, no setup.\n\n## Idempotency\n\nEvery POST endpoint that creates a resource is idempotent. Two layered protections cover every retry pattern:\n\n1. Explicit Idempotency-Key header (Stripe-shape, 24h TTL). Pass the same opaque key on each retry of a logical operation and the server replays the first response verbatim. Reusing a key with a different body returns 409.\n2. Body-fingerprint fallback (120s TTL). When the header is absent, the server synthesises a key from sha256(scope, route, canonical-body) and dedups identical retries inside a 120s window. Absorbs double-clicks, mobile double-taps, agent retries on transient 5xx, and reverse-proxy retries on network blips. Use the explicit header for true exactly-once across longer windows.\n\nEvery response from a create endpoint carries:\n- X-Idempotency-Source: explicit | fingerprint | miss — which dedup path matched (explicit = caller passed an Idempotency-Key; fingerprint = the body-fingerprint cache replayed; miss = handler ran fresh).\n- X-Idempotent-Replay: true — present only when the response was served from the cache (either path)."
   },
@@ -65,7 +65,7 @@ const openAPISpec = `{
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DBProvisionResponse" } } } },
-          "400": { "description": "Invalid Idempotency-Key (empty, >255 chars, or contains non-ASCII-printable characters)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "400": { "description": "Bad request — one of: name_required (name field missing/empty), invalid_name (name fails the 1-64-char start-alnum pattern or contains invalid UTF-8), invalid_body (request body is not valid JSON), invalid_env, or an invalid Idempotency-Key (empty, >255 chars, or non-ASCII-printable).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim — anonymous fingerprint that previously provisioned must claim with email before re-provisioning). Includes agent_action with copy the calling agent can show the user, plus upgrade_url and (for the recycle gate) claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "409": { "description": "Idempotency-Key already used with a different request body (error=idempotency_key_conflict). The agent reused a key for a logically different call — generate a new key.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
@@ -79,7 +79,7 @@ const openAPISpec = `{
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VectorProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Vector database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VectorProvisionResponse" } } } },
-          "400": { "description": "Invalid dimensions (must be 1..16000) or invalid env.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "400": { "description": "Bad request — one of: invalid dimensions (must be 1..16000), invalid env, invalid_name (name contains invalid UTF-8), or invalid_body (request body is not valid JSON).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
@@ -93,7 +93,7 @@ const openAPISpec = `{
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Cache provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CacheProvisionResponse" } } } },
-          "400": { "description": "Invalid Idempotency-Key (empty, >255 chars, or contains non-ASCII-printable characters)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "400": { "description": "Bad request — one of: name_required (name field missing/empty), invalid_name (name fails the 1-64-char start-alnum pattern or contains invalid UTF-8), invalid_body (request body is not valid JSON), invalid_env, or an invalid Idempotency-Key (empty, >255 chars, or non-ASCII-printable).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
@@ -108,7 +108,7 @@ const openAPISpec = `{
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "MongoDB database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NoSQLProvisionResponse" } } } },
-          "400": { "description": "Invalid Idempotency-Key (empty, >255 chars, or contains non-ASCII-printable characters)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "400": { "description": "Bad request — one of: name_required (name field missing/empty), invalid_name (name fails the 1-64-char start-alnum pattern or contains invalid UTF-8), invalid_body (request body is not valid JSON), invalid_env, or an invalid Idempotency-Key (empty, >255 chars, or non-ASCII-printable).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
@@ -123,7 +123,7 @@ const openAPISpec = `{
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Queue provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueProvisionResponse" } } } },
-          "400": { "description": "Invalid Idempotency-Key (empty, >255 chars, or contains non-ASCII-printable characters)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "400": { "description": "Bad request — one of: name_required (name field missing/empty), invalid_name (name fails the 1-64-char start-alnum pattern or contains invalid UTF-8), invalid_body (request body is not valid JSON), invalid_env, or an invalid Idempotency-Key (empty, >255 chars, or non-ASCII-printable).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
@@ -138,7 +138,7 @@ const openAPISpec = `{
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Webhook receiver provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WebhookProvisionResponse" } } } },
-          "400": { "description": "Invalid Idempotency-Key (empty, >255 chars, or contains non-ASCII-printable characters)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "400": { "description": "Bad request — one of: name_required (name field missing/empty), invalid_name (name fails the 1-64-char start-alnum pattern or contains invalid UTF-8), invalid_body (request body is not valid JSON), invalid_env, or an invalid Idempotency-Key (empty, >255 chars, or non-ASCII-printable).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
@@ -1323,7 +1323,7 @@ const openAPISpec = `{
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
           "201": { "description": "Storage provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StorageProvisionResponse" } } } },
-          "400": { "description": "Invalid Idempotency-Key (empty, >255 chars, or contains non-ASCII-printable characters)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "400": { "description": "Bad request — one of: name_required (name field missing/empty), invalid_name (name fails the 1-64-char start-alnum pattern or contains invalid UTF-8), invalid_body (request body is not valid JSON), invalid_env, or an invalid Idempotency-Key (empty, >255 chars, or non-ASCII-printable).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Storage limit reached. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "429": { "description": "Anonymous fingerprint limit exceeded. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
@@ -2222,10 +2222,42 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/usage/wall": {
+      "get": {
+        "summary": "Quota-wall nudge state (dashboard upgrade banner)",
+        "description": "Returns the most recent near_quota_wall row written by the worker's QuotaWallNudgeWorker, scoped to the caller's team and bounded to the last 24h. The dashboard polls this on mount and every 5 minutes to decide whether to render the upgrade banner. Team-tier callers always get near_wall=false (team is unlimited). Fails open — a DB error returns 503 rather than a misleading near_wall=false.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Usage-wall state", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "near_wall": { "type": "boolean", "description": "True when the team has crossed the 80% quota threshold within the freshness window." }, "at": { "type": "string", "format": "date-time", "description": "When the worker recorded the threshold crossing. Present only when near_wall is true." }, "tier": { "type": "string", "description": "Team plan tier at the time the row was written." }, "axis": { "type": "string", "description": "Which quota axis tripped (e.g. 'storage')." }, "service": { "type": "string", "description": "Which service the axis belongs to (postgres / redis / mongodb / …)." }, "current": { "type": "integer", "description": "Measured usage at the time of the crossing." }, "limit": { "type": "integer", "description": "The tier limit the usage is approaching." }, "percent_used": { "type": "number", "description": "current / limit as a percent." } }, "required": ["ok", "near_wall"] } } } },
+          "401": { "description": "Unauthorized" },
+          "503": { "description": "Failed to read usage-wall state from the platform DB", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      }
+    },
+    "/api/v1/experiments/converted": {
+      "post": {
+        "summary": "A/B-experiment conversion sink",
+        "description": "The dashboard fires this from the click handler on an experimental UI element (e.g. the 'Upgrade to Pro' button) before navigating to checkout. Writes an audit_log row (kind = 'experiment.conversion') tagged with the variant the user clicked. The server validates that the experiment + variant are registered AND that the supplied variant matches the variant the server would itself bucket this team into — a mismatch (usually a stale cached /auth/me across a salt rotation) returns 400. The audit write failing still returns 200 (the write is logged, not fatal to the click flow).",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "properties": {
+            "experiment": { "type": "string", "description": "Registered experiment name (e.g. 'upgrade_button')." },
+            "variant": { "type": "string", "description": "The variant the client rendered. Must be a registered variant of the experiment AND match the server's bucket for this team." },
+            "action": { "type": "string", "maxLength": 64, "description": "Short action identifier (e.g. 'checkout_started'). Truncated to 64 chars." }
+          }, "required": ["experiment", "variant"] } } }
+        },
+        "responses": {
+          "200": { "description": "Conversion recorded", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } } } } },
+          "400": { "description": "Invalid body, unknown_experiment, invalid_variant, or variant_mismatch", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
     "/api/v1/audit": {
       "get": {
         "summary": "Customer-facing audit log export (W7-C compliance)",
-        "description": "Returns audit events scoped to the caller's team for compliance review. Includes rows where team_id = caller_team OR metadata.resource_id resolves to a resource the caller owns. Rows whose kind starts with 'admin.' are NEVER returned regardless of tier — those are reserved for the internal operator audit feed (compliance traceability for operator activity is handled through a separate channel). Pagination is cursor-style via ?before=<created_at>. The response body echoes the resolved lookback_days so the caller knows the tier window. Actor emails are partially redacted on the wire ('m***@example.com') to balance traceability against PII exposure; user_id stays in full so the buyer can correlate against their own team-membership records. Emit sites include the existing onboarding.claimed, subscription.*, promote.*, payment.grace_* kinds plus W7-C-added data-access kinds resource.read, resource.list_by_team, connection_url.decrypted. Tier gate: anonymous/free → 402, hobby = 30d lookback, pro = 90d, growth/team = unlimited.",
+        "description": "Returns audit events scoped to the caller's team for compliance review. Includes rows where team_id = caller_team OR metadata.resource_id resolves to a resource the caller owns. Rows whose kind starts with 'admin.' are NEVER returned regardless of tier — those are reserved for the internal operator audit feed (compliance traceability for operator activity is handled through a separate channel). Pagination is cursor-style via ?before=<created_at>. The response body echoes the resolved lookback_days so the caller knows the tier window. Actor emails are partially redacted on the wire ('m***@example.com') to balance traceability against PII exposure; user_id stays in full so the buyer can correlate against their own team-membership records. Emit sites include the existing onboarding.claimed, subscription.*, promote.*, payment.grace_* kinds plus W7-C-added data-access kinds resource.read, resource.list_by_team, connection_url.decrypted. Tier gate: anonymous/free → 402, hobby = 30d lookback, hobby_plus = 60d, pro = 90d, growth/team = unlimited.",
         "security": [{ "bearerAuth": [] }],
         "parameters": [
           { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50, "minimum": 1, "maximum": 200 }, "description": "Page size. Default 50, max 200. The endpoint returns at most this many rows per call; use ?before=<next_cursor> to fetch older rows." },
@@ -2264,7 +2296,7 @@ const openAPISpec = `{
     "/api/v1/capabilities": {
       "get": {
         "summary": "Tier capabilities matrix (public)",
-        "description": "Returns the full tier matrix as JSON so AI agents can discover 'what can I do at which tier' without provisioning-and-failing or scraping llms.txt. Iterates the live plans registry — a tier added in plans.yaml automatically appears here without a code change. Tiers are sorted by the upgrade ladder (anonymous → free → hobby → hobby_plus → growth → pro → team). *_yearly variants are excluded; their annual discount surfaces on the canonical monthly row via annual_discount_percent. Public, unauthenticated.",
+        "description": "Returns the full tier matrix as JSON so AI agents can discover 'what can I do at which tier' without provisioning-and-failing or scraping llms.txt. Iterates the live plans registry — a tier added in plans.yaml automatically appears here without a code change. Tiers are sorted by the upgrade ladder (anonymous → free → hobby → hobby_plus → pro → growth → team — pricing order: hobby $9 < hobby_plus $19 < pro $49 < growth $99 < team $199). *_yearly variants are excluded; their annual discount surfaces on the canonical monthly row via annual_discount_percent. Public, unauthenticated.",
         "responses": {
           "200": { "description": "Capability matrix", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CapabilitiesResponse" } } } },
           "503": { "description": "plans.yaml registry failed to load", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
@@ -2376,6 +2408,8 @@ const openAPISpec = `{
           "env": { "type": "string", "description": "Resolved environment bucket the resource landed in (defaults to 'development' when env was omitted — see migration 026)." },
           "env_override_reason": { "type": "string", "description": "Present only when the request omitted env and the API defaulted it (value 'default_no_env_specified'). Absent when env was sent explicitly." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
+          "dedicated": { "type": "boolean", "description": "True when the resource was provisioned on dedicated (single-tenant) infrastructure rather than the shared pool. Authenticated provisions only." },
+          "warning": { "type": "string", "description": "Present only when the resource is already over its storage limit at provision time — accompanied by the X-Instant-Notice: storage_limit_reached response header." },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email to convert the anonymous resource into a claimed (authenticated) one — no need to string-parse the upgrade URL. Absent on authenticated provisions." },
           "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL the agent can hand to the user to drive the dashboard claim flow." }
@@ -2383,9 +2417,9 @@ const openAPISpec = `{
       },
       "VectorProvisionRequest": {
         "type": "object",
-        "description": "Request body for POST /vector/new. Identical to ProvisionRequest plus the optional dimensions hint.",
+        "description": "Request body for POST /vector/new. Like ProvisionRequest plus the optional dimensions hint. NOTE: unlike /db/new, the name field on /vector/new is optional — it is sanitized (invalid UTF-8 → 400 invalid_name) but a missing/empty name is accepted and a default label is generated. Send a name explicitly for parity with the other provisioning endpoints.",
         "properties": {
-          "name": { "type": "string", "description": "Optional human-readable label (max 120 chars)" },
+          "name": { "type": "string", "maxLength": 64, "description": "Optional human-readable label. Sanitized server-side; invalid UTF-8 → 400 invalid_name. A missing/empty name is accepted (a default is generated) — this is the one provisioning endpoint where name is not required." },
           "env": { "type": "string", "description": "Optional environment scope. Defaults to 'development'.", "default": "development" },
           "parent_resource_id": { "type": "string", "format": "uuid", "description": "Optional family-link parent (authenticated callers only). See ProvisionRequest." },
           "dimensions": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 1536, "description": "Default embedding dimension for documentation. pgvector lets you pick per-column dimensions at table-create time, so this is purely informational. Defaults to 1536 (OpenAI text-embedding-ada-002 / text-embedding-3-small). Use 3072 for text-embedding-3-large." }
@@ -2406,6 +2440,8 @@ const openAPISpec = `{
           "extension": { "type": "string", "enum": ["pgvector"], "description": "Always 'pgvector' for /vector/new. Declared so clients can confirm the extension is present without querying pg_extension." },
           "dimensions": { "type": "integer", "description": "Echo of the requested dimensions hint (defaults to 1536). Informational only — pgvector enforces dimensions per column, not per database." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
+          "dedicated": { "type": "boolean", "description": "True when the resource was provisioned on dedicated (single-tenant) infrastructure rather than the shared pool. Authenticated provisions only." },
+          "warning": { "type": "string", "description": "Present only when the resource is already over its storage limit at provision time — accompanied by the X-Instant-Notice: storage_limit_reached response header." },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
           "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
@@ -2425,6 +2461,8 @@ const openAPISpec = `{
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
           "limits": { "type": "object", "properties": { "memory_mb": { "type": "integer" }, "expires_in": { "type": "string" } } },
+          "dedicated": { "type": "boolean", "description": "True when the resource was provisioned on dedicated (single-tenant) infrastructure rather than the shared pool. Authenticated provisions only." },
+          "warning": { "type": "string", "description": "Present only when the resource is already over its storage limit at provision time — accompanied by the X-Instant-Notice: storage_limit_reached response header." },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
           "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
@@ -2443,6 +2481,8 @@ const openAPISpec = `{
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
+          "dedicated": { "type": "boolean", "description": "True when the resource was provisioned on dedicated (single-tenant) infrastructure rather than the shared pool. Authenticated provisions only." },
+          "warning": { "type": "string", "description": "Present only when the resource is already over its storage limit at provision time — accompanied by the X-Instant-Notice: storage_limit_reached response header." },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
           "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
@@ -2460,7 +2500,8 @@ const openAPISpec = `{
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
-          "limits": { "type": "object" },
+          "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "expires_in": { "type": "string", "description": "Anonymous-only" } }, "description": "Queue storage cap. storage_mb is read from plans.yaml for the resolved tier." },
+          "dedicated": { "type": "boolean", "description": "True when the resource was provisioned on dedicated (single-tenant) infrastructure rather than the shared pool." },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
           "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
@@ -2499,6 +2540,9 @@ const openAPISpec = `{
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "expires_in": { "type": "string", "description": "Anonymous-only" } } },
+          "warning": { "type": "string", "description": "Present only when the bucket is already over its storage limit at provision time — accompanied by the X-Instant-Notice: storage_limit_reached response header." },
+          "expires_at": { "type": "string", "format": "date-time", "description": "Anonymous-tier only. RFC3339 timestamp at which the resource auto-expires (24h TTL)." },
+          "credentials_note": { "type": "string", "description": "Present only on the rate-limited anonymous dedup response, where access_key_id/secret_access_key are NOT re-emitted (the secret is minted once at provision time and never stored)." },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
           "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
         }
@@ -2637,7 +2681,9 @@ const openAPISpec = `{
           "user_id": { "type": "string", "format": "uuid" },
           "team_id": { "type": "string", "format": "uuid" },
           "team_name": { "type": "string", "description": "Present only when the team has a non-empty name" },
-          "plan_tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "hobby_plus", "pro", "team", "growth"], "description": "Best-effort enrichment from the teams table; absent on DB lookup failure" }
+          "email": { "type": "string", "format": "email", "description": "Authenticated user's email. Best-effort enrichment from the users table; absent on DB lookup failure." },
+          "tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "hobby_plus", "pro", "team", "growth"], "description": "Canonical alias of plan_tier — the dashboard's preferred field name. Best-effort enrichment from the teams table; absent on DB lookup failure." },
+          "plan_tier": { "type": "string", "enum": ["anonymous", "free", "hobby", "hobby_plus", "pro", "team", "growth"], "description": "Legacy alias of tier kept for agents that already key off it. Best-effort enrichment from the teams table; absent on DB lookup failure" }
         },
         "required": ["ok", "user_id", "team_id"]
       },
@@ -2928,6 +2974,8 @@ const openAPISpec = `{
           "backup_retention_days":   { "type": "integer" },
           "backup_restore_enabled":  { "type": "boolean" },
           "manual_backups_per_day":  { "type": "integer" },
+          "rpo_minutes":             { "type": "integer", "description": "Recovery Point Objective in minutes — the maximum window of data loss a restore can incur. 0 means no backup/RPO guarantee for the tier." },
+          "rto_minutes":             { "type": "integer", "description": "Recovery Time Objective in minutes — the target time to restore service after an incident. 0 means no RTO guarantee for the tier." },
           "annual_discount_percent": { "type": "integer", "description": "Discount percent of the {tier}_yearly variant vs 12x the monthly. 0 when no yearly variant exists." },
           "upgrade_url":             { "type": "string", "format": "uri" }
         },

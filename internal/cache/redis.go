@@ -98,8 +98,18 @@ func GetOrSet[T any](
 	// the leader and the followers see the same value+error pair. The leader
 	// is the only one that touches Redis SET — followers piggyback on the
 	// returned value.
+	//
+	// P2 (BugBash 2026-05-18): fn runs under a context DECOUPLED from the
+	// leader's request via context.WithoutCancel — otherwise, if the leader's
+	// HTTP client disconnects mid-flight, its ctx is cancelled and every
+	// follower piggybacking on group.Do inherits the leader's
+	// context.Canceled, turning one dropped client into a spurious 500 for
+	// all collapsed callers. A 25s deadline still bounds a genuinely stuck fn
+	// so the singleflight key cannot wedge forever.
 	v, err, _ := group.Do(key, func() (interface{}, error) {
-		out, fnErr := fn(ctx)
+		fnCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 25*time.Second)
+		defer cancel()
+		out, fnErr := fn(fnCtx)
 		if fnErr != nil {
 			return out, fnErr
 		}
@@ -112,7 +122,7 @@ func GetOrSet[T any](
 				slog.Warn("cache.set_marshal_failed", "key", key, "error", jerr.Error())
 				return out, nil
 			}
-			if setErr := rdb.Set(ctx, key, encoded, ttl).Err(); setErr != nil {
+			if setErr := rdb.Set(fnCtx, key, encoded, ttl).Err(); setErr != nil {
 				// Same fail-open as GET: log but return the value.
 				slog.Warn("cache.set_failed", "key", key, "error", setErr.Error())
 			}

@@ -252,12 +252,19 @@ func (h *BillingHandler) planIDToTier(planID string) string {
 //     A /claim-created account can reach the dashboard but has not proven it
 //     controls the email on file; a magic-link sign-in flips the flag.
 //   - Verified user → proceed.
-//   - DEGRADED PATHS fail OPEN, by design: an empty user_id (the legacy
-//     /billing/checkout alias has no RequireAuth user context) or a user-row
-//     lookup error must not block a paying customer over an infra hiccup —
-//     the same fail-open principle as the Redis checkout dedup. The miss is
-//     logged at WARN so an operator can see it. The pre-052 grandfather
-//     backfill means existing users are verified=true regardless.
+//   - DEGRADED PATHS fail OPEN, by design: a user-row lookup error must not
+//     block a paying customer over an infra hiccup — the same fail-open
+//     principle as the Redis checkout dedup. The miss is logged at WARN so an
+//     operator can see it. The pre-052 grandfather backfill means existing
+//     users are verified=true regardless.
+//   - P2 (BugBash 2026-05-18): an empty user_id is NOT a real degraded path.
+//     Both /billing/checkout registrations sit behind RequireAuth (the legacy
+//     alias at router.go and the /api/v1 group route), so a missing user_id
+//     can only happen via a middleware misconfiguration, not a legitimate
+//     unauthenticated call. The earlier comment claimed the legacy alias had
+//     "no RequireAuth user context" — that was factually wrong. The branch is
+//     kept fail-open (an unreachable case staying permissive is harmless) but
+//     the false justification is corrected here.
 func (h *BillingHandler) requireVerifiedEmail(c *fiber.Ctx, action string) (bool, error) {
 	userIDStr := middleware.GetUserID(c)
 	if userIDStr == "" {

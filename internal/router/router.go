@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"errors"
 	"log/slog"
@@ -123,12 +124,19 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Use(fiberRecover.New(fiberRecover.Config{
 		EnableStackTrace: cfg.Environment == "development",
 	}))
+	// P2 (BugBash 2026-05-18): the three http://localhost:* origins are
+	// dev-only — shipping them in the prod allowlist lets a page served
+	// from an attacker-controlled localhost dev server make credentialed
+	// cross-origin calls. Append them only when ENVIRONMENT=development.
+	corsAllowOrigins := "https://instanode.dev,https://www.instanode.dev"
+	if cfg.Environment == "development" {
+		corsAllowOrigins += ",http://localhost:5173,http://localhost:3000,http://localhost:5174"
+	}
 	app.Use(fiberCORS.New(fiberCORS.Config{
-		// Production origin (GitHub Pages serves instanode.dev) + every
-		// reasonable local-dev port. The wildcard would still work for
-		// bearer-token traffic (no cookies in flight) but an explicit
-		// allowlist makes the policy auditable. Add origins as needed.
-		AllowOrigins:  "https://instanode.dev,https://www.instanode.dev,http://localhost:5173,http://localhost:3000,http://localhost:5174",
+		// Production origin (GitHub Pages serves instanode.dev). Local-dev
+		// ports are appended only in development (see corsAllowOrigins above)
+		// so the prod allowlist stays auditable and localhost-free.
+		AllowOrigins:  corsAllowOrigins,
 		AllowMethods:  "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 		AllowHeaders:  "Content-Type,Authorization,X-Request-ID,X-E2E-Test-Token,X-E2E-Source-IP",
 		ExposeHeaders: "X-Request-ID,X-Instant-Upgrade,X-Instant-Notice",
@@ -312,7 +320,10 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Get("/metrics", func(c *fiber.Ctx) error {
 		if cfg.MetricsToken != "" {
 			auth := c.Get("Authorization")
-			if auth != "Bearer "+cfg.MetricsToken {
+			// P2 (BugBash 2026-05-18): constant-time compare — a plain `!=`
+			// on the secret leaks its length and prefix via response timing.
+			expected := "Bearer " + cfg.MetricsToken
+			if subtle.ConstantTimeCompare([]byte(auth), []byte(expected)) != 1 {
 				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"ok": false, "error": "unauthorized"})
 			}
 		}

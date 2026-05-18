@@ -142,24 +142,49 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 				upgradeURL = urls.UpgradeStartURL(jwtToken)
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
-			metrics.FingerprintAbuseBlocked.Inc()
-
 			// Decrypt the stored connection_url to return it in plaintext.
 			connectionURL := h.decryptStorageURL(existing.ConnectionURL.String, requestID)
 
-			return c.JSON(fiber.Map{
-				"ok":             true,
-				"id":             existing.ID.String(),
-				"token":          existing.Token.String(),
-				"name":           existing.Name.String,
-				"connection_url": connectionURL,
-				"tier":           existing.Tier,
-				"env":            existing.Env,
-				"limits":         h.storageAnonymousLimits(),
-				"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
-				"upgrade":        upgradeURL,
-				"upgrade_jwt":    jwtToken,
-			})
+			// P2-04: mirror the db/cache/nosql/queue dedup guard — only return
+			// the existing resource when it has a usable connection_url. An
+			// empty URL means provisioning failed mid-flight on the existing
+			// row; fall through to a fresh provision rather than handing the
+			// caller a 200 with an unusable resource.
+			if connectionURL != "" {
+				metrics.FingerprintAbuseBlocked.Inc()
+				dedupResp := fiber.Map{
+					"ok":             true,
+					"id":             existing.ID.String(),
+					"token":          existing.Token.String(),
+					"name":           existing.Name.String,
+					"connection_url": connectionURL,
+					"tier":           existing.Tier,
+					"env":            existing.Env,
+					"limits":         h.storageAnonymousLimits(),
+					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
+					"upgrade":        upgradeURL,
+					"upgrade_jwt":    jwtToken,
+					"expires_at":     existing.ExpiresAt.Time.Format(time.RFC3339),
+				}
+				// P2-05: the S3 prefix is recoverable from the persisted
+				// provider_resource_id, but the secret_access_key is minted
+				// once at provision time and never stored — it cannot be
+				// re-derived on a dedup hit. Surface the prefix and an
+				// explicit note so the caller knows credentials are not
+				// re-issued on the rate-limited dedup path.
+				if existing.ProviderResourceID.String != "" {
+					dedupResp["prefix"] = existing.ProviderResourceID.String + "/"
+				}
+				dedupResp["credentials_note"] = "access_key_id/secret_access_key are issued once at provision time and not re-emitted on a dedup hit — sign up to provision a fresh bucket with credentials"
+				// P2-06: use respondOK so the dedup response carries
+				// decorateEnvOverride's env_override_reason like every other
+				// provision response.
+				return respondOK(c, dedupResp)
+			}
+			// Empty connection_url — provisioning failed mid-flight on the
+			// existing resource. Fall through to provision a fresh one.
+			slog.Warn("storage.new.dedup_empty_url — provisioning fresh",
+				"token", existing.Token, "request_id", requestID)
 		}
 	}
 

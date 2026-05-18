@@ -155,7 +155,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 					"connection_url": connectionURL,
 					"tier":           existing.Tier,
 					"env":            existing.Env,
-					"limits":         nosqlAnonymousLimits(),
+					"limits":         h.nosqlAnonymousLimits(),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
@@ -285,7 +285,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 		"connection_url": creds.URL,
 		"tier":           "anonymous",
 		"env":            resource.Env,
-		"limits":         nosqlAnonymousLimits(),
+		"limits":         h.nosqlAnonymousLimits(),
 		"note":           upgradeNote(upgradeURL),
 		"upgrade":        upgradeURL,
 		"upgrade_jwt":    jwtToken,
@@ -460,10 +460,14 @@ func (h *NoSQLHandler) decryptConnectionURL(encrypted, requestID string) string 
 	return plain
 }
 
-func nosqlAnonymousLimits() fiber.Map {
+// nosqlAnonymousLimits returns the limits map for anonymous MongoDB resources.
+// storage_mb and connections are read from plans.Registry (convention #3) so a
+// plans.yaml edit to the anonymous tier flows through automatically instead of
+// drifting against a hardcoded literal — matches dbAnonymousLimits.
+func (h *NoSQLHandler) nosqlAnonymousLimits() fiber.Map {
 	return fiber.Map{
-		"storage_mb":  5,
-		"connections": 2,
+		"storage_mb":  h.plans.StorageLimitMB(tierAnonymous, models.ResourceTypeMongoDB),
+		"connections": h.plans.ConnectionsLimit(tierAnonymous, models.ResourceTypeMongoDB),
 		// FIX-G (2026-05-14, #167): per-token cap is 2, but the underlying
 		// MongoDB pod is shared-tenant and admits up to 20 simultaneous
 		// connections across all anonymous tokens (`--maxConns 20` on the
