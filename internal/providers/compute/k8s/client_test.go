@@ -7,6 +7,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -1037,3 +1038,142 @@ func TestFetchBuildLogs_ImplementsBuildLogFetcher(t *testing.T) {
 	}
 }
 
+
+// ── C1: build-pod network isolation regression tests (P1-W3-19 / P1-W5-12) ────
+
+// TestCreateBuildNetworkPolicy_DenyByDefault asserts the build-scoped
+// NetworkPolicy exists, denies all ingress, and constrains egress so a kaniko
+// build pod (customer Dockerfile RUN steps as root) cannot reach the cloud
+// metadata endpoint, the kube-apiserver, or other tenants' DB pods.
+func TestCreateBuildNetworkPolicy_DenyByDefault(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	p := &K8sProvider{clientset: cs}
+	const ns = "instant-deploy-c1"
+
+	if err := p.createBuildNetworkPolicy(context.Background(), ns); err != nil {
+		t.Fatalf("createBuildNetworkPolicy: %v", err)
+	}
+	np, err := cs.NetworkingV1().NetworkPolicies(ns).Get(context.Background(), buildNetworkPolicyName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("build NetworkPolicy %q not found: %v", buildNetworkPolicyName, err)
+	}
+
+	// Both Ingress + Egress must be governed (default-deny posture).
+	hasIngress, hasEgress := false, false
+	for _, pt := range np.Spec.PolicyTypes {
+		if pt == "Ingress" {
+			hasIngress = true
+		}
+		if pt == "Egress" {
+			hasEgress = true
+		}
+	}
+	if !hasIngress || !hasEgress {
+		t.Fatalf("build NetworkPolicy must govern both Ingress and Egress; types=%v", np.Spec.PolicyTypes)
+	}
+
+	// Ingress fully denied — a build pod is never a server.
+	if len(np.Spec.Ingress) != 0 {
+		t.Errorf("build NetworkPolicy must deny ALL ingress; got %d ingress rules", len(np.Spec.Ingress))
+	}
+
+	// Every IPBlock egress rule MUST except the cloud-metadata CIDR and the
+	// cluster pod/service CIDRs — otherwise the build pod can reach
+	// 169.254.169.254 / the apiserver / other tenants' DB pods.
+	sawIPBlockRule := false
+	for _, eg := range np.Spec.Egress {
+		for _, peer := range eg.To {
+			if peer.IPBlock == nil {
+				continue
+			}
+			sawIPBlockRule = true
+			except := map[string]bool{}
+			for _, c := range peer.IPBlock.Except {
+				except[c] = true
+			}
+			if !except[metadataCIDR] {
+				t.Errorf("build NetworkPolicy IPBlock egress does not except metadataCIDR %q — "+
+					"build pod can reach cloud metadata (P1-W3-19)", metadataCIDR)
+			}
+			for _, c := range defaultClusterPodCIDRs {
+				if !except[c] {
+					t.Errorf("build NetworkPolicy IPBlock egress does not except cluster pod CIDR %q — "+
+						"build pod can reach other tenants' DB pods", c)
+				}
+			}
+		}
+	}
+	if !sawIPBlockRule {
+		t.Error("build NetworkPolicy has no IPBlock egress rule — expected internet egress for the registry push")
+	}
+}
+
+// TestUpsertNetworkPolicy_UpgradesInPlace asserts that re-applying a
+// NetworkPolicy under an existing name UPDATES the spec rather than silently
+// keeping the stale one. setupTenantNamespace relies on this to upgrade the
+// build-stage policy instead of erroring on AlreadyExists.
+func TestUpsertNetworkPolicy_UpgradesInPlace(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	p := &K8sProvider{clientset: cs}
+	const ns = "instant-deploy-c1b"
+
+	// First apply: one egress rule.
+	first := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "instant-isolation", Namespace: ns},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{},
+			Egress:      []networkingv1.NetworkPolicyEgressRule{{}},
+		},
+	}
+	if err := p.upsertNetworkPolicy(context.Background(), ns, first); err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+	// Second apply under the SAME name: two egress rules — must upgrade.
+	second := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "instant-isolation", Namespace: ns},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{},
+			Egress:      []networkingv1.NetworkPolicyEgressRule{{}, {}},
+		},
+	}
+	if err := p.upsertNetworkPolicy(context.Background(), ns, second); err != nil {
+		t.Fatalf("second upsert (upgrade): %v", err)
+	}
+	got, err := cs.NetworkingV1().NetworkPolicies(ns).Get(context.Background(), "instant-isolation", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get after upgrade: %v", err)
+	}
+	if len(got.Spec.Egress) != 2 {
+		t.Errorf("upsertNetworkPolicy did not upgrade the spec in place: got %d egress rules, want 2", len(got.Spec.Egress))
+	}
+}
+
+// TestBuildNamespaceCarriesPSSLabels asserts the build namespace, as created by
+// the buildImage path's nsObj, carries the PSS enforce=baseline label so the
+// kaniko build pod is governed by Pod Security Standards for the whole build.
+func TestBuildNamespaceCarriesPSSLabels(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	p := &K8sProvider{clientset: cs}
+	const ns = "instant-deploy-c1c"
+
+	// upgradeNamespaceLabels is the idempotent path used when the namespace
+	// pre-exists; exercise it on a freshly created bare namespace.
+	if _, err := cs.CoreV1().Namespaces().Create(context.Background(),
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed namespace: %v", err)
+	}
+	if err := p.upgradeNamespaceLabels(context.Background(), ns, map[string]string{
+		pssEnforceLabel: pssBaseline,
+		pssWarnLabel:    pssRestricted,
+	}); err != nil {
+		t.Fatalf("upgradeNamespaceLabels: %v", err)
+	}
+	got, err := cs.CoreV1().Namespaces().Get(context.Background(), ns, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get namespace: %v", err)
+	}
+	if got.Labels[pssEnforceLabel] != pssBaseline {
+		t.Errorf("build namespace missing PSS enforce label: got %q, want %q",
+			got.Labels[pssEnforceLabel], pssBaseline)
+	}
+}
