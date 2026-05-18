@@ -16,6 +16,7 @@ package models_test
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 	"os"
 	"testing"
 
@@ -97,6 +98,81 @@ func TestAuditLog_InsertWithRealTeamID_StillWorks(t *testing.T) {
 	require.NotEmpty(t, events)
 	assert.Equal(t, teamID, events[0].TeamID)
 	assert.Equal(t, "provision", events[0].Kind)
+}
+
+// captureHandler is a slog.Handler that records every Record it sees so a
+// test can assert on the structured attributes of an emitted log line.
+type captureHandler struct {
+	records []slog.Record
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.records = append(h.records, r)
+	return nil
+}
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
+
+// attrMap flattens a slog.Record's attributes into a string-keyed map for
+// easy assertion.
+func attrMap(r slog.Record) map[string]slog.Value {
+	m := make(map[string]slog.Value)
+	r.Attrs(func(a slog.Attr) bool {
+		m[a.Key] = a.Value
+		return true
+	})
+	return m
+}
+
+// TestAuditLog_InsertEmitsSlogLineForNR is the P1-W3-01 regression: after a
+// successful INSERT, InsertAuditEvent MUST emit an `audit.event` slog line so
+// the audit event reaches New Relic Log. The kind MUST be logged under the
+// key `audit_kind` (NOT `kind` — that collides with River's job kind). ~10 NR
+// alerts query `audit_kind`; renaming the field silently breaks all of them.
+func TestAuditLog_InsertEmitsSlogLineForNR(t *testing.T) {
+	requireDBAudit(t)
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+
+	cap := &captureHandler{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(cap))
+	defer slog.SetDefault(prev)
+
+	teamID := seedTeam(t, db)
+	resID := uuid.New()
+	err := models.InsertAuditEvent(context.Background(), db, models.AuditEvent{
+		TeamID:       teamID,
+		Actor:        "agent",
+		Kind:         "deploy.failed",
+		ResourceType: "deployment",
+		ResourceID:   uuid.NullUUID{UUID: resID, Valid: true},
+		Summary:      "deploy failed",
+	})
+	require.NoError(t, err)
+
+	// Find the audit.event line among captured records.
+	var found *slog.Record
+	for i := range cap.records {
+		if cap.records[i].Message == "audit.event" {
+			found = &cap.records[i]
+			break
+		}
+	}
+	require.NotNil(t, found, "InsertAuditEvent must emit an 'audit.event' slog line")
+
+	m := attrMap(*found)
+	// CRITICAL contract: the kind is logged under `audit_kind`, never `kind`.
+	require.Contains(t, m, "audit_kind",
+		"audit event kind MUST be logged under the key 'audit_kind' (NR alerts query this)")
+	assert.NotContains(t, m, "kind",
+		"the key 'kind' must NOT be used — it collides with River's job kind in NR Log")
+	assert.Equal(t, "deploy.failed", m["audit_kind"].String())
+	assert.Equal(t, "agent", m["actor"].String())
+	assert.Equal(t, teamID.String(), m["team_id"].String())
+	assert.Equal(t, "deployment", m["resource_type"].String())
+	assert.Equal(t, resID.String(), m["resource_id"].String())
 }
 
 func TestAuditLog_NullTeamRows_NotVisibleInTeamScopedRead(t *testing.T) {

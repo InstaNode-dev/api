@@ -103,15 +103,41 @@ func (h *DeployHandler) StartTeardownReconciler(ctx context.Context) {
 // RunTeardownSweep executes one teardown pass. Errors on individual rows are
 // logged and swallowed so one bad deployment never stalls the rest — same
 // fail-open posture as the worker's reconcilers.
+//
+// P1-W5-17 (bug-hunt 2026-05-18): the api runs replicas:2 and this sweep
+// fires in every pod. The whole sweep now runs inside ONE transaction whose
+// SELECT carries FOR UPDATE SKIP LOCKED — each expired deployment is row-locked
+// by the pod that selects it, so the sibling pod's concurrent sweep skips
+// every claimed row and never double-invokes compute.Teardown on the same
+// namespace. The lock is held until Commit; SKIP LOCKED means the loser pod
+// no-ops rather than blocking.
 func (h *DeployHandler) RunTeardownSweep(ctx context.Context) {
 	start := time.Now()
 
-	expired, err := models.GetExpiredDeploymentsAwaitingTeardown(ctx, h.db, deployTeardownBatchLimit)
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		slog.Error("deploy.teardown_reconciler.begin_tx_failed", "error", err)
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	expired, err := models.GetExpiredDeploymentsAwaitingTeardown(ctx, tx, deployTeardownBatchLimit)
 	if err != nil {
 		slog.Error("deploy.teardown_reconciler.list_failed", "error", err)
 		return
 	}
 	if len(expired) == 0 {
+		// Nothing claimed — commit the empty tx to release it promptly.
+		if commitErr := tx.Commit(); commitErr != nil {
+			slog.Error("deploy.teardown_reconciler.commit_failed", "error", commitErr)
+			return
+		}
+		committed = true
 		return
 	}
 
@@ -131,7 +157,7 @@ func (h *DeployHandler) RunTeardownSweep(ctx context.Context) {
 			continue
 		}
 
-		n, markErr := models.MarkDeploymentTornDown(ctx, h.db, d.ID)
+		n, markErr := models.MarkDeploymentTornDown(ctx, tx, d.ID)
 		if markErr != nil {
 			slog.Error("deploy.teardown_reconciler.mark_failed",
 				"deploy_id", d.ID, "app_id", d.AppID, "error", markErr)
@@ -155,6 +181,18 @@ func (h *DeployHandler) RunTeardownSweep(ctx context.Context) {
 			"provider_id", d.ProviderID, "team_id", d.TeamID)
 		tornDown++
 	}
+
+	// Commit releases the FOR UPDATE SKIP LOCKED row locks and persists the
+	// status flips. A commit failure rolls the whole sweep back: the torn-down
+	// compute is already gone but the rows stay 'expired', so the next sweep
+	// re-selects and re-marks them (MarkDeploymentTornDown is idempotent and
+	// compute.Teardown is NotFound-safe — no double-teardown harm).
+	if commitErr := tx.Commit(); commitErr != nil {
+		slog.Error("deploy.teardown_reconciler.commit_failed",
+			"error", commitErr, "torn_down", tornDown, "failed", failed)
+		return
+	}
+	committed = true
 
 	slog.Info("deploy.teardown_reconciler.sweep_completed",
 		"candidates", len(expired),

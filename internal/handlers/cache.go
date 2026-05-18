@@ -208,6 +208,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 	metrics.ProvisionDuration.WithLabelValues("redis", "anonymous").Observe(time.Since(provStart).Seconds())
 	if err != nil {
 		metrics.ProvisionFailures.WithLabelValues("redis", "grpc_error").Inc()
+		middleware.RecordProvisionFail("redis", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("cache.new.provision_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
 		// Soft-delete the resource record so limits aren't falsely consumed.
@@ -274,6 +275,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 		"request_id", requestID,
 	)
 	metrics.ProvisionsTotal.WithLabelValues("redis", "anonymous").Inc()
+	middleware.RecordProvisionSuccess("redis")
 	metrics.ConversionFunnel.WithLabelValues("provision").Inc()
 
 	if markErr := h.markRecycleSeen(ctx, fp); markErr != nil {
@@ -378,6 +380,7 @@ func (h *CacheHandler) newCacheAuthenticated(
 	metrics.ProvisionDuration.WithLabelValues("redis", tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {
 		metrics.ProvisionFailures.WithLabelValues("redis", "grpc_error").Inc()
+		middleware.RecordProvisionFail("redis", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("cache.new.provision_failed_auth",
 			"error", err, "token", tokenStr, "team_id", teamIDStr, "request_id", requestID)
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
@@ -426,6 +429,7 @@ func (h *CacheHandler) newCacheAuthenticated(
 		"request_id", requestID,
 	)
 	metrics.ProvisionsTotal.WithLabelValues("redis", tier).Inc()
+	middleware.RecordProvisionSuccess("redis")
 
 	cacheAuthStorageLimitMB := h.plans.StorageLimitMB(tier, "redis")
 	_, cacheAuthStorageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, cacheAuthStorageLimitMB)
@@ -562,6 +566,7 @@ func (h *CacheHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 	metrics.ProvisionDuration.WithLabelValues(models.ResourceTypeRedis, in.Tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {
 		metrics.ProvisionFailures.WithLabelValues(models.ResourceTypeRedis, "grpc_error").Inc()
+		middleware.RecordProvisionFail(models.ResourceTypeRedis, middleware.ProvisionFailBackendUnavailable)
 		slog.Error("twin.cache.provision_failed",
 			"error", err, "token", tokenStr, "team_id", in.TeamID, "request_id", in.RequestID)
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
@@ -602,6 +607,7 @@ func (h *CacheHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 		"request_id", in.RequestID,
 	)
 	metrics.ProvisionsTotal.WithLabelValues(models.ResourceTypeRedis, in.Tier).Inc()
+	middleware.RecordProvisionSuccess(models.ResourceTypeRedis)
 
 	storageLimitMB := h.plans.StorageLimitMB(in.Tier, models.ResourceTypeRedis)
 	_, storageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, storageLimitMB)

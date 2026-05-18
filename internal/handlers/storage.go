@@ -217,6 +217,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 	metrics.ProvisionDuration.WithLabelValues("storage", "anonymous").Observe(time.Since(provStart).Seconds())
 	if err != nil {
 		metrics.ProvisionFailures.WithLabelValues("storage", "grpc_error").Inc()
+		middleware.RecordProvisionFail("storage", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("storage.new.provision_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
 		// Soft-delete the resource record so limits aren't falsely consumed.
@@ -279,6 +280,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 		"request_id", requestID,
 	)
 	metrics.ProvisionsTotal.WithLabelValues("storage", "anonymous").Inc()
+	middleware.RecordProvisionSuccess("storage")
 	metrics.ConversionFunnel.WithLabelValues("provision").Inc()
 
 	if markErr := h.markRecycleSeen(ctx, fp); markErr != nil {
@@ -378,6 +380,7 @@ func (h *StorageHandler) newStorageAuthenticated(
 	metrics.ProvisionDuration.WithLabelValues("storage", team.PlanTier).Observe(time.Since(provStart).Seconds())
 	if err != nil {
 		metrics.ProvisionFailures.WithLabelValues("storage", "grpc_error").Inc()
+		middleware.RecordProvisionFail("storage", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("storage.new.provision_failed_auth",
 			"error", err, "token", tokenStr, "team_id", teamIDStr, "request_id", requestID)
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
@@ -419,6 +422,7 @@ func (h *StorageHandler) newStorageAuthenticated(
 		"request_id", requestID,
 	)
 	metrics.ProvisionsTotal.WithLabelValues("storage", team.PlanTier).Inc()
+	middleware.RecordProvisionSuccess("storage")
 
 	// In admin-mode the provider just minted a per-tenant IAM user. Surface
 	// that as a discrete audit row so compliance can answer "who held this

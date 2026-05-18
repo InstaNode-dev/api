@@ -191,6 +191,57 @@ func TestRunTeardownSweep_FailedTeardownLeavesRowForRetry(t *testing.T) {
 		"the retry sweep must complete the teardown")
 }
 
+// TestRunTeardownSweep_ConcurrentSweepsNoDoubleTeardown is the P1-W5-17
+// regression: the api runs replicas:2 and StartTeardownReconciler sweeps in
+// every pod. Before the fix, GetExpiredDeploymentsAwaitingTeardown was a plain
+// SELECT, so both pods picked the same expired rows and double-invoked
+// compute.Teardown on the same namespace. The fix adds FOR UPDATE SKIP LOCKED
+// inside a per-sweep transaction. This test runs two sweeps concurrently
+// (the two-pod scenario) against a shared pool of expired deployments and
+// asserts every provider_id is torn down EXACTLY once across both sweeps.
+func TestRunTeardownSweep_ConcurrentSweepsNoDoubleTeardown(t *testing.T) {
+	reconcilerRequireDB(t)
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+
+	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, "hobby"))
+	defer db.Exec(`DELETE FROM teams WHERE id = $1`, teamID)
+	defer db.Exec(`DELETE FROM deployments WHERE team_id = $1`, teamID)
+
+	// Seed a batch of expired deployments — enough that a race window exists.
+	const n = 12
+	pids := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		pid := "app-conc-" + uuid.NewString()[:8]
+		pids = append(pids, pid)
+		seedExpiredDeploy(t, db, teamID, models.DeployStatusExpired, pid)
+	}
+
+	// Two pods share ONE recording fake so we can assert the global count.
+	fake := &fakeTeardownProvider{}
+	podA := newReconcilerHandler(t, db, fake)
+	podB := newReconcilerHandler(t, db, fake)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); podA.RunTeardownSweep(context.Background()) }()
+	go func() { defer wg.Done(); podB.RunTeardownSweep(context.Background()) }()
+	wg.Wait()
+
+	// Every expired deployment must be torn down exactly once — no provider_id
+	// appears twice in the recorded teardown calls.
+	seen := make(map[string]int)
+	for _, p := range fake.tornDown {
+		seen[p]++
+	}
+	for _, p := range pids {
+		assert.Equal(t, 1, seen[p],
+			"provider_id %s must be torn down exactly once across both pods (FOR UPDATE SKIP LOCKED)", p)
+	}
+	assert.Equal(t, n, fake.teardownCount(),
+		"exactly n teardown calls — no double-pickup between the two concurrent sweeps")
+}
+
 // TestRunTeardownSweep_DoesNotReprocessDeletedRows: a row already 'deleted'
 // is never picked up again — no double Teardown.
 func TestRunTeardownSweep_DoesNotReprocessDeletedRows(t *testing.T) {

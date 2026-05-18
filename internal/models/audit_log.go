@@ -13,6 +13,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,6 +23,19 @@ import (
 // Keeps a single call from sweeping a large team's history; the dashboard
 // uses limit=20 by default.
 const auditMaxLimit = 200
+
+// auditLogMsg is the slog message every audit event is logged under. NR Log
+// alerts/dashboards filter on `message='audit.event'`, then on the
+// per-event-kind `audit_kind` attribute (see auditLogKindField).
+const auditLogMsg = "audit.event"
+
+// auditLogKindField is the slog attribute key under which the audit event's
+// kind is logged. It is DELIBERATELY `audit_kind` and NOT `kind`: River's
+// job-middleware slog lines already log a `kind` attribute (the River job
+// kind), so reusing `kind` here would collide in NR Log and make per-kind
+// audit alerts ambiguous. The infra repo's NR alerts query this exact
+// attribute name — do not rename it without updating those alerts in lockstep.
+const auditLogKindField = "audit_kind"
 
 // AuditEvent is one row in the audit_log table. Metadata is stored as
 // raw JSONB bytes so callers can serialize arbitrary k/v without the
@@ -79,6 +93,30 @@ func InsertAuditEvent(ctx context.Context, db *sql.DB, ev AuditEvent) error {
 	if err != nil {
 		return fmt.Errorf("models.InsertAuditEvent: %w", err)
 	}
+
+	// Emit a structured slog line so the audit event reaches New Relic Log.
+	// The Postgres row alone is invisible to NR — ~10 NR alerts and the
+	// billing-dunning dashboard filter `FROM Log WHERE audit_kind=...`, and
+	// without this line that field source never exists (P1-W3-01).
+	//
+	// The kind is logged under `audit_kind`, NOT `kind`: the River worker's
+	// job middleware already emits a `kind` attribute, and reusing it here
+	// would collide. The infra repo's NR alerts query `audit_kind` exactly.
+	attrs := []any{
+		auditLogKindField, ev.Kind,
+		"actor", ev.Actor,
+	}
+	if ev.TeamID != uuid.Nil {
+		attrs = append(attrs, "team_id", ev.TeamID.String())
+	}
+	if ev.ResourceType != "" {
+		attrs = append(attrs, "resource_type", ev.ResourceType)
+	}
+	if ev.ResourceID.Valid {
+		attrs = append(attrs, "resource_id", ev.ResourceID.UUID.String())
+	}
+	slog.InfoContext(ctx, auditLogMsg, attrs...)
+
 	return nil
 }
 
