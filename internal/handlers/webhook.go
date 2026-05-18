@@ -300,6 +300,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 	if err != nil {
 		slog.Error("webhook.new.create_resource_failed",
 			"error", err, "fingerprint", fp, "request_id", requestID)
+		middleware.RecordProvisionFail("webhook", middleware.ProvisionFailInternal)
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision webhook resource")
 	}
 	tokenStr = resource.Token.String()
@@ -341,6 +342,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 		"request_id", requestID,
 	)
 	metrics.ProvisionsTotal.WithLabelValues("webhook", "anonymous").Inc()
+	middleware.RecordProvisionSuccess("webhook")
 	metrics.ConversionFunnel.WithLabelValues("provision").Inc()
 
 	if markErr := h.markRecycleSeen(ctx, fp); markErr != nil {
@@ -394,6 +396,7 @@ func (h *WebhookHandler) newWebhookAuthenticated(
 	if err != nil {
 		slog.Error("webhook.new.create_resource_failed_auth",
 			"error", err, "team_id", teamIDStr, "request_id", requestID)
+		middleware.RecordProvisionFail("webhook", middleware.ProvisionFailInternal)
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision webhook resource")
 	}
 
@@ -429,6 +432,7 @@ func (h *WebhookHandler) newWebhookAuthenticated(
 		"request_id", requestID,
 	)
 	metrics.ProvisionsTotal.WithLabelValues("webhook", team.PlanTier).Inc()
+	middleware.RecordProvisionSuccess("webhook")
 
 	return respondCreated(c, fiber.Map{
 		"ok":          true,

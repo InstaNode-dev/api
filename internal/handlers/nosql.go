@@ -204,6 +204,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 	metrics.ProvisionDuration.WithLabelValues("mongodb", "anonymous").Observe(time.Since(provStart).Seconds())
 	if err != nil {
 		metrics.ProvisionFailures.WithLabelValues("mongodb", "grpc_error").Inc()
+		middleware.RecordProvisionFail("mongodb", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("nosql.new.provision_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
 		// Soft-delete the resource record so limits aren't falsely consumed.
@@ -263,6 +264,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 		"request_id", requestID,
 	)
 	metrics.ProvisionsTotal.WithLabelValues("mongodb", "anonymous").Inc()
+	middleware.RecordProvisionSuccess("mongodb")
 	metrics.ConversionFunnel.WithLabelValues("provision").Inc()
 
 	if markErr := h.markRecycleSeen(ctx, fp); markErr != nil {
@@ -364,6 +366,7 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 	metrics.ProvisionDuration.WithLabelValues("mongodb", tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {
 		metrics.ProvisionFailures.WithLabelValues("mongodb", "grpc_error").Inc()
+		middleware.RecordProvisionFail("mongodb", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("nosql.new.provision_failed_auth",
 			"error", err, "token", tokenStr, "team_id", teamIDStr, "request_id", requestID)
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
@@ -404,6 +407,7 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 		"request_id", requestID,
 	)
 	metrics.ProvisionsTotal.WithLabelValues("mongodb", tier).Inc()
+	middleware.RecordProvisionSuccess("mongodb")
 
 	nosqlAuthStorageLimitMB := h.plans.StorageLimitMB(tier, "mongodb")
 	_, nosqlAuthStorageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, nosqlAuthStorageLimitMB)
@@ -555,6 +559,7 @@ func (h *NoSQLHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 	metrics.ProvisionDuration.WithLabelValues(models.ResourceTypeMongoDB, in.Tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {
 		metrics.ProvisionFailures.WithLabelValues(models.ResourceTypeMongoDB, "grpc_error").Inc()
+		middleware.RecordProvisionFail(models.ResourceTypeMongoDB, middleware.ProvisionFailBackendUnavailable)
 		slog.Error("twin.nosql.provision_failed",
 			"error", err, "token", tokenStr, "team_id", in.TeamID, "request_id", in.RequestID)
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
@@ -589,6 +594,7 @@ func (h *NoSQLHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 		"request_id", in.RequestID,
 	)
 	metrics.ProvisionsTotal.WithLabelValues(models.ResourceTypeMongoDB, in.Tier).Inc()
+	middleware.RecordProvisionSuccess(models.ResourceTypeMongoDB)
 
 	storageLimitMB := h.plans.StorageLimitMB(in.Tier, models.ResourceTypeMongoDB)
 	_, storageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, storageLimitMB)

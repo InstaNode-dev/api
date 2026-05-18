@@ -231,6 +231,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 	metrics.ProvisionDuration.WithLabelValues("postgres", "anonymous").Observe(time.Since(provStart).Seconds())
 	if err != nil {
 		metrics.ProvisionFailures.WithLabelValues("postgres", "grpc_error").Inc()
+		middleware.RecordProvisionFail("postgres", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("db.new.provision_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
@@ -288,6 +289,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 	)
 
 	metrics.ProvisionsTotal.WithLabelValues("postgres", "anonymous").Inc()
+	middleware.RecordProvisionSuccess("postgres")
 	metrics.ConversionFunnel.WithLabelValues("provision").Inc()
 
 	// Record this fingerprint as having had at least one anonymous touch.
@@ -399,6 +401,7 @@ func (h *DBHandler) newDBAuthenticated(
 	metrics.ProvisionDuration.WithLabelValues("postgres", tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {
 		metrics.ProvisionFailures.WithLabelValues("postgres", "grpc_error").Inc()
+		middleware.RecordProvisionFail("postgres", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("db.new.provision_failed_auth",
 			"error", err, "token", tokenStr, "team_id", teamIDStr, "request_id", requestID)
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
@@ -438,6 +441,7 @@ func (h *DBHandler) newDBAuthenticated(
 		"request_id", requestID,
 	)
 	metrics.ProvisionsTotal.WithLabelValues("postgres", tier).Inc()
+	middleware.RecordProvisionSuccess("postgres")
 
 	authStorageLimitMB := h.plans.StorageLimitMB(tier, "postgres")
 	_, authStorageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, authStorageLimitMB)
@@ -596,6 +600,7 @@ func (h *DBHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionForTwi
 	metrics.ProvisionDuration.WithLabelValues(models.ResourceTypePostgres, in.Tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {
 		metrics.ProvisionFailures.WithLabelValues(models.ResourceTypePostgres, "grpc_error").Inc()
+		middleware.RecordProvisionFail(models.ResourceTypePostgres, middleware.ProvisionFailBackendUnavailable)
 		slog.Error("twin.db.provision_failed",
 			"error", err, "token", tokenStr, "team_id", in.TeamID, "request_id", in.RequestID)
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
@@ -628,6 +633,7 @@ func (h *DBHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionForTwi
 		"request_id", in.RequestID,
 	)
 	metrics.ProvisionsTotal.WithLabelValues(models.ResourceTypePostgres, in.Tier).Inc()
+	middleware.RecordProvisionSuccess(models.ResourceTypePostgres)
 
 	storageLimitMB := h.plans.StorageLimitMB(in.Tier, models.ResourceTypePostgres)
 	_, storageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, storageLimitMB)

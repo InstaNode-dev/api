@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -730,30 +731,68 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 			})
 		}
 	case "subscription.cancelled":
-		h.handleSubscriptionCancelled(ctx, c, event)
+		// P1-W3-09: a swallowed downgrade failure used to leave the team on
+		// a paid tier forever (the up-front dedup claim blocked Razorpay's
+		// replay). Release the claim and 500 on failure so the event retries.
+		if hErr := h.handleSubscriptionCancelled(ctx, c, event); hErr != nil {
+			slog.Error("billing.webhook.subscription_cancelled.failed",
+				"error", hErr, "event_id", eventID)
+			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"ok": false, "error": "subscription_cancelled_failed",
+			})
+		}
 	case "subscription.halted":
 		// P1-F: Razorpay halts a subscription once all charge retries are
 		// exhausted. It is terminal — there will be no further charge —
 		// so the team is downgraded immediately, identical to a cancel.
 		// Without this case a halted subscription kept paid-tier limits
 		// until the 15-minute reconciler caught up.
-		h.handleSubscriptionCancelled(ctx, c, event)
+		if hErr := h.handleSubscriptionCancelled(ctx, c, event); hErr != nil {
+			slog.Error("billing.webhook.subscription_halted.failed",
+				"error", hErr, "event_id", eventID)
+			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"ok": false, "error": "subscription_halted_failed",
+			})
+		}
 	case "subscription.completed":
 		// P1-F: the subscription reached the end of its agreed term
 		// (total_count of billing cycles consumed). No renewal — downgrade
 		// per the same policy as a cancellation.
-		h.handleSubscriptionCancelled(ctx, c, event)
+		if hErr := h.handleSubscriptionCancelled(ctx, c, event); hErr != nil {
+			slog.Error("billing.webhook.subscription_completed.failed",
+				"error", hErr, "event_id", eventID)
+			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"ok": false, "error": "subscription_completed_failed",
+			})
+		}
 	case "subscription.paused":
 		// P1-F: a paused subscription is not billing. Treat it like a
 		// failed charge — open a grace period so the team keeps its tier
 		// for the grace window, and the dunning emails / reconciler take
 		// over. subscription.resumed reverses this.
-		h.handleSubscriptionPaused(ctx, c, event)
+		if hErr := h.handleSubscriptionPaused(ctx, c, event); hErr != nil {
+			slog.Error("billing.webhook.subscription_paused.failed",
+				"error", hErr, "event_id", eventID)
+			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"ok": false, "error": "subscription_paused_failed",
+			})
+		}
 	case "subscription.resumed":
 		// P1-F: a previously paused subscription resumed billing. Recover
 		// any active grace row so the dunning state machine stops, mirroring
 		// the grace recovery handleSubscriptionCharged does on a good charge.
-		h.handleSubscriptionResumed(ctx, c, event)
+		if hErr := h.handleSubscriptionResumed(ctx, c, event); hErr != nil {
+			slog.Error("billing.webhook.subscription_resumed.failed",
+				"error", hErr, "event_id", eventID)
+			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"ok": false, "error": "subscription_resumed_failed",
+			})
+		}
 	case "subscription.charged_failed":
 		// Razorpay's documented event name for a failed subscription
 		// charge. Triggers the dunning state machine — see
@@ -764,7 +803,14 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 		// payment belongs to an active subscription we ALSO open a
 		// grace period (idempotent — partial-unique index swallows
 		// duplicate calls). See handlePaymentFailed below.
-		h.handlePaymentFailed(ctx, c, event)
+		if hErr := h.handlePaymentFailed(ctx, c, event); hErr != nil {
+			slog.Error("billing.webhook.payment_failed.failed",
+				"error", hErr, "event_id", eventID)
+			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"ok": false, "error": "payment_failed_handler_failed",
+			})
+		}
 	default:
 		span.SetAttributes(attribute.String("rzp.event.unhandled", "true"))
 	}
@@ -964,18 +1010,33 @@ func maybeMarkAdminPromoCodeUsed(ctx context.Context, db *sql.DB, sub rzpSubscri
 }
 
 // handleSubscriptionCancelled processes subscription.cancelled events (cancel → downgrade to hobby).
-func (h *BillingHandler) handleSubscriptionCancelled(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) {
+//
+// P1-W3-09 (bug-hunt 2026-05-18): this handler returns an error on every
+// failure path so RazorpayWebhook can release the dedup claim and return 500
+// — Razorpay then redelivers and the downgrade is retried. A swallowed DB
+// failure here previously left the team on a paid tier forever (the claim row
+// blocked the replay). A parse failure is NOT retryable, so it returns nil:
+// retrying a malformed payload is pointless and would just re-burn the claim.
+func (h *BillingHandler) handleSubscriptionCancelled(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) error {
 	sub, ok := parseSubscriptionEntity(event)
 	if !ok {
 		slog.Error("billing.subscription.cancelled.parse_failed")
-		return
+		return nil
 	}
 
 	teamID, err := resolveTeamFromNotes(ctx, h, sub)
 	if err != nil {
+		// A missing/unknown-team payload will never resolve — non-retryable,
+		// keep the claim and 200. A real DB error IS retryable: return it so
+		// dispatch releases the claim and 500s for redelivery.
+		if teamResolveUnretryable(err) {
+			slog.Warn("billing.subscription.cancelled.team_unresolvable",
+				"error", err, "sub_id", sub.ID)
+			return nil
+		}
 		slog.Error("billing.subscription.cancelled.team_resolve_failed",
 			"error", err, "sub_id", sub.ID)
-		return
+		return fmt.Errorf("subscription.cancelled team resolve: %w", err)
 	}
 
 	// Snapshot the prior tier so the audit row can capture from→to. Failure
@@ -1007,7 +1068,7 @@ func (h *BillingHandler) handleSubscriptionCancelled(ctx context.Context, c *fib
 	if updateErr := models.UpdatePlanTier(ctx, h.db, teamID, tier); updateErr != nil {
 		slog.Error("billing.subscription.cancelled.downgrade_failed",
 			"error", updateErr, "team_id", teamID)
-		return
+		return fmt.Errorf("subscription.cancelled downgrade: %w", updateErr)
 	}
 
 	slog.Info("billing.subscription.cancelled",
@@ -1017,18 +1078,26 @@ func (h *BillingHandler) handleSubscriptionCancelled(ctx context.Context, c *fib
 	// the downgrade above is already committed and must not be reverted on
 	// an audit failure.
 	emitSubscriptionCanceledAudit(ctx, h.db, teamID, fromTier, tier, sub.ID)
+	return nil
 }
 
 // handlePaymentFailed processes payment.failed events.
 // Does NOT downgrade — Razorpay retries before firing subscription.cancelled.
-func (h *BillingHandler) handlePaymentFailed(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) {
+//
+// P1-W3-09: returns an error on a retryable failure (the dunning email send
+// failed) so RazorpayWebhook releases the dedup claim and 500s — Razorpay
+// then redelivers and the customer still gets their payment-failed notice.
+// Non-retryable conditions (no payment entity, malformed payload, no email
+// address on the payment) return nil: a retry would re-burn the claim for
+// nothing.
+func (h *BillingHandler) handlePaymentFailed(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) error {
 	if event.Payload.Payment == nil {
-		return
+		return nil
 	}
 	var pay rzpPaymentEntity
 	if err := json.Unmarshal(event.Payload.Payment.Entity, &pay); err != nil {
 		slog.Warn("billing.payment.failed.parse_failed", "error", err)
-		return
+		return nil
 	}
 
 	slog.Warn("billing.payment.failed",
@@ -1040,17 +1109,18 @@ func (h *BillingHandler) handlePaymentFailed(ctx context.Context, c *fiber.Ctx, 
 
 	if pay.Email == "" {
 		slog.Warn("billing.payment.failed.no_email", "payment_id", pay.ID)
-		return
+		return nil
 	}
 
 	if err := h.email.SendPaymentFailed(ctx, pay.Email, pay.AttemptCount, nil); err != nil {
 		slog.Error("billing.payment.failed.email_failed",
 			"error", err, "to", pay.Email, "payment_id", pay.ID)
-		return
+		return fmt.Errorf("payment.failed email send: %w", err)
 	}
 
 	slog.Info("billing.payment.failed.email_sent",
 		"to", pay.Email, "payment_id", pay.ID)
+	return nil
 }
 
 // handleSubscriptionChargeFailed processes subscription.charged_failed
@@ -1108,23 +1178,35 @@ func (h *BillingHandler) handleSubscriptionChargeFailed(ctx context.Context, c *
 // dunning state machine drives the reminder emails. subscription.resumed
 // reverses this. Fully idempotent: startGracePeriodForTeam swallows a
 // redelivery via the partial-unique index on the active grace row.
-func (h *BillingHandler) handleSubscriptionPaused(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) {
+//
+// P1-W3-09: returns an error on a retryable team-resolve failure so
+// RazorpayWebhook releases the dedup claim and 500s — Razorpay redelivers
+// and the grace period still gets opened. A parse failure is non-retryable
+// and returns nil.
+func (h *BillingHandler) handleSubscriptionPaused(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) error {
 	sub, ok := parseSubscriptionEntity(event)
 	if !ok {
 		slog.Error("billing.subscription.paused.parse_failed")
-		return
+		return nil
 	}
 
 	teamID, err := resolveTeamFromNotes(ctx, h, sub)
 	if err != nil {
+		// Missing/unknown-team payload → non-retryable. Real DB error → retryable.
+		if teamResolveUnretryable(err) {
+			slog.Warn("billing.subscription.paused.team_unresolvable",
+				"error", err, "sub_id", sub.ID)
+			return nil
+		}
 		slog.Error("billing.subscription.paused.team_resolve_failed",
 			"error", err, "sub_id", sub.ID)
-		return
+		return fmt.Errorf("subscription.paused team resolve: %w", err)
 	}
 
 	slog.Info("billing.subscription.paused", "team_id", teamID, "subscription_id", sub.ID)
 	// attemptedAmount is unknown for a pause (no failed charge) — pass 0.
 	startGracePeriodForTeam(ctx, h.db, teamID, sub.ID, 0)
+	return nil
 }
 
 // handleSubscriptionResumed processes subscription.resumed events (P1-F).
@@ -1136,22 +1218,34 @@ func (h *BillingHandler) handleSubscriptionPaused(ctx context.Context, c *fiber.
 // good charge. Fully idempotent: a redelivery finds no active grace row
 // and is a silent no-op. The tier itself is not re-elevated here — the
 // next subscription.charged does that; resume only stops the dunning clock.
-func (h *BillingHandler) handleSubscriptionResumed(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) {
+//
+// P1-W3-09: returns an error on a retryable team-resolve failure so
+// RazorpayWebhook releases the dedup claim and 500s — Razorpay redelivers
+// and the grace clock still gets stopped. A parse failure is non-retryable
+// and returns nil.
+func (h *BillingHandler) handleSubscriptionResumed(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) error {
 	sub, ok := parseSubscriptionEntity(event)
 	if !ok {
 		slog.Error("billing.subscription.resumed.parse_failed")
-		return
+		return nil
 	}
 
 	teamID, err := resolveTeamFromNotes(ctx, h, sub)
 	if err != nil {
+		// Missing/unknown-team payload → non-retryable. Real DB error → retryable.
+		if teamResolveUnretryable(err) {
+			slog.Warn("billing.subscription.resumed.team_unresolvable",
+				"error", err, "sub_id", sub.ID)
+			return nil
+		}
 		slog.Error("billing.subscription.resumed.team_resolve_failed",
 			"error", err, "sub_id", sub.ID)
-		return
+		return fmt.Errorf("subscription.resumed team resolve: %w", err)
 	}
 
 	slog.Info("billing.subscription.resumed", "team_id", teamID, "subscription_id", sub.ID)
 	maybeRecoverPaymentGrace(ctx, h.db, teamID, sub.ID)
+	return nil
 }
 
 // startGracePeriodForTeam centralises the grace-start logic so both
@@ -1264,8 +1358,32 @@ func parseSubscriptionEntity(event rzpWebhookEvent) (rzpSubscriptionEntity, bool
 	return sub, true
 }
 
+// ErrTeamUnresolvable is the sentinel returned by resolveTeamFromNotes when
+// the subscription event simply does not carry enough information to find a
+// team (no valid notes.team_id and no subscription_id). P1-W3-09: webhook
+// dispatch treats this as a NON-retryable failure — a payload that will never
+// resolve must not 500-and-retry forever, so the claim is kept and 200 is
+// returned. A genuine DB error (returned as-is, NOT wrapped in this sentinel)
+// is the retryable case that releases the claim and 500s.
+var ErrTeamUnresolvable = errors.New("cannot resolve team: missing notes.team_id and no subscription_id")
+
+// teamResolveUnretryable reports whether a resolveTeamFromNotes error is a
+// permanent failure that will never succeed on retry — a malformed/missing
+// payload (ErrTeamUnresolvable) or a team that genuinely does not exist
+// (models.ErrTeamNotFound). P1-W3-09: these keep the dedup claim and return
+// 200; everything else (real DB/connection errors) is retryable, releasing
+// the claim and returning 500 so Razorpay redelivers.
+func teamResolveUnretryable(err error) bool {
+	var notFound *models.ErrTeamNotFound
+	return errors.Is(err, ErrTeamUnresolvable) || errors.As(err, &notFound)
+}
+
 // resolveTeamFromNotes returns the team UUID from subscription notes.
 // Falls back to a DB lookup by subscription ID when notes are absent.
+//
+// Error contract (P1-W3-09): a missing-data failure returns ErrTeamUnresolvable
+// (non-retryable); a real DB error from GetTeamByRazorpaySubscriptionID is
+// returned unwrapped (retryable). Callers use errors.Is to tell them apart.
 func resolveTeamFromNotes(ctx context.Context, h *BillingHandler, sub rzpSubscriptionEntity) (uuid.UUID, error) {
 	if teamIDStr := sub.Notes["team_id"]; teamIDStr != "" {
 		id, err := uuid.Parse(teamIDStr)
@@ -1283,7 +1401,7 @@ func resolveTeamFromNotes(ctx context.Context, h *BillingHandler, sub rzpSubscri
 		}
 		return team.ID, nil
 	}
-	return uuid.Nil, errors.New("cannot resolve team: missing notes.team_id and no subscription_id")
+	return uuid.Nil, ErrTeamUnresolvable
 }
 
 // Self-serve cancel was removed per policy — see project memory

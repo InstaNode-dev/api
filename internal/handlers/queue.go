@@ -215,6 +215,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 	metrics.ProvisionDuration.WithLabelValues("queue", "anonymous").Observe(time.Since(provStart).Seconds())
 	if err != nil {
 		metrics.ProvisionFailures.WithLabelValues("queue", "grpc_error").Inc()
+		middleware.RecordProvisionFail("queue", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("queue.new.provision_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
 		// Soft-delete the resource record so limits aren't falsely consumed.
@@ -267,6 +268,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		"request_id", requestID,
 	)
 	metrics.ProvisionsTotal.WithLabelValues("queue", "anonymous").Inc()
+	middleware.RecordProvisionSuccess("queue")
 	metrics.ConversionFunnel.WithLabelValues("provision").Inc()
 
 	if markErr := h.markRecycleSeen(ctx, fp); markErr != nil {
@@ -377,6 +379,7 @@ func (h *QueueHandler) newQueueAuthenticated(
 	metrics.ProvisionDuration.WithLabelValues("queue", tier).Observe(time.Since(provStart).Seconds())
 	if err != nil {
 		metrics.ProvisionFailures.WithLabelValues("queue", "grpc_error").Inc()
+		middleware.RecordProvisionFail("queue", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("queue.new.provision_failed_auth",
 			"error", err, "token", tokenStr, "team_id", teamIDStr, "request_id", requestID)
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
@@ -418,6 +421,7 @@ func (h *QueueHandler) newQueueAuthenticated(
 		"request_id", requestID,
 	)
 	metrics.ProvisionsTotal.WithLabelValues("queue", tier).Inc()
+	middleware.RecordProvisionSuccess("queue")
 
 	resp := fiber.Map{
 		"ok":             true,

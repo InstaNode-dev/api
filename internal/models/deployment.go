@@ -758,11 +758,20 @@ const activeDeploymentStatusesSQL = `('building', 'deploying', 'healthy')`
 // UpdateDeploymentProviderID for them, so there is no k8s object to tear
 // down. The reconciler marks those terminal directly without a Teardown
 // call — this query only returns rows that genuinely need a compute call.
-func GetExpiredDeploymentsAwaitingTeardown(ctx context.Context, db *sql.DB, limit int) ([]*Deployment, error) {
+//
+// P1-W5-17 (bug-hunt 2026-05-18): the api runs replicas:2 and StartTeardownReconciler
+// sweeps in EVERY pod, so a plain SELECT had both pods pick the same rows and
+// double-invoke compute.Teardown. The select MUST run inside the same
+// transaction the reconciler holds for the sweep and now carries
+// `FOR UPDATE SKIP LOCKED`: a row locked by one pod's sweep tx is silently
+// skipped by the other pod's sweep, so each expired deployment is claimed
+// and torn down by exactly one pod. The lock is held until the sweep tx
+// commits — SKIP LOCKED means the loser never blocks, it just no-ops.
+func GetExpiredDeploymentsAwaitingTeardown(ctx context.Context, tx *sql.Tx, limit int) ([]*Deployment, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := db.QueryContext(ctx, `
+	rows, err := tx.QueryContext(ctx, `
 		SELECT `+deploymentColumns+`
 		FROM deployments
 		WHERE status = $1
@@ -770,6 +779,7 @@ func GetExpiredDeploymentsAwaitingTeardown(ctx context.Context, db *sql.DB, limi
 		  AND provider_id != ''
 		ORDER BY updated_at ASC
 		LIMIT $2
+		FOR UPDATE SKIP LOCKED
 	`, DeployStatusExpired, limit)
 	if err != nil {
 		return nil, fmt.Errorf("models.GetExpiredDeploymentsAwaitingTeardown: %w", err)
@@ -793,8 +803,12 @@ func GetExpiredDeploymentsAwaitingTeardown(ctx context.Context, db *sql.DB, limi
 // (e.g. a DELETE /deploy/:id raced the reconciler) is left untouched and
 // RowsAffected reports 0, so the caller can tell a real teardown from a
 // no-op.
-func MarkDeploymentTornDown(ctx context.Context, db *sql.DB, id uuid.UUID) (int64, error) {
-	res, err := db.ExecContext(ctx, `
+//
+// P1-W5-17: runs on the same transaction as GetExpiredDeploymentsAwaitingTeardown
+// so the row claimed by FOR UPDATE SKIP LOCKED is flipped under the lock that
+// claimed it — no other pod's sweep can race the status transition.
+func MarkDeploymentTornDown(ctx context.Context, tx *sql.Tx, id uuid.UUID) (int64, error) {
+	res, err := tx.ExecContext(ctx, `
 		UPDATE deployments
 		SET status = $1, updated_at = now()
 		WHERE id = $2 AND status = $3

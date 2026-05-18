@@ -13,6 +13,19 @@ const (
 	metricResourceExpired  = "Custom/Resource/Expired"
 )
 
+// Provision-fail reason tags. The same enum the `error_reason` slog field
+// uses, so NR Log lines and the Custom/Provision/Fail metric can be joined.
+// Passed as the `reason` arg to RecordProvisionFail.
+const (
+	// ProvisionFailBackendUnavailable — the provisioner gRPC / object-store
+	// backend call failed; the handler returns 503. This is the modal
+	// provision failure the NR provisioning dashboard tracks.
+	ProvisionFailBackendUnavailable = "backend_unavailable"
+	// ProvisionFailInternal — a platform-DB write (CreateResource, team
+	// lookup) failed before the backend was even reached; handler 503s.
+	ProvisionFailInternal = "internal"
+)
+
 // nrAppGlobal is set once at startup from main and read by the emit
 // helpers below. Storing the application on a package var lets handler
 // code call a single-arg helper (RecordProvisionSuccess("postgres"))
@@ -45,10 +58,10 @@ func recordOne(name string, count float64) {
 // service without exploding metric cardinality (NR caps at 2k unique
 // metric names per minute).
 //
-// Called from handlers (deploy.go, db.go, cache.go, ...) right after a
-// successful provision. Handler files are NOT modified as part of
-// Track 3 — this helper exists for those handlers to call once they
-// adopt it in a follow-up.
+// Called from the 6 provision handlers (db.go, cache.go, nosql.go,
+// queue.go, storage.go, webhook.go) right after a successful provision —
+// next to the existing metrics.ProvisionsTotal Prometheus counter — so the
+// NR provisioning dashboard has a data source (P1-W3-04, bug-hunt 2026-05-18).
 func RecordProvisionSuccess(family string) {
 	if nrAppGlobal == nil {
 		return
