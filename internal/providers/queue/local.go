@@ -8,7 +8,7 @@ package queue
 // under their assigned prefix (e.g. "a1b2c3d4.orders", "a1b2c3d4.events").
 //
 // Connection URL format: nats://{host}:4222
-// Subject prefix:        {token_prefix8}.
+// Subject prefix:        {full_token}.  (dashes stripped — see subjident.go)
 //
 // Deprovision is a no-op — the NATS server has no per-user state to clean up
 // because it runs without authentication.
@@ -27,9 +27,11 @@ type Credentials struct {
 	// NATS runs without authentication — no credentials are embedded.
 	URL string
 
-	// SubjectPrefix is the subject namespace for this resource.
-	// Callers must use subjects of the form "{SubjectPrefix}{event-name}".
-	// Example: if SubjectPrefix is "a1b2c3d4.", use "a1b2c3d4.orders".
+	// SubjectPrefix is the subject namespace for this resource. It is derived
+	// from the FULL token (dashes stripped) — see subjident.go. On the shared
+	// no-auth NATS backend this prefix is the ONLY tenant-isolation boundary,
+	// so it must NOT be truncated (P1-W4-04). Callers must use subjects of the
+	// form "{SubjectPrefix}{event-name}".
 	SubjectPrefix string
 
 	// ProviderResourceID is the k8s namespace for dedicated (pro/team) provisions.
@@ -76,11 +78,11 @@ func (p *Provider) Provision(ctx context.Context, token, tier string) (*Credenti
 		return nil, fmt.Errorf("queue.Provision: NATS unhealthy (HTTP %d from %s)", resp.StatusCode, monitorURL)
 	}
 
-	prefix := token
-	if len(prefix) > 8 {
-		prefix = prefix[:8]
-	}
-	subjectPrefix := prefix + "."
+	// SubjectPrefix is derived from the FULL token (subjident.go). On the
+	// shared no-auth NATS backend this prefix is the ONLY tenant-isolation
+	// boundary — truncating it to token[:8] let any two tokens that share 8
+	// hex chars publish/subscribe to each other's subjects (P1-W4-04).
+	subjectPrefix := canonicalSubjectPrefix(token)
 	url := fmt.Sprintf("nats://%s:4222", p.natsHost)
 
 	slog.Info("queue.Provision: NATS healthy, connection URL issued",
@@ -98,13 +100,13 @@ func (p *Provider) Provision(ctx context.Context, token, tier string) (*Credenti
 // Deprovision is a no-op. NATS runs without per-user state — there is nothing
 // to delete on the server. The subject prefix is simply abandoned.
 func (p *Provider) Deprovision(_ context.Context, token string) error {
-	prefix := token
-	if len(prefix) > 8 {
-		prefix = prefix[:8]
-	}
+	// resolveSubjectPrefix returns the canonical full-token prefix. The shared
+	// NATS backend has no per-user server state to delete, so this is a
+	// structural no-op; resolving the prefix keeps the log line truthful for
+	// resources provisioned both before and after the P1-W4-04 fix.
 	slog.Info("queue.Deprovision: subject prefix released (NATS has no per-user state)",
 		"token", token,
-		"subject_prefix", prefix+".",
+		"subject_prefix", resolveSubjectPrefix(token, ""),
 	)
 	return nil
 }

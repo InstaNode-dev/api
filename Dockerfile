@@ -17,7 +17,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o /instant .
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata docker-cli
+# docker-cli intentionally NOT installed: prod builds run via kaniko-in-k8s
+# (COMPUTE_PROVIDER=k8s), so the api process never shells out to `docker`.
+# Keeping it out trims the image and removes an unused tool from the surface.
+RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=builder /instant /app/instant
 # plans.yaml is the single source of truth for all plan limits and pricing.

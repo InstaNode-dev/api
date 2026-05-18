@@ -228,6 +228,54 @@ const (
 	metadataCIDR = "169.254.0.0/16"
 )
 
+const (
+	// ── Build-pod network-isolation constants (P1-W3-19 / P1-W5-12) ──────────
+	//
+	// The Kaniko build Job runs the CUSTOMER's Dockerfile RUN steps as root for
+	// up to buildJobActiveDeadlineSecs (10 min). Before this policy existed the
+	// build namespace had NO NetworkPolicy until setupTenantNamespace retrofitted
+	// one AFTER the build finished — leaving the build pod with unrestricted
+	// egress (cloud metadata at 169.254.169.254, the kube-apiserver, other
+	// tenants' DB pods) for the full build window. buildNetworkPolicyName is
+	// installed by createBuildNetworkPolicy in buildImage, BEFORE the Job is
+	// created, and is later upgraded in place by setupTenantNamespace.
+
+	// buildNetworkPolicyName is the NetworkPolicy applied to the build namespace
+	// for the duration of the kaniko build. setupTenantNamespace installs a
+	// NetworkPolicy under a DIFFERENT name (instant-isolation); both can coexist
+	// (k8s unions all NetworkPolicies selecting a pod), and the build policy is
+	// strictly the more restrictive of the two — it has no DB-port egress rule.
+	buildNetworkPolicyName = "instant-build-isolation"
+
+	// dataNamespaceName is the namespace housing the in-cluster object store
+	// (MinIO) that serves the kaniko build context. The build NetworkPolicy
+	// allows egress here ONLY on the object-store port so kaniko can fetch the
+	// presigned build-context tarball — every other in-cluster destination
+	// stays blocked.
+	dataNamespaceName = "instant-data"
+
+	// objectStorePort is the in-cluster MinIO API port the kaniko init-container
+	// curls the build context from.
+	objectStorePort = 9000
+
+	// httpsPort / httpPort are the egress ports the kaniko build pod needs to
+	// reach the external image registry (GHCR) to push the built image, and any
+	// external (non-MinIO) build-context object store. Cluster-internal IPs are
+	// still blocked via egressExceptCIDRs(); only genuine public registry/object
+	// store endpoints are reachable on these ports.
+	httpsPort = 443
+	httpPort  = 80
+
+	// pssEnforceLabel / pssWarnLabel are the Pod Security Standards namespace
+	// label keys. pssBaseline is the policy level applied at enforce time —
+	// "baseline" blocks host namespaces, privileged containers and hostPath
+	// while still allowing the writes a real build needs.
+	pssEnforceLabel = "pod-security.kubernetes.io/enforce"
+	pssWarnLabel    = "pod-security.kubernetes.io/warn"
+	pssBaseline     = "baseline"
+	pssRestricted   = "restricted"
+)
+
 // defaultClusterPodCIDRs / defaultClusterServiceCIDRs are the union of the
 // CIDR ranges used by the two clusters this platform runs on:
 //   - k3s / Rancher Desktop (local dev): pods 10.42.0.0/16, services 10.43.0.0/16
@@ -436,8 +484,8 @@ func (p *K8sProvider) setupTenantNamespace(ctx context.Context, namespaceName, t
 				// Pod Security Standards: enforce baseline, warn on restricted.
 				// "baseline" blocks known privilege escalation vectors (host namespaces,
 				// privileged containers, hostPath) while allowing /tmp writes, etc.
-				"pod-security.kubernetes.io/enforce": "baseline",
-				"pod-security.kubernetes.io/warn":    "restricted",
+				pssEnforceLabel: pssBaseline,
+				pssWarnLabel:    pssRestricted,
 				// Tenant labels for auditing and network policy selectors.
 				"instant.dev/tenant": tenantID,
 				"instant.dev/tier":   tier,
@@ -446,7 +494,16 @@ func (p *K8sProvider) setupTenantNamespace(ctx context.Context, namespaceName, t
 		},
 	}
 	_, err := p.clientset.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
+	if apierrors.IsAlreadyExists(err) {
+		// buildImage may have created the namespace first (it brings the
+		// namespace up before the kaniko Job so the build NetworkPolicy can be
+		// installed). buildImage already stamps the PSS labels, but upgrade the
+		// full label set here idempotently so a namespace created by any older
+		// path still ends up with enforce=baseline + the tenant labels.
+		if uerr := p.upgradeNamespaceLabels(ctx, namespaceName, ns.Labels); uerr != nil {
+			return fmt.Errorf("upgrade namespace labels %q: %w", namespaceName, uerr)
+		}
+	} else if err != nil {
 		return fmt.Errorf("create namespace %q: %w", namespaceName, err)
 	}
 
@@ -680,9 +737,170 @@ func (p *K8sProvider) createNetworkPolicyInNS(ctx context.Context, ns, teamID st
 			},
 		},
 	}
-	_, err := p.clientset.NetworkingV1().NetworkPolicies(ns).Create(ctx, np, metav1.CreateOptions{})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := p.upsertNetworkPolicy(ctx, ns, np); err != nil {
 		return fmt.Errorf("create network policy in %q: %w", ns, err)
+	}
+	return nil
+}
+
+// upsertNetworkPolicy creates the NetworkPolicy, or updates it in place when it
+// already exists. Idempotent apply semantics matter for the build path: the
+// kaniko-stage build NetworkPolicy may already be present when a later call
+// installs/upgrades the tenant-isolation policy, and a plain Create that
+// tolerated AlreadyExists would silently keep a stale spec instead of
+// upgrading it.
+func (p *K8sProvider) upsertNetworkPolicy(ctx context.Context, ns string, np *networkingv1.NetworkPolicy) error {
+	_, err := p.clientset.NetworkingV1().NetworkPolicies(ns).Create(ctx, np, metav1.CreateOptions{})
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	existing, gerr := p.clientset.NetworkingV1().NetworkPolicies(ns).Get(ctx, np.Name, metav1.GetOptions{})
+	if gerr != nil {
+		return fmt.Errorf("get existing network policy %q: %w", np.Name, gerr)
+	}
+	existing.Spec = np.Spec
+	existing.Labels = np.Labels
+	_, uerr := p.clientset.NetworkingV1().NetworkPolicies(ns).Update(ctx, existing, metav1.UpdateOptions{})
+	return uerr
+}
+
+// upgradeNamespaceLabels merges the given labels onto an existing namespace.
+// Used when buildImage created the namespace before setupTenantNamespace runs:
+// it guarantees the PSS enforce/warn labels and tenant labels are present even
+// on a namespace first created by an older code path.
+func (p *K8sProvider) upgradeNamespaceLabels(ctx context.Context, namespaceName string, labels map[string]string) error {
+	existing, err := p.clientset.CoreV1().Namespaces().Get(ctx, namespaceName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get namespace: %w", err)
+	}
+	if existing.Labels == nil {
+		existing.Labels = map[string]string{}
+	}
+	changed := false
+	for k, v := range labels {
+		if existing.Labels[k] != v {
+			existing.Labels[k] = v
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	_, err = p.clientset.CoreV1().Namespaces().Update(ctx, existing, metav1.UpdateOptions{})
+	return err
+}
+
+// createBuildNetworkPolicy installs a build-scoped default-deny NetworkPolicy
+// in the kaniko build namespace BEFORE the build Job is created (P1-W3-19 /
+// P1-W5-12).
+//
+// The kaniko Job runs the customer's Dockerfile RUN steps as root. Without this
+// policy the build pod had unrestricted egress for the full ≤10-min build
+// window — it could reach the cloud metadata endpoint (169.254.169.254), the
+// kube-apiserver, and other tenants' DB pods, and could POST the mounted
+// registry credential (/kaniko/.docker/config.json) to an attacker.
+//
+// The policy is intentionally MORE restrictive than the tenant-isolation
+// policy setupTenantNamespace installs later: it has NO DB-port egress rule at
+// all. Egress is permitted ONLY to:
+//   - DNS (kube-dns in kube-system, UDP+TCP 53) — required for any hostname.
+//   - the in-cluster object store (instant-data namespace, objectStorePort) —
+//     the kaniko init-container fetches the presigned build-context tarball.
+//   - external internet on httpPort/httpsPort — kaniko pushes the built image
+//     to the registry (GHCR). Cluster-internal CIDRs + the metadata CIDR are in
+//     the Except list (egressExceptCIDRs), so "external internet" genuinely
+//     excludes other tenants' pods and the kube-apiserver.
+//
+// Ingress is fully denied — a build pod is never a server.
+//
+// k8s unions all NetworkPolicies that select a pod, and this policy carries a
+// distinct name (buildNetworkPolicyName) from the tenant-isolation policy, so
+// the two coexist; the effective egress is the union, which is still bounded
+// because neither policy grants metadata/apiserver access.
+func (p *K8sProvider) createBuildNetworkPolicy(ctx context.Context, ns string) error {
+	proto53UDP := corev1.ProtocolUDP
+	proto53TCP := corev1.ProtocolTCP
+	port53 := intstr.FromInt(53)
+
+	np := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      buildNetworkPolicyName,
+			Namespace: ns,
+			Labels: map[string]string{
+				"managed-by":            "instant.dev",
+				"instant.dev/component": "build-staging",
+			},
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			// Select every pod in the build namespace.
+			PodSelector: metav1.LabelSelector{},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+				networkingv1.PolicyTypeEgress,
+			},
+			// Ingress: fully denied — a kaniko build pod is never a server.
+			Ingress: []networkingv1.NetworkPolicyIngressRule{},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{
+					// DNS resolution via kube-dns (UDP + TCP port 53).
+					To: []networkingv1.NetworkPolicyPeer{
+						{
+							NamespaceSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{
+									"kubernetes.io/metadata.name": "kube-system",
+								},
+							},
+						},
+					},
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Protocol: &proto53UDP, Port: &port53},
+						{Protocol: &proto53TCP, Port: &port53},
+					},
+				},
+				{
+					// In-cluster object store (MinIO in instant-data) — the
+					// kaniko init-container fetches the presigned build context.
+					To: []networkingv1.NetworkPolicyPeer{
+						{
+							NamespaceSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{
+									"kubernetes.io/metadata.name": dataNamespaceName,
+								},
+							},
+						},
+					},
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(objectStorePort)},
+					},
+				},
+				{
+					// External internet on HTTP(S) — kaniko pushes the built
+					// image to the registry (GHCR) and may fetch an external
+					// build context. Cluster pod/service CIDRs + the cloud
+					// metadata link-local range are in the Except list, so this
+					// rule cannot reach other tenants' pods, the kube-apiserver,
+					// or 169.254.169.254.
+					To: []networkingv1.NetworkPolicyPeer{
+						{
+							IPBlock: &networkingv1.IPBlock{
+								CIDR:   "0.0.0.0/0",
+								Except: egressExceptCIDRs(),
+							},
+						},
+					},
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(httpsPort)},
+						{Protocol: ptrProto(corev1.ProtocolTCP), Port: ptrPort(httpPort)},
+					},
+				},
+			},
+		},
+	}
+	if err := p.upsertNetworkPolicy(ctx, ns, np); err != nil {
+		return fmt.Errorf("create build network policy in %q: %w", ns, err)
 	}
 	return nil
 }
@@ -1183,12 +1401,40 @@ func (p *K8sProvider) buildImage(ctx context.Context, ns, appID, imageTag string
 	// 0. Ensure the namespace exists. The stack pipeline normally creates it
 	//    via setupTenantNamespace AFTER the build step, so we need to be the
 	//    first to bring it up. Idempotent.
+	//
+	//    SECURITY (P1-W3-19 / P1-W5-12): the PSS enforce/warn labels are stamped
+	//    HERE — at namespace creation, before the kaniko Job — so the build pod
+	//    (customer Dockerfile RUN steps, running as root) is governed by the
+	//    baseline Pod Security Standard for the full build window, not only
+	//    after setupTenantNamespace retrofits it post-build.
 	nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
-		Name:   ns,
-		Labels: map[string]string{"managed-by": "instant.dev", "instant.dev/component": "build-staging"},
+		Name: ns,
+		Labels: map[string]string{
+			"managed-by":            "instant.dev",
+			"instant.dev/component": "build-staging",
+			pssEnforceLabel:         pssBaseline,
+			pssWarnLabel:            pssRestricted,
+		},
 	}}
-	if _, err := p.clientset.CoreV1().Namespaces().Create(ctx, nsObj, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("k8s.buildImage: ensure namespace %q: %w", ns, err)
+	if _, err := p.clientset.CoreV1().Namespaces().Create(ctx, nsObj, metav1.CreateOptions{}); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("k8s.buildImage: ensure namespace %q: %w", ns, err)
+		}
+		// Namespace pre-exists (e.g. a retried build) — make sure the PSS labels
+		// are present even if an older path created it without them.
+		if uerr := p.upgradeNamespaceLabels(ctx, ns, nsObj.Labels); uerr != nil {
+			return fmt.Errorf("k8s.buildImage: upgrade namespace labels %q: %w", ns, uerr)
+		}
+	}
+
+	// 0b. Install the build-scoped default-deny NetworkPolicy BEFORE the kaniko
+	//     Job is created. This closes the egress window in which the build pod
+	//     could reach cloud metadata (169.254.169.254), the kube-apiserver, or
+	//     other tenants' DB pods — and neuters the registry-credential-exfil
+	//     vector (a build pod with no off-cluster egress except registry HTTPS
+	//     cannot POST /kaniko/.docker/config.json to an attacker).
+	if err := p.createBuildNetworkPolicy(ctx, ns); err != nil {
+		return fmt.Errorf("k8s.buildImage: %w", err)
 	}
 
 	// 1. Tarball delivery. Prefer S3 when MinIO is configured (no 1 MiB cap);
