@@ -514,7 +514,7 @@ const AgentActionDeletionAlreadyPending = "Tell the user a deletion email is alr
 // token. We deliberately conflate "expired", "already used", and "never
 // existed" to avoid leaking token validity to an attacker. The remedy
 // is the same in every case: re-request via DELETE.
-const AgentActionDeletionTokenExpiredOrUsed = "Tell the user the confirmation token is expired or already used. Have them call DELETE on the resource again to mint a fresh email — see the flow at https://instanode.dev/docs/api. The previous link is dead either way."
+const AgentActionDeletionTokenExpiredOrUsed = "Tell the user the confirmation token is expired or already used. Have them call DELETE on the resource again to mint a fresh email — see the flow at https://instanode.dev/docs. The previous link is dead either way."
 
 // AgentActionDeletionConfirmed is returned in the 200 success envelope
 // from POST /confirm-deletion. The agent surfaces this to the user as
@@ -524,7 +524,7 @@ const AgentActionDeletionConfirmed = "Tell the user the deletion is confirmed an
 // AgentActionDeletionCancelled is returned in the 200 success envelope
 // from DELETE /confirm-deletion. The resource stayed active; the slot
 // stays consumed.
-const AgentActionDeletionCancelled = "Tell the user the pending deletion is cancelled. The resource stays active and the slot stays consumed. If they want to delete again, they have to start fresh with a new DELETE call — see https://instanode.dev/docs/api."
+const AgentActionDeletionCancelled = "Tell the user the pending deletion is cancelled. The resource stays active and the slot stays consumed. If they want to delete again, they have to start fresh with a new DELETE call — see https://instanode.dev/docs."
 
 // AgentActionDeletionEmailDisabled is the fallback used when the team
 // has no primary user email on file (extremely rare — claimed teams

@@ -69,6 +69,13 @@ const githubMaxDeploysPerHour = 10
 // githubRateLimitWindow is the rolling window for githubMaxDeploysPerHour.
 const githubRateLimitWindow = time.Hour
 
+// githubMaxWebhookBodyBytes is the hard ceiling on the inbound GitHub
+// webhook body. GitHub itself caps push payloads at 25 MiB; we accept up
+// to that and reject anything larger with 413 BEFORE HMAC verification
+// and JSON unmarshal so a hostile sender cannot make the handler buffer
+// and parse an unbounded body.
+const githubMaxWebhookBodyBytes = 25 << 20
+
 // githubAllowedTiers names the plan tiers permitted to wire a GitHub
 // connection. Anonymous / free are excluded because they can't deploy at
 // all (deployments_apps=0). Hobby is allowed because a Hobby team CAN have
@@ -421,6 +428,18 @@ func (h *GitHubDeployHandler) Receive(c *fiber.Ctx) error {
 	// Capture the body for HMAC + later JSON parse. Fiber buffers the body
 	// internally so c.Body() is safe to call multiple times.
 	body := c.Body()
+
+	// P2 (BugBash 2026-05-18): cap the inbound body BEFORE HMAC verify +
+	// JSON unmarshal. GitHub itself never sends a push payload over 25 MiB;
+	// anything larger is hostile — reject with 413 rather than burning CPU
+	// hashing and parsing it.
+	if len(body) > githubMaxWebhookBodyBytes {
+		slog.Warn("github.receive.body_too_large",
+			"connection_id", conn.ID, "bytes", len(body),
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusRequestEntityTooLarge, "payload_too_large",
+			"GitHub webhook payload exceeds the 25 MiB cap")
+	}
 
 	sigHeader := c.Get("X-Hub-Signature-256")
 	if !VerifyGitHubSignature(plaintextSecret, body, sigHeader) {

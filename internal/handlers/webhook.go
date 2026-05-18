@@ -272,7 +272,10 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 				"upgrade_jwt": jwtToken,
 			}
 			if existing.ExpiresAt.Valid {
-				resp["expires_at"] = existing.ExpiresAt.Time
+				// P2-03: emit RFC3339 (not the default RFC3339Nano of a raw
+				// time.Time) so expires_at has one wire shape across every
+				// provisioning endpoint — matches storage.go.
+				resp["expires_at"] = existing.ExpiresAt.Time.Format(time.RFC3339)
 			}
 			return respondOK(c, resp)
 		}
@@ -362,7 +365,9 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 		"note":        upgradeNote(upgradeURL),
 		"upgrade":     upgradeURL,
 		"upgrade_jwt": jwtToken,
-		"expires_at":  expiresAt,
+		// P2-03: RFC3339 to match storage.go and the webhook dedup branch —
+		// one wire shape for expires_at across all provisioning endpoints.
+		"expires_at": expiresAt.Format(time.RFC3339),
 	})
 }
 
@@ -780,6 +785,17 @@ func (h *WebhookHandler) ListRequests(c *fiber.Ctx) error {
 	// (404, mirroring Receive).
 	if resource.ResourceType != models.ResourceTypeWebhook {
 		return respondError(c, fiber.StatusNotFound, "not_found", "Webhook token not found")
+	}
+
+	// P2 (BugBash 2026-05-18): reject a non-active webhook for consistency
+	// with Receive. Receive rejects status != 'active' (suspended / deleted /
+	// reaped) with 410; ListRequests must do the same — otherwise a suspended
+	// webhook's stored payloads (which may carry credentials sent by the
+	// upstream) stay readable through the public list API after the resource
+	// has been quota-suspended.
+	if resource.Status != "active" {
+		return respondError(c, fiber.StatusGone, "webhook_inactive",
+			"This webhook token is no longer active")
 	}
 
 	// P1-C: reject an expired webhook for consistency with Receive — an expired

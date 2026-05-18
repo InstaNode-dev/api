@@ -32,6 +32,19 @@ func TestIsSecretKey(t *testing.T) {
 		{"MY_DSN", true, "ends with DSN suffix"},
 		{"MONGO_URI", true, "ends with URI suffix"},
 
+		// P2-W2-28 (BugBash 2026-05-18) — fragments added so these mask
+		{"AUTH_TOKEN", true, "contains AUTH (also TOKEN)"},
+		{"BASIC_AUTH", true, "contains AUTH"},
+		{"DB_CREDENTIALS", true, "contains CRED"},
+		{"AWS_CREDENTIAL", true, "contains CRED"},
+		{"PRIVATE_KEY", true, "contains PRIVATE"},
+		{"TLS_CERT", true, "contains CERT"},
+		{"JWT", true, "contains JWT"},
+		{"SESSION_JWT", true, "contains JWT"},
+		{"BEARER_TOKEN", true, "contains BEARER"},
+		{"SIGNING_SECRET", true, "contains SIGN (also SECRET)"},
+		{"REQUEST_SIGNATURE", true, "contains SIGN"},
+
 		// Innocuous keys — must NOT be masked
 		{"NODE_ENV", false, "plain env name"},
 		{"PORT", false, "port number"},

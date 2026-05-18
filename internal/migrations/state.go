@@ -72,26 +72,42 @@ func NewReader(db *sql.DB, ttl time.Duration, clock func() time.Time) *Reader {
 // flipped to "unknown" (and an empty filename/count if never seeded) so
 // the caller always gets a usable State — never blocks /healthz on a DB
 // outage.
+//
+// P2 (BugBash 2026-05-18): the mutex is NEVER held across the (up-to-2s)
+// queryState DB call. The old code took r.mu for the whole method, so a
+// slow DB serialized every concurrent /healthz probe behind one lock —
+// readiness probes piled up and the pod flapped. Now the lock only guards
+// the in-memory cache read and write; the DB IO happens lock-free. A
+// short window of N concurrent refreshes during a TTL expiry is acceptable
+// (each probe is independent and the result is idempotent) and far cheaper
+// than serializing every probe.
 func (r *Reader) Get(ctx context.Context) State {
+	now := r.clock()
+
+	// Fast path: serve the cached value under the lock if still fresh.
+	r.mu.Lock()
+	if !r.expires.IsZero() && now.Before(r.expires) {
+		cached := r.cached
+		r.mu.Unlock()
+		return cached
+	}
+	r.mu.Unlock()
+
+	// Refresh: DB IO happens WITHOUT the lock held.
+	s, err := queryState(ctx, r.db)
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	now := r.clock()
-	if !r.expires.IsZero() && now.Before(r.expires) {
-		return r.cached
-	}
-
-	s, err := queryState(ctx, r.db)
 	if err != nil {
 		// DB unreachable / schema_migrations missing. Surface "unknown"
 		// but keep the TTL — we don't want to hammer a sick DB on every
 		// /healthz hit. Refresh in TTL window with a fresh attempt.
 		r.cached = State{Status: StatusUnknown}
-		r.expires = now.Add(r.ttl)
+		r.expires = r.clock().Add(r.ttl)
 		return r.cached
 	}
 	r.cached = s
-	r.expires = now.Add(r.ttl)
+	r.expires = r.clock().Add(r.ttl)
 	return r.cached
 }
 

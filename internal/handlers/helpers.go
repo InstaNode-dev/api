@@ -191,16 +191,16 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	// StatusNotFound / StatusMethodNotAllowed / StatusRequestEntityTooLarge
 	// / StatusUnsupportedMediaType.
 	"not_found": {
-		AgentAction: "Tell the user the URL is wrong or the resource no longer exists. Have them check the path against https://instanode.dev/docs/api — anon resources also auto-expire after 24h, so re-provision if needed.",
+		AgentAction: "Tell the user the URL is wrong or the resource no longer exists. Have them check the path against https://instanode.dev/docs — anon resources also auto-expire after 24h, so re-provision if needed.",
 	},
 	"method_not_allowed": {
-		AgentAction: "Tell the user the HTTP method is wrong for this URL. Have them check the Allow response header (or https://instanode.dev/docs/api) for the supported methods.",
+		AgentAction: "Tell the user the HTTP method is wrong for this URL. Have them check the Allow response header (or https://instanode.dev/docs) for the supported methods.",
 	},
 	"payload_too_large": {
-		AgentAction: "Tell the user the request body is too big. Have them shrink it — see per-endpoint limits at https://instanode.dev/docs/api.",
+		AgentAction: "Tell the user the request body is too big. Have them shrink it — see per-endpoint limits at https://instanode.dev/docs.",
 	},
 	"unsupported_media_type": {
-		AgentAction: "Tell the user the Content-Type is wrong. Have them use application/json for JSON routes or multipart/form-data for /deploy/new and /stacks/new — see https://instanode.dev/docs/api.",
+		AgentAction: "Tell the user the Content-Type is wrong. Have them use application/json for JSON routes or multipart/form-data for /deploy/new and /stacks/new — see https://instanode.dev/docs.",
 	},
 
 	// ── Circuit-breaker shorts ─────────────────────────────────────────────

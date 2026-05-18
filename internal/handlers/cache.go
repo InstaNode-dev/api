@@ -156,7 +156,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 					"connection_url": connectionURL,
 					"tier":           existing.Tier,
 					"env":            existing.Env,
-					"limits":         cacheAnonymousLimits(),
+					"limits":         h.cacheAnonymousLimits(),
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
@@ -296,7 +296,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 		"connection_url": creds.URL,
 		"tier":           "anonymous",
 		"env":            resource.Env,
-		"limits":         cacheAnonymousLimits(),
+		"limits":         h.cacheAnonymousLimits(),
 		"note":           upgradeNote(upgradeURL),
 		"upgrade":        upgradeURL,
 		"upgrade_jwt":    jwtToken,
@@ -477,9 +477,13 @@ func (h *CacheHandler) decryptConnectionURL(encrypted, requestID string) string 
 	return plain
 }
 
-func cacheAnonymousLimits() fiber.Map {
+// cacheAnonymousLimits returns the limits map for anonymous Redis resources.
+// memory_mb is read from plans.Registry (convention #3) so a plans.yaml edit
+// to the anonymous tier flows through automatically instead of drifting
+// against a hardcoded literal — matches dbAnonymousLimits/queueAnonymousLimits.
+func (h *CacheHandler) cacheAnonymousLimits() fiber.Map {
 	return fiber.Map{
-		"memory_mb":  5,
+		"memory_mb":  h.plans.StorageLimitMB(tierAnonymous, models.ResourceTypeRedis),
 		"expires_in": "24h",
 	}
 }

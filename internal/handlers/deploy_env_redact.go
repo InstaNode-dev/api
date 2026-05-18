@@ -35,6 +35,11 @@ const envRedactedMask = "***"
 // constants — not scattered string literals — per project convention.
 //
 // Extend this slice (not inline call sites) when adding new heuristics.
+// P2-W2-28 (BugBash 2026-05-18): the original set missed several common
+// secret-bearing key conventions — AUTH (AUTH_TOKEN, BASIC_AUTH),
+// CRED/CREDENTIAL, PRIVATE (PRIVATE_KEY), CERT (TLS_CERT), JWT (JWT_SECRET
+// is caught by SECRET, but bare JWT / *_JWT is not), BEARER, SIGN/SIGNING.
+// These are added as fragments so any key containing them is masked.
 var secretKeyFragments = []string{
 	"SECRET",
 	"PASSWORD",
@@ -43,6 +48,13 @@ var secretKeyFragments = []string{
 	"TOKEN",
 	"_KEY",
 	"APIKEY",
+	"AUTH",
+	"CRED",
+	"PRIVATE",
+	"CERT",
+	"JWT",
+	"BEARER",
+	"SIGN",
 }
 
 // secretKeySuffixes is the set of uppercase suffixes that classify a value
