@@ -118,6 +118,27 @@ func expectDomainListByTeam(mock sqlmock.Sqlmock, teamID uuid.UUID, count int) {
 		WithArgs(teamID).WillReturnRows(rows)
 }
 
+// expectOwnedStackBySlug stubs models.GetStackBySlug with a team-owned stack
+// row. The custom-domain Create handler runs requireOwnedStack BEFORE the
+// per-count cap check (so a non-owned stack returns 404, not a quota 402),
+// hence the cap-path tests must stub this query first.
+func expectOwnedStackBySlug(mock sqlmock.Sqlmock, teamID uuid.UUID, slug string) {
+	cols := []string{
+		"id", "team_id", "name", "slug", "namespace", "status", "tier",
+		"env", "parent_stack_id", "expires_at", "fingerprint",
+		"created_at", "updated_at",
+	}
+	rows := sqlmock.NewRows(cols).AddRow(
+		uuid.New(), teamID, sql.NullString{String: "Acme Stack", Valid: true},
+		slug, "ns-"+slug, "healthy", "pro",
+		sql.NullString{String: "production", Valid: true}, uuid.NullUUID{},
+		sql.NullTime{}, sql.NullString{},
+		time.Now(), time.Now(),
+	)
+	mock.ExpectQuery(`SELECT.*FROM stacks WHERE slug`).
+		WithArgs(slug).WillReturnRows(rows)
+}
+
 // postDomain fires the create request. We pass a non-empty body so the
 // handler doesn't reject for invalid_body before it reaches the cap check.
 // (Body parse happens *after* the cap check, so under cap we'll see a
@@ -170,6 +191,8 @@ func TestCustomDomainCreate_HobbyPlus_AtCap_Returns402WithAgentAction(t *testing
 	require.NoError(t, err)
 	defer db.Close()
 	expectTeamRowForCustomDomain(mock, teamID, "hobby_plus")
+	// The handler resolves the (owned) stack before the cap check.
+	expectOwnedStackBySlug(mock, teamID, "any-slug")
 	// hobby_plus cap is 1; simulate 1 existing domain — next add must 402.
 	expectDomainListByTeam(mock, teamID, 1)
 
@@ -198,6 +221,8 @@ func TestCustomDomainCreate_Pro_OverCap_Returns402(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 	expectTeamRowForCustomDomain(mock, teamID, "pro")
+	// The handler resolves the (owned) stack before the cap check.
+	expectOwnedStackBySlug(mock, teamID, "any-slug")
 	// Pro cap is 5; simulate 5 existing domains.
 	expectDomainListByTeam(mock, teamID, 5)
 
@@ -214,30 +239,27 @@ func TestCustomDomainCreate_Pro_OverCap_Returns402(t *testing.T) {
 	assert.Equal(t, "pro", body["tier"])
 }
 
-// Hobby Plus under the cap — the count check passes; the handler proceeds
-// to the stack lookup which will fail (no stack row stubbed). We assert
-// the response is NOT a 402 with the cap error, which proves the count
-// branch let the request through.
+// Hobby Plus under the cap — the count check passes when reached. The
+// handler resolves the stack BEFORE the cap check, so a missing stack
+// short-circuits with 404 before the count query ever runs. We assert the
+// response is NOT a 402 with the cap error, which proves the under-cap path
+// is never wrongly surfaced.
 func TestCustomDomainCreate_HobbyPlus_UnderCap_PassesCountCheck(t *testing.T) {
 	teamID := uuid.New()
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
 	expectTeamRowForCustomDomain(mock, teamID, "hobby_plus")
-	// 0 existing domains, cap 1 — should pass and continue past the cap.
-	expectDomainListByTeam(mock, teamID, 0)
-	// The next step in the handler is requireOwnedStack — a SELECT on
+	// The first step after requireTeam is requireOwnedStack — a SELECT on
 	// stacks WHERE slug = 'any-slug'. Stub it returning no rows so the
-	// handler short-circuits with 404 (or service_unavailable) rather
-	// than 402-cap-reached. We allow any matching pattern.
+	// handler short-circuits with 404 rather than 402-cap-reached.
 	mock.ExpectQuery(`SELECT.*FROM stacks`).WillReturnError(sql.ErrNoRows)
 
 	app := customDomainTestApp(t, db, teamID)
 	resp := postDomain(t, app, "any-slug", map[string]string{"hostname": "app.example.com"})
 	defer resp.Body.Close()
 
-	// The exact status after the cap check depends on subsequent stubs —
-	// what matters here is that the body is NOT custom_domains_limit_reached.
+	// What matters here is that the body is NOT custom_domains_limit_reached.
 	var body map[string]any
 	_ = json.NewDecoder(resp.Body).Decode(&body)
 	if errStr, ok := body["error"].(string); ok {

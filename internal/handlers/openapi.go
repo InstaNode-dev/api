@@ -154,7 +154,7 @@ const openAPISpec = `{
           { "name": "X-Hub-Signature-256", "in": "header", "required": false, "schema": { "type": "string" }, "description": "sha256=<hex> — required only when the webhook resource has hmac_secret configured." },
           { "name": "X-Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string" }, "description": "Opaque key (e.g. from Stripe's Idempotency-Key); two requests with the same key replay the original response." }
         ],
-        "requestBody": { "content": { "application/json": {}, "application/x-www-form-urlencoded": {}, "text/plain": {} } },
+        "requestBody": { "description": "Raw body of any content type — the handler stores the bytes verbatim and does not parse by Content-Type. The listed types are the common cases; the wildcard entry documents that any media type is accepted.", "content": { "application/json": {}, "application/x-www-form-urlencoded": {}, "text/plain": {}, "application/octet-stream": {}, "*/*": {} } },
         "responses": {
           "200": { "description": "Payload stored", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string" } } } } } },
           "401": { "description": "HMAC signature missing or invalid (when hmac_secret is set on the resource).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },

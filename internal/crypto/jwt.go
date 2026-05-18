@@ -32,6 +32,12 @@ type ErrJWTSign struct {
 func (e *ErrJWTSign) Error() string { return fmt.Sprintf("jwt sign failed: %v", e.Cause) }
 func (e *ErrJWTSign) Unwrap() error { return e.Cause }
 
+// jwtSigningAlg is the single HMAC variant InstantNode mints with. VerifyJWT /
+// VerifyOnboardingJWT pin to exactly this via jwt.WithValidMethods (RFC 8725
+// §3.1) — restricting to the SigningMethodHMAC family alone still accepts
+// HS384/HS512, an attacker-selectable alg downgrade we don't want.
+const jwtSigningAlg = "HS256"
+
 // ErrJWTVerify is returned when JWT verification fails.
 type ErrJWTVerify struct {
 	Cause error
@@ -66,7 +72,7 @@ func VerifyJWT(secret []byte, tokenStr string) (*InstantClaims, error) {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return secret, nil
-	})
+	}, jwt.WithValidMethods([]string{jwtSigningAlg}))
 	if err != nil {
 		// Return jwt.ValidationError directly so callers can use errors.Is
 		// with sentinels like jwt.ErrTokenExpired.
@@ -115,7 +121,7 @@ func VerifyOnboardingJWT(secret []byte, tokenStr string) (*OnboardingClaims, err
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return secret, nil
-	})
+	}, jwt.WithValidMethods([]string{jwtSigningAlg}))
 	if err != nil {
 		return nil, &ErrJWTVerify{Cause: err}
 	}

@@ -2137,7 +2137,19 @@ func deploymentStatus(deploy *appsv1.Deployment) string {
 	return "building"
 }
 
+// maxExtractedTarBytes caps the total uncompressed size extractTarGz will
+// write. A crafted gzip bomb compresses to a few KB but expands to gigabytes;
+// without a ceiling that fills the extraction volume. 512 MiB is comfortably
+// above the 50 MiB handler-side upload limit yet well under any node disk.
+const maxExtractedTarBytes int64 = 512 << 20
+
 // extractTarGz extracts a gzipped tar archive to destDir.
+//
+// Only regular files and directories are materialised. Symlink / hardlink /
+// device / fifo entries are skipped — a symlink entry can point outside
+// destDir (the zip-slip guard only checks the entry's own path, not its
+// target) and the build path has no need for them. Total extracted size is
+// capped by maxExtractedTarBytes to defend against a decompression bomb.
 func extractTarGz(data []byte, destDir string) error {
 	gr, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
@@ -2146,6 +2158,7 @@ func extractTarGz(data []byte, destDir string) error {
 	defer gr.Close()
 
 	tr := tar.NewReader(gr)
+	var written int64
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -2174,11 +2187,21 @@ func extractTarGz(data []byte, destDir string) error {
 			if err != nil {
 				return fmt.Errorf("open file %q: %w", target, err)
 			}
-			if _, err := io.Copy(f, tr); err != nil {
-				f.Close()
+			// Cap the copy so a single oversized entry can't blow the budget;
+			// LimitReader+EOF check detects truncation against the ceiling.
+			remaining := maxExtractedTarBytes - written
+			n, err := io.Copy(f, io.LimitReader(tr, remaining+1))
+			f.Close()
+			if err != nil {
 				return fmt.Errorf("write file %q: %w", target, err)
 			}
-			f.Close()
+			written += n
+			if written > maxExtractedTarBytes {
+				return fmt.Errorf("tar archive exceeds %d byte extraction limit", maxExtractedTarBytes)
+			}
+		default:
+			// Skip symlinks, hardlinks, devices, fifos — see func doc.
+			continue
 		}
 	}
 	return nil

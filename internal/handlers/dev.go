@@ -22,7 +22,7 @@ type setTierRequest struct {
 // NewSetTierHandler returns a handler for POST /internal/set-tier.
 // Only upgrades are allowed (pro, team). Downgrade is intentionally blocked —
 // use the real Razorpay cancellation flow for that path.
-func NewSetTierHandler(db *sql.DB, aesKey string) fiber.Handler {
+func NewSetTierHandler(db *sql.DB) fiber.Handler {
 	// Only upgrade tiers are allowed. hobby is not accepted — downgrade is Razorpay's job.
 	upgradeTiers := map[string]bool{"pro": true, "team": true, "growth": true}
 

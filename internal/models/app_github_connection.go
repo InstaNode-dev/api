@@ -206,3 +206,81 @@ func CountRecentGitHubDeploys(ctx context.Context, db *sql.DB, connectionID uuid
 	).Scan(&n)
 	return n, err
 }
+
+// ErrGitHubDeployRateLimited is returned by CountAndEnqueueGitHubDeployLocked
+// when the connection has already hit its per-window deploy cap. It carries
+// the observed recent count so the caller can surface it in the response.
+type ErrGitHubDeployRateLimited struct {
+	Recent int
+}
+
+func (e *ErrGitHubDeployRateLimited) Error() string {
+	return fmt.Sprintf("github deploy rate limit reached (%d recent)", e.Recent)
+}
+
+// CountAndEnqueueGitHubDeployLocked closes the count-then-enqueue TOCTOU on the
+// per-connection deploy rate limit. The standalone CountRecentGitHubDeploys +
+// EnqueueGitHubDeploy pair has a window in which two concurrent pushes to the
+// same repo each see `recent < cap` and both enqueue, exceeding the cap.
+//
+// This serializes both steps inside one transaction that first takes a
+// row-level lock on the app_github_connections row (`SELECT ... FOR UPDATE`);
+// concurrent webhook deliveries for the same connection therefore queue
+// behind the lock and observe each other's inserts. Different connections do
+// not contend (the lock is per-row).
+//
+// Returns *ErrGitHubDeployRateLimited when the cap is already met — the row is
+// NOT inserted in that case.
+func CountAndEnqueueGitHubDeployLocked(
+	ctx context.Context,
+	db *sql.DB,
+	p EnqueueGitHubDeployParams,
+	since time.Time,
+	maxPerWindow int,
+) (uuid.UUID, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck — no-op after a successful Commit
+
+	// Serialize all concurrent webhook deliveries for this connection.
+	var locked uuid.UUID
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM app_github_connections WHERE id = $1 FOR UPDATE`,
+		p.ConnectionID,
+	).Scan(&locked); err != nil {
+		return uuid.Nil, err
+	}
+
+	var recent int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM pending_github_deploys
+		 WHERE connection_id = $1 AND enqueued_at >= $2`,
+		p.ConnectionID, since,
+	).Scan(&recent); err != nil {
+		return uuid.Nil, err
+	}
+	if recent >= maxPerWindow {
+		return uuid.Nil, &ErrGitHubDeployRateLimited{Recent: recent}
+	}
+
+	var pusher sql.NullString
+	if p.PusherLogin != "" {
+		pusher = sql.NullString{String: p.PusherLogin, Valid: true}
+	}
+	var id uuid.UUID
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO pending_github_deploys (connection_id, app_id, commit_sha, pusher_login)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id`,
+		p.ConnectionID, p.AppID, p.CommitSHA, pusher,
+	).Scan(&id); err != nil {
+		return uuid.Nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return uuid.Nil, err
+	}
+	return id, nil
+}

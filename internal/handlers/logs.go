@@ -118,6 +118,15 @@ func (h *LogsHandler) ResourceLogs(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "lookup_failed", "Failed to look up resource")
 	}
 
+	// A non-active resource (expired / deleted / suspended) has no live pods
+	// to stream from — reject early with the same status-guard the webhook
+	// Receive/ListRequests paths use, rather than failing opaquely later at
+	// the pod-list step.
+	if resource.Status != "active" {
+		return respondError(c, fiber.StatusConflict, "not_active",
+			"Resource is not active (status: "+resource.Status+") — logs are only available for active resources")
+	}
+
 	if resource.Tier != "growth" {
 		return respondError(c, fiber.StatusBadRequest, "not_growth",
 			"Log streaming is only available for growth-tier (isolated) resources. "+

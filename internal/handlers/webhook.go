@@ -180,12 +180,13 @@ func webhookListKey(token string) string {
 }
 
 // webhookAnonLimits returns the limits map for anonymous webhook resources.
-// requests_stored is read from plans.Registry (convention #3) — the webhook
-// service maps to the webhook_requests_stored YAML field — so a plans.yaml
-// edit flows through instead of drifting against a hardcoded literal.
+// requests_stored is sourced through webhookMaxStored — the SAME accessor the
+// LTRIM enforcement path uses — so the advertised cap and the cap actually
+// enforced never drift (a plans.yaml -1/0 edge previously surfaced one raw
+// number here and a different clamped one to Redis).
 func (h *WebhookHandler) webhookAnonLimits() fiber.Map {
 	return fiber.Map{
-		"requests_stored": h.plans.StorageLimitMB(tierAnonymous, "webhook"),
+		"requests_stored": h.webhookMaxStored(tierAnonymous),
 		"expires_in":      "24h",
 	}
 }

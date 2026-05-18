@@ -202,6 +202,12 @@ func emitTeamSettingsChangedAudit(db *sql.DB, teamID uuid.UUID, userID, field, o
 			Actor:    "user",
 			Metadata: meta,
 		}
+		// Actor is "user", so the structured user_id column MUST be populated
+		// (not only the changed_by_user_id metadata key) — otherwise the row
+		// reads as actor=user / user_id=NULL.
+		if parsed, perr := uuid.Parse(userID); perr == nil {
+			ev.UserID = uuid.NullUUID{UUID: parsed, Valid: true}
+		}
 		if err := models.InsertAuditEvent(ctx, db, ev); err != nil {
 			slog.Warn("audit.team_settings_changed.insert_failed",
 				"error", err, "team_id", teamID, "field", field)

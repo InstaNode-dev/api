@@ -485,6 +485,15 @@ func (h *ResourceHandler) RotateCredentials(c *fiber.Ctx) error {
 		"request_id", requestID,
 	)
 
+	// W7-C parity: rotation returns connection_url in plaintext just like
+	// GetCredentials, so it MUST emit the same connection_url.decrypted audit
+	// row. GetCredentials's header comment already promises "the rotation
+	// handler also fires the same kind"; this is that emitter.
+	auditUserID := middleware.GetUserID(c) // capture before goroutine — c is recycled
+	safego.Go("resource.url_rotate_audit", func() {
+		emitConnectionURLDecryptedAudit(h.db, teamID, auditUserID, resource.ID, "credential_rotation")
+	})
+
 	// Rotation response is the ONE place we expose connection_url in plaintext.
 	return c.JSON(fiber.Map{
 		"ok":             true,

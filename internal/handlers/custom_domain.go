@@ -324,6 +324,11 @@ func (h *CustomDomainHandler) Create(c *fiber.Ctx) error {
 			"Custom domains require the Hobby Plus plan or higher. Upgrade at https://instanode.dev/pricing")
 	}
 
+	stack, err := h.requireOwnedStack(c, team, c.Params("slug"))
+	if err != nil {
+		return err
+	}
+
 	// FIX-G (2026-05-14): per-count cap. Until now the only gate was the
 	// boolean feature flag above, so a Hobby Plus team could bind an
 	// unbounded number of hostnames. The cap mirrors plans.yaml
@@ -336,6 +341,10 @@ func (h *CustomDomainHandler) Create(c *fiber.Ctx) error {
 	// finishes still consumes the slot until the team deletes it. That's
 	// intentional: it prevents an agent loop from re-issuing TXT challenges
 	// in a tight retry without ever cleaning up.
+	//
+	// Ordering: this runs AFTER requireOwnedStack so a request for a stack
+	// the caller doesn't own returns a 404 (the "never confirm existence"
+	// rule) rather than a 402 quota response that leaks "the stack exists".
 	domainCap := h.plans.CustomDomainsMaxLimit(team.PlanTier)
 	if domainCap >= 0 {
 		existing, listErr := models.ListCustomDomainsByTeam(c.Context(), h.db, team.ID)
@@ -364,11 +373,6 @@ func (h *CustomDomainHandler) Create(c *fiber.Ctx) error {
 				"agent_action": "delete_existing_or_upgrade",
 			})
 		}
-	}
-
-	stack, err := h.requireOwnedStack(c, team, c.Params("slug"))
-	if err != nil {
-		return err
 	}
 
 	var body createCustomDomainBody
