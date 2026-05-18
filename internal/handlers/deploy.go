@@ -545,12 +545,17 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		return nameErr
 	}
 
-	// Optional port field (default 8080).
+	// Optional port field (default 8080). A present-but-non-numeric value
+	// (e.g. "abc") is a caller error and is rejected — previously it silently
+	// fell through to 8080, deploying on a port the caller never asked for.
 	port := 8080
-	if ports := form.Value["port"]; len(ports) > 0 {
-		if p, err := strconv.Atoi(ports[0]); err == nil {
-			port = p
+	if ports := form.Value["port"]; len(ports) > 0 && strings.TrimSpace(ports[0]) != "" {
+		p, err := strconv.Atoi(strings.TrimSpace(ports[0]))
+		if err != nil {
+			return respondError(c, fiber.StatusBadRequest, "invalid_port",
+				"Field 'port' must be a number between 1 and 65535")
 		}
+		port = p
 	}
 	if port < 1 || port > 65535 {
 		return respondError(c, fiber.StatusBadRequest, "invalid_port",

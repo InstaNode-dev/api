@@ -333,6 +333,12 @@ func jwkThumbprintBase64URL(key jwk.Key) (string, error) {
 // attacker who can spoof the forwarded host could otherwise forge a proof
 // whose htu matches a request to a different host. Only the path comes from
 // the live request.
+//
+// P3 (2026-05-18): the path is taken from c.OriginalURL() (the URI as the
+// client sent it, query string stripped) rather than c.Path() (the
+// post-routing value). Behind a path-rewriting ingress the two differ, and
+// the client signs the URL it actually requested — using the rewritten path
+// would reject every valid proof.
 func requestCanonicalURL(c *fiber.Ctx) string {
 	base, err := url.Parse(CanonicalResourceURLFor(c))
 	if err != nil || base.Host == "" {
@@ -340,7 +346,13 @@ func requestCanonicalURL(c *fiber.Ctx) string {
 		// unparseable value in practice, but never panic on the auth path.
 		base = &url.URL{Scheme: "https", Host: c.Hostname()}
 	}
-	u := url.URL{Scheme: base.Scheme, Host: base.Host, Path: c.Path()}
+	// c.OriginalURL() is path+query as received; strip the query (htu has
+	// none). url.Parse handles both an absolute and a path-only value.
+	reqPath := c.Path()
+	if orig, perr := url.Parse(c.OriginalURL()); perr == nil && orig.Path != "" {
+		reqPath = orig.Path
+	}
+	u := url.URL{Scheme: base.Scheme, Host: base.Host, Path: reqPath}
 	return u.String()
 }
 

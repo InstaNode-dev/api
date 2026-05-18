@@ -128,15 +128,23 @@ func updateTeamName(ctx context.Context, db *sql.DB, teamID uuid.UUID, name stri
 
 func emitTeamUpdatedAudit(c *fiber.Ctx, db *sql.DB, teamID uuid.UUID, newName string) {
 	meta, _ := json.Marshal(map[string]any{"field": "name", "new_value": newName})
+	// Capture the acting user before the goroutine — c is recycled after the
+	// handler returns. Actor is "user", so user_id MUST be populated too;
+	// leaving it NULL produced an actor/user_id mismatch in the audit_log.
+	userID := middleware.GetUserID(c)
 	safego.Go("team_self.bg", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		if err := models.InsertAuditEvent(ctx, db, models.AuditEvent{
+		ev := models.AuditEvent{
 			Kind:     models.AuditKindTeamUpdated,
 			TeamID:   teamID,
 			Actor:    "user",
 			Metadata: meta,
-		}); err != nil {
+		}
+		if parsed, perr := uuid.Parse(userID); perr == nil {
+			ev.UserID = uuid.NullUUID{UUID: parsed, Valid: true}
+		}
+		if err := models.InsertAuditEvent(ctx, db, ev); err != nil {
 			slog.Warn("audit.team_updated.insert_failed", "error", err, "team_id", teamID)
 		}
 	})

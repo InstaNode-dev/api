@@ -212,3 +212,30 @@ func splitToken(tok string) []string {
 	parts = append(parts, tok[start:])
 	return parts
 }
+
+// TestVerify_RejectsNonHS256HMACVariant pins the RFC 8725 algorithm
+// allowlist: VerifyJWT / VerifyOnboardingJWT accept ONLY HS256. A token
+// signed with another HMAC variant (HS384/HS512) — still in the
+// SigningMethodHMAC family the keyfunc type-asserts — must be rejected, so
+// an attacker can't downgrade the alg. Regression for BugHunt P3-05.
+func TestVerify_RejectsNonHS256HMACVariant(t *testing.T) {
+	now := time.Now().UTC()
+	for _, method := range []*jwt.SigningMethodHMAC{jwt.SigningMethodHS384, jwt.SigningMethodHS512} {
+		claims := crypto.OnboardingClaims{
+			Fingerprint: "abcdef1234",
+			RegisteredClaims: jwt.RegisteredClaims{
+				ID:        "jti-" + method.Alg(),
+				IssuedAt:  jwt.NewNumericDate(now),
+				ExpiresAt: jwt.NewNumericDate(now.Add(time.Hour)),
+			},
+		}
+		signed, err := jwt.NewWithClaims(method, claims).SignedString([]byte(testJWTSecret))
+		require.NoError(t, err)
+
+		_, verr := crypto.VerifyOnboardingJWT([]byte(testJWTSecret), signed)
+		assert.Error(t, verr, "VerifyOnboardingJWT must reject a %s-signed token", method.Alg())
+
+		_, verr2 := crypto.VerifyJWT([]byte(testJWTSecret), signed)
+		assert.Error(t, verr2, "VerifyJWT must reject a %s-signed token", method.Alg())
+	}
+}

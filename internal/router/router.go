@@ -1018,7 +1018,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// These bypass Razorpay and directly mutate DB state. Never expose in production.
 	if cfg.Environment == "development" {
 		internal := app.Group("/internal")
-		internal.Post("/set-tier", handlers.NewSetTierHandler(db, cfg.AESKey))
+		internal.Post("/set-tier", handlers.NewSetTierHandler(db))
 	}
 
 	return app

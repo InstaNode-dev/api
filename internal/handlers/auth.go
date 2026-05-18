@@ -812,13 +812,21 @@ func readOAuthStateCookie(c *fiber.Ctx) (string, string, bool) {
 }
 
 // clearOAuthStateCookie expires the oauth_state cookie immediately.
-func clearOAuthStateCookie(c *fiber.Ctx) {
+//
+// The Secure + SameSite attributes MUST mirror setOAuthStateCookie: some
+// browsers refuse to overwrite a Secure cookie from a write that omits
+// Secure, so an attribute-stripped expiring write can silently no-op and
+// leave the single-use state token readable. Keep this in sync with
+// setOAuthStateCookie.
+func clearOAuthStateCookie(c *fiber.Ctx, secure bool) {
 	c.Cookie(&fiber.Cookie{
 		Name:     oauthStateCookie,
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
+		Secure:   secure,
 		HTTPOnly: true,
+		SameSite: "Lax",
 	})
 }
 
@@ -931,10 +939,10 @@ func (h *AuthHandler) GitHubCallback(c *fiber.Ctx) error {
 
 	cookieState, returnTo, ok := readOAuthStateCookie(c)
 	if !ok || cookieState != stateParam {
-		clearOAuthStateCookie(c)
+		clearOAuthStateCookie(c, h.cfg.Environment == "production")
 		return renderAuthError(c, fiber.StatusBadRequest, "Sign-in expired", "The sign-in link expired or was opened in a different browser. Please try again.")
 	}
-	clearOAuthStateCookie(c)
+	clearOAuthStateCookie(c, h.cfg.Environment == "production")
 
 	// P1-K: single-use consume. The cookie check above proves the state was
 	// minted by us, but a cookie can be replayed within its 5-minute window.
@@ -1022,10 +1030,10 @@ func (h *AuthHandler) GoogleCallbackBrowser(c *fiber.Ctx) error {
 
 	cookieState, returnTo, ok := readOAuthStateCookie(c)
 	if !ok || cookieState != stateParam {
-		clearOAuthStateCookie(c)
+		clearOAuthStateCookie(c, h.cfg.Environment == "production")
 		return renderAuthError(c, fiber.StatusBadRequest, "Sign-in expired", "The sign-in link expired or was opened in a different browser. Please try again.")
 	}
-	clearOAuthStateCookie(c)
+	clearOAuthStateCookie(c, h.cfg.Environment == "production")
 
 	// P1-K: single-use consume — see GitHubCallback for the rationale.
 	if !h.consumeOAuthState(c.Context(), stateParam) {

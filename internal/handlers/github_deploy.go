@@ -504,24 +504,6 @@ func (h *GitHubDeployHandler) Receive(c *fiber.Ctx) error {
 		})
 	}
 
-	// Rate-limit: max 10 deploys/hour/repo. Cheap COUNT query against the
-	// partial index; bounded by the 1h window.
-	since := time.Now().Add(-githubRateLimitWindow)
-	recent, countErr := models.CountRecentGitHubDeploys(c.Context(), h.db, conn.ID, since)
-	if countErr != nil {
-		slog.Warn("github.receive.rate_count_failed", "error", countErr,
-			"connection_id", conn.ID)
-		// Fail open — don't block a legitimate deploy on a count blip.
-	} else if recent >= githubMaxDeploysPerHour {
-		slog.Info("github.receive.rate_limited",
-			"connection_id", conn.ID, "recent", recent,
-			"request_id", middleware.GetRequestID(c))
-		return respondErrorWithRetry(c, fiber.StatusTooManyRequests,
-			"rate_limited",
-			fmt.Sprintf("GitHub deploys for this connection are capped at %d/hour. Try again shortly.", githubMaxDeploysPerHour),
-			int(githubRateLimitWindow.Seconds()))
-	}
-
 	// Emit push_received BEFORE enqueue so the audit trail reflects the
 	// signal arriving even if the enqueue fails.
 	h.emitAudit(models.AuditKindGitHubPushReceived, conn.TeamID, fiber.Map{
@@ -531,13 +513,30 @@ func (h *GitHubDeployHandler) Receive(c *fiber.Ctx) error {
 		"pusher":        ev.Pusher.Name,
 	})
 
-	pendingID, enqErr := models.EnqueueGitHubDeploy(c.Context(), h.db, models.EnqueueGitHubDeployParams{
-		ConnectionID: conn.ID,
-		AppID:        conn.AppID,
-		CommitSHA:    ev.After,
-		PusherLogin:  ev.Pusher.Name,
-	})
+	// Rate-limit + enqueue in one serialized transaction. The count and the
+	// insert run under a FOR UPDATE lock on the connection row, so two
+	// concurrent pushes to the same repo can no longer both pass a stale
+	// `recent < cap` check and both enqueue (the count-then-enqueue TOCTOU).
+	// Bounded by the 1h window; different connections don't contend.
+	since := time.Now().Add(-githubRateLimitWindow)
+	pendingID, enqErr := models.CountAndEnqueueGitHubDeployLocked(c.Context(), h.db,
+		models.EnqueueGitHubDeployParams{
+			ConnectionID: conn.ID,
+			AppID:        conn.AppID,
+			CommitSHA:    ev.After,
+			PusherLogin:  ev.Pusher.Name,
+		}, since, githubMaxDeploysPerHour)
 	if enqErr != nil {
+		var rateLimited *models.ErrGitHubDeployRateLimited
+		if errors.As(enqErr, &rateLimited) {
+			slog.Info("github.receive.rate_limited",
+				"connection_id", conn.ID, "recent", rateLimited.Recent,
+				"request_id", middleware.GetRequestID(c))
+			return respondErrorWithRetry(c, fiber.StatusTooManyRequests,
+				"rate_limited",
+				fmt.Sprintf("GitHub deploys for this connection are capped at %d/hour. Try again shortly.", githubMaxDeploysPerHour),
+				int(githubRateLimitWindow.Seconds()))
+		}
 		slog.Error("github.receive.enqueue_failed", "error", enqErr,
 			"connection_id", conn.ID, "commit", ev.After)
 		return respondError(c, fiber.StatusServiceUnavailable, "enqueue_failed",

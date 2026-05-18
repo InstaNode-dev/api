@@ -231,8 +231,12 @@ func (h *AdminCustomersHandler) List(c *fiber.Ctx) error {
 	args := []interface{}{}
 	whereParts := []string{"1=1"}
 	if q != "" {
-		args = append(args, "%"+strings.ToLower(q)+"%")
-		whereParts = append(whereParts, fmt.Sprintf("lower(coalesce(u.email,'')) LIKE $%d", len(args)))
+		// Escape LIKE metacharacters in the user-supplied term so a query of
+		// "%" or "_" is matched literally instead of as a wildcard (it would
+		// otherwise return every customer). Backslash is the escape char and
+		// must itself be escaped first.
+		args = append(args, "%"+escapeLikePattern(strings.ToLower(q))+"%")
+		whereParts = append(whereParts, fmt.Sprintf("lower(coalesce(u.email,'')) LIKE $%d ESCAPE '\\'", len(args)))
 	}
 	if len(tiers) == 1 {
 		// Single-tier path preserves the existing exact-match query
@@ -939,6 +943,23 @@ func (h *AdminCustomersHandler) computeMRR(tier string) (int, int) {
 // The "all unknown → empty list" branch keeps the dashboard filter pills
 // UI-stable: a stale or typo'd value renders "no results" rather than a
 // 400 error banner. See the comment in List() for the full rationale.
+// likeEscapeReplacer escapes the three SQL LIKE metacharacters with a
+// backslash. Backslash itself is escaped first (it is also the ESCAPE char),
+// so the replacement order is fixed and order-independent here.
+var likeEscapeReplacer = strings.NewReplacer(
+	`\`, `\\`,
+	`%`, `\%`,
+	`_`, `\_`,
+)
+
+// escapeLikePattern makes a user-supplied search term safe to embed in a
+// `LIKE '%' || term || '%' ESCAPE '\'` clause: "%" and "_" become literal
+// characters instead of wildcards. Without it an admin search of "%" returns
+// every customer.
+func escapeLikePattern(s string) string {
+	return likeEscapeReplacer.Replace(s)
+}
+
 func adminParseTierFilter(raw string) ([]string, bool) {
 	if raw == "" {
 		return nil, false
