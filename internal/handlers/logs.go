@@ -53,6 +53,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"instant.dev/common/resourcestatus"
 	"instant.dev/internal/models"
 )
 
@@ -122,7 +123,7 @@ func (h *LogsHandler) ResourceLogs(c *fiber.Ctx) error {
 	// to stream from — reject early with the same status-guard the webhook
 	// Receive/ListRequests paths use, rather than failing opaquely later at
 	// the pod-list step.
-	if resource.Status != "active" {
+	if resStatus, _ := resourcestatus.Parse(resource.Status); !resStatus.IsActive() {
 		return respondError(c, fiber.StatusConflict, "not_active",
 			"Resource is not active (status: "+resource.Status+") — logs are only available for active resources")
 	}

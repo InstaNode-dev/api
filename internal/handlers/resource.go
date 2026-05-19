@@ -14,6 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	mongooptions "go.mongodb.org/mongo-driver/mongo/options"
+	"instant.dev/common/resourcestatus"
 	"instant.dev/internal/config"
 	"instant.dev/internal/crypto"
 	"instant.dev/internal/middleware"
@@ -554,12 +555,13 @@ func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
 	// Cheap idempotency-error check up front: if the row is already paused
 	// we return 409 without touching the provider. Saves a wasteful REVOKE
 	// round-trip on a no-op call.
-	if resource.Status == "paused" {
+	resStatus, _ := resourcestatus.Parse(resource.Status)
+	if resStatus.IsPaused() {
 		return respondErrorWithAgentAction(c, fiber.StatusConflict, "already_paused",
 			"Resource is already paused.",
 			AgentActionResourceAlreadyPaused, "")
 	}
-	if resource.Status != "active" {
+	if !resStatus.IsActive() {
 		return respondError(c, fiber.StatusConflict, "invalid_state",
 			"Resource is "+resource.Status+" and cannot be paused")
 	}
@@ -644,12 +646,12 @@ func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
 	// `resource` field so the click-handler can swap local React state in
 	// place rather than re-fetch. Keep the legacy top-level fields for any
 	// agent/CLI client that consumed the flat shape (additive change).
-	resource.Status = "paused"
+	resource.Status = resourcestatus.StatusPaused.String()
 	return c.JSON(fiber.Map{
 		"ok":       true,
 		"id":       resource.ID,
 		"token":    resource.Token,
-		"status":   "paused",
+		"status":   resourcestatus.StatusPaused.String(),
 		"message":  "Resource paused. Storage is preserved and the connection URL is unchanged; new connections are refused until resume.",
 		"resource": resourceToMap(resource, h.plans),
 	})
@@ -692,7 +694,7 @@ func (h *ResourceHandler) Resume(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
 	}
 
-	if resource.Status != "paused" {
+	if resStatus, _ := resourcestatus.Parse(resource.Status); !resStatus.IsPaused() {
 		return respondErrorWithAgentAction(c, fiber.StatusConflict, "not_paused",
 			"Resource is not paused (current status: "+resource.Status+").",
 			AgentActionResourceNotPaused, "")
@@ -760,12 +762,12 @@ func (h *ResourceHandler) Resume(c *fiber.Ctx) error {
 
 	// W10 fix #81: parallel to Pause — surface the full Resource so the
 	// dashboard adapter can swap state without refetching.
-	resource.Status = "active"
+	resource.Status = resourcestatus.StatusActive.String()
 	return c.JSON(fiber.Map{
 		"ok":       true,
 		"id":       resource.ID,
 		"token":    resource.Token,
-		"status":   "active",
+		"status":   resourcestatus.StatusActive.String(),
 		"message":  "Resource resumed. The connection URL is unchanged — your existing config still works.",
 		"resource": resourceToMap(resource, h.plans),
 	})
