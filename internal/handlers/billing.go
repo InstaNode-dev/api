@@ -124,9 +124,9 @@ type BillingHandler struct {
 	// idempotency guard in CreateCheckoutAPI is unit-testable: a test can
 	// assert the function is invoked EXACTLY ONCE across two checkout calls
 	// for a team that already has a live pending subscription. The production
-	// default goes through razorpay.NewClient + the package circuit breaker;
-	// see ensureRazorpayFns. nil-safe: lazily initialised by ensureRazorpayFns
-	// so a handler built via the bare struct literal still works.
+	// default goes through razorpay.NewClient + the package circuit breaker and
+	// is wired ONCE in NewBillingHandler — never mutated per-request — so the
+	// shared handler is safe for concurrent CreateCheckoutAPI goroutines.
 	CreateSubscription func(subBody map[string]any) (map[string]any, error)
 
 	// FetchCheckoutSubscription GETs a Razorpay subscription's raw fields
@@ -135,17 +135,59 @@ type BillingHandler struct {
 	// not determine" — the caller fails OPEN (logs + creates a fresh
 	// subscription) so a Razorpay GET hiccup never blocks a legitimate
 	// checkout. The production default goes through razorpay.NewClient +
-	// Subscription.Fetch under the circuit breaker.
+	// Subscription.Fetch under the circuit breaker and is wired ONCE in
+	// NewBillingHandler — never mutated per-request — so the shared handler is
+	// safe for concurrent CreateCheckoutAPI goroutines.
 	FetchCheckoutSubscription func(subscriptionID string) (status, shortURL string, err error)
 }
 
 // NewBillingHandler constructs a BillingHandler.
+//
+// All overridable function fields (FetchSubscriptionDetails, CreateSubscription,
+// FetchCheckoutSubscription) are wired to their production defaults HERE, at
+// construction time, and never mutated again. This is load-bearing for
+// concurrency correctness: CreateCheckoutAPI is invoked by many goroutines at
+// once (Fiber serves each request on its own goroutine, and a single
+// BillingHandler instance is shared by the router). The previous design
+// lazily initialised CreateSubscription / FetchCheckoutSubscription on the
+// first request via ensureRazorpayFns(), an unsynchronised check-then-write on
+// shared struct fields — a genuine data race (caught by `go test -race`,
+// TestCheckoutDedup_ConcurrentGoroutines_AtMostOneReachesRazorpay). Setting the
+// defaults once here, before the handler is ever registered on a route,
+// eliminates the per-request mutation entirely — no lock needed.
+//
+// Tests that want to fake Razorpay still construct via NewBillingHandler and
+// then assign the field directly (e.g. `bh.CreateSubscription = ...`) BEFORE
+// the handler is exercised; that single-goroutine setup overwrites the default
+// with no race.
 func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient *email.Client) *BillingHandler {
 	h := &BillingHandler{db: db, cfg: cfg, email: emailClient}
 	// Default to the real Razorpay portal; tests override this field directly.
 	h.FetchSubscriptionDetails = func(subID string) (*razorpaybilling.SubscriptionDetails, error) {
 		portal := &razorpaybilling.Portal{DB: h.db, Cfg: h.cfg}
 		return portal.FetchSubscriptionDetails(subID)
+	}
+	// CreateSubscription mints a new Razorpay subscription. Wired once here so
+	// CreateCheckoutAPI never mutates the field per-request (see the doc above).
+	h.CreateSubscription = func(subBody map[string]any) (map[string]any, error) {
+		client := razorpay.NewClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
+		return razorpaybilling.CallWithBreaker(func() (map[string]any, error) {
+			return client.Subscription.Create(subBody, nil)
+		})
+	}
+	// FetchCheckoutSubscription GETs a subscription's status + short_url for the
+	// F7 reuse probe. Wired once here for the same reason as CreateSubscription.
+	h.FetchCheckoutSubscription = func(subscriptionID string) (string, string, error) {
+		client := razorpay.NewClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
+		sub, err := razorpaybilling.CallWithBreaker(func() (map[string]any, error) {
+			return client.Subscription.Fetch(subscriptionID, nil, nil)
+		})
+		if err != nil {
+			return "", "", err
+		}
+		status, _ := sub["status"].(string)
+		shortURL, _ := sub["short_url"].(string)
+		return status, shortURL, nil
 	}
 	return h
 }
@@ -158,37 +200,6 @@ func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient *email.Client
 func (h *BillingHandler) WithRedis(rdb *redis.Client) *BillingHandler {
 	h.rdb = rdb
 	return h
-}
-
-// ensureRazorpayFns lazily wires the production CreateSubscription /
-// FetchCheckoutSubscription implementations when they have not been overridden
-// by a test. Called at the top of CreateCheckoutAPI so a handler built via the
-// bare struct literal (some test fixtures) still has working Razorpay
-// plumbing. A test that wants to fake the calls sets the fields BEFORE the
-// handler runs; ensureRazorpayFns then leaves them untouched.
-func (h *BillingHandler) ensureRazorpayFns() {
-	if h.CreateSubscription == nil {
-		h.CreateSubscription = func(subBody map[string]any) (map[string]any, error) {
-			client := razorpay.NewClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
-			return razorpaybilling.CallWithBreaker(func() (map[string]any, error) {
-				return client.Subscription.Create(subBody, nil)
-			})
-		}
-	}
-	if h.FetchCheckoutSubscription == nil {
-		h.FetchCheckoutSubscription = func(subscriptionID string) (string, string, error) {
-			client := razorpay.NewClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
-			sub, err := razorpaybilling.CallWithBreaker(func() (map[string]any, error) {
-				return client.Subscription.Fetch(subscriptionID, nil, nil)
-			})
-			if err != nil {
-				return "", "", err
-			}
-			status, _ := sub["status"].(string)
-			shortURL, _ := sub["short_url"].(string)
-			return status, shortURL, nil
-		}
-	}
 }
 
 // reusablePendingCheckout scans the team's unresolved pending_checkouts rows
@@ -501,7 +512,6 @@ func (h *BillingHandler) requireVerifiedEmail(c *fiber.Ctx, action string) (bool
 //   - 502  Razorpay rejected the create-subscription call
 //   - 503  RAZORPAY_KEY_ID/SECRET or the requested tier's plan_id not configured
 func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
-	h.ensureRazorpayFns()
 	requestID := middleware.GetRequestID(c)
 	teamIDStr := middleware.GetTeamID(c)
 
@@ -761,8 +771,8 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	}
 
 	// h.CreateSubscription wraps the outbound Subscription.Create with the
-	// package-level Razorpay circuit breaker (see defaultCreateSubscription /
-	// ensureRazorpayFns). When Razorpay is hosed, the breaker returns
+	// package-level Razorpay circuit breaker (wired once in NewBillingHandler).
+	// When Razorpay is hosed, the breaker returns
 	// circuit.ErrOpen → 503 billing_provider_unavailable instead of waiting on
 	// the HTTP timeout — agents see a clear "retry in 60s" signal. This is the
 	// ONLY subscription-minting call site in CreateCheckoutAPI; the F7 guard

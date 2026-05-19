@@ -69,6 +69,14 @@ jobs:
     env:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/instant_dev_test?sslmode=disable
       TEST_REDIS_URL: redis://localhost:6379/15
+      # db-provider admin target. internal/providers/db/local.go CREATEs a
+      # customer database per /db/new; in tests it connects to
+      # TEST_POSTGRES_CUSTOMERS_URL. testhelpers defaults this to an
+      # unreachable localhost:5434, so without this every postgres-
+      # provisioning test (TestDBNew_*, TestBulkTwin_*) 503'd. Points at an
+      # instant_customers DB created on the same service container below —
+      # exactly as deploy.yml's proven-green gate does.
+      TEST_POSTGRES_CUSTOMERS_URL: postgres://postgres:postgres@localhost:5432/instant_customers?sslmode=disable
     steps:
       - uses: actions/checkout@v4
 
@@ -96,9 +104,41 @@ jobs:
         with:
           go-version: '1.25'
 
+      - name: Apply DB migrations to the test database
+        # Mirrors deploy.yml's proven-green gate. Before this step CI ran
+        # tests against a BARE Postgres whose schema came ONLY from
+        # testhelpers.runMigrations — a hand-maintained mirror. This step
+        # applies the REAL migration files (exactly like `make test-db-up`),
+        # then creates instant_customers — the db provider's local backend
+        # (internal/providers/db/local.go) CREATEs a customer database per
+        # /db/new and connects to TEST_POSTGRES_CUSTOMERS_URL for it. Without
+        # this DB every postgres provision (TestDBNew_*, TestBulkTwin_*) 503'd.
+        env:
+          PGPASSWORD: postgres
+        run: |
+          for f in $(ls internal/db/migrations/*.sql | sort); do
+            echo "→ applying $(basename "$f")"
+            psql -h localhost -U postgres -d instant_dev_test -f "$f" >/dev/null
+          done
+          echo "all migrations applied to instant_dev_test"
+          psql -h localhost -U postgres -d postgres -c "CREATE DATABASE instant_customers" >/dev/null
+          echo "created instant_customers (db-provider admin target)"
+
       - run: go build ./...
       - run: go vet ./...
-      - run: go test ./... -v -race -count=1
+
+      # The gate. This MUST stay equal to deploy.yml's proven-green
+      # invocation (`go test ./... -short -count=1 -p 1`) PLUS `-race`:
+      #   - `-p 1` is load-bearing: every package shares the single
+      #     instant_dev_test DB + redis/15. Default parallelism runs ~25
+      #     package binaries at once and they corrupt each other's DB/redis
+      #     state mid-test. `-p 1` serialises package execution.
+      #   - `-short` matches deploy.yml so the two gates run the identical
+      #     hermetic suite (tests that genuinely need a live k8s/provisioner
+      #     stack are tagged `e2e` and excluded from `./...` anyway).
+      #   - `-race` is the extra rigor CI adds over deploy.yml — it caught
+      #     the BillingHandler.ensureRazorpayFns data race.
+      - run: go test ./... -short -race -count=1 -p 1
 
   # E2E requires a live Kubernetes stack (see repo CLAUDE.md). This job does not
   # run on push/PR — only on schedule or manual dispatch — so default CI stays fast.

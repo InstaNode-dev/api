@@ -304,3 +304,91 @@ func TestCheckoutDedup_NoRedis_NoOp(t *testing.T) {
 		resp.Body.Close()
 	}
 }
+
+// TestCheckoutHandler_ConcurrentRequests_NoRaceOnRazorpayFns is the
+// regression test for the F7-lazy-init data race.
+//
+// Root cause it pins: BillingHandler.CreateCheckoutAPI used to call
+// h.ensureRazorpayFns() at its top — an unsynchronised check-then-write
+// (`if h.CreateSubscription == nil { h.CreateSubscription = ... }`) on
+// shared handler struct fields. A single *BillingHandler is registered
+// once on the router and served by one goroutine per request, so two
+// concurrent first-time /api/v1/billing/checkout calls raced on those
+// fields. `go test -race` in CI flagged it as a genuine DATA RACE
+// (TestCheckoutDedup_ConcurrentGoroutines_AtMostOneReachesRazorpay).
+//
+// The fix wires CreateSubscription / FetchCheckoutSubscription ONCE in
+// NewBillingHandler — no per-request mutation — so the shared handler is
+// safe for concurrent goroutines.
+//
+// This test deliberately does NOT call WithRedis: with no SETNX guard the
+// concurrent callers are NOT serialised, so they genuinely run
+// CreateCheckoutAPI in parallel on the same handler. It also does NOT
+// override CreateSubscription / FetchCheckoutSubscription — the handler
+// runs against the production-default fields, which is exactly the
+// surface that used to be lazily initialised under a race. Run under
+// `-race`, this test FAILS if the lazy-init pattern is ever reintroduced.
+func TestCheckoutHandler_ConcurrentRequests_NoRaceOnRazorpayFns(t *testing.T) {
+	teamID := uuid.NewString()
+	cfg := &config.Config{
+		JWTSecret:         "test-secret-that-is-at-least-32-bytes-long!!",
+		RazorpayKeyID:     "rzp_test_key",
+		RazorpayKeySecret: "rzp_test_secret",
+		// RazorpayPlanIDPro intentionally empty → every call lands on the
+		// 503 billing_not_configured branch. The race we guard against was
+		// at the TOP of CreateCheckoutAPI (the old ensureRazorpayFns call),
+		// reached on every request regardless of how far it got.
+	}
+
+	// One shared handler — exactly as the router wires it. No WithRedis, so
+	// the SETNX guard is inert and the goroutines are not serialised.
+	bh := handlers.NewBillingHandler(nil, cfg, email.NewNoop())
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			if errors.Is(err, handlers.ErrResponseWritten) {
+				return nil
+			}
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"ok": false, "error": "internal_error",
+			})
+		},
+	})
+	app.Use(func(c *fiber.Ctx) error {
+		c.Locals(middleware.LocalKeyTeamID, teamID)
+		return c.Next()
+	})
+	app.Post("/api/v1/billing/checkout", bh.CreateCheckoutAPI)
+
+	const numCallers = 16
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	queued := make(chan struct{}, numCallers)
+
+	for i := 0; i < numCallers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			queued <- struct{}{}
+			<-start // release all goroutines into CreateCheckoutAPI at once
+			b, _ := json.Marshal(map[string]any{"plan": "pro"})
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/billing/checkout", bytes.NewReader(b))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := app.Test(req, 5000)
+			if err != nil {
+				t.Errorf("app.Test: %v", err)
+				return
+			}
+			defer resp.Body.Close()
+			// No guard → every call proceeds to plan-id resolution → 503.
+			// The assertion is secondary; the PRIMARY contract is that
+			// `-race` sees no DATA RACE on the handler's function fields.
+			assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode,
+				"unguarded concurrent call must reach the 503 not_configured branch")
+		}()
+	}
+	for i := 0; i < numCallers; i++ {
+		<-queued
+	}
+	close(start)
+	wg.Wait()
+}
