@@ -47,11 +47,36 @@ const canonicalAPIBase = urls.PublicAPIBase
 // intentionally small and code-reviewable; do not load it from a config
 // flag, since an open-redirect bug here gives an attacker a phishing primitive
 // (we'd be appending a real session_token to a URL they control).
+//
+// T10 P1-4 (BugHunt 2026-05-20): the http://localhost entries are dev-only.
+// In production, a victim on a machine where an attacker controls a localhost
+// listener could have the session_token redirected there. allowedReturnOrigins
+// keeps both for back-compat; validateReturnTo gates them on
+// returnToAllowsLocalhost which is wired from cfg.Environment at startup.
 var allowedReturnOrigins = []string{
 	"https://instanode.dev",
 	"https://www.instanode.dev",
+}
+
+// allowedReturnOriginsDev contains the http://localhost entries used in
+// development only. validateReturnTo merges these with allowedReturnOrigins
+// when returnToAllowsLocalhost is true.
+var allowedReturnOriginsDev = []string{
 	"http://localhost:5173",
 	"http://localhost:3000",
+}
+
+// returnToAllowsLocalhost controls whether validateReturnTo treats
+// http://localhost:5173 and http://localhost:3000 as allowed return-to
+// origins. Set to true in development at startup, false in production.
+// T10 P1-4 (BugHunt 2026-05-20).
+var returnToAllowsLocalhost = true
+
+// SetReturnToAllowsLocalhost is called from router wiring at startup.
+// Pass cfg.Environment != "production" to enable localhost allowlisting
+// for local dev and tests only.
+func SetReturnToAllowsLocalhost(allow bool) {
+	returnToAllowsLocalhost = allow
 }
 
 // validateReturnTo accepts a raw ?return_to= value and returns either the
@@ -74,6 +99,13 @@ func validateReturnTo(raw string) string {
 	for _, ok := range allowedReturnOrigins {
 		if origin == ok {
 			return raw
+		}
+	}
+	if returnToAllowsLocalhost {
+		for _, ok := range allowedReturnOriginsDev {
+			if origin == ok {
+				return raw
+			}
 		}
 	}
 	return defaultReturnTo
@@ -882,8 +914,17 @@ func (h *AuthHandler) consumeOAuthState(ctx context.Context, state string) bool 
 		return false
 	}
 	if err != nil {
-		slog.Warn("auth.oauth.state_consume_failed", "error", err)
-		return true // fail open — cookie check still gates
+		// T10 P1-3 (BugHunt 2026-05-20): fail CLOSED on Redis error.
+		// Previously this fell back to "cookie check still gates" — but
+		// the oauth_state cookie is replayable inside its 5-minute MaxAge
+		// window, so failing open here means a Redis blip silently strips
+		// the single-use defence. An attacker who captures a victim's
+		// in-flight state cookie + code can mint a second session within
+		// 5 minutes. Treat Redis errors as "we cannot prove this is a
+		// first-use" → reject. Genuine sign-ins re-try the entire OAuth
+		// dance, which writes a fresh state into Redis.
+		slog.Error("auth.oauth.state_consume_failed_failclosed", "error", err)
+		return false
 	}
 	return val != ""
 }

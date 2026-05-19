@@ -2,12 +2,141 @@ package handlers
 
 // openapi.go — serves GET /openapi.json with an OpenAPI 3.1 description of the live API.
 
-import "github.com/gofiber/fiber/v2"
+import (
+	"strings"
+	"sync"
+
+	"github.com/gofiber/fiber/v2"
+)
+
+// openAPIEnvironment is set by router wiring at startup. When the value is
+// not "development", ServeOpenAPI strips the /internal/set-tier path entry
+// from the served spec — that route is only registered in development
+// (router.go), so leaking it in the production spec lies to agents and
+// advertises an internal privilege-escalation surface.
+//
+// T19 P0-1 fix (BugHunt 2026-05-20).
+var openAPIEnvironment = "production"
+
+// openAPISpecForEnv caches the per-environment rendered spec so repeat
+// requests don't re-slice the string.
+var (
+	openAPISpecOnce sync.Once
+	openAPISpecProd string
+)
+
+// SetOpenAPIEnvironment wires the runtime ENVIRONMENT into ServeOpenAPI.
+// Called from router.New at startup.
+func SetOpenAPIEnvironment(env string) {
+	if env != "" {
+		openAPIEnvironment = env
+	}
+}
+
+// stripInternalSetTierPath removes the "/internal/set-tier": { ... } block
+// from the spec. The block is a single, self-contained JSON object value
+// (no nested "/internal/set-tier" anywhere else in the spec — verified by
+// the registry-iterating test below). We scan for the literal key and
+// walk balanced braces until the closing one, then trim a trailing comma.
+//
+// This is text surgery on a const JSON document. It is cheap (runs once
+// per process via sync.Once) and avoids the larger refactor of moving
+// the spec into a generated struct. If the surgery ever fails (the key
+// is absent / brace mismatch), we fall back to the unmodified spec — a
+// dev-route in the prod spec is the documented bug, not a regression.
+func stripInternalSetTierPath(spec string) string {
+	const key = `"/internal/set-tier"`
+	keyIdx := strings.Index(spec, key)
+	if keyIdx < 0 {
+		return spec
+	}
+	// Find the colon after the key, then the opening brace.
+	colon := strings.Index(spec[keyIdx:], ":")
+	if colon < 0 {
+		return spec
+	}
+	openIdx := strings.Index(spec[keyIdx+colon:], "{")
+	if openIdx < 0 {
+		return spec
+	}
+	openIdx += keyIdx + colon
+	// Walk balanced braces, ignoring those inside double-quoted strings.
+	depth := 0
+	inStr := false
+	esc := false
+	closeIdx := -1
+	for i := openIdx; i < len(spec); i++ {
+		ch := spec[i]
+		if esc {
+			esc = false
+			continue
+		}
+		if inStr {
+			if ch == '\\' {
+				esc = true
+				continue
+			}
+			if ch == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				closeIdx = i
+			}
+		}
+		if closeIdx >= 0 {
+			break
+		}
+	}
+	if closeIdx < 0 {
+		return spec
+	}
+	end := closeIdx + 1
+	// Walk past whitespace; eat a trailing comma if present so the
+	// "paths" object stays valid JSON. If no comma, we may be the
+	// last entry — also eat the *preceding* comma instead.
+	for end < len(spec) && (spec[end] == ' ' || spec[end] == '\t' || spec[end] == '\n' || spec[end] == '\r') {
+		end++
+	}
+	if end < len(spec) && spec[end] == ',' {
+		end++
+		return spec[:keyIdx] + spec[end:]
+	}
+	// Last entry: trim back to the preceding comma so we don't leave
+	// a dangling one before the closing `}` of "paths".
+	start := keyIdx
+	for start > 0 {
+		ch := spec[start-1]
+		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+			start--
+			continue
+		}
+		if ch == ',' {
+			start--
+		}
+		break
+	}
+	return spec[:start] + spec[end:]
+}
 
 // ServeOpenAPI handles GET /openapi.json.
 func ServeOpenAPI(c *fiber.Ctx) error {
 	c.Set("Content-Type", "application/json; charset=utf-8")
-	return c.SendString(openAPISpec)
+	if openAPIEnvironment == "development" {
+		return c.SendString(openAPISpec)
+	}
+	openAPISpecOnce.Do(func() {
+		openAPISpecProd = stripInternalSetTierPath(openAPISpec)
+	})
+	return c.SendString(openAPISpecProd)
 }
 
 // openAPISpec is embedded at build time. It covers all stable, agent-facing endpoints.
@@ -2407,6 +2536,7 @@ const openAPISpec = `{
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket the resource landed in (defaults to 'development' when env was omitted — see migration 026)." },
           "env_override_reason": { "type": "string", "description": "Present only when the request omitted env and the API defaulted it (value 'default_no_env_specified'). Absent when env was sent explicitly." },
+          "expires_at": { "type": "string", "format": "date-time", "description": "Anonymous-tier only. RFC3339 timestamp at which the resource auto-expires (24h TTL). Absent on authenticated provisions (no auto-expiry). Added by T19 P0-2 (BugHunt 2026-05-20) so the TTL contract matches storage/webhook." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "dedicated": { "type": "boolean", "description": "True when the resource was provisioned on dedicated (single-tenant) infrastructure rather than the shared pool. Authenticated provisions only." },
           "warning": { "type": "string", "description": "Present only when the resource is already over its storage limit at provision time — accompanied by the X-Instant-Notice: storage_limit_reached response header." },
@@ -2437,6 +2567,7 @@ const openAPISpec = `{
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
+          "expires_at": { "type": "string", "format": "date-time", "description": "Anonymous-tier only. RFC3339 24h-TTL expiry. T19 P0-2 (BugHunt 2026-05-20)." },
           "extension": { "type": "string", "enum": ["pgvector"], "description": "Always 'pgvector' for /vector/new. Declared so clients can confirm the extension is present without querying pg_extension." },
           "dimensions": { "type": "integer", "description": "Echo of the requested dimensions hint (defaults to 1536). Informational only — pgvector enforces dimensions per column, not per database." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
@@ -2460,6 +2591,7 @@ const openAPISpec = `{
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
+          "expires_at": { "type": "string", "format": "date-time", "description": "Anonymous-tier only. RFC3339 24h-TTL expiry. T19 P0-2 (BugHunt 2026-05-20)." },
           "limits": { "type": "object", "properties": { "memory_mb": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "dedicated": { "type": "boolean", "description": "True when the resource was provisioned on dedicated (single-tenant) infrastructure rather than the shared pool. Authenticated provisions only." },
           "warning": { "type": "string", "description": "Present only when the resource is already over its storage limit at provision time — accompanied by the X-Instant-Notice: storage_limit_reached response header." },
@@ -2480,6 +2612,7 @@ const openAPISpec = `{
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
+          "expires_at": { "type": "string", "format": "date-time", "description": "Anonymous-tier only. RFC3339 24h-TTL expiry. T19 P0-2 (BugHunt 2026-05-20)." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "dedicated": { "type": "boolean", "description": "True when the resource was provisioned on dedicated (single-tenant) infrastructure rather than the shared pool. Authenticated provisions only." },
           "warning": { "type": "string", "description": "Present only when the resource is already over its storage limit at provision time — accompanied by the X-Instant-Notice: storage_limit_reached response header." },
@@ -2500,6 +2633,7 @@ const openAPISpec = `{
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
+          "expires_at": { "type": "string", "format": "date-time", "description": "Anonymous-tier only. RFC3339 24h-TTL expiry. T19 P0-2 (BugHunt 2026-05-20)." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "expires_in": { "type": "string", "description": "Anonymous-only" } }, "description": "Queue storage cap. storage_mb is read from plans.yaml for the resolved tier." },
           "dedicated": { "type": "boolean", "description": "True when the resource was provisioned on dedicated (single-tenant) infrastructure rather than the shared pool." },
           "note": { "type": "string" },
@@ -2656,6 +2790,7 @@ const openAPISpec = `{
           "stack_id": { "type": "string", "description": "Format: stk-<8-char-hex>. Use this for GET /stacks/{slug}." },
           "status": { "type": "string", "enum": ["building", "deploying", "healthy", "failed", "stopped"], "description": "Overall stack status. 'healthy' only when every service is healthy." },
           "tier": { "type": "string" },
+          "env": { "type": "string", "description": "Resolved environment bucket the stack landed in (defaults to 'development' when env was omitted — see migration 026 and CLAUDE.md convention #11). T19 P0-3 (BugHunt 2026-05-20): handler echoes env (stack.go:811) so callers know which bucket they landed in." },
           "name": { "type": "string", "description": "Optional human-readable label (from manifest.name)" },
           "services": {
             "type": "array",

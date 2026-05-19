@@ -319,6 +319,15 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 		"upgrade":        upgradeURL,
 		"upgrade_jwt":    jwtToken,
 	}
+	// T19 P0-2 (BugHunt 2026-05-20): unify the TTL contract across all
+	// provisioning endpoints — storage/webhook already emit a top-level
+	// RFC3339 expires_at; db/cache/nosql/queue/vector did not. Anonymous
+	// resources always carry an expires_at (24h TTL); skipping the field
+	// when the column is NULL keeps authenticated/permanent responses
+	// shape-compatible.
+	if resource.ExpiresAt.Valid {
+		resp["expires_at"] = resource.ExpiresAt.Time.Format(time.RFC3339)
+	}
 	if storageExceeded {
 		resp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
@@ -505,7 +514,10 @@ func (h *DBHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) err
 	ctx := c.UserContext()
 	res, err := h.ProvisionForTwinCore(ctx, in)
 	if err != nil {
-		return respondProvisionFailed(c, err, err.Error())
+		// T12 P1-1 (BugBash 2026-05-20): use a static message, never err.Error(),
+		// to avoid leaking the admin DSN (which contains the admin password) into
+		// the response body. Matches the non-twin path's static phrasing.
+		return respondProvisionFailed(c, err, "Failed to provision Postgres database")
 	}
 
 	resp := fiber.Map{

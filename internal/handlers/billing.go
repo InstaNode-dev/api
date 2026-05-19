@@ -811,9 +811,28 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadGateway, "razorpay_error", "Razorpay returned an incomplete subscription response")
 	}
 
-	// Persist subscription ID early for traceability; non-fatal if it fails — the
-	// subscription.charged webhook will fall back to notes.team_id (or a DB lookup
-	// by sub_id once persisted via that webhook path).
+	// T9 P0-1 (BugHunt 2026-05-20): persist BOTH the subscription_id on
+	// the team row AND the pending_checkouts row before returning the
+	// short_url to the caller. Previously both writes were best-effort
+	// (logged + swallowed). On a DB brownout at checkout time the live
+	// Razorpay subscription existed but the platform had no record →
+	// F7's reuse guard could not find anything to reuse, so a re-click
+	// minted a SECOND live subscription and both billed the card.
+	//
+	// Making these fatal returns 503 to the caller; the customer
+	// retries; the second attempt either hits the live-subscription
+	// reuse (now possible because the first attempt no longer leaked
+	// a sub) OR fast-fails consistently. Razorpay's idempotency on
+	// /subscriptions does NOT cover our case (no Idempotency-Key sent,
+	// and our retry would carry a fresh body anyway).
+	//
+	// Downside accepted: one DB hiccup at checkout → user sees 503 +
+	// must retry. The cost of leaving them with an unrecorded live
+	// subscription (silent double-charge, no email) is much higher.
+	customerEmail := ""
+	if owner, ownerErr := models.GetUserByTeamID(c.Context(), h.db, teamID); ownerErr == nil && owner != nil {
+		customerEmail = owner.Email
+	}
 	if updateErr := models.UpdateRazorpaySubscriptionID(c.Context(), h.db, teamID, subID); updateErr != nil {
 		slog.Error("billing.checkout.update_subscription_id_failed",
 			"error", updateErr,
@@ -821,18 +840,8 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 			"subscription_id", subID,
 			"request_id", requestID,
 		)
-	}
-
-	// Record the pending checkout so the worker's checkout reconciler can
-	// notice an upgrade that never completes. A pre-authorization failure on
-	// Razorpay's hosted page creates no payment object → no payment.failed
-	// webhook → no payment-failure email; this row is what closes that gap.
-	// The activated/charged webhook stamps resolved_at the moment the
-	// subscription succeeds. Non-fatal on error — match UpdateRazorpaySubscriptionID:
-	// a missed row only costs a missed failure email, never a blocked checkout.
-	customerEmail := ""
-	if owner, ownerErr := models.GetUserByTeamID(c.Context(), h.db, teamID); ownerErr == nil && owner != nil {
-		customerEmail = owner.Email
+		return respondError(c, fiber.StatusServiceUnavailable, "billing_persistence_failed",
+			"Could not persist your subscription. Razorpay created it but our DB write failed — retry to reuse the same subscription. Contact support if this persists.")
 	}
 	if insertErr := models.InsertPendingCheckout(c.Context(), h.db, subID, teamID, customerEmail, plan); insertErr != nil {
 		slog.Error("billing.checkout.pending_checkout_insert_failed",
@@ -841,6 +850,8 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 			"subscription_id", subID,
 			"request_id", requestID,
 		)
+		return respondError(c, fiber.StatusServiceUnavailable, "billing_persistence_failed",
+			"Could not persist your subscription. Razorpay created it but our DB write failed — retry to reuse the same subscription. Contact support if this persists.")
 	}
 
 	slog.Info("billing.checkout.created",
@@ -2384,6 +2395,13 @@ func (h *BillingHandler) UpdatePaymentMethodAPI(c *fiber.Ctx) error {
 
 type changePlanBody struct {
 	TargetPlan string `json:"target_plan"`
+	// PlanFrequency mirrors the checkout body field. The ChangePlanModal
+	// presents an Annual radio so it sends "yearly" on this field; the
+	// backend's Portal.ChangePlan path uses razorpayPlanIDs() which only
+	// resolves to monthly plan IDs. Until yearly-via-change-plan is wired,
+	// surface a clear 400 instead of silently routing to monthly. T9 P1-1
+	// (BugHunt 2026-05-20).
+	PlanFrequency string `json:"plan_frequency"`
 }
 
 // ChangePlanAPI handles POST /api/v1/billing/change-plan (session JWT).
@@ -2408,6 +2426,22 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 	target := strings.ToLower(strings.TrimSpace(body.TargetPlan))
 	if target == "" {
 		return respondError(c, fiber.StatusBadRequest, "missing_target_plan", "target_plan is required")
+	}
+	// T9 P1-1 (BugHunt 2026-05-20): the ChangePlanModal's Annual radio
+	// posts plan_frequency:"yearly" but this endpoint's Razorpay-side
+	// resolver only knows monthly plan IDs. Returning 400 here is a
+	// clear contract: yearly-via-change-plan is not yet supported.
+	// Empty / "monthly" both proceed as before.
+	freq := strings.ToLower(strings.TrimSpace(body.PlanFrequency))
+	switch freq {
+	case "", "monthly":
+		// OK — fall through.
+	case "yearly":
+		return respondError(c, fiber.StatusBadRequest, "yearly_change_plan_unsupported",
+			"Changing to a yearly plan via /change-plan is not yet supported. Cancel and use POST /api/v1/billing/checkout with plan_frequency='yearly', or contact support@instanode.dev.")
+	default:
+		return respondError(c, fiber.StatusBadRequest, "invalid_frequency",
+			"plan_frequency must be 'monthly' or 'yearly'")
 	}
 	var planTier string
 	if err := h.db.QueryRowContext(c.Context(), `SELECT plan_tier FROM teams WHERE id = $1`, teamID).Scan(&planTier); err != nil {

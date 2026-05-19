@@ -276,7 +276,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 	}
 
 	// internal_url omitted on the anonymous path — see internal_url.go.
-	return respondCreated(c, fiber.Map{
+	queueResp := fiber.Map{
 		"ok":             true,
 		"id":             resource.ID.String(),
 		"token":          tokenStr,
@@ -289,7 +289,13 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		"note":           upgradeNote(upgradeURL),
 		"upgrade":        upgradeURL,
 		"upgrade_jwt":    jwtToken,
-	})
+	}
+	// T19 P0-2 (BugHunt 2026-05-20): emit top-level expires_at for
+	// shape parity with storage/webhook responses; see db.go for rationale.
+	if resource.ExpiresAt.Valid {
+		queueResp["expires_at"] = resource.ExpiresAt.Time.Format(time.RFC3339)
+	}
+	return respondCreated(c, queueResp)
 }
 
 func (h *QueueHandler) newQueueAuthenticated(

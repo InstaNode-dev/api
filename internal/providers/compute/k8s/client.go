@@ -1448,6 +1448,23 @@ func (p *K8sProvider) buildImage(ctx context.Context, ns, appID, imageTag string
 		if err := p.upsertBuildContextSecret(ctx, ns, ctxSecret, tarball); err != nil {
 			return fmt.Errorf("k8s.buildImage: build-context secret: %w", err)
 		}
+		// T6 P0-2 (BugHunt 2026-05-20): the Secret holds the user's
+		// tarball and is only needed for the duration of this kaniko
+		// build. In the single-app /deploy/new path it lives in
+		// instant-deploy-* (which gets torn down later); on the stack
+		// path it lives in the long-lived instant-stack-* namespace
+		// and would accumulate one stale multi-hundred-KB row per
+		// redeploy. Defer-delete regardless of outcome so the lifecycle
+		// matches the Job's. Use a background-derived context so the
+		// cleanup still runs if the build deadline has already fired.
+		defer func() {
+			delCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if delErr := p.clientset.CoreV1().Secrets(ns).Delete(delCtx, ctxSecret, metav1.DeleteOptions{}); delErr != nil && !apierrors.IsNotFound(delErr) {
+				slog.Warn("k8s.buildImage.cleanup_secret_failed",
+					"namespace", ns, "name", ctxSecret, "error", delErr)
+			}
+		}()
 	}
 
 	// 2. Ensure registry auth secret exists in this namespace (copied from instant ns).
@@ -1498,8 +1515,33 @@ func sanitizeName(s string) string {
 	return string(out)
 }
 
+// buildContextSecretMaxBytes is the hard cap on tarballs delivered via the
+// legacy k8s-Secret fallback. etcd's default ServerRequestBytesLimit is
+// 1.5 MiB; k8s validates request bodies at 1 MiB by default and rejects
+// any Secret larger than that with the opaque "etcdserver: request is
+// too large" error. The /deploy/new handler accepts up to 50 MiB so the
+// MinIO/S3 path can carry real apps, but tarballs that fall back to the
+// Secret path because object-store is unavailable need an actionable
+// 413 instead of a silent async build failure.
+//
+// T6 P0-2 (BugHunt 2026-05-20).
+const buildContextSecretMaxBytes = 900 * 1024 // 900 KiB — under k8s's 1 MiB limit with headroom for the Secret envelope
+
+// ErrBuildContextTooLargeForSecret is returned by upsertBuildContextSecret
+// when the tarball exceeds the etcd Secret cap. The deploy handler maps
+// this to a 413 with an `agent_action` telling the operator to configure
+// the MinIO/S3 build-context backend.
+var ErrBuildContextTooLargeForSecret = errors.New("build context exceeds k8s Secret size limit; configure MinIO/S3 backend for tarballs > 900 KiB")
+
 // upsertBuildContextSecret writes the tarball into a Secret under key "context.tar.gz".
+//
+// T6 P0-2: reject up front when len(tarball) > buildContextSecretMaxBytes
+// so the caller surfaces a clear 413 + agent_action instead of letting the
+// k8s API server reject with an opaque etcd-too-large error mid-build.
 func (p *K8sProvider) upsertBuildContextSecret(ctx context.Context, ns, name string, tarball []byte) error {
+	if len(tarball) > buildContextSecretMaxBytes {
+		return fmt.Errorf("%w (size=%d bytes, limit=%d)", ErrBuildContextTooLargeForSecret, len(tarball), buildContextSecretMaxBytes)
+	}
 	sec := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,

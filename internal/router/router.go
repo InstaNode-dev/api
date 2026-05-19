@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"log/slog"
+	"strings"
 
 	"github.com/gofiber/contrib/otelfiber/v2"
 	"github.com/gofiber/fiber/v2"
@@ -82,8 +83,18 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 			_ = handlers.WriteFiberError(c, code, errKey, msg)
 			return nil
 		},
-		// Trust proxy headers for real IPs (adjust in production to specific trusted proxies)
-		ProxyHeader: "X-Forwarded-For",
+		// Trust proxy headers for real IPs.
+		//
+		// T13 P1-1 (BugHunt 2026-05-20): when TRUSTED_PROXY_CIDRS is set,
+		// enable EnableTrustedProxyCheck so Fiber only honours XFF from
+		// inside those CIDRs (e.g. the DOKS load-balancer subnet).
+		// Without this, a client could spoof XFF and poison
+		// geo/ASN→fingerprint dedup or falsify audit-log source IPs.
+		// Leaving it disabled keeps the legacy permissive behaviour for
+		// local dev / docker-compose where the api is reached directly.
+		ProxyHeader:             "X-Forwarded-For",
+		EnableTrustedProxyCheck: cfg.TrustedProxyCIDRs != "",
+		TrustedProxies:          parseTrustedProxyCIDRs(cfg.TrustedProxyCIDRs),
 	})
 
 	// ── Liveness probe (MUST be registered before any middleware) ────────────
@@ -287,7 +298,17 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		})
 	})
 
-	// OpenAPI spec — machine-readable description of the agent-facing API
+	// OpenAPI spec — machine-readable description of the agent-facing API.
+	// T19 P0-1 (BugHunt 2026-05-20): pass ENVIRONMENT so the served spec
+	// strips /internal/set-tier in production (where the route is not
+	// registered — see line 1019 — and leaking it in the doc lies to
+	// agents + advertises an internal privilege-escalation surface).
+	handlers.SetOpenAPIEnvironment(cfg.Environment)
+	// T10 P1-4 (BugHunt 2026-05-20): drop http://localhost from the
+	// return_to allowlist in production. A victim on a machine where
+	// an attacker controls a localhost listener could otherwise have
+	// the session_token redirected there.
+	handlers.SetReturnToAllowsLocalhost(cfg.Environment != "production")
 	app.Get("/openapi.json", handlers.ServeOpenAPI)
 
 	// /llms.txt — agent discovery doc, 302 to marketing where it's the
@@ -363,16 +384,19 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// this is the intentional anti-abuse posture documented in
 	// internal/middleware/idempotency.go. See that file for the full
 	// rationale on the rate-budget vs quota-budget split.
-	app.Post("/db/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "db.new"), dbH.NewDB)
-	// /vector/new — pgvector-enabled Postgres. Same OptionalAuth +
-	// RequireWritable chain as /db/new so anonymous callers can wedge into
-	// the AI-app-builder flow and impersonated sessions still 403.
-	app.Post("/vector/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "vector.new"), vectorH.NewVector)
-	app.Post("/cache/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "cache.new"), cacheH.NewCache)
-	app.Post("/nosql/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "nosql.new"), nosqlH.NewNoSQL)
-	app.Post("/queue/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "queue.new"), queueH.NewQueue)
-	app.Post("/storage/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "storage.new"), storageH.NewStorage)
-	app.Post("/webhook/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "webhook.new"), webhookH.NewWebhook)
+	// T19 P1-7 (BugHunt 2026-05-20): provisioning routes use the strict
+	// OptionalAuth variant — a present-but-invalid Authorization header
+	// returns 401 instead of silently falling through to anonymous-tier
+	// provisioning. This closes the "agent with expired token gets
+	// anonymous limits with no signal" bug. Missing headers still pass
+	// through as anonymous (the routes are explicitly anonymous-capable).
+	app.Post("/db/new", middleware.OptionalAuthStrict(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "db.new"), dbH.NewDB)
+	app.Post("/vector/new", middleware.OptionalAuthStrict(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "vector.new"), vectorH.NewVector)
+	app.Post("/cache/new", middleware.OptionalAuthStrict(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "cache.new"), cacheH.NewCache)
+	app.Post("/nosql/new", middleware.OptionalAuthStrict(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "nosql.new"), nosqlH.NewNoSQL)
+	app.Post("/queue/new", middleware.OptionalAuthStrict(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "queue.new"), queueH.NewQueue)
+	app.Post("/storage/new", middleware.OptionalAuthStrict(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "storage.new"), storageH.NewStorage)
+	app.Post("/webhook/new", middleware.OptionalAuthStrict(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "webhook.new"), webhookH.NewWebhook)
 	// /webhook/receive/:token is registered with app.All so any HTTP method
 	// (GET for Slack URL verification, POST for the bulk of webhook senders,
 	// PUT/DELETE for a handful of esoteric flows) reaches the handler
@@ -979,11 +1003,30 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	api.Post("/experiments/converted", experimentsH.Converted)
 
 	// Vault — per-team encrypted secret storage (Phase 1: Heroku-shape platform).
+	//
+	// T11 P1-1 (BugHunt 2026-05-20): every per-key MUTATING vault route is
+	// gated by RequireEnvAccess(VaultWrite) with the :env path param as the
+	// lookup. Before this fix, only /vault/copy honoured the team's
+	// env_policy — PUT/POST-rotate/DELETE on /vault/:env/:key bypassed the
+	// policy entirely, so a `developer` could write/rotate/delete prod
+	// secrets even when the team had set `{"production":{"vault_write":["owner"]}}`.
+	// Reads (GET /vault/:env/:key and GET /vault/:env) stay unguarded — read
+	// access is the documented default and is gated separately by the
+	// in-handler tier check.
+	vaultEnvLookup := middleware.WithEnvLookup(func(c *fiber.Ctx) (string, error) {
+		return c.Params("env"), nil
+	})
 	vaultH := handlers.NewVaultHandler(db, cfg, planRegistry)
-	api.Put("/vault/:env/:key", vaultH.PutSecret)
+	api.Put("/vault/:env/:key",
+		middleware.RequireEnvAccess(middleware.EnvPolicyActionVaultWrite, vaultEnvLookup),
+		vaultH.PutSecret,
+	)
 	api.Get("/vault/:env/:key", vaultH.GetSecret)
 	api.Get("/vault/:env", vaultH.ListKeys)
-	api.Delete("/vault/:env/:key", vaultH.DeleteSecret)
+	api.Delete("/vault/:env/:key",
+		middleware.RequireEnvAccess(middleware.EnvPolicyActionVaultWrite, vaultEnvLookup),
+		vaultH.DeleteSecret,
+	)
 	// Idempotency middleware (FOLLOWUP-6, 2026-05-14): rotate creates a NEW
 	// versioned row in vault_secrets on every call — double-clicking the
 	// "Rotate" button in the dashboard produced two new versions
@@ -994,7 +1037,11 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// idempotent at the read-path). DELETE is idempotent-by-construction.
 	// /vault/copy is a bulk variant — flagged separately, out of scope for
 	// this PR.
-	api.Post("/vault/:env/:key/rotate", middleware.Idempotency(rdb, "vault.rotate"), vaultH.RotateSecret)
+	api.Post("/vault/:env/:key/rotate",
+		middleware.RequireEnvAccess(middleware.EnvPolicyActionVaultWrite, vaultEnvLookup),
+		middleware.Idempotency(rdb, "vault.rotate"),
+		vaultH.RotateSecret,
+	)
 	// Vault env-to-env bulk copy (Pro+ tier-gated inside the handler) —
 	// pairs with POST /api/v1/stacks/:slug/promote for the dashboard's
 	// "promote staging → production" flow. RequireEnvAccess gates the
@@ -1037,4 +1084,27 @@ func isolationLabel(b storageprovider.Backend) string {
 	default:
 		return string(b)
 	}
+}
+
+// parseTrustedProxyCIDRs splits the comma-separated TRUSTED_PROXY_CIDRS env
+// var into individual CIDR strings for Fiber's TrustedProxies allowlist.
+// Trims whitespace, drops empty entries, and returns nil when the input is
+// empty — Fiber's EnableTrustedProxyCheck handles a nil TrustedProxies list
+// by skipping the check entirely. T13 P1-1 (BugHunt 2026-05-20).
+func parseTrustedProxyCIDRs(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

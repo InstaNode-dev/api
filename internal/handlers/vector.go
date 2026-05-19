@@ -219,9 +219,15 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 	if err := parseProvisionBody(c, &body); err != nil {
 		return err
 	}
-	cleanName, sanErr := sanitizeNameForRequest(c, body.Name)
-	if sanErr != nil {
-		return sanErr
+	// T14 P1-1 (BugHunt 2026-05-20): use requireName like the other 7
+	// provisioning endpoints (db/cache/nosql/queue/storage/webhook/deploy).
+	// vector.go was the only outlier still using sanitizeNameForRequest,
+	// which permits a missing/empty name — a single-site-fallacy carry-over
+	// from when /vector/new shipped. Mandatory naming is now enforced
+	// uniformly across every provisioning route.
+	cleanName, nameErr := requireName(c, body.Name)
+	if nameErr != nil {
+		return nameErr
 	}
 	body.Name = cleanName
 
@@ -418,6 +424,11 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 		"note":           upgradeNote(upgradeURL),
 		"upgrade":        upgradeURL,
 		"upgrade_jwt":    jwtToken,
+	}
+	// T19 P0-2 (BugHunt 2026-05-20): emit top-level expires_at for
+	// shape parity with storage/webhook responses; see db.go for rationale.
+	if resource.ExpiresAt.Valid {
+		resp["expires_at"] = resource.ExpiresAt.Time.Format(time.RFC3339)
 	}
 	if storageExceeded {
 		resp["warning"] = "Storage limit reached. Upgrade to continue."
