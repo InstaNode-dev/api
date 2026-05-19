@@ -409,6 +409,21 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			received_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_razorpay_webhook_events_received_at ON razorpay_webhook_events(received_at)`,
+		// 053_pending_checkouts — payment-failure coverage gap. Records every
+		// subscription /api/v1/billing/checkout creates; the webhook marks it
+		// resolved on activate/charge; the worker reconciler notifies rows that
+		// never resolved. Mirrored so handler tests can INSERT/UPDATE it.
+		`CREATE TABLE IF NOT EXISTS pending_checkouts (
+			subscription_id      TEXT PRIMARY KEY,
+			team_id              UUID NOT NULL REFERENCES teams(id),
+			customer_email       TEXT NOT NULL,
+			plan_tier            TEXT NOT NULL,
+			created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+			resolved_at          TIMESTAMPTZ,
+			failure_notified_at  TIMESTAMPTZ
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_checkouts_unresolved
+			ON pending_checkouts (created_at) WHERE resolved_at IS NULL AND failure_notified_at IS NULL`,
 		// 030_resource_heartbeat — companion for the worker's provisioner_reconciler
 		// and resource_heartbeat jobs (shipped 2026-05-13). Mirrored here so a fresh
 		// SetupTestDB has the columns the heartbeat-driven resource model fields read.

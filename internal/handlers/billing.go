@@ -562,6 +562,26 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 		)
 	}
 
+	// Record the pending checkout so the worker's checkout reconciler can
+	// notice an upgrade that never completes. A pre-authorization failure on
+	// Razorpay's hosted page creates no payment object → no payment.failed
+	// webhook → no payment-failure email; this row is what closes that gap.
+	// The activated/charged webhook stamps resolved_at the moment the
+	// subscription succeeds. Non-fatal on error — match UpdateRazorpaySubscriptionID:
+	// a missed row only costs a missed failure email, never a blocked checkout.
+	customerEmail := ""
+	if owner, ownerErr := models.GetUserByTeamID(c.Context(), h.db, teamID); ownerErr == nil && owner != nil {
+		customerEmail = owner.Email
+	}
+	if insertErr := models.InsertPendingCheckout(c.Context(), h.db, subID, teamID, customerEmail, plan); insertErr != nil {
+		slog.Error("billing.checkout.pending_checkout_insert_failed",
+			"error", insertErr,
+			"team_id", teamID,
+			"subscription_id", subID,
+			"request_id", requestID,
+		)
+	}
+
 	slog.Info("billing.checkout.created",
 		"team_id", teamID,
 		"plan", plan,
@@ -805,6 +825,23 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 		// charge. Triggers the dunning state machine — see
 		// handleSubscriptionChargeFailed for the 7-day grace contract.
 		h.handleSubscriptionChargeFailed(ctx, c, event)
+	case "subscription.pending":
+		// Razorpay fires subscription.pending when a charge fails and the
+		// subscription is awaiting retry. Unlike payment.failed there may be
+		// NO payment object behind it (a pre-authorization / mandate failure
+		// on the hosted checkout page) — so this is the only soft-failure
+		// signal that path emits. Treat it like handlePaymentFailed: resolve
+		// the team and send the existing payment-failure notification.
+		// Release the claim + 500 on a retryable failure so Razorpay
+		// redelivers, identical to the payment.failed branch.
+		if hErr := h.handleSubscriptionPending(ctx, c, event); hErr != nil {
+			slog.Error("billing.webhook.subscription_pending.failed",
+				"error", hErr, "event_id", eventID)
+			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"ok": false, "error": "subscription_pending_handler_failed",
+			})
+		}
 	case "payment.failed":
 		// Legacy single-payment failure email path. When the failed
 		// payment belongs to an active subscription we ALSO open a
@@ -819,7 +856,12 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 			})
 		}
 	default:
+		// Log unhandled events at WARN so they surface in New Relic — a span
+		// attribute alone is invisible to log-based alerting. A new Razorpay
+		// event type we should handle (a coverage gap) shows up here.
 		span.SetAttributes(attribute.String("rzp.event.unhandled", "true"))
+		slog.Warn("billing.webhook.unhandled_event",
+			"event_type", event.Event, "event_id", eventID)
 	}
 
 	// Dispatch succeeded (no 500-return path was taken). The dedup claim
@@ -932,6 +974,21 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 		if updateErr := models.UpdateRazorpaySubscriptionID(ctx, h.db, teamID, sub.ID); updateErr != nil {
 			slog.Error("billing.subscription.charged.update_sub_id_failed",
 				"error", updateErr, "team_id", teamID)
+		}
+	}
+
+	// Checkout completed — clear the pending_checkouts row so the worker's
+	// checkout reconciler does not later notify this subscription as a
+	// payment failure. Reached from BOTH subscription.activated and
+	// subscription.charged (this handler serves both); ResolvePendingCheckout
+	// is idempotent (`WHERE resolved_at IS NULL`) so the second event is a
+	// harmless no-op. Best-effort: a miss only leaves a stale unresolved row
+	// the reconciler's own grace window will eventually reconcile against the
+	// live subscription state.
+	if sub.ID != "" {
+		if resolveErr := models.ResolvePendingCheckout(ctx, h.db, sub.ID); resolveErr != nil {
+			slog.Warn("billing.subscription.charged.pending_checkout_resolve_failed",
+				"error", resolveErr, "team_id", teamID, "subscription_id", sub.ID)
 		}
 	}
 
@@ -1127,6 +1184,78 @@ func (h *BillingHandler) handlePaymentFailed(ctx context.Context, c *fiber.Ctx, 
 
 	slog.Info("billing.payment.failed.email_sent",
 		"to", pay.Email, "payment_id", pay.ID)
+	return nil
+}
+
+// subscriptionPendingAttemptCount is the attempt_count passed to
+// SendPaymentFailed for a subscription.pending event. Unlike payment.failed
+// (which carries a real payment.attempt_count), a subscription.pending event
+// has NO payment object — there is no attempt count to read. 1 renders the
+// non-urgent "your payment didn't go through, please retry" copy, which is the
+// correct tone for a first soft-failure / pre-authorization failure.
+const subscriptionPendingAttemptCount = 1
+
+// handleSubscriptionPending processes subscription.pending events.
+//
+// Razorpay fires subscription.pending when a subscription charge fails and the
+// subscription is awaiting a retry. Crucially, this is the ONLY failure signal
+// emitted when a pre-authorization / mandate fails on Razorpay's hosted
+// checkout page ("seller does not support recurring payments", a declined
+// mandate): that path creates NO payment object, so payment.failed never
+// fires. Without this case the customer got no email at all — the exact
+// coverage gap a live Pro upgrade test exposed.
+//
+// Treated as a soft failure: resolve the team, look up the owner's email, and
+// send the existing payment-failure notification (the same SendPaymentFailed
+// call handlePaymentFailed uses). Does NOT downgrade — Razorpay retries the
+// charge and fires subscription.halted only once all retries are exhausted.
+//
+// Error contract mirrors handlePaymentFailed: a retryable failure (the email
+// send errored) returns an error so RazorpayWebhook releases the dedup claim
+// and 500s, and Razorpay redelivers. Non-retryable conditions (malformed
+// payload, unresolvable team, no email on file) return nil — a retry would
+// re-burn the claim for nothing.
+func (h *BillingHandler) handleSubscriptionPending(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) error {
+	sub, ok := parseSubscriptionEntity(event)
+	if !ok {
+		slog.Error("billing.subscription.pending.parse_failed")
+		return nil // malformed payload — retrying won't help; swallow
+	}
+
+	teamID, err := resolveTeamFromNotes(ctx, h, sub)
+	if err != nil {
+		// A missing/unknown-team payload will never resolve — non-retryable.
+		// A real DB error IS retryable: return it so dispatch releases the
+		// claim and 500s for redelivery.
+		if teamResolveUnretryable(err) {
+			slog.Warn("billing.subscription.pending.team_unresolvable",
+				"error", err, "sub_id", sub.ID)
+			return nil
+		}
+		slog.Error("billing.subscription.pending.team_resolve_failed",
+			"error", err, "sub_id", sub.ID)
+		return fmt.Errorf("subscription.pending team resolve: %w", err)
+	}
+
+	// The subscription entity carries no email — look up the team owner.
+	owner, ownerErr := models.GetUserByTeamID(ctx, h.db, teamID)
+	if ownerErr != nil || owner == nil || owner.Email == "" {
+		slog.Warn("billing.subscription.pending.no_email",
+			"error", ownerErr, "team_id", teamID, "sub_id", sub.ID)
+		return nil // no address to notify — non-retryable
+	}
+
+	slog.Warn("billing.subscription.pending",
+		"team_id", teamID, "subscription_id", sub.ID, "to", owner.Email)
+
+	if err := h.email.SendPaymentFailed(ctx, owner.Email, subscriptionPendingAttemptCount, nil); err != nil {
+		slog.Error("billing.subscription.pending.email_failed",
+			"error", err, "to", owner.Email, "team_id", teamID, "sub_id", sub.ID)
+		return fmt.Errorf("subscription.pending email send: %w", err)
+	}
+
+	slog.Info("billing.subscription.pending.email_sent",
+		"to", owner.Email, "team_id", teamID, "subscription_id", sub.ID)
 	return nil
 }
 
