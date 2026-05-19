@@ -52,6 +52,23 @@ const (
 	AuditKindPaymentGraceRecovered  = "payment.grace_recovered"
 	AuditKindPaymentGraceTerminated = "payment.grace_terminated"
 
+	// AuditKindBillingChargeUndeliverable fires when a Razorpay
+	// subscription.charged webhook confirms a real card charge that the
+	// platform CANNOT translate into a delivered upgrade — the team is
+	// unresolvable (bad/missing notes, not a transient DB fault — see F2's
+	// teamResolveUnretryable classification) OR the resolved plan tier is
+	// not in plans.yaml (F3). This is the make-good worklist signal: an
+	// operator must reconcile the charge in the Razorpay dashboard (issue a
+	// refund or hand-grant the tier). Metadata carries subscription_id,
+	// payment_id, and reason ("team_unresolvable" | "unknown_tier") plus
+	// resolved_tier / plan_id when known. The audit row is paired with a
+	// loud slog.Error so an alert can key on the kind. This kind is
+	// intentionally NOT wired into the worker's email forwarder
+	// (supportedAuditKinds) — it is an internal operator alert, not a
+	// customer-facing email; a customer who was wrongly charged should hear
+	// from a human, not an automated template.
+	AuditKindBillingChargeUndeliverable = "billing.charge_undeliverable"
+
 	// Promote approval lifecycle (PR #65) — non-dev promotes require an
 	// email-link approval before the worker executes them.
 	AuditKindPromoteApprovalRequested = "promote.approval_requested"

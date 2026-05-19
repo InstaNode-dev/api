@@ -93,7 +93,14 @@ func TestBillingWebhook_SubscriptionHalted_Downgrades(t *testing.T) {
 }
 
 // TestBillingWebhook_SubscriptionCompleted_Downgrades verifies a completed
-// subscription (agreed term ended) downgrades the team.
+// subscription that NEVER took a payment (paid_count == 0) downgrades the team.
+//
+// Updated 2026-05-19 for audit finding F12: a completion on a HEALTHY paying
+// subscription (paid_count > 0) must NOT downgrade — that punished a loyal
+// 12-month customer. The healthy-completion contract is pinned by
+// TestBillingWebhook_SubscriptionCompleted_HealthyPayingTeam_NotDowngraded in
+// billing_trust_test.go. This test now exercises the paid_count == 0 path
+// (the genuine end-of-relationship), which still downgrades.
 func TestBillingWebhook_SubscriptionCompleted_Downgrades(t *testing.T) {
 	dunningWebhookSkipUnlessDB(t)
 	db, cleanDB := testhelpers.SetupTestDB(t)
@@ -103,12 +110,14 @@ func TestBillingWebhook_SubscriptionCompleted_Downgrades(t *testing.T) {
 	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
 	defer db.Exec(`DELETE FROM teams WHERE id = $1::uuid`, teamID)
 
-	payload := makeSubscriptionLifecyclePayload(t, "subscription.completed", teamID, "sub_"+uuid.NewString(), 12)
+	// paid_count = 0 → the subscription completed without ever charging the
+	// card → genuine downgrade (to the 'free' floor for a never-paid sub).
+	payload := makeSubscriptionLifecyclePayload(t, "subscription.completed", teamID, "sub_"+uuid.NewString(), 0)
 	postLifecycleWebhook(t, app, payload)
 
 	var planTier string
 	require.NoError(t, db.QueryRow(`SELECT plan_tier FROM teams WHERE id = $1::uuid`, teamID).Scan(&planTier))
-	assert.Equal(t, "hobby", planTier, "completed subscription must downgrade the team")
+	assert.Equal(t, "free", planTier, "a never-paid completed subscription must downgrade the team")
 }
 
 // TestBillingWebhook_SubscriptionPaused_OpensGrace verifies a paused
