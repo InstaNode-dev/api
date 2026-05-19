@@ -71,6 +71,33 @@ const (
 	yearlyOngoingTotalCount  = 100
 )
 
+// reusableSubscriptionStatuses is the set of Razorpay subscription `status`
+// values that mean "the customer can still complete this checkout" — the
+// hosted short_url is live and a card mandate has not yet been
+// authorized+charged into an active subscription. Audit finding F7:
+// CreateCheckoutAPI reuses an existing subscription in one of these states
+// instead of minting a SECOND subscription that could double-charge the card.
+//
+//   - created       — subscription minted, no payment authorized yet.
+//   - authenticated — mandate authorized, first charge not yet captured.
+//   - pending       — Razorpay retrying a failed initial charge; still payable.
+//
+// Any other status (active/halted/cancelled/completed/expired) is NOT
+// reusable: active/halted already bill the card (a new checkout is a genuine
+// separate intent or a no-op the already-on-tier guard catches), and
+// cancelled/completed/expired are terminal — the short_url is dead.
+var reusableSubscriptionStatuses = map[string]struct{}{
+	"created":       {},
+	"authenticated": {},
+	"pending":       {},
+}
+
+// errCheckoutAlreadyOnTier is the error code returned when a team requests a
+// checkout for a tier it already holds (or a lower one). Returning a 4xx with
+// this code — rather than minting a subscription — stops a confused customer
+// from buying a plan they already pay for.
+const errCheckoutAlreadyOnTier = "already_on_plan"
+
 // BillingHandler handles billing and Razorpay webhook endpoints.
 type BillingHandler struct {
 	db    *sql.DB
@@ -91,6 +118,25 @@ type BillingHandler struct {
 	// Returning (nil, nil) is valid and means "no details available" —
 	// callers should default the relevant response fields.
 	FetchSubscriptionDetails func(subscriptionID string) (*razorpaybilling.SubscriptionDetails, error)
+
+	// CreateSubscription mints a new Razorpay subscription. Factored into an
+	// overridable field (not an inline razorpay client call) so the F7
+	// idempotency guard in CreateCheckoutAPI is unit-testable: a test can
+	// assert the function is invoked EXACTLY ONCE across two checkout calls
+	// for a team that already has a live pending subscription. The production
+	// default goes through razorpay.NewClient + the package circuit breaker;
+	// see ensureRazorpayFns. nil-safe: lazily initialised by ensureRazorpayFns
+	// so a handler built via the bare struct literal still works.
+	CreateSubscription func(subBody map[string]any) (map[string]any, error)
+
+	// FetchCheckoutSubscription GETs a Razorpay subscription's raw fields
+	// (status + short_url) for the F7 reuse probe. Overridable for the same
+	// testability reason as CreateSubscription. A returned error means "could
+	// not determine" — the caller fails OPEN (logs + creates a fresh
+	// subscription) so a Razorpay GET hiccup never blocks a legitimate
+	// checkout. The production default goes through razorpay.NewClient +
+	// Subscription.Fetch under the circuit breaker.
+	FetchCheckoutSubscription func(subscriptionID string) (status, shortURL string, err error)
 }
 
 // NewBillingHandler constructs a BillingHandler.
@@ -112,6 +158,100 @@ func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient *email.Client
 func (h *BillingHandler) WithRedis(rdb *redis.Client) *BillingHandler {
 	h.rdb = rdb
 	return h
+}
+
+// ensureRazorpayFns lazily wires the production CreateSubscription /
+// FetchCheckoutSubscription implementations when they have not been overridden
+// by a test. Called at the top of CreateCheckoutAPI so a handler built via the
+// bare struct literal (some test fixtures) still has working Razorpay
+// plumbing. A test that wants to fake the calls sets the fields BEFORE the
+// handler runs; ensureRazorpayFns then leaves them untouched.
+func (h *BillingHandler) ensureRazorpayFns() {
+	if h.CreateSubscription == nil {
+		h.CreateSubscription = func(subBody map[string]any) (map[string]any, error) {
+			client := razorpay.NewClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
+			return razorpaybilling.CallWithBreaker(func() (map[string]any, error) {
+				return client.Subscription.Create(subBody, nil)
+			})
+		}
+	}
+	if h.FetchCheckoutSubscription == nil {
+		h.FetchCheckoutSubscription = func(subscriptionID string) (string, string, error) {
+			client := razorpay.NewClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
+			sub, err := razorpaybilling.CallWithBreaker(func() (map[string]any, error) {
+				return client.Subscription.Fetch(subscriptionID, nil, nil)
+			})
+			if err != nil {
+				return "", "", err
+			}
+			status, _ := sub["status"].(string)
+			shortURL, _ := sub["short_url"].(string)
+			return status, shortURL, nil
+		}
+	}
+}
+
+// reusablePendingCheckout scans the team's unresolved pending_checkouts rows
+// (newest first) and returns the subscription_id + short_url of the first one
+// Razorpay still reports as payable (status in reusableSubscriptionStatuses).
+//
+// Audit finding F7: this is the load-bearing idempotency guard. A confused
+// customer whose first checkout silently failed and who clicks "Upgrade" again
+// minutes later must NOT get a second Razorpay subscription that can
+// double-charge their card. Returning a live subscription here makes the
+// second click reuse the first checkout's short_url instead.
+//
+// Fail-open by contract: a DB error or a Razorpay GET error on any candidate
+// is logged and skipped — a probe failure must never block a legitimate new
+// checkout. ok=false means "no reusable subscription found, mint a new one".
+//
+// failure_notified_at being set (the worker already emailed "your checkout
+// didn't complete") does NOT by itself disqualify a row — the customer may
+// still complete it — so the Razorpay status is the sole authority.
+func (h *BillingHandler) reusablePendingCheckout(ctx context.Context, teamID uuid.UUID, requestID string) (subID, shortURL string, ok bool) {
+	if h.db == nil {
+		return "", "", false
+	}
+	pending, err := models.FindUnresolvedPendingCheckouts(ctx, h.db, teamID)
+	if err != nil {
+		// Fail open — a DB hiccup on the reuse probe must not block checkout.
+		slog.Warn("billing.checkout.pending_lookup_failed_open",
+			"error", err,
+			"team_id", teamID,
+			"request_id", requestID,
+		)
+		return "", "", false
+	}
+	for _, pc := range pending {
+		if pc.SubscriptionID == "" {
+			continue
+		}
+		status, url, fetchErr := h.FetchCheckoutSubscription(pc.SubscriptionID)
+		if fetchErr != nil {
+			// Fail open per-candidate: log and try the next row. If every
+			// probe fails the caller mints a fresh subscription — the rare
+			// duplicate during a Razorpay brownout is below the cost of
+			// blocking a paying customer.
+			slog.Warn("billing.checkout.pending_subscription_fetch_failed_open",
+				"error", fetchErr,
+				"team_id", teamID,
+				"subscription_id", pc.SubscriptionID,
+				"request_id", requestID,
+			)
+			continue
+		}
+		if _, reusable := reusableSubscriptionStatuses[strings.ToLower(strings.TrimSpace(status))]; reusable && url != "" {
+			slog.Info("billing.checkout.reusing_pending_subscription",
+				"team_id", teamID,
+				"subscription_id", pc.SubscriptionID,
+				"razorpay_status", status,
+				"failure_notified", pc.FailureNotifiedAt.Valid,
+				"request_id", requestID,
+			)
+			return pc.SubscriptionID, url, true
+		}
+	}
+	return "", "", false
 }
 
 // checkoutRequest is the request body for POST /api/v1/billing/checkout.
@@ -347,12 +487,21 @@ func (h *BillingHandler) requireVerifiedEmail(c *fiber.Ctx, action string) (bool
 //
 // Response: {"ok": true, "short_url": "...", "subscription_id": "..."}
 //
+// Idempotency (audit finding F7): before minting a new Razorpay subscription
+// the handler (a) short-circuits when the team is already on the requested
+// tier or higher, and (b) reuses an existing live, payable subscription from
+// pending_checkouts instead of creating a second one that could double-charge
+// the customer's card. The 60s Redis SETNX is kept only as a cheap fast-path
+// against concurrent double-taps; the pending-subscription reuse is the real
+// guarantee against a delayed re-click.
+//
 // Status codes:
-//   - 400  invalid plan / invalid body
+//   - 400  invalid plan / invalid body / already on the requested tier
 //   - 401  no/invalid session (RequireAuth handles this)
 //   - 502  Razorpay rejected the create-subscription call
 //   - 503  RAZORPAY_KEY_ID/SECRET or the requested tier's plan_id not configured
 func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
+	h.ensureRazorpayFns()
 	requestID := middleware.GetRequestID(c)
 	teamIDStr := middleware.GetTeamID(c)
 
@@ -487,7 +636,57 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "billing_not_configured", "Razorpay credentials/plans not configured for this environment")
 	}
 
-	client := razorpay.NewClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
+	// ── F7 idempotency guard ────────────────────────────────────────────────
+	// Two real-money failure modes the 60s Redis SETNX above does NOT cover:
+	//
+	//  1. The team already pays for this tier (or a higher one). A confused
+	//     re-click must not mint a subscription for a plan they already have.
+	//  2. The team has a checkout still in flight from minutes/hours ago
+	//     (silent first attempt, F1/F2). Minting a SECOND subscription here is
+	//     the F7 double-charge bug: once both authorize, both bill the card.
+	//
+	// Both are checked before client construction so a reused/rejected
+	// checkout never even constructs a Razorpay create body. Fail-open: a DB
+	// brownout on the team lookup falls through to create (never block a
+	// paying customer); the Razorpay GET inside reusablePendingCheckout is
+	// already fail-open per-candidate.
+	if h.db != nil {
+		if team, teamErr := models.GetTeamByID(c.Context(), h.db, teamID); teamErr != nil {
+			slog.Warn("billing.checkout.team_lookup_failed_open",
+				"error", teamErr,
+				"team_id", teamID,
+				"request_id", requestID,
+			)
+		} else if team != nil {
+			currentTier := strings.ToLower(strings.TrimSpace(team.PlanTier))
+			// Already on the requested tier or higher → no checkout needed.
+			// plans.Rank gives a stable tier ordering; an equal-or-greater
+			// rank means the customer already paid for at least this plan.
+			if plans.Rank(currentTier) >= plans.Rank(plan) && plans.Rank(plan) > 0 {
+				slog.Info("billing.checkout.already_on_tier",
+					"team_id", teamID,
+					"current_tier", currentTier,
+					"requested_plan", plan,
+					"request_id", requestID,
+				)
+				return respondError(c, fiber.StatusBadRequest, errCheckoutAlreadyOnTier,
+					"This team is already on the '"+currentTier+"' plan. No checkout is needed — visit /dashboard to manage the existing subscription.")
+			}
+		}
+	}
+	// Reuse a live, still-payable subscription from a prior checkout instead
+	// of creating a second one. When found, return the SAME short_url +
+	// subscription_id the first checkout produced — same response shape as a
+	// fresh create below.
+	if reuseSubID, reuseURL, reuse := h.reusablePendingCheckout(c.Context(), teamID, requestID); reuse {
+		return c.JSON(fiber.Map{
+			"ok":              true,
+			"short_url":       reuseURL,
+			"subscription_id": reuseSubID,
+			"reused":          true,
+		})
+	}
+	// ────────────────────────────────────────────────────────────────────────
 
 	// total_count is the number of billing cycles Razorpay charges before the
 	// subscription auto-completes (fires subscription.completed → historically
@@ -561,13 +760,14 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 		"notes":           notes,
 	}
 
-	// Wrap the outbound Subscription.Create with the package-level
-	// Razorpay circuit breaker. When Razorpay is hosed, return 503
-	// billing_provider_unavailable instead of waiting on the HTTP
-	// timeout — agents see a clear "retry in 60s" signal.
-	sub, err := razorpaybilling.CallWithBreaker(func() (map[string]any, error) {
-		return client.Subscription.Create(subBody, nil)
-	})
+	// h.CreateSubscription wraps the outbound Subscription.Create with the
+	// package-level Razorpay circuit breaker (see defaultCreateSubscription /
+	// ensureRazorpayFns). When Razorpay is hosed, the breaker returns
+	// circuit.ErrOpen → 503 billing_provider_unavailable instead of waiting on
+	// the HTTP timeout — agents see a clear "retry in 60s" signal. This is the
+	// ONLY subscription-minting call site in CreateCheckoutAPI; the F7 guard
+	// above guarantees it is reached at most once per live checkout intent.
+	sub, err := h.CreateSubscription(subBody)
 	if err != nil {
 		if errors.Is(err, circuit.ErrOpen) {
 			slog.Error("billing.checkout.razorpay_circuit_open",

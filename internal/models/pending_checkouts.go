@@ -52,6 +52,54 @@ func InsertPendingCheckout(ctx context.Context, db *sql.DB, subscriptionID strin
 	return err
 }
 
+// PendingCheckout is one unresolved row from pending_checkouts — a Razorpay
+// subscription a /api/v1/billing/checkout call created whose outcome (activate
+// / charge / abandon) is not yet known.
+type PendingCheckout struct {
+	SubscriptionID    string
+	PlanTier          string
+	FailureNotifiedAt sql.NullTime
+}
+
+// FindUnresolvedPendingCheckouts returns every pending_checkouts row for the
+// team that is still unresolved (resolved_at IS NULL), newest first.
+//
+// Audit finding F7: CreateCheckoutAPI uses this to detect that the team
+// already has a checkout in flight before minting a SECOND Razorpay
+// subscription against the customer's card. The newest-first ordering means
+// the caller probes the most-recently-created subscription first — the one
+// the customer most likely still has open.
+//
+// failure_notified_at is returned (not filtered) so the caller can apply its
+// own policy: a row the worker already emailed a failure notice for is a
+// weaker reuse candidate, but the caller still verifies against Razorpay
+// rather than assuming the subscription is dead.
+func FindUnresolvedPendingCheckouts(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]PendingCheckout, error) {
+	if db == nil {
+		return nil, nil
+	}
+	rows, err := db.QueryContext(ctx,
+		`SELECT subscription_id, plan_tier, failure_notified_at
+		   FROM pending_checkouts
+		  WHERE team_id = $1 AND resolved_at IS NULL
+		  ORDER BY created_at DESC`,
+		teamID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingCheckout
+	for rows.Next() {
+		var pc PendingCheckout
+		if scanErr := rows.Scan(&pc.SubscriptionID, &pc.PlanTier, &pc.FailureNotifiedAt); scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, pc)
+	}
+	return out, rows.Err()
+}
+
 // ResolvePendingCheckout marks a pending checkout resolved once its
 // subscription activates or charges — the checkout completed, so the worker
 // reconciler must not later notify it as a failure.
