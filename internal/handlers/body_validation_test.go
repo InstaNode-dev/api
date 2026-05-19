@@ -179,6 +179,15 @@ func TestProvisioningBodyValidation_EmptyBody_StillWorks(t *testing.T) {
 	for _, ep := range allProvisioningEndpoints {
 		ep := ep
 		t.Run(ep.name, func(t *testing.T) {
+			// 2026-05-20: vector is now naming-mandatory (T14-P1-1, commit
+			// 4ba9a8b). An absent body cannot carry the required `name`
+			// label, so vector legitimately 400s name_required. The intent
+			// here (empty body doesn't trip invalid_body parsing) is
+			// exercised by the other endpoints. The EmptyJSONObject sibling
+			// test below proves a minimal {"name":"…"} JSON parses cleanly.
+			if ep.name == "vector" {
+				t.Skip("vector requires `name`; covered by EmptyJSONObject_StillWorks/vector")
+			}
 			db, cleanDB := testhelpers.SetupTestDB(t)
 			defer cleanDB()
 			rdb, cleanRedis := testhelpers.SetupTestRedis(t)
