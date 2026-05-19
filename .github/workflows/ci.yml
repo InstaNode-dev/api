@@ -10,15 +10,37 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
   schedule:
     # Weekly — reserved for optional scheduled jobs (see e2e job).
     - cron: '0 6 * * 1'
   workflow_dispatch:
 
 jobs:
+  # Stale-green guard. A PR can show a green CI run that was executed BEFORE a
+  # breaking commit landed on the base branch — merging it would ship a broken
+  # master. This job FAILS if the PR branch does not contain origin/<base> as
+  # an ancestor, forcing an "Update branch" before the PR can merge.
+  up-to-date-with-base:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fail if PR branch is behind its base branch
+        run: |
+          BASE="${{ github.event.pull_request.base.ref }}"
+          git fetch origin "${BASE}" --depth=1
+          if git merge-base --is-ancestor "origin/${BASE}" HEAD; then
+            echo "PR branch contains origin/${BASE} — up to date."
+          else
+            echo "::error::PR branch is behind origin/${BASE}. Update the branch (merge/rebase ${BASE}) and re-run CI so it validates against current base."
+            exit 1
+          fi
+
   build-and-test:
     runs-on: ubuntu-latest
     services:
