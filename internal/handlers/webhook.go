@@ -35,6 +35,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"instant.dev/common/resourcestatus"
 	"instant.dev/internal/config"
 	"instant.dev/internal/crypto"
 	"instant.dev/internal/metrics"
@@ -517,7 +518,7 @@ func (h *WebhookHandler) Receive(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusNotFound, "not_found", "Webhook token not found")
 	}
 
-	if resource.Status != "active" {
+	if resStatus, _ := resourcestatus.Parse(resource.Status); !resStatus.IsActive() {
 		return respondError(c, fiber.StatusGone, "webhook_inactive", "This webhook token is no longer active")
 	}
 
@@ -526,7 +527,7 @@ func (h *WebhookHandler) Receive(c *fiber.Ctx) error {
 	// can still be status='active' until the next worker tick. Each Receive
 	// re-extends the Redis-list TTL, so without this check an expired webhook
 	// keeps accepting (and persisting) payloads indefinitely.
-	if resource.ExpiresAt.Valid && resource.ExpiresAt.Time.Before(time.Now()) {
+	if resource.ExpiresAt.Valid && resourcestatus.IsPastTTL(resource.ExpiresAt.Time, time.Now()) {
 		return respondError(c, fiber.StatusGone, "webhook_expired",
 			"This webhook token has expired. Sign up to keep your webhook alive.")
 	}
@@ -794,7 +795,7 @@ func (h *WebhookHandler) ListRequests(c *fiber.Ctx) error {
 	// webhook's stored payloads (which may carry credentials sent by the
 	// upstream) stay readable through the public list API after the resource
 	// has been quota-suspended.
-	if resource.Status != "active" {
+	if resStatus, _ := resourcestatus.Parse(resource.Status); !resStatus.IsActive() {
 		return respondError(c, fiber.StatusGone, "webhook_inactive",
 			"This webhook token is no longer active")
 	}
@@ -802,7 +803,7 @@ func (h *WebhookHandler) ListRequests(c *fiber.Ctx) error {
 	// P1-C: reject an expired webhook for consistency with Receive — an expired
 	// anonymous webhook's stored requests are about to be swept by the worker;
 	// don't serve them as if the resource were still live.
-	if resource.ExpiresAt.Valid && resource.ExpiresAt.Time.Before(time.Now()) {
+	if resource.ExpiresAt.Valid && resourcestatus.IsPastTTL(resource.ExpiresAt.Time, time.Now()) {
 		return respondError(c, fiber.StatusGone, "webhook_expired",
 			"This webhook token has expired. Sign up to keep your webhook alive.")
 	}

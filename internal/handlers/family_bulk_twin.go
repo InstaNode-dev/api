@@ -71,6 +71,7 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/semaphore"
 
+	"instant.dev/common/resourcestatus"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
@@ -435,7 +436,7 @@ func (h *BulkTwinHandler) findParents(
 		if r.ParentResourceID != nil {
 			continue // skip — already a twin, not a root
 		}
-		if r.Status != "active" {
+		if rStatus, _ := resourcestatus.Parse(r.Status); !rStatus.IsActive() {
 			continue // skip paused / deleted; ListResourcesByTeamAndEnv already drops deleted, this defends against paused
 		}
 		if _, allowed := typeFilter[r.ResourceType]; !allowed {

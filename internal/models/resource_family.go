@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
+	"instant.dev/common/resourcestatus"
 )
 
 // FamilyMember is one row in a family payload — the subset of Resource fields
@@ -41,9 +42,9 @@ type FamilyMember struct {
 // the stable family identifier. MembersPerEnv groups by env so the dashboard
 // renders an env-grid (prod / staging / dev) without client-side bucketing.
 type FamilySummary struct {
-	FamilyRootID  uuid.UUID
-	ResourceType  string
-	MembersByEnv  map[string]FamilyMember
+	FamilyRootID uuid.UUID
+	ResourceType string
+	MembersByEnv map[string]FamilyMember
 }
 
 // GetResourceFamily returns the root + all members of the family that `id`
@@ -260,7 +261,7 @@ func ValidateFamilyParent(
 		}
 		return uuid.Nil, err
 	}
-	if parent.Status == "deleted" {
+	if parentStatus, _ := resourcestatus.Parse(parent.Status); parentStatus.IsDeleted() {
 		return uuid.Nil, &FamilyLinkError{
 			Reason: "deleted_parent",
 			Detail: "parent resource has been deleted",
@@ -303,4 +304,3 @@ func ValidateFamilyParent(
 
 	return rootID, nil
 }
-
