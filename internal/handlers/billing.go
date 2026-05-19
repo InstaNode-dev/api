@@ -1479,12 +1479,42 @@ func (h *BillingHandler) handleSubscriptionCancelled(ctx context.Context, c *fib
 	slog.Info("billing.subscription.cancelled",
 		"team_id", teamID, "subscription_id", sub.ID, "new_tier", tier)
 
+	// EMAIL-BUGBASH F2: when an operator demotes a paying customer, the
+	// admin path (a) emits a subscription.canceled_by_admin audit row whose
+	// own forwarder sends a cancellation email AND (b) calls the Razorpay
+	// cancel API, which fires this very subscription.cancelled webhook. If we
+	// also emit subscription.canceled here the customer gets TWO near-
+	// identical cancellation emails for one event. So: if a fresh
+	// subscription.canceled_by_admin row exists for this team, the admin
+	// path already covered the customer — skip the webhook-path emit.
+	// Fail-open: a lookup error falls through to the historical always-emit
+	// behaviour (a rare duplicate beats a missed cancellation notice).
+	if recent, lookupErr := models.RecentAuditEventExists(
+		ctx, h.db, teamID, models.AuditKindSubscriptionCanceledByAdmin, adminCancelDedupWindow,
+	); lookupErr != nil {
+		slog.Warn("billing.subscription.cancelled.admin_dedup_lookup_failed",
+			"error", lookupErr, "team_id", teamID)
+	} else if recent {
+		slog.Info("billing.subscription.cancelled.admin_initiated_skip_email",
+			"team_id", teamID, "subscription_id", sub.ID,
+			"note", "subscription.canceled_by_admin already emitted — webhook path skips its cancellation email to avoid a duplicate")
+		return nil
+	}
+
 	// Best-effort audit emit for the Loops cancellation email. Fail-open:
 	// the downgrade above is already committed and must not be reverted on
 	// an audit failure.
 	emitSubscriptionCanceledAudit(ctx, h.db, teamID, fromTier, tier, sub.ID)
 	return nil
 }
+
+// adminCancelDedupWindow is how recent a subscription.canceled_by_admin
+// audit row must be for handleSubscriptionCancelled to treat the incoming
+// subscription.cancelled webhook as the admin-cancel echo (EMAIL-BUGBASH
+// F2). Razorpay fires the webhook within seconds-to-minutes of the cancel
+// API call; 1 hour is a generous margin that still cannot collide with an
+// unrelated customer-initiated cancellation a month later.
+const adminCancelDedupWindow = time.Hour
 
 // handleSubscriptionCompleted processes subscription.completed events (F12).
 //
@@ -1581,15 +1611,50 @@ func (h *BillingHandler) handlePaymentFailed(ctx context.Context, c *fiber.Ctx, 
 		return nil
 	}
 
+	// C5 per-cycle dedup. payment.failed and subscription.pending are two
+	// distinct Razorpay events for the same failed billing cycle, and both
+	// call SendPaymentFailed — without a shared key the customer gets two
+	// dunning emails. dunningDedupKey collapses one recipient's failed cycle
+	// to a single send. A (false, nil) claim means the sibling event already
+	// sent the dunning notice. Fail-open: a dedup DB error sends anyway.
+	if key := dunningDedupKey(pay.Email); key != "" {
+		claimed, claimErr := models.ClaimEmailSend(ctx, h.db, key, models.EmailSendKindDunning)
+		if claimErr != nil {
+			slog.Warn("billing.payment.failed.dunning_dedup_failed",
+				"error", claimErr, "dedup_key", key)
+		} else if !claimed {
+			slog.Info("billing.payment.failed.dunning_deduped",
+				"payment_id", pay.ID, "dedup_key", key,
+				"note", "subscription.pending sibling already sent the dunning email")
+			return nil
+		}
+	}
+
 	if err := h.email.SendPaymentFailed(ctx, pay.Email, pay.AttemptCount, nil); err != nil {
 		slog.Error("billing.payment.failed.email_failed",
-			"error", err, "to", pay.Email, "payment_id", pay.ID)
+			"error", err, "to", models.MaskEmail(pay.Email), "payment_id", pay.ID)
 		return fmt.Errorf("payment.failed email send: %w", err)
 	}
 
 	slog.Info("billing.payment.failed.email_sent",
-		"to", pay.Email, "payment_id", pay.ID)
+		"to", models.MaskEmail(pay.Email), "payment_id", pay.ID)
 	return nil
+}
+
+// dunningDedupKey builds the per-billing-cycle dedup key for the payment-
+// failed dunning email (EMAIL-BUGBASH C5). payment.failed and
+// subscription.pending fire for the same failed cycle within the same span
+// of hours, and the payment entity carries no subscription id — so the only
+// anchor common to both events is the recipient address. The key buckets on
+// the recipient + the UTC date: one dunning email per recipient per day.
+// A monthly/yearly subscription has at most one failed cycle per day, so the
+// bucket never collapses two genuinely-distinct failed cycles.
+func dunningDedupKey(recipient string) string {
+	recipient = strings.ToLower(strings.TrimSpace(recipient))
+	if recipient == "" {
+		return ""
+	}
+	return fmt.Sprintf("dunning:%s:%s", recipient, time.Now().UTC().Format("2006-01-02"))
 }
 
 // subscriptionPendingAttemptCount is the attempt_count passed to
@@ -1651,16 +1716,32 @@ func (h *BillingHandler) handleSubscriptionPending(ctx context.Context, c *fiber
 	}
 
 	slog.Warn("billing.subscription.pending",
-		"team_id", teamID, "subscription_id", sub.ID, "to", owner.Email)
+		"team_id", teamID, "subscription_id", sub.ID, "to", models.MaskEmail(owner.Email))
+
+	// C5 per-cycle dedup — same key space as handlePaymentFailed. If the
+	// sibling payment.failed event already sent the dunning email for this
+	// recipient today, skip. Fail-open: a dedup DB error sends anyway.
+	if key := dunningDedupKey(owner.Email); key != "" {
+		claimed, claimErr := models.ClaimEmailSend(ctx, h.db, key, models.EmailSendKindDunning)
+		if claimErr != nil {
+			slog.Warn("billing.subscription.pending.dunning_dedup_failed",
+				"error", claimErr, "dedup_key", key)
+		} else if !claimed {
+			slog.Info("billing.subscription.pending.dunning_deduped",
+				"team_id", teamID, "sub_id", sub.ID, "dedup_key", key,
+				"note", "payment.failed sibling already sent the dunning email")
+			return nil
+		}
+	}
 
 	if err := h.email.SendPaymentFailed(ctx, owner.Email, subscriptionPendingAttemptCount, nil); err != nil {
 		slog.Error("billing.subscription.pending.email_failed",
-			"error", err, "to", owner.Email, "team_id", teamID, "sub_id", sub.ID)
+			"error", err, "to", models.MaskEmail(owner.Email), "team_id", teamID, "sub_id", sub.ID)
 		return fmt.Errorf("subscription.pending email send: %w", err)
 	}
 
 	slog.Info("billing.subscription.pending.email_sent",
-		"to", owner.Email, "team_id", teamID, "subscription_id", sub.ID)
+		"to", models.MaskEmail(owner.Email), "team_id", teamID, "subscription_id", sub.ID)
 	return nil
 }
 
@@ -2439,6 +2520,27 @@ func formatChargedAmount(amountMinor int64, currency string) string {
 	}
 }
 
+// receiptDedupKey builds the per-billing-cycle dedup key for the payment
+// receipt (EMAIL-BUGBASH C4). subscription.activated and subscription.charged
+// are DISTINCT Razorpay events for the same cycle — both route into
+// sendPaymentReceipt — so without a shared key the customer gets two
+// receipts. The key is keyed on (subscription_id, paid_count): both events of
+// one cycle carry the same subscription and the same count of paid invoices.
+// When paid_count is unavailable it falls back to the payment id; if neither
+// is present it returns "" and ClaimEmailSend degrades to always-send.
+func receiptDedupKey(sub rzpSubscriptionEntity, event rzpWebhookEvent) string {
+	if sub.ID == "" {
+		return ""
+	}
+	if sub.PaidCount != nil {
+		return fmt.Sprintf("receipt:%s:paid:%d", sub.ID, *sub.PaidCount)
+	}
+	if paymentID, _, _ := chargedPaymentMeta(event); paymentID != "" {
+		return fmt.Sprintf("receipt:%s:pay:%s", sub.ID, paymentID)
+	}
+	return ""
+}
+
 // sendPaymentReceipt sends the F4 payment-success receipt email to the team
 // owner after a successful subscription.charged. It is fully fail-open: every
 // failure (no owner row, no email on file, email-send error) is logged at WARN
@@ -2449,6 +2551,11 @@ func formatChargedAmount(amountMinor int64, currency string) string {
 // customer was already on this tier (a renewal charge); a strict change means
 // this charge upgraded them. Either way a receipt is sent — renewals are no
 // longer silent.
+//
+// EMAIL-BUGBASH C4: before sending, the cycle is claimed in email_send_dedup
+// so subscription.activated + subscription.charged (two distinct events, same
+// cycle) yield exactly one receipt. The claim is fail-open: a dedup DB error
+// sends anyway (a rare duplicate beats a missed receipt).
 func (h *BillingHandler) sendPaymentReceipt(ctx context.Context, teamID uuid.UUID, toTier, fromTier string, event rzpWebhookEvent) {
 	if h.email == nil {
 		return
@@ -2460,7 +2567,25 @@ func (h *BillingHandler) sendPaymentReceipt(ctx context.Context, teamID uuid.UUI
 		return
 	}
 
-	_, amountMinor, currency := chargedPaymentMeta(event)
+	// C4 per-cycle dedup. A (false, nil) claim means another event of this
+	// same billing cycle already sent the receipt — skip silently.
+	if sub, ok := parseSubscriptionEntity(event); ok {
+		if key := receiptDedupKey(sub, event); key != "" {
+			claimed, claimErr := models.ClaimEmailSend(ctx, h.db, key, models.EmailSendKindReceipt)
+			if claimErr != nil {
+				slog.Warn("billing.subscription.charged.receipt_dedup_failed",
+					"error", claimErr, "team_id", teamID, "dedup_key", key)
+				// fail open: fall through and send.
+			} else if !claimed {
+				slog.Info("billing.subscription.charged.receipt_deduped",
+					"team_id", teamID, "dedup_key", key,
+					"note", "another event of this billing cycle already sent the receipt")
+				return
+			}
+		}
+	}
+
+	paymentID, amountMinor, currency := chargedPaymentMeta(event)
 
 	reg := plans.Default()
 	planLabel := reg.DisplayName(toTier)
@@ -2477,14 +2602,19 @@ func (h *BillingHandler) sendPaymentReceipt(ctx context.Context, teamID uuid.UUI
 		AmountDisplay: formatChargedAmount(amountMinor, currency),
 		Period:        period,
 		IsRenewal:     strings.EqualFold(strings.TrimSpace(fromTier), strings.TrimSpace(toTier)),
+		// C8: AmountKnown is true only when a real payment entity carried a
+		// positive amount; otherwise the receipt renders the parenthetical
+		// "(see your billing dashboard ...)" pointer instead of a fabricated
+		// definite figure.
+		AmountKnown: paymentID != "" && amountMinor > 0,
 	}
 	if err := h.email.SendPaymentSucceeded(ctx, owner.Email, receipt); err != nil {
 		slog.Warn("billing.subscription.charged.receipt_send_failed",
-			"error", err, "team_id", teamID, "to", owner.Email)
+			"error", err, "team_id", teamID, "to", models.MaskEmail(owner.Email))
 		return
 	}
 	slog.Info("billing.subscription.charged.receipt_sent",
-		"team_id", teamID, "to", owner.Email, "plan", toTier, "is_renewal", receipt.IsRenewal)
+		"team_id", teamID, "to", models.MaskEmail(owner.Email), "plan", toTier, "is_renewal", receipt.IsRenewal)
 }
 
 // emitChargeUndeliverableAudit writes a high-severity

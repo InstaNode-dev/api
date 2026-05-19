@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -178,4 +179,122 @@ func HasSuppressionFor(ctx context.Context, db *sql.DB, emailAddr string) (bool,
 		return false, nil
 	}
 	return false, fmt.Errorf("models.HasSuppressionFor decay: %w", err)
+}
+
+// Email-send dedup-kind labels. Stored in email_send_dedup.email_kind for
+// operator-side filtering ("how many receipts vs dunning sends today").
+const (
+	EmailSendKindReceipt = "receipt" // payment-success receipt (C4)
+	EmailSendKindDunning = "dunning" // payment-failed dunning notice (C5)
+)
+
+// ClaimEmailSend attempts to claim a one-time email send for dedupKey.
+//
+// EMAIL-BUGBASH C4/C5: Razorpay fires DISTINCT events for one billing cycle
+// (subscription.activated + subscription.charged → receipt; payment.failed
+// + subscription.pending → dunning). Each event has its own event_id so the
+// razorpay_webhook_events replay guard does not collapse them. ClaimEmailSend
+// collapses them at the email layer: the caller builds a dedupKey that is
+// stable across both events of a cycle, calls ClaimEmailSend, and only sends
+// the email when this returns (true, nil).
+//
+// Returns:
+//   - (true,  nil) — this caller inserted the row; it OWNS the send.
+//   - (false, nil) — the row already existed; another event of the same
+//     cycle already sent (or is sending) the email — caller MUST skip.
+//   - (false, err) — DB error. The caller decides: a fail-OPEN caller may
+//     send anyway (better a rare duplicate than a missed receipt); a
+//     fail-CLOSED caller skips. sendPaymentReceipt / dunning fail open.
+//
+// Idempotent: a webhook redelivery re-attempts the same key and gets
+// (false, nil) — no duplicate email.
+func ClaimEmailSend(ctx context.Context, db *sql.DB, dedupKey, emailKind string) (bool, error) {
+	if db == nil {
+		// No DB — degrade to "always send" (the historical behaviour
+		// before the dedup ledger existed). A nil DB only happens in unit
+		// tests that don't exercise dedup.
+		return true, nil
+	}
+	if strings.TrimSpace(dedupKey) == "" {
+		// No stable key to dedup on — fall back to always-send rather than
+		// claiming an empty key that would collide across unrelated cycles.
+		return true, nil
+	}
+	res, err := db.ExecContext(ctx, `
+		INSERT INTO email_send_dedup (dedup_key, email_kind)
+		VALUES ($1, $2)
+		ON CONFLICT (dedup_key) DO NOTHING
+	`, dedupKey, emailKind)
+	if err != nil {
+		return false, fmt.Errorf("models.ClaimEmailSend: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// RecentAuditEventExists reports whether an audit_log row of the given kind
+// exists for teamID created within the lookback window.
+//
+// EMAIL-BUGBASH F2: an admin demote emits subscription.canceled_by_admin AND
+// triggers a Razorpay cancel that fires a subscription.cancelled webhook ->
+// emitSubscriptionCanceledAudit -> a second customer-facing cancellation
+// email. handleSubscriptionCancelled calls this before emitting its audit
+// row: if a fresh subscription.canceled_by_admin row exists for the team,
+// the admin-path email already covers the customer and the webhook path
+// skips its emit, so the customer gets exactly one cancellation email.
+func RecentAuditEventExists(ctx context.Context, db *sql.DB, teamID uuid.UUID, kind string, within time.Duration) (bool, error) {
+	if db == nil || teamID == uuid.Nil || kind == "" {
+		return false, nil
+	}
+	cutoff := time.Now().UTC().Add(-within)
+	var exists bool
+	err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM audit_log
+			 WHERE team_id = $1
+			   AND kind = $2
+			   AND created_at > $3
+		)
+	`, teamID, kind, cutoff).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("models.RecentAuditEventExists: %w", err)
+	}
+	return exists, nil
+}
+
+// SuppressionChecker is a DB-backed implementation of the structural
+// interface the api's email.Client consults before every synchronous send
+// (EMAIL-BUGBASH C3). It exists so the api's own sends (magic link, payment
+// receipt, dunning, team invite, deletion confirm) respect the email_events
+// suppression table — previously HasSuppressionFor had zero callers in api,
+// only the worker forwarder used it, so a hard-bounced or unsubscribed
+// address still received every api-originated email.
+//
+// It is deliberately a thin wrapper around HasSuppressionFor: one canonical
+// suppression rule, used by both the worker forwarder and the api send path.
+type SuppressionChecker struct {
+	db *sql.DB
+}
+
+// NewSuppressionChecker returns a SuppressionChecker bound to db. A nil db
+// yields a checker whose IsSuppressed always returns (false, nil) — i.e. a
+// no-op that never suppresses — so test/bootstrap paths without a database
+// degrade to "send everything" rather than panicking.
+func NewSuppressionChecker(db *sql.DB) *SuppressionChecker {
+	return &SuppressionChecker{db: db}
+}
+
+// IsSuppressed reports whether emailAddr has a recorded hard bounce,
+// unsubscribe, or spam complaint within the suppression window. It satisfies
+// the email.SuppressionChecker interface structurally (no import cycle:
+// models does not import email).
+//
+// Fail-open contract: a DB error is returned as (false, err) so the email
+// Client's send path can log it and proceed — a Postgres blip must never
+// block a transactional email such as a sign-in link.
+func (s *SuppressionChecker) IsSuppressed(ctx context.Context, emailAddr string) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, nil
+	}
+	return HasSuppressionFor(ctx, s.db, emailAddr)
 }

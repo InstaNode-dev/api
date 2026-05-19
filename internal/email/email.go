@@ -76,12 +76,29 @@ type provider interface {
 	Name() ProviderName
 }
 
+// SuppressionChecker reports whether an address has a recorded suppression
+// (hard bounce / unsubscribe / spam complaint). The api's synchronous email
+// sends (magic link, receipt, dunning, invite, deletion-confirm) consult it
+// before every send so api-originated mail respects the email_events
+// suppression table that migration 025 exists to serve (EMAIL-BUGBASH C3).
+//
+// Implementations MUST fail open: a (false, err) return on a DB error means
+// "could not determine — send anyway", because a Postgres blip must never
+// silently swallow a transactional email like a sign-in link.
+//
+// models.NewSuppressionChecker provides the production DB-backed
+// implementation; tests pass a fake or leave it nil (nil = no check).
+type SuppressionChecker interface {
+	IsSuppressed(ctx context.Context, emailAddr string) (bool, error)
+}
+
 // Client is the public façade. Handlers depend on *Client; they never see the
 // provider type, so swapping backends does not ripple into call sites.
 type Client struct {
-	provider provider
-	fromName string
-	fromAddr string
+	provider    provider
+	fromName    string
+	fromAddr    string
+	suppression SuppressionChecker
 }
 
 // New constructs an email Client. Provider selection precedence:
@@ -142,6 +159,16 @@ func NewNoop() *Client {
 	return New(Config{Provider: string(ProviderNoop)})
 }
 
+// WithSuppressionChecker attaches a SuppressionChecker so every subsequent
+// send consults the email_events suppression table first (EMAIL-BUGBASH C3).
+// Returns the same *Client for fluent wiring in main.go. Passing nil clears
+// the checker (the no-check default). Tests that want suppression coverage
+// inject a fake here.
+func (c *Client) WithSuppressionChecker(s SuppressionChecker) *Client {
+	c.suppression = s
+	return c
+}
+
 // resolveProvider implements the precedence rules documented on New.
 func resolveProvider(cfg Config) ProviderName {
 	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
@@ -162,14 +189,38 @@ func resolveProvider(cfg Config) ProviderName {
 }
 
 // send is the internal dispatch wrapper. Every public Send* method funnels
-// through here so logging + provider routing stay in one place.
+// through here so logging, suppression checks, and provider routing stay in
+// one place.
+//
+// EMAIL-BUGBASH C3: before dispatching, the recipient is checked against the
+// suppression table. A suppressed address (hard bounce / unsubscribe / spam
+// complaint) is skipped and the send returns nil — a skipped send is a
+// success from the caller's view, not an error to retry. The check is
+// fail-open: a DB error during the lookup logs and proceeds with the send,
+// because a Postgres blip must never swallow a transactional email.
 func (c *Client) send(ctx context.Context, to, subject, plainText, htmlBody string) error {
 	if c.provider == nil {
 		// Defensive: a zero-value Client (never returned by New) would
 		// otherwise panic. Treat it as noop.
-		slog.Warn("email.client.no_provider", "to", to, "subject", subject)
+		slog.Warn("email.client.no_provider", "to", maskEmail(to), "subject", subject)
 		return nil
 	}
+
+	if c.suppression != nil && strings.TrimSpace(to) != "" {
+		suppressed, err := c.suppression.IsSuppressed(ctx, to)
+		if err != nil {
+			// Fail open — log and send anyway. A suppression-lookup failure
+			// must never block a sign-in link or a payment receipt.
+			slog.Warn("email.suppression.check_failed",
+				"to", maskEmail(to), "subject", subject, "error", err)
+		} else if suppressed {
+			slog.Info("email.suppressed",
+				"to", maskEmail(to), "subject", subject,
+				"reason", "recipient has a hard-bounce/unsubscribe/spam-complaint suppression row")
+			return nil
+		}
+	}
+
 	return c.provider.Send(ctx, to, subject, plainText, htmlBody)
 }
 
@@ -205,7 +256,7 @@ func (p *resendProvider) Send(ctx context.Context, to, subject, plainText, htmlB
 	if _, err := p.client.Emails.SendWithContext(ctx, params); err != nil {
 		slog.Error("email.send_failed",
 			"provider", string(ProviderResend),
-			"to", to,
+			"to", maskEmail(to),
 			"subject", subject,
 			"error", err,
 		)
@@ -277,7 +328,7 @@ func (p *brevoProvider) Send(ctx context.Context, to, subject, plainText, htmlBo
 	if err != nil {
 		slog.Error("email.send_failed",
 			"provider", string(ProviderBrevo),
-			"to", to,
+			"to", maskEmail(to),
 			"subject", subject,
 			"error", err,
 		)
@@ -295,7 +346,7 @@ func (p *brevoProvider) Send(ctx context.Context, to, subject, plainText, htmlBo
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	slog.Error("email.send_failed",
 		"provider", string(ProviderBrevo),
-		"to", to,
+		"to", maskEmail(to),
 		"subject", subject,
 		"status", resp.StatusCode,
 		"body", string(respBody),
@@ -312,9 +363,12 @@ type noopProvider struct{}
 func (p *noopProvider) Name() ProviderName { return ProviderNoop }
 
 func (p *noopProvider) Send(_ context.Context, to, subject, _, _ string) error {
-	slog.Info("email.skipped",
+	// EMAIL-BUGBASH L1: DEBUG, not INFO — the noop provider runs on every
+	// non-prod env and a per-send INFO line is log spam. The recipient is
+	// masked regardless of level so a plaintext address never reaches logs.
+	slog.Debug("email.skipped",
 		"provider", string(ProviderNoop),
-		"to", to,
+		"to", maskEmail(to),
 		"subject", subject,
 	)
 	return nil
@@ -324,48 +378,43 @@ func (p *noopProvider) Send(_ context.Context, to, subject, _, _ string) error {
 // 2026-05-14 per policy memory project_no_trial_pay_day_one.md. The platform
 // has no trial period; hobby/pro/team are paid from day one. Anonymous (24h
 // TTL) is the only free tier and is not eligible for these emails.
+//
+// SendWeeklyDigest was removed on 2026-05-19 (EMAIL-BUGBASH C1/F6). It was
+// dead code (zero production callers) AND broken: it hardcoded the wrong
+// domain (instant.dev) and its "Unsubscribe" link was `?token=<recipient
+// email>` — leaking the plaintext address into the URL with no working
+// unsubscribe semantics. The live weekly digest is the worker-side
+// `digest.weekly` audit kind → renderDigestWeekly. Do NOT re-add a digest
+// sender here; the digest belongs to the suppression-checked worker path.
 
-// SendWeeklyDigest sends the Monday morning digest email.
-func (c *Client) SendWeeklyDigest(ctx context.Context, to string) error {
-	subject := "Your instant.dev weekly summary"
+// maxPaymentAttempts is the documented Razorpay charge-retry ceiling. The
+// payment-failed copy says "attempt N of <maxPaymentAttempts>" and the
+// attempt counter is clamped into [1, maxPaymentAttempts] so a Razorpay
+// payload reporting 0 or 4+ can never render a nonsensical "attempt 4 of 3"
+// (EMAIL-BUGBASH C6).
+const maxPaymentAttempts = 3
 
-	plain := `Your instant.dev weekly summary
-
-Here is a quick snapshot of your account activity this week.
-
-View your dashboard: https://instant.dev/dashboard
-
-`
-	plain += fmt.Sprintf("Unsubscribe: https://instant.dev/unsubscribe?token=%s\n", to)
-
-	html := fmt.Sprintf(`<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"></head>
-<body style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#111;">
-  <h2>Your instant.dev weekly summary</h2>
-  <p>Here is a quick snapshot of your account activity this week.</p>
-  <p style="margin-top:32px;">
-    <a href="https://instant.dev/dashboard"
-       style="background:#111;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:bold;">
-      View dashboard &rarr;
-    </a>
-  </p>
-  <p style="margin-top:40px;color:#888;font-size:12px;">
-    <a href="https://instant.dev/unsubscribe?token=%s" style="color:#888;">Unsubscribe</a>
-  </p>
-</body>
-</html>`, to)
-
-	return c.send(ctx, to, subject, plain, html)
+// clampAttemptCount bounds a raw Razorpay attempt count into the
+// [1, maxPaymentAttempts] range used by the payment-failed email copy.
+func clampAttemptCount(n int) int {
+	if n < 1 {
+		return 1
+	}
+	if n > maxPaymentAttempts {
+		return maxPaymentAttempts
+	}
+	return n
 }
 
 // SendPaymentFailed sends a payment failure notification email.
-// attemptCount is the number of attempts Razorpay has made (1–3).
+// attemptCount is the number of attempts Razorpay has made (1–3); values
+// outside that range are clamped (EMAIL-BUGBASH C6).
 // nextAttemptDate is when Razorpay will retry; nil means no further retry is scheduled.
 func (c *Client) SendPaymentFailed(ctx context.Context, to string, attemptCount int, nextAttemptDate *time.Time) error {
-	subject := "Payment failed for your instant.dev subscription"
+	subject := "Payment failed for your instanode.dev subscription"
 
-	isFinal := attemptCount >= 3
+	attemptCount = clampAttemptCount(attemptCount)
+	isFinal := attemptCount >= maxPaymentAttempts
 
 	retryLine := ""
 	retryHTML := ""
@@ -382,34 +431,45 @@ func (c *Client) SendPaymentFailed(ctx context.Context, to string, attemptCount 
 		urgencyHTML = `<p style="color:#c0392b;font-weight:bold;">This is the final retry. Your subscription will be cancelled if payment fails again.</p>`
 	}
 
-	plain := fmt.Sprintf(`Your payment for instant.dev failed (attempt %d of 3).
-
-%s
-%s
-Update your payment method to keep your subscription active:
-https://instant.dev/billing/checkout
-
-— The instant.dev team
-`, attemptCount, retryLine, urgencyLine)
+	// C7: build the plain-text body from only the non-empty lines so an
+	// absent retryLine / urgencyLine does not interpolate blank lines into
+	// the text/plain part (the HTML branch collapses empty %s on its own).
+	plainLines := []string{
+		fmt.Sprintf("Your payment for instanode.dev failed (attempt %d of %d).", attemptCount, maxPaymentAttempts),
+		"",
+	}
+	if retryLine != "" {
+		plainLines = append(plainLines, retryLine)
+	}
+	if urgencyLine != "" {
+		plainLines = append(plainLines, urgencyLine)
+	}
+	plainLines = append(plainLines,
+		"Update your payment method to keep your subscription active:",
+		"https://instanode.dev/app/billing",
+		"",
+		"— The instanode.dev team",
+	)
+	plain := strings.Join(plainLines, "\n") + "\n"
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"></head>
 <body style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#111;">
-  <h2>Payment failed for your instant.dev subscription</h2>
-  <p>Your payment failed (attempt <strong>%d of 3</strong>).</p>
+  <h2>Payment failed for your instanode.dev subscription</h2>
+  <p>Your payment failed (attempt <strong>%d of %d</strong>).</p>
   %s
   %s
   <p>Update your payment method to keep your subscription active.</p>
   <p style="margin-top:32px;">
-    <a href="https://instant.dev/billing/checkout"
+    <a href="https://instanode.dev/app/billing"
        style="background:#111;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:bold;">
       Update payment method &rarr;
     </a>
   </p>
-  <p style="margin-top:40px;color:#666;font-size:13px;">— The instant.dev team</p>
+  <p style="margin-top:40px;color:#666;font-size:13px;">— The instanode.dev team</p>
 </body>
-</html>`, attemptCount, retryHTML, urgencyHTML)
+</html>`, attemptCount, maxPaymentAttempts, retryHTML, urgencyHTML)
 
 	return c.send(ctx, to, subject, plain, html)
 }
@@ -425,11 +485,19 @@ https://instant.dev/billing/checkout
 // a first-charge "thanks for upgrading" receipt and a recurring
 // "your subscription renewed" receipt — both are still a receipt and both
 // always send (renewals are NOT silent: F4).
+//
+// AmountKnown is false when the Razorpay payment entity was absent on the
+// charge event so no real amount could be resolved (EMAIL-BUGBASH C8). When
+// false, SendPaymentSucceeded does NOT print AmountDisplay as a definite
+// "Amount" value — it instead renders a clearly-parenthetical "(see your
+// billing dashboard for the exact amount)" so a receipt never states a
+// fabricated or misleading charge figure.
 type PaymentReceipt struct {
 	Plan          string
 	AmountDisplay string
 	Period        string
 	IsRenewal     bool
+	AmountKnown   bool
 }
 
 // SendPaymentSucceeded sends the customer's payment receipt — fired on every
@@ -452,6 +520,17 @@ func (c *Client) SendPaymentSucceeded(ctx context.Context, to string, receipt Pa
 	}
 	subject := headline
 
+	// C8: when the amount is not known (no payment entity on the event),
+	// render the row as a clearly-parenthetical pointer rather than as a
+	// definite "Amount" value, so the receipt never asserts a fabricated
+	// or misleading charge figure.
+	amountPlain := receipt.AmountDisplay
+	amountHTMLValue := htmlEscape(receipt.AmountDisplay)
+	if !receipt.AmountKnown {
+		amountPlain = "(see your billing dashboard for the exact amount)"
+		amountHTMLValue = `<span style="font-weight:normal;color:#666;">(see your billing dashboard for the exact amount)</span>`
+	}
+
 	plain := fmt.Sprintf(`%s
 
 %s
@@ -466,7 +545,7 @@ View your billing details: https://instanode.dev/app/billing
 Need help? Reply to this email or contact support@instanode.dev.
 
 — The instanode.dev team
-`, headline, leadPlain, receipt.Plan, receipt.AmountDisplay, receipt.Period)
+`, headline, leadPlain, receipt.Plan, amountPlain, receipt.Period)
 
 	htmlBody := fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -491,7 +570,7 @@ Need help? Reply to this email or contact support@instanode.dev.
   </p>
   <p style="margin-top:40px;color:#666;font-size:13px;">— The instanode.dev team</p>
 </body>
-</html>`, headline, leadHTML, htmlEscape(receipt.Plan), htmlEscape(receipt.AmountDisplay), htmlEscape(receipt.Period))
+</html>`, headline, leadHTML, htmlEscape(receipt.Plan), amountHTMLValue, htmlEscape(receipt.Period))
 
 	return c.send(ctx, to, subject, plain, htmlBody)
 }
@@ -542,17 +621,17 @@ request this email, you can safely ignore it.
 	return c.send(ctx, toEmail, subject, plain, htmlBody)
 }
 
-// SendTeamInvite emails an invitation to join a team on instant.dev.
+// SendTeamInvite emails an invitation to join a team on instanode.dev.
 func (c *Client) SendTeamInvite(ctx context.Context, toEmail, teamName, acceptURL string) error {
-	subject := "You've been invited to an instant.dev team"
+	subject := "You've been invited to an instanode.dev team"
 	plain := fmt.Sprintf(`Hi,
 
-You've been invited to join the team %q on instant.dev.
+You've been invited to join the team %q on instanode.dev.
 
 Open this link while signed in with %s to accept:
 %s
 
-— The instant.dev team
+— The instanode.dev team
 `, teamName, toEmail, acceptURL)
 
 	safeTeam := htmlEscape(teamName)
@@ -562,10 +641,10 @@ Open this link while signed in with %s to accept:
 <head><meta charset="UTF-8"></head>
 <body style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#111;">
   <h2>Team invitation</h2>
-  <p>You've been invited to join <strong>%s</strong> on instant.dev.</p>
+  <p>You've been invited to join <strong>%s</strong> on instanode.dev.</p>
   <p>Sign in with <strong>%s</strong>, then open:</p>
   <p style="margin-top:16px;"><a href="%s">Accept invitation</a></p>
-  <p style="margin-top:40px;color:#666;font-size:13px;">— The instant.dev team</p>
+  <p style="margin-top:40px;color:#666;font-size:13px;">— The instanode.dev team</p>
 </body>
 </html>`, safeTeam, htmlEscape(toEmail), safeURL)
 
@@ -650,4 +729,23 @@ func htmlEscape(s string) string {
 	s = strings.ReplaceAll(s, ">", "&gt;")
 	s = strings.ReplaceAll(s, `"`, "&quot;")
 	return s
+}
+
+// maskEmail returns a privacy-preserving rendering of a recipient address
+// for slog lines (EMAIL-BUGBASH L1). "alice@example.com" → "a***@example.com";
+// a one-char local part is kept as-is to avoid emitting a bare "@domain".
+// An address with no "@" is returned unchanged. This mirrors
+// models.MaskEmail — duplicated here rather than imported because the email
+// package sits below models in the dependency graph and must not import it.
+func maskEmail(addr string) string {
+	at := strings.LastIndex(addr, "@")
+	if at <= 0 {
+		return addr
+	}
+	local := addr[:at]
+	domain := addr[at:]
+	if len(local) == 1 {
+		return local + domain
+	}
+	return local[:1] + "***" + domain
 }

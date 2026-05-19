@@ -114,6 +114,11 @@ func main() {
 		FromName:     cfg.EmailFromName,
 		FromAddress:  cfg.EmailFromAddress,
 	})
+	// EMAIL-BUGBASH C3: consult the email_events suppression table before
+	// every synchronous api send (magic link, receipt, dunning, invite,
+	// deletion confirm) so api-originated mail never reaches a hard-bounced,
+	// unsubscribed, or spam-complaining address. Fail-open on a DB error.
+	emailClient = emailClient.WithSuppressionChecker(models.NewSuppressionChecker(database))
 
 	plansPath := os.Getenv("PLANS_PATH")
 	if plansPath == "" {
