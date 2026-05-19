@@ -121,6 +121,17 @@ type AuthHandler struct {
 // completing their sign-in. Called in a goroutine so the writer never blocks
 // the HTTP response.
 func emitAuthLoginAudit(db *sql.DB, teamID, userID uuid.UUID, email, provider, ip, userAgent string) {
+	// Data-race fix: ip and userAgent reach this function as c.IP() /
+	// c.Get("User-Agent") results, whose backing bytes live inside the
+	// fasthttp request Ctx. fiber recycles that Ctx into a pool the instant
+	// the handler returns, so the background goroutine below MUST read
+	// heap-owned copies, never aliases into the recycled Ctx. email/provider
+	// are already heap-owned (DB column / package const) but cloned for
+	// symmetry; teamID/userID are value types.
+	email = strings.Clone(email)
+	provider = strings.Clone(provider)
+	ip = strings.Clone(ip)
+	userAgent = strings.Clone(userAgent)
 	safego.Go("auth.bg", func() {
 		meta := map[string]string{
 			"provider":   provider,

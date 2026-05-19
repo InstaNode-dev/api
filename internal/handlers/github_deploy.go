@@ -654,8 +654,15 @@ func githubConnectionToMap(conn *models.AppGitHubConnection, appID string) fiber
 // emitDeployAudit's best-effort contract: failures are logged but never
 // surface to the caller.
 func (h *GitHubDeployHandler) emitAudit(kind string, teamID uuid.UUID, meta fiber.Map) {
+	// Data-race fix: callers build `meta` with c.IP() / c.Get("User-Agent")
+	// values, whose backing bytes live inside the fasthttp request Ctx.
+	// fiber recycles that Ctx into a pool the instant the handler returns.
+	// Marshal `meta` to JSON HERE, on the handler goroutine, so the
+	// background goroutine only ever touches the heap-owned `blob` bytes —
+	// never the recycled Ctx. kind is cloned for the same reason.
+	kind = strings.Clone(kind)
+	blob, _ := json.Marshal(meta)
 	safego.Go("github_deploy.bg", func() {
-		blob, _ := json.Marshal(meta)
 		ev := models.AuditEvent{
 			TeamID:       teamID,
 			Actor:        "system",
