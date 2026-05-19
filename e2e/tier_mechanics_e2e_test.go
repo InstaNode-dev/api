@@ -21,9 +21,17 @@
 //
 // Required env:
 //
-//	E2E_BASE_URL           live server (default: http://localhost:30080)
-//	E2E_JWT_SECRET         required for management-API tests (team-specific tests)
-//	E2E_RAZORPAY_WEBHOOK_SECRET  required for Razorpay upgrade tests
+//	E2E_BASE_URL                live server (default: http://localhost:30080)
+//	E2E_JWT_SECRET              required for management-API tests (team-specific tests)
+//	E2E_RAZORPAY_WEBHOOK_SECRET required for Razorpay upgrade tests
+//	E2E_RAZORPAY_PLAN_ID_PRO    the configured Pro plan_id — required for the
+//	                            pro-tier upgrade assertions (C1–C8). Post-F3 an
+//	                            empty plan_id maps to `hobby`, not `pro`, so a
+//	                            real plan_id is the only way to reach `pro`.
+//	                            Tests that need it SKIP when it is unset.
+//	E2E_TEST_TOKEN              fingerprint-isolation token (see helpers_test.go) —
+//	                            required in practice behind an XFF-overwriting
+//	                            ingress or every test hits the recycle gate.
 package e2e
 
 import (
@@ -39,8 +47,16 @@ import (
 
 // ── C1: Limit progression across tiers ────────────────────────────────────────
 //
-// Verifies the planned limit values from plans.yaml are correctly reflected in
-// provisioning responses across all three tiers.
+// Verifies the limit values from plans.yaml are correctly reflected in
+// provisioning responses across the tiers a team actually moves through.
+//
+// Stale-assertion fix (WEBHOOK-VERIFY-2026-05-19): a claimed-but-unpaid team is
+// `free`, not `hobby` — `tier := team.PlanTier` (cache.go) means an
+// authenticated provision by a just-claimed team gets tier=free. The middle
+// step now asserts `free` (whose limits, by design, equal anonymous — the free
+// claim is an identity step, the real jump is the paid upgrade). The pro leg
+// sends the configured Pro plan_id so it lands on a genuine `pro` (post-F3 an
+// empty plan_id would map to `hobby`, not `pro`).
 
 func TestE2E_TierMechanics_C1_LimitProgressionAcrossTiers(t *testing.T) {
 	// anonymous limits — POST /cache/new (no auth)
@@ -62,27 +78,30 @@ func TestE2E_TierMechanics_C1_LimitProgressionAcrossTiers(t *testing.T) {
 	}
 	t.Logf("C1 anonymous: memory_mb=%.0f", anonMemMB)
 
-	// hobby limits — claim the anonymous resource → get hobby session → POST /cache/new with auth
-	secret := razorpayWebhookSecret(t) // also implicitly requires JWT_SECRET
+	// free limits — claim the anonymous resource → get a free session → POST /cache/new with auth.
+	// A claimed-but-unpaid team is `free`; an authenticated provision gets tier=free.
+	secret := razorpayWebhookSecret(t)   // also implicitly requires JWT_SECRET
+	proPlanID := razorpayProPlanID(t)    // required for the genuine pro upgrade leg
 	teamID, sessionJWT, _ := claimAndGetSession(t)
-	_ = teamID // used in upgrade tests below
+	_ = teamID // used in the upgrade step below
 
-	hobbyProv := provisionAnonymousAuth(t, sessionJWT)
-	if hobbyProv.Tier != "hobby" {
-		t.Fatalf("C1: expected hobby tier for authenticated provision, got %q", hobbyProv.Tier)
+	freeProv := provisionAnonymousAuth(t, sessionJWT)
+	if freeProv.Tier != "free" {
+		t.Fatalf("C1: expected free tier for a claimed-but-unpaid team's authenticated provision, got %q", freeProv.Tier)
 	}
-	hobbyMemMB, ok := hobbyProv.Limits["memory_mb"].(float64)
+	freeMemMB, ok := freeProv.Limits["memory_mb"].(float64)
 	if !ok {
-		t.Fatalf("C1: hobby limits.memory_mb must be a number, got %T", hobbyProv.Limits["memory_mb"])
+		t.Fatalf("C1: free limits.memory_mb must be a number, got %T", freeProv.Limits["memory_mb"])
 	}
-	if hobbyMemMB <= anonMemMB {
-		t.Errorf("C1: hobby memory_mb (%.0f) must exceed anonymous (%.0f)", hobbyMemMB, anonMemMB)
+	// The free tier deliberately mirrors anonymous limits (no jump on claim alone).
+	if freeMemMB != anonMemMB {
+		t.Errorf("C1: free memory_mb (%.0f) should equal anonymous (%.0f) — the free claim is an identity step", freeMemMB, anonMemMB)
 	}
-	t.Logf("C1 hobby:     memory_mb=%.0f (%.0fx anonymous)", hobbyMemMB, hobbyMemMB/anonMemMB)
+	t.Logf("C1 free:      memory_mb=%.0f (== anonymous; the paid upgrade is the real jump)", freeMemMB)
 
-	// pro limits — upgrade the team, then provision another cache resource
+	// pro limits — upgrade the team with the real Pro plan_id, then provision another cache resource.
 	subscriptionID := "cus_test_" + uuid.NewString()[:12]
-	webhookResp := postRazorpayWebhook(t, secret, subscriptionChargedPayload(teamID, subscriptionID, ""))
+	webhookResp := postRazorpayWebhook(t, secret, subscriptionChargedPayload(teamID, subscriptionID, proPlanID))
 	if webhookResp.StatusCode != 200 {
 		t.Fatalf("C1: upgrade webhook: want 200, got %d\n%s", webhookResp.StatusCode, readBody(t, webhookResp))
 	}
@@ -97,42 +116,40 @@ func TestE2E_TierMechanics_C1_LimitProgressionAcrossTiers(t *testing.T) {
 	if !ok {
 		t.Fatalf("C1: pro limits.memory_mb must be a number, got %T", proProv.Limits["memory_mb"])
 	}
-	if proMemMB <= hobbyMemMB {
-		t.Errorf("C1: pro memory_mb (%.0f) must exceed hobby (%.0f)", proMemMB, hobbyMemMB)
+	if proMemMB <= freeMemMB {
+		t.Errorf("C1: pro memory_mb (%.0f) must exceed free (%.0f)", proMemMB, freeMemMB)
 	}
-	t.Logf("C1 pro:       memory_mb=%.0f (%.0fx hobby)", proMemMB, proMemMB/hobbyMemMB)
+	t.Logf("C1 pro:       memory_mb=%.0f (%.0fx free)", proMemMB, proMemMB/freeMemMB)
 
 	// Assert the exact values from plans.yaml so a plans.yaml edit breaks this test.
-	want := map[string]float64{"anonymous": 5, "hobby": 25, "pro": 256}
-	for tier, wantVal := range want {
-		switch tier {
-		case "anonymous":
-			if anonMemMB != wantVal {
-				t.Errorf("C1: anonymous memory_mb: want %.0f, got %.0f (plans.yaml changed?)", wantVal, anonMemMB)
-			}
-		case "hobby":
-			if hobbyMemMB != wantVal {
-				t.Errorf("C1: hobby memory_mb: want %.0f, got %.0f (plans.yaml changed?)", wantVal, hobbyMemMB)
-			}
-		case "pro":
-			if proMemMB != wantVal {
-				t.Errorf("C1: pro memory_mb: want %.0f, got %.0f (plans.yaml changed?)", wantVal, proMemMB)
-			}
-		}
+	if anonMemMB != 5 {
+		t.Errorf("C1: anonymous memory_mb: want 5, got %.0f (plans.yaml changed?)", anonMemMB)
+	}
+	if freeMemMB != 5 {
+		t.Errorf("C1: free memory_mb: want 5, got %.0f (plans.yaml changed?)", freeMemMB)
+	}
+	if proMemMB != 512 {
+		t.Errorf("C1: pro memory_mb: want 512, got %.0f (plans.yaml changed?)", proMemMB)
 	}
 }
 
-// ── C2: Claim freezes resource.tier at 'hobby' ────────────────────────────────
+// ── C2: Claim sets resource.tier='free'; upgrade elevates it to the paid tier ──
 //
-// When an anonymous resource is claimed, its tier becomes 'hobby' regardless of
-// what the team's plan_tier is. This is hardcoded in onboarding.go:
+// When an anonymous resource is claimed, its tier becomes 'free' (the
+// claimed-but-unpaid floor) — onboarding.go:
 //
-//	UPDATE resources SET team_id = $1, tier = 'hobby', expires_at = NULL
+//	UPDATE resources SET team_id = $1, tier = 'free', expires_at = NULL
 //
-// Implication: even if you upgrade before claiming, the claimed resource is 'hobby'.
+// Stale-assertion fix (WEBHOOK-VERIFY-2026-05-19): the prior test asserted the
+// claim set tier='hobby' and the upgrade reached 'pro' from an empty plan_id —
+// both pre-date current behaviour (the `free` tier; the F3 fallback). This now
+// asserts the claimed resource lands on 'free', then a charge with the real Pro
+// plan_id elevates the team AND the claimed resource to 'pro' via
+// ElevateResourceTiersByTeam.
 
-func TestE2E_TierMechanics_C2_ClaimSetsResourceTierToHobbyNotTeamTier(t *testing.T) {
+func TestE2E_TierMechanics_C2_ClaimSetsResourceTierThenUpgradeElevates(t *testing.T) {
 	secret := razorpayWebhookSecret(t)
+	proPlanID := razorpayProPlanID(t)
 
 	// Provision anonymous cache.
 	ip := uniqueIP(t)
@@ -141,7 +158,7 @@ func TestE2E_TierMechanics_C2_ClaimSetsResourceTierToHobbyNotTeamTier(t *testing
 	email := uniqueEmail()
 	teamName := "e2e-c2-" + uuid.NewString()[:6]
 
-	// Claim it — creates a hobby team.
+	// Claim it — creates a free (claimed-but-unpaid) team.
 	claimResp := post(t, "/claim", map[string]any{
 		"jwt":       jwt,
 		"email":     email,
@@ -154,9 +171,9 @@ func TestE2E_TierMechanics_C2_ClaimSetsResourceTierToHobbyNotTeamTier(t *testing
 	decodeJSON(t, claimResp, &claim)
 	sessionJWT := makeSessionJWTWithUser(t, claim.UserID, claim.TeamID, email)
 
-	// Upgrade to pro immediately after claiming.
+	// Upgrade to pro immediately after claiming, with the real Pro plan_id.
 	subscriptionID := "cus_test_" + uuid.NewString()[:12]
-	webhookResp := postRazorpayWebhook(t, secret, subscriptionChargedPayload(claim.TeamID, subscriptionID, ""))
+	webhookResp := postRazorpayWebhook(t, secret, subscriptionChargedPayload(claim.TeamID, subscriptionID, proPlanID))
 	if webhookResp.StatusCode != 200 {
 		t.Fatalf("C2: upgrade webhook: want 200, got %d", webhookResp.StatusCode)
 	}
@@ -186,36 +203,41 @@ func TestE2E_TierMechanics_C2_ClaimSetsResourceTierToHobbyNotTeamTier(t *testing
 		t.Errorf("C2: expected team tier=pro after webhook, got %q", me["tier"])
 	}
 
-	// After our ElevateResourceTiersByTeam fix, the upgrade webhook now promotes all
-	// active resources. So a resource claimed as 'hobby' gets elevated to 'pro'
-	// immediately after the checkout.session.completed webhook fires.
+	// After the ElevateResourceTiersByTeam fix, the upgrade webhook promotes all
+	// active resources. So a resource claimed as 'free' gets elevated to 'pro'
+	// immediately after the subscription.charged webhook fires.
 	if claimedTier != "pro" {
 		t.Errorf("C2: claimed resource should be elevated to 'pro' by upgrade webhook, got %q", claimedTier)
 	}
-	t.Logf("C2: claim SQL sets tier='hobby', then upgrade webhook elevates to tier=%q ✓", claimedTier)
+	t.Logf("C2: claim SQL sets tier='free', then upgrade webhook elevates to tier=%q ✓", claimedTier)
 	t.Logf("C2: team tier=%q, resource tier=%q — ElevateResourceTiersByTeam promotes existing resources", me["tier"], claimedTier)
 }
 
 // ── C3: Pre-upgrade cache + new pro cache after Razorpay upgrade ────────────────
 //
-// After checkout webhook, ElevateResourceTiersByTeam promotes existing active
-// resources. A hobby-tier cache provisioned before upgrade should list as pro,
+// After the charge webhook, ElevateResourceTiersByTeam promotes existing active
+// resources. A free-tier cache provisioned before upgrade should list as pro,
 // and a new provision after upgrade should report pro limits.
+//
+// Stale-assertion fix (WEBHOOK-VERIFY-2026-05-19): the pre-upgrade provision is
+// `free` (a claimed-but-unpaid team), not `hobby`; and the upgrade now sends
+// the real Pro plan_id so it genuinely reaches `pro`.
 
 func TestE2E_TierMechanics_C3_PreUpgradeCacheElevatedAfterTeamUpgrade(t *testing.T) {
 	secret := razorpayWebhookSecret(t)
+	proPlanID := razorpayProPlanID(t)
 	teamID, sessionJWT, _ := claimAndGetSession(t)
 
-	// Provision a cache resource BEFORE upgrading (will have resource.tier='hobby').
-	hobbyProv := provisionAnonymousAuth(t, sessionJWT)
-	if hobbyProv.Tier != "hobby" {
-		t.Skipf("C3: expected hobby tier for pre-upgrade provision, got %q", hobbyProv.Tier)
+	// Provision a cache resource BEFORE upgrading (will have resource.tier='free').
+	freeProv := provisionAnonymousAuth(t, sessionJWT)
+	if freeProv.Tier != "free" {
+		t.Fatalf("C3: expected free tier for a claimed-but-unpaid team's pre-upgrade provision, got %q", freeProv.Tier)
 	}
-	preUpgradeLimit, _ := hobbyProv.Limits["memory_mb"].(float64)
+	preUpgradeLimit, _ := freeProv.Limits["memory_mb"].(float64)
 
-	// Upgrade the team.
+	// Upgrade the team with the real Pro plan_id.
 	subscriptionID := "cus_test_" + uuid.NewString()[:12]
-	webhookResp := postRazorpayWebhook(t, secret, subscriptionChargedPayload(teamID, subscriptionID, ""))
+	webhookResp := postRazorpayWebhook(t, secret, subscriptionChargedPayload(teamID, subscriptionID, proPlanID))
 	if webhookResp.StatusCode != 200 {
 		t.Fatalf("C3: upgrade webhook: want 200, got %d", webhookResp.StatusCode)
 	}
@@ -229,7 +251,7 @@ func TestE2E_TierMechanics_C3_PreUpgradeCacheElevatedAfterTeamUpgrade(t *testing
 
 	// Verify: new resource has higher limit than old resource.
 	if postUpgradeNewLimit <= preUpgradeLimit {
-		t.Errorf("C3: new pro resource limit (%.0f) must exceed old hobby resource limit (%.0f)",
+		t.Errorf("C3: new pro resource limit (%.0f) must exceed old free resource limit (%.0f)",
 			postUpgradeNewLimit, preUpgradeLimit)
 	}
 
@@ -253,16 +275,16 @@ func TestE2E_TierMechanics_C3_PreUpgradeCacheElevatedAfterTeamUpgrade(t *testing
 		tierByToken[item.Token] = item.Tier
 	}
 
-	if got, ok := tierByToken[hobbyProv.Token]; ok {
+	if got, ok := tierByToken[freeProv.Token]; ok {
 		if got != "pro" {
 			t.Errorf("C3: pre-upgrade resource should be elevated to pro after upgrade webhook; got tier=%q", got)
 		}
-		t.Logf("C3: pre-upgrade resource %q elevated to tier=%q ✓", hobbyProv.Token, got)
+		t.Logf("C3: pre-upgrade resource %q elevated to tier=%q ✓", freeProv.Token, got)
 	} else {
-		t.Errorf("C3: pre-upgrade resource %q not found in list", hobbyProv.Token)
+		t.Errorf("C3: pre-upgrade resource %q not found in list", freeProv.Token)
 	}
 
-	t.Logf("C3: pre-upgrade=%.0f/day (hobby) → upgraded resource elevated to pro (%.0f/day)",
+	t.Logf("C3: pre-upgrade=%.0f (free) → upgraded resource elevated to pro (%.0f)",
 		preUpgradeLimit, postUpgradeNewLimit)
 }
 
@@ -280,6 +302,7 @@ func TestE2E_TierMechanics_C3_PreUpgradeCacheElevatedAfterTeamUpgrade(t *testing
 
 func TestE2E_TierMechanics_C4_StorageLimitsAreInformationalPerTier(t *testing.T) {
 	secret := razorpayWebhookSecret(t)
+	proPlanID := razorpayProPlanID(t)
 
 	// anonymous DB limits
 	anonIP := uniqueIP(t)
@@ -306,37 +329,38 @@ func TestE2E_TierMechanics_C4_StorageLimitsAreInformationalPerTier(t *testing.T)
 	t.Logf("C4 anonymous postgres: storage_mb=%d connections=%d",
 		anonDBBody.Limits.StorageMB, anonDBBody.Limits.Connections)
 
-	// hobby DB limits
+	// free DB limits — a claimed-but-unpaid team is `free`; an authenticated
+	// provision gets tier=free, whose limits mirror anonymous by design.
 	teamID, sessionJWT, _ := claimAndGetSession(t)
-	hobbyDB := apiPost(t, "/db/new", nil,
+	freeDB := apiPost(t, "/db/new", nil,
 		"X-Forwarded-For", uniqueIP(t),
 		"Authorization", "Bearer "+sessionJWT,
 	)
-	skipIfServiceDown(t, hobbyDB, "postgres")
-	var hobbyDBBody struct {
+	skipIfServiceDown(t, freeDB, "postgres")
+	var freeDBBody struct {
 		Limits struct {
 			StorageMB   int `json:"storage_mb"`
 			Connections int `json:"connections"`
 		} `json:"limits"`
 		Tier string `json:"tier"`
 	}
-	decodeJSON(t, hobbyDB, &hobbyDBBody)
+	decodeJSON(t, freeDB, &freeDBBody)
 
-	if hobbyDBBody.Tier != "hobby" {
-		t.Fatalf("C4: expected hobby tier for authenticated provision, got %q", hobbyDBBody.Tier)
+	if freeDBBody.Tier != "free" {
+		t.Fatalf("C4: expected free tier for a claimed-but-unpaid team's authenticated provision, got %q", freeDBBody.Tier)
 	}
-	if hobbyDBBody.Limits.StorageMB != 500 {
-		t.Errorf("C4: hobby postgres storage_mb: want 500, got %d", hobbyDBBody.Limits.StorageMB)
+	if freeDBBody.Limits.StorageMB != 10 {
+		t.Errorf("C4: free postgres storage_mb: want 10, got %d", freeDBBody.Limits.StorageMB)
 	}
-	if hobbyDBBody.Limits.Connections != 5 {
-		t.Errorf("C4: hobby postgres connections: want 5, got %d", hobbyDBBody.Limits.Connections)
+	if freeDBBody.Limits.Connections != 2 {
+		t.Errorf("C4: free postgres connections: want 2, got %d", freeDBBody.Limits.Connections)
 	}
-	t.Logf("C4 hobby postgres: storage_mb=%d connections=%d",
-		hobbyDBBody.Limits.StorageMB, hobbyDBBody.Limits.Connections)
+	t.Logf("C4 free postgres: storage_mb=%d connections=%d",
+		freeDBBody.Limits.StorageMB, freeDBBody.Limits.Connections)
 
-	// pro DB limits (upgrade then provision)
+	// pro DB limits (upgrade with the real Pro plan_id, then provision)
 	subscriptionID := "cus_test_" + uuid.NewString()[:12]
-	webhookResp := postRazorpayWebhook(t, secret, subscriptionChargedPayload(teamID, subscriptionID, ""))
+	webhookResp := postRazorpayWebhook(t, secret, subscriptionChargedPayload(teamID, subscriptionID, proPlanID))
 	if webhookResp.StatusCode != 200 {
 		t.Fatalf("C4: upgrade webhook: want 200, got %d", webhookResp.StatusCode)
 	}
@@ -358,8 +382,8 @@ func TestE2E_TierMechanics_C4_StorageLimitsAreInformationalPerTier(t *testing.T)
 	if proDBBody.Tier != "pro" {
 		t.Errorf("C4: expected pro tier after upgrade, got %q", proDBBody.Tier)
 	}
-	if proDBBody.Limits.StorageMB != 5120 {
-		t.Errorf("C4: pro postgres storage_mb: want 5120, got %d", proDBBody.Limits.StorageMB)
+	if proDBBody.Limits.StorageMB != 10240 {
+		t.Errorf("C4: pro postgres storage_mb: want 10240, got %d", proDBBody.Limits.StorageMB)
 	}
 	if proDBBody.Limits.Connections != 20 {
 		t.Errorf("C4: pro postgres connections: want 20, got %d", proDBBody.Limits.Connections)
@@ -382,6 +406,7 @@ func TestE2E_TierMechanics_C4_StorageLimitsAreInformationalPerTier(t *testing.T)
 
 func TestE2E_TierMechanics_C5_CacheAndNoSQLLimitsPerTier(t *testing.T) {
 	secret := razorpayWebhookSecret(t)
+	proPlanID := razorpayProPlanID(t)
 	teamID, sessionJWT, _ := claimAndGetSession(t)
 
 	ip := uniqueIP(t)
@@ -400,26 +425,30 @@ func TestE2E_TierMechanics_C5_CacheAndNoSQLLimitsPerTier(t *testing.T) {
 		t.Errorf("C5: anonymous redis memory_mb: want 5, got %d", anonCacheBody.Limits.MemoryMB)
 	}
 
-	// Hobby Redis (authenticated)
-	hobbyCache := apiPost(t, "/cache/new", nil,
+	// Free Redis (authenticated — a claimed-but-unpaid team is `free`, whose
+	// limits mirror anonymous by design).
+	freeCache := apiPost(t, "/cache/new", nil,
 		"X-Forwarded-For", uniqueIP(t),
 		"Authorization", "Bearer "+sessionJWT,
 	)
-	skipIfServiceDown(t, hobbyCache, "redis")
-	var hobbyCacheBody struct {
+	skipIfServiceDown(t, freeCache, "redis")
+	var freeCacheBody struct {
 		Limits struct {
 			MemoryMB int `json:"memory_mb"`
 		} `json:"limits"`
 		Tier string `json:"tier"`
 	}
-	decodeJSON(t, hobbyCache, &hobbyCacheBody)
-	if hobbyCacheBody.Limits.MemoryMB != 25 {
-		t.Errorf("C5: hobby redis memory_mb: want 25, got %d", hobbyCacheBody.Limits.MemoryMB)
+	decodeJSON(t, freeCache, &freeCacheBody)
+	if freeCacheBody.Tier != "free" {
+		t.Fatalf("C5: expected free tier for a claimed-but-unpaid team's authenticated provision, got %q", freeCacheBody.Tier)
+	}
+	if freeCacheBody.Limits.MemoryMB != 5 {
+		t.Errorf("C5: free redis memory_mb: want 5, got %d", freeCacheBody.Limits.MemoryMB)
 	}
 
-	// Upgrade, then pro Redis
+	// Upgrade with the real Pro plan_id, then pro Redis
 	subscriptionID := "cus_test_" + uuid.NewString()[:12]
-	webhookResp := postRazorpayWebhook(t, secret, subscriptionChargedPayload(teamID, subscriptionID, ""))
+	webhookResp := postRazorpayWebhook(t, secret, subscriptionChargedPayload(teamID, subscriptionID, proPlanID))
 	if webhookResp.StatusCode != 200 {
 		t.Fatalf("C5: upgrade webhook: want 200, got %d", webhookResp.StatusCode)
 	}
@@ -436,12 +465,12 @@ func TestE2E_TierMechanics_C5_CacheAndNoSQLLimitsPerTier(t *testing.T) {
 		Tier string `json:"tier"`
 	}
 	decodeJSON(t, proCache, &proCacheBody)
-	if proCacheBody.Limits.MemoryMB != 256 {
-		t.Errorf("C5: pro redis memory_mb: want 256, got %d", proCacheBody.Limits.MemoryMB)
+	if proCacheBody.Limits.MemoryMB != 512 {
+		t.Errorf("C5: pro redis memory_mb: want 512, got %d", proCacheBody.Limits.MemoryMB)
 	}
 
-	t.Logf("C5 redis memory_mb: anonymous=%d → hobby=%d → pro=%d",
-		anonCacheBody.Limits.MemoryMB, hobbyCacheBody.Limits.MemoryMB, proCacheBody.Limits.MemoryMB)
+	t.Logf("C5 redis memory_mb: anonymous=%d → free=%d → pro=%d",
+		anonCacheBody.Limits.MemoryMB, freeCacheBody.Limits.MemoryMB, proCacheBody.Limits.MemoryMB)
 
 	// NoSQL limits
 	anonNoSQL := apiPost(t, "/nosql/new", nil, "X-Forwarded-For", ip)
@@ -457,7 +486,7 @@ func TestE2E_TierMechanics_C5_CacheAndNoSQLLimitsPerTier(t *testing.T) {
 		t.Errorf("C5: anonymous mongodb storage_mb: want 5, got %d", anonNoSQLBody.Limits.StorageMB)
 	}
 
-	t.Logf("C5 mongodb storage_mb anonymous=%d (hobby=100, pro=2048)", anonNoSQLBody.Limits.StorageMB)
+	t.Logf("C5 mongodb storage_mb anonymous=%d (hobby=100, pro=5120 per plans.yaml)", anonNoSQLBody.Limits.StorageMB)
 }
 
 // ── C6: Provision dedup — same fingerprint returns existing token ──────────────
@@ -530,11 +559,12 @@ func TestE2E_TierMechanics_C6_ProvisionDedupReturnsSameToken(t *testing.T) {
 
 func TestE2E_TierMechanics_C7_DowngradeNewProvisionsRevertToHobby(t *testing.T) {
 	secret := razorpayWebhookSecret(t)
+	proPlanID := razorpayProPlanID(t)
 	teamID, sessionJWT, _ := claimAndGetSession(t)
 
-	// Upgrade.
+	// Upgrade with the real Pro plan_id (post-F3 an empty plan_id maps to hobby).
 	subscriptionID := "cus_test_" + uuid.NewString()[:12]
-	upgradeResp := postRazorpayWebhook(t, secret, subscriptionChargedPayload(teamID, subscriptionID, ""))
+	upgradeResp := postRazorpayWebhook(t, secret, subscriptionChargedPayload(teamID, subscriptionID, proPlanID))
 	if upgradeResp.StatusCode != 200 {
 		t.Fatalf("C7: upgrade webhook: want 200, got %d", upgradeResp.StatusCode)
 	}
@@ -587,17 +617,18 @@ func TestE2E_TierMechanics_C7_DowngradeNewProvisionsRevertToHobby(t *testing.T) 
 
 func TestE2E_TierMechanics_C8_ResourceListShowsFrozenTiers(t *testing.T) {
 	secret := razorpayWebhookSecret(t)
+	proPlanID := razorpayProPlanID(t)
 	teamID, sessionJWT, _ := claimAndGetSession(t)
 
-	// Provision one hobby-tier cache.
-	hobbyProv := provisionAnonymousAuth(t, sessionJWT)
-	if hobbyProv.Tier != "hobby" {
-		t.Skipf("C8: expected hobby provision, got %q", hobbyProv.Tier)
+	// Provision one free-tier cache (a claimed-but-unpaid team is `free`).
+	freeProv := provisionAnonymousAuth(t, sessionJWT)
+	if freeProv.Tier != "free" {
+		t.Fatalf("C8: expected free provision for a claimed-but-unpaid team, got %q", freeProv.Tier)
 	}
 
-	// Upgrade.
+	// Upgrade with the real Pro plan_id.
 	subscriptionID := "cus_test_" + uuid.NewString()[:12]
-	webhookResp := postRazorpayWebhook(t, secret, subscriptionChargedPayload(teamID, subscriptionID, ""))
+	webhookResp := postRazorpayWebhook(t, secret, subscriptionChargedPayload(teamID, subscriptionID, proPlanID))
 	if webhookResp.StatusCode != 200 {
 		t.Fatalf("C8: upgrade webhook: want 200, got %d", webhookResp.StatusCode)
 	}
@@ -621,22 +652,22 @@ func TestE2E_TierMechanics_C8_ResourceListShowsFrozenTiers(t *testing.T) {
 	}
 	decodeJSON(t, listResp, &listBody)
 
-	// Find the hobby and pro resources in the list.
+	// Find the free and pro resources in the list.
 	tierByToken := make(map[string]string)
 	for _, item := range listBody.Items {
 		tierByToken[item.Token] = item.Tier
 	}
 
 	// After ElevateResourceTiersByTeam fix: the upgrade webhook promotes ALL existing
-	// resources, so the pre-upgrade hobby resource is now 'pro' in the list.
-	if got, ok := tierByToken[hobbyProv.Token]; ok {
+	// resources, so the pre-upgrade free resource is now 'pro' in the list.
+	if got, ok := tierByToken[freeProv.Token]; ok {
 		if got != "pro" {
 			t.Errorf("C8: pre-upgrade resource tier in list: want 'pro' (elevated by webhook), got %q", got)
 		}
-		t.Logf("C8: pre-upgrade resource %q shows tier=%q in list ✓ (elevated by upgrade webhook)", hobbyProv.Token, got)
+		t.Logf("C8: pre-upgrade resource %q shows tier=%q in list ✓ (elevated by upgrade webhook)", freeProv.Token, got)
 	} else {
 		t.Errorf("C8: pre-upgrade resource %q not found in list; tokens present: %v",
-			hobbyProv.Token, tierByToken)
+			freeProv.Token, tierByToken)
 	}
 
 	// Pro resource provisioned after upgrade also shows tier='pro'.
@@ -653,17 +684,19 @@ func TestE2E_TierMechanics_C8_ResourceListShowsFrozenTiers(t *testing.T) {
 	t.Logf("C8: both resources show tier='pro' after upgrade — ElevateResourceTiersByTeam promotes all active resources")
 }
 
-// ── C9: Anonymous → hobby limit jump via claim (no Razorpay required) ────────
+// ── C9: Anonymous → free via claim (no Razorpay required) ────────────────────
 //
-// This test verifies the core tier-scaling mechanic end-to-end without Razorpay:
-// 1. Anonymous provision → 5MB redis memory
-// 2. Claim it (creates hobby team) → provision another → 25MB redis memory
-// 3. The resource.tier jumps 5x just by claiming — no payment required.
-//
-// This is the "free account" value prop: claim = instant upgrade.
-// Pro upgrade (via Razorpay) adds another 10x on top of hobby.
+// Stale-assertion fix (WEBHOOK-VERIFY-2026-05-19): this test previously claimed
+// "claim = instant 5x limit jump to hobby". That pre-dates the `free` tier — a
+// claimed-but-unpaid team is `free`, whose limits deliberately MIRROR anonymous
+// (no-trial / pay-from-day-one policy: the real jump is the paid upgrade, not
+// the claim). The test now verifies the actual no-Razorpay mechanic:
+//   1. Anonymous provision → 5MB redis memory.
+//   2. Claim it → team is `free`; a new provision is tier=free with the SAME
+//      5MB limit — claiming alone does not raise limits.
+// The paid pro upgrade (asserted in C1/C5) is what raises them.
 
-func TestE2E_TierMechanics_C9_AnonToHobbyLimitJumpViaClaim(t *testing.T) {
+func TestE2E_TierMechanics_C9_AnonToFreeViaClaim(t *testing.T) {
 	// Skip if JWT secret not set (needed for /auth/me and authenticated provisions).
 	if os.Getenv("E2E_JWT_SECRET") == "" {
 		t.Skip("E2E_JWT_SECRET not set — skipping authenticated tier tests")
@@ -684,61 +717,60 @@ func TestE2E_TierMechanics_C9_AnonToHobbyLimitJumpViaClaim(t *testing.T) {
 	}
 	t.Logf("C9: anonymous memory_mb=%.0f", anonLimit)
 
-	// Claim → hobby account.
+	// Claim → free account (claimed-but-unpaid).
 	teamID, sessionJWT, _ := claimAndGetSession(t)
 	_ = teamID
 
-	// Provision a new cache resource as hobby user.
-	hobbyProv := provisionAnonymousAuth(t, sessionJWT)
-	if hobbyProv.Tier != "hobby" {
-		t.Fatalf("C9: expected hobby tier for authenticated provision, got %q", hobbyProv.Tier)
+	// Provision a new cache resource as a free-tier user.
+	freeProv := provisionAnonymousAuth(t, sessionJWT)
+	if freeProv.Tier != "free" {
+		t.Fatalf("C9: expected free tier for a claimed-but-unpaid team's authenticated provision, got %q", freeProv.Tier)
 	}
-	hobbyLimit, ok := hobbyProv.Limits["memory_mb"].(float64)
+	freeLimit, ok := freeProv.Limits["memory_mb"].(float64)
 	if !ok {
-		t.Fatalf("C9: hobby limits.memory_mb must be float64, got %T", hobbyProv.Limits["memory_mb"])
+		t.Fatalf("C9: free limits.memory_mb must be float64, got %T", freeProv.Limits["memory_mb"])
 	}
-	if hobbyLimit != 25 {
-		t.Errorf("C9: hobby memory_mb: want 25, got %.0f", hobbyLimit)
-	}
-
-	ratio := hobbyLimit / anonLimit
-	if ratio < 2 {
-		t.Errorf("C9: hobby memory_mb must be at least 2x anonymous; got %.1fx", ratio)
+	// The free tier mirrors anonymous — claiming alone does not raise limits.
+	if freeLimit != anonLimit {
+		t.Errorf("C9: free memory_mb (%.0f) should equal anonymous (%.0f) — claiming alone does not raise limits",
+			freeLimit, anonLimit)
 	}
 
-	t.Logf("C9: anonymous=%.0f → hobby=%.0f (%.0fx increase from free claim alone)", anonLimit, hobbyLimit, ratio)
-	t.Logf("C9: mechanism: POST /claim sets resource.tier='hobby' + team.plan_tier='hobby'")
-	t.Logf("C9:            new provisions use team.plan_tier → gets hobby limits immediately")
+	t.Logf("C9: anonymous=%.0f → free=%.0f (claim is an identity step; the paid upgrade is the real jump)", anonLimit, freeLimit)
+	t.Logf("C9: mechanism: POST /claim sets resource.tier='free' + team.plan_tier='free'")
+	t.Logf("C9:            new provisions use team.plan_tier → free limits == anonymous limits")
 }
 
-// ── C10: Hobby resource has correct limits and is accessible via management API ─
+// ── C10: Free resource has correct limits and is accessible via management API ─
 //
-// Verifies that a hobby-tier cache resource provisioned by an authenticated user:
-//   - Has memory_mb limit = 25 (hobby tier from plans.yaml)
+// Verifies that a free-tier cache resource provisioned by an authenticated user:
+//   - Has memory_mb limit = 5 (free tier from plans.yaml, mirrors anonymous)
 //   - Is visible via GET /api/v1/resources with status=active
 //   - Does NOT expose connection_url in the list response
 //
+// Stale-assertion fix (WEBHOOK-VERIFY-2026-05-19): a claimed-but-unpaid team is
+// `free`, not `hobby` — the prior `hobby`/25MB assertions pre-date the tier.
 // No Razorpay required — uses JWT + claim only.
 
-func TestE2E_TierMechanics_C10_HobbyResource_CorrectLimits_VisibleInAPI(t *testing.T) {
+func TestE2E_TierMechanics_C10_FreeResource_CorrectLimits_VisibleInAPI(t *testing.T) {
 	if os.Getenv("E2E_JWT_SECRET") == "" {
 		t.Skip("E2E_JWT_SECRET not set — skipping authenticated tier tests")
 	}
 
 	_, sessionJWT, _ := claimAndGetSession(t)
 
-	// Provision a hobby cache resource.
+	// Provision a free cache resource.
 	prov := provisionAnonymousAuth(t, sessionJWT)
-	if prov.Tier != "hobby" {
-		t.Skipf("C10: expected hobby provision, got %q", prov.Tier)
+	if prov.Tier != "free" {
+		t.Fatalf("C10: expected free provision for a claimed-but-unpaid team, got %q", prov.Tier)
 	}
 
-	// Verify hobby memory_mb limit is exactly 25 (from plans.yaml).
-	hobbyMemMB, _ := prov.Limits["memory_mb"].(float64)
-	if hobbyMemMB != 25 {
-		t.Errorf("C10: hobby memory_mb: want 25, got %.0f", hobbyMemMB)
+	// Verify free memory_mb limit is exactly 5 (from plans.yaml, mirrors anonymous).
+	freeMemMB, _ := prov.Limits["memory_mb"].(float64)
+	if freeMemMB != 5 {
+		t.Errorf("C10: free memory_mb: want 5, got %.0f", freeMemMB)
 	}
-	t.Logf("C10: hobby cache %s | memory_mb=%.0f", prov.Token, hobbyMemMB)
+	t.Logf("C10: free cache %s | memory_mb=%.0f", prov.Token, freeMemMB)
 
 	// The resource must appear in the management API list with status=active.
 	listResp := get(t, "/api/v1/resources", "Authorization", "Bearer "+sessionJWT)
@@ -755,7 +787,7 @@ func TestE2E_TierMechanics_C10_HobbyResource_CorrectLimits_VisibleInAPI(t *testi
 		if item["token"] == prov.Token {
 			found = true
 			if item["status"] != "active" {
-				t.Errorf("C10: hobby resource status: want active, got %v", item["status"])
+				t.Errorf("C10: free resource status: want active, got %v", item["status"])
 			}
 			if _, hasURL := item["connection_url"]; hasURL {
 				t.Error("C10: connection_url must NOT be exposed in management API list response")
@@ -764,7 +796,7 @@ func TestE2E_TierMechanics_C10_HobbyResource_CorrectLimits_VisibleInAPI(t *testi
 		}
 	}
 	if !found {
-		t.Errorf("C10: hobby resource %q not found in management API list", prov.Token)
+		t.Errorf("C10: free resource %q not found in management API list", prov.Token)
 	}
 }
 

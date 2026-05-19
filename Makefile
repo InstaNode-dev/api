@@ -95,17 +95,32 @@ test:
 test-e2e:
 	go test ./e2e/... -v -tags e2e -timeout 60s
 
-# E2E tests with JWT secret fetched from the k8s cluster.
+# E2E tests with secrets fetched from the k8s cluster.
 # This enables management-API tests (GET /auth/me, credential rotation, etc.)
-# that require a valid signed session JWT.
+# that require a valid signed session JWT, the Razorpay billing/webhook suite,
+# and the genuine free/hobby -> pro upgrade assertions.
 #
 # When to use: run `make test-e2e-full` instead of `make test-e2e` any time
-# you change an authenticated endpoint or want the complete E2E suite.
+# you change an authenticated endpoint, the billing path, or want the complete
+# E2E suite.
+#
+# Secrets pulled read-only from the `instant-secrets` secret:
+#   JWT_SECRET               — sign session JWTs (auth-gated tests)
+#   RAZORPAY_WEBHOOK_SECRET  — sign synthetic Razorpay webhook payloads
+#   RAZORPAY_PLAN_ID_PRO     — the real Pro plan_id; without it the pro-tier
+#                              upgrade assertions SKIP (post-F3 an empty
+#                              plan_id maps to `hobby`, not `pro`).
+#   E2E_TEST_TOKEN           — restores per-test fingerprint isolation behind
+#                              an ingress that overwrites X-Forwarded-For;
+#                              without it every test can hit the recycle gate.
 #
 # Requires: kubectl access to the `instant` namespace.
 test-e2e-full:
 	E2E_JWT_SECRET=$(shell kubectl get secret instant-secrets -n instant -o jsonpath='{.data.JWT_SECRET}' 2>/dev/null | base64 -d) \
-	  go test ./e2e/... -v -tags e2e -timeout 60s
+	E2E_RAZORPAY_WEBHOOK_SECRET=$(shell kubectl get secret instant-secrets -n instant -o jsonpath='{.data.RAZORPAY_WEBHOOK_SECRET}' 2>/dev/null | base64 -d) \
+	E2E_RAZORPAY_PLAN_ID_PRO=$(shell kubectl get secret instant-secrets -n instant -o jsonpath='{.data.RAZORPAY_PLAN_ID_PRO}' 2>/dev/null | base64 -d) \
+	E2E_TEST_TOKEN=$(shell kubectl get secret instant-secrets -n instant -o jsonpath='{.data.E2E_TEST_TOKEN}' 2>/dev/null | base64 -d) \
+	  go test ./e2e/... -v -tags e2e -timeout 90s
 
 test-e2e-docker:
 	E2E_BASE_URL=http://localhost:8080 go test ./e2e/... -v -tags e2e -timeout 60s
