@@ -128,6 +128,10 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 				return respondError(c, fiber.StatusTooManyRequests, "provision_limit_reached",
 					"Daily anonymous provisioning limit reached for this network. Sign up at "+urls.StartURLPrefix)
 			}
+			// F2 TOCTOU fix (2026-05-19): over-cap caller, both lookups missed
+			// (burst winners not yet committed). Hard-deny — never fall through
+			// to a fresh provision. See denyProvisionOverCap for the full rationale.
+			return h.denyProvisionOverCap(c, fp, "mongodb")
 		}
 		if err == nil {
 			jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "mongodb", []string{existing.Token.String()})
