@@ -3,6 +3,7 @@ package email_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -275,6 +276,247 @@ func TestBrevoProvider_HandlesUnauthorized(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unauthorized") && !strings.Contains(err.Error(), "Key not found") {
 		t.Errorf("error should include Brevo response body, got %q", err.Error())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// EMAIL-BUGBASH 2026-05-19 regression tests.
+// ---------------------------------------------------------------------------
+
+// captureBrevo builds a Brevo-backed client wired to a test server and
+// returns the client plus a pointer to the last captured request body. Used
+// by the domain-drift / amount / suppression tests below.
+func captureBrevo(t *testing.T) (*email.Client, *map[string]any) {
+	t.Helper()
+	captured := &map[string]any{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		*captured = body
+		w.WriteHeader(http.StatusCreated)
+	}))
+	t.Cleanup(srv.Close)
+	rewrite := &urlRewriter{base: srv.URL, inner: http.DefaultTransport}
+	c := email.New(email.Config{
+		Provider:    "brevo",
+		BrevoAPIKey: "xkeysib-test",
+		HTTPClient:  &http.Client{Transport: rewrite},
+	})
+	return c, captured
+}
+
+// TestNoEmailBodyContainsInstantDev is the EMAIL-BUGBASH C2/F1/F11 domain-drift
+// regression guard. It drives every customer-facing api email through a fake
+// Brevo server and asserts the subject + textContent + htmlContent never
+// contain the bare wrong domain "instant.dev". Fails before the fix because
+// SendPaymentFailed and SendTeamInvite hardcoded "instant.dev".
+//
+// "instanode.dev" legitimately contains "instant.dev" as a substring is NOT
+// true ("instanode" != "instant"), so a plain Contains check is safe; but to
+// be unambiguous the assertion strips the correct domain first.
+func TestNoEmailBodyContainsInstantDev(t *testing.T) {
+	next := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	sends := []struct {
+		name string
+		fn   func(c *email.Client) error
+	}{
+		{"SendPaymentFailed", func(c *email.Client) error {
+			return c.SendPaymentFailed(context.Background(), "u@example.com", 2, &next)
+		}},
+		{"SendPaymentFailedFinal", func(c *email.Client) error {
+			return c.SendPaymentFailed(context.Background(), "u@example.com", 3, nil)
+		}},
+		{"SendTeamInvite", func(c *email.Client) error {
+			return c.SendTeamInvite(context.Background(), "u@example.com", "Acme", "https://api.instanode.dev/i/abc")
+		}},
+		{"SendPaymentSucceeded", func(c *email.Client) error {
+			return c.SendPaymentSucceeded(context.Background(), "u@example.com", email.PaymentReceipt{
+				Plan: "Pro", AmountDisplay: "$49.00", Period: "monthly", AmountKnown: true,
+			})
+		}},
+		{"SendMagicLink", func(c *email.Client) error {
+			return c.SendMagicLink(context.Background(), "u@example.com", "https://api.instanode.dev/m?t=x")
+		}},
+		{"SendDeletionConfirmation", func(c *email.Client) error {
+			return c.SendDeletionConfirmation(context.Background(), "u@example.com", "deployment x", "https://api.instanode.dev/d?t=x", 15)
+		}},
+	}
+	for _, s := range sends {
+		t.Run(s.name, func(t *testing.T) {
+			c, captured := captureBrevo(t)
+			if err := s.fn(c); err != nil {
+				t.Fatalf("%s: %v", s.name, err)
+			}
+			for _, field := range []string{"subject", "textContent", "htmlContent"} {
+				v, _ := (*captured)[field].(string)
+				// Strip the correct domain so any remaining "instant.dev"
+				// substring is unambiguously the wrong domain.
+				stripped := strings.ReplaceAll(v, "instanode.dev", "")
+				if strings.Contains(stripped, "instant.dev") {
+					t.Errorf("%s.%s contains wrong domain instant.dev:\n%s", s.name, field, v)
+				}
+			}
+		})
+	}
+}
+
+// TestSendPaymentFailed_UsesCorrectBillingURL pins the C2/F1 CTA fix: the
+// payment-failed email must link to instanode.dev/app/billing, never the dead
+// instant.dev/billing/checkout path.
+func TestSendPaymentFailed_UsesCorrectBillingURL(t *testing.T) {
+	c, captured := captureBrevo(t)
+	if err := c.SendPaymentFailed(context.Background(), "u@example.com", 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"textContent", "htmlContent"} {
+		v, _ := (*captured)[field].(string)
+		if !strings.Contains(v, "https://instanode.dev/app/billing") {
+			t.Errorf("%s missing correct billing URL, got:\n%s", field, v)
+		}
+		if strings.Contains(v, "/billing/checkout") {
+			t.Errorf("%s still references dead /billing/checkout path:\n%s", field, v)
+		}
+	}
+}
+
+// TestSendPaymentFailed_AttemptCountClamped is the C6 regression guard:
+// out-of-range attempt counts must never render "attempt 4 of 3" /
+// "attempt 0 of 3". The clamp bounds the count into [1, 3].
+func TestSendPaymentFailed_AttemptCountClamped(t *testing.T) {
+	cases := []struct{ in int }{{-1}, {0}, {4}, {99}}
+	for _, tc := range cases {
+		c, captured := captureBrevo(t)
+		if err := c.SendPaymentFailed(context.Background(), "u@example.com", tc.in, nil); err != nil {
+			t.Fatalf("attempt=%d: %v", tc.in, err)
+		}
+		for _, field := range []string{"textContent", "htmlContent"} {
+			v, _ := (*captured)[field].(string)
+			for _, bad := range []string{"attempt 0 of", "attempt 4 of", "attempt 99 of", "attempt -1 of", "0 of 3", "4 of 3"} {
+				if strings.Contains(v, bad) {
+					t.Errorf("attempt=%d: %s renders unclamped %q:\n%s", tc.in, field, bad, v)
+				}
+			}
+		}
+	}
+}
+
+// TestSendPaymentFailed_NoBlankLinesInPlainText is the C7 guard: when no
+// retry date and not final, the text/plain body must not contain a run of
+// blank lines from empty interpolated %s.
+func TestSendPaymentFailed_NoBlankLinesInPlainText(t *testing.T) {
+	c, captured := captureBrevo(t)
+	// attempt 2, no nextAttemptDate, not final → both retryLine and
+	// urgencyLine are empty.
+	if err := c.SendPaymentFailed(context.Background(), "u@example.com", 2, nil); err != nil {
+		t.Fatal(err)
+	}
+	txt, _ := (*captured)["textContent"].(string)
+	if strings.Contains(txt, "\n\n\n") {
+		t.Errorf("plain text has a run of blank lines (C7):\n%q", txt)
+	}
+}
+
+// TestSendPaymentSucceeded_UnknownAmount is the C8 guard: when AmountKnown is
+// false the receipt must NOT print a definite "Amount: <value>" — it renders
+// the parenthetical pointer instead.
+func TestSendPaymentSucceeded_UnknownAmount(t *testing.T) {
+	c, captured := captureBrevo(t)
+	err := c.SendPaymentSucceeded(context.Background(), "u@example.com", email.PaymentReceipt{
+		Plan: "Pro", AmountDisplay: "see your billing dashboard", Period: "monthly", AmountKnown: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	txt, _ := (*captured)["textContent"].(string)
+	if !strings.Contains(txt, "(see your billing dashboard for the exact amount)") {
+		t.Errorf("unknown-amount receipt missing parenthetical pointer:\n%s", txt)
+	}
+	// Known-amount path still prints the figure.
+	c2, captured2 := captureBrevo(t)
+	if err := c2.SendPaymentSucceeded(context.Background(), "u@example.com", email.PaymentReceipt{
+		Plan: "Pro", AmountDisplay: "$49.00", Period: "monthly", AmountKnown: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	txt2, _ := (*captured2)["textContent"].(string)
+	if !strings.Contains(txt2, "$49.00") {
+		t.Errorf("known-amount receipt missing the amount:\n%s", txt2)
+	}
+}
+
+// fakeSuppression is a test SuppressionChecker. suppressed addresses return
+// true; errFor addresses return an error (to exercise the fail-open path).
+type fakeSuppression struct {
+	suppressed map[string]bool
+	errFor     map[string]bool
+}
+
+func (f *fakeSuppression) IsSuppressed(_ context.Context, addr string) (bool, error) {
+	if f.errFor[addr] {
+		return false, errors.New("fake db error")
+	}
+	return f.suppressed[addr], nil
+}
+
+// TestSuppressedAddressIsNotSent is the C3 regression guard: a client with a
+// SuppressionChecker must NOT POST to Brevo for a suppressed recipient. The
+// fake Brevo server records whether it was hit; for a suppressed address it
+// must stay untouched, and send() must still return nil (a skip is success).
+func TestSuppressedAddressIsNotSent(t *testing.T) {
+	var hit bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hit = true
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	rewrite := &urlRewriter{base: srv.URL, inner: http.DefaultTransport}
+	c := email.New(email.Config{
+		Provider: "brevo", BrevoAPIKey: "xkeysib-test",
+		HTTPClient: &http.Client{Transport: rewrite},
+	}).WithSuppressionChecker(&fakeSuppression{
+		suppressed: map[string]bool{"bounced@example.com": true},
+	})
+
+	// Suppressed recipient — must NOT hit Brevo, must return nil.
+	if err := c.SendMagicLink(context.Background(), "bounced@example.com", "https://x/m?t=1"); err != nil {
+		t.Fatalf("send to suppressed address should return nil, got %v", err)
+	}
+	if hit {
+		t.Fatal("C3: a suppressed address was still POSTed to Brevo")
+	}
+
+	// Non-suppressed recipient — must hit Brevo.
+	if err := c.SendMagicLink(context.Background(), "ok@example.com", "https://x/m?t=2"); err != nil {
+		t.Fatalf("send to ok address: %v", err)
+	}
+	if !hit {
+		t.Fatal("non-suppressed address should have been sent")
+	}
+}
+
+// TestSuppressionCheck_FailsOpen verifies that a SuppressionChecker error
+// does NOT block the send — a Postgres blip must never swallow a sign-in
+// link (C3 fail-open contract).
+func TestSuppressionCheck_FailsOpen(t *testing.T) {
+	var hit bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hit = true
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	rewrite := &urlRewriter{base: srv.URL, inner: http.DefaultTransport}
+	c := email.New(email.Config{
+		Provider: "brevo", BrevoAPIKey: "xkeysib-test",
+		HTTPClient: &http.Client{Transport: rewrite},
+	}).WithSuppressionChecker(&fakeSuppression{
+		errFor: map[string]bool{"u@example.com": true},
+	})
+	if err := c.SendMagicLink(context.Background(), "u@example.com", "https://x/m?t=1"); err != nil {
+		t.Fatalf("fail-open: send should still succeed on suppression error, got %v", err)
+	}
+	if !hit {
+		t.Fatal("fail-open: send should have proceeded to Brevo despite the suppression error")
 	}
 }
 
