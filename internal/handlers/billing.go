@@ -51,6 +51,26 @@ const checkoutInflightTTL = 60 * time.Second
 // the same team also bounces — the subscription belongs to the team.
 const checkoutInflightKeyPrefix = "team_checkout_inflight:"
 
+// monthlyOngoingTotalCount / yearlyOngoingTotalCount are the Razorpay
+// subscription `total_count` values for an ONGOING (effectively indefinite)
+// plan. Razorpay's create-subscription API requires a finite total_count, so
+// "indefinite" is expressed as a count large enough that the subscription
+// never auto-completes in any realistic customer lifetime:
+//
+//   - monthly: 1200 cycles = 100 years of monthly charges.
+//   - yearly:  100 cycles  = 100 years of annual charges.
+//
+// Audit finding F12: the previous values (12 monthly / 1 yearly) made a
+// healthy paying customer's subscription auto-`completed` after the agreed
+// term, which the webhook treated as a cancellation and downgraded — silently
+// punishing a loyal customer. With these values the subscription stays active
+// for the customer's entire realistic lifetime; a genuine cancellation still
+// flows through subscription.cancelled, untouched.
+const (
+	monthlyOngoingTotalCount = 1200
+	yearlyOngoingTotalCount  = 100
+)
+
 // BillingHandler handles billing and Razorpay webhook endpoints.
 type BillingHandler struct {
 	db    *sql.DB
@@ -240,6 +260,30 @@ func (h *BillingHandler) planIDToTier(planID string) string {
 		"action", "Check RAZORPAY_PLAN_ID_* env vars — an unknown plan_id will be treated as "+planIDToTierFallback,
 	)
 	return planIDToTierFallback
+}
+
+// planIDRecognised reports whether planID matches a configured RAZORPAY_PLAN_ID_*
+// value — i.e. whether planIDToTier returned a genuine mapping rather than the
+// fail-safe fallback. handleSubscriptionCharged uses this for F3: an
+// unrecognised plan_id means the platform does not actually know what tier the
+// customer paid for, so the charge must be flagged for operator make-good
+// (billing.charge_undeliverable) even though the safe fallback tier is still
+// granted to cap blast radius. An empty planID is treated as unrecognised.
+func (h *BillingHandler) planIDRecognised(planID string) bool {
+	if planID == "" {
+		return false
+	}
+	for _, configured := range []string{
+		h.cfg.RazorpayPlanIDTeam, h.cfg.RazorpayPlanIDTeamYearly,
+		h.cfg.RazorpayPlanIDPro, h.cfg.RazorpayPlanIDProYearly,
+		h.cfg.RazorpayPlanIDHobbyPlus, h.cfg.RazorpayPlanIDHobbyPlusYearly,
+		h.cfg.RazorpayPlanIDHobby, h.cfg.RazorpayPlanIDHobbyYearly,
+	} {
+		if configured != "" && planID == configured {
+			return true
+		}
+	}
+	return false
 }
 
 // requireVerifiedEmail gates billing/upgrade actions on the acting user's
@@ -445,12 +489,19 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 
 	client := razorpay.NewClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
 
-	// total_count is the number of billing cycles before the subscription
-	// auto-completes. Monthly: 12 cycles ≈ 12 months. Yearly: 1 cycle ≈ 1
-	// year. cancel-at-cycle-end exits earlier via the cancelled webhook.
-	totalCount := 12
+	// total_count is the number of billing cycles Razorpay charges before the
+	// subscription auto-completes (fires subscription.completed → historically
+	// a downgrade). For an ONGOING monthly plan we never want that
+	// auto-completion: a customer who pays every month must not be silently
+	// downgraded at month 13 (audit finding F12). Razorpay's API requires a
+	// finite total_count, so we use monthlyOngoingTotalCount — a count so
+	// large (100 years of monthly cycles) the subscription is ongoing for
+	// every practical purpose. A yearly plan uses yearlyOngoingTotalCount for
+	// the same reason. Genuine cancel-at-cycle-end still exits early via the
+	// cancelled webhook; the count is only the auto-complete ceiling.
+	totalCount := monthlyOngoingTotalCount
 	if frequency == "yearly" {
-		totalCount = 1
+		totalCount = yearlyOngoingTotalCount
 	}
 	notes := map[string]interface{}{
 		"team_id":        teamID.String(),
@@ -784,10 +835,17 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 			})
 		}
 	case "subscription.completed":
-		// P1-F: the subscription reached the end of its agreed term
-		// (total_count of billing cycles consumed). No renewal — downgrade
-		// per the same policy as a cancellation.
-		if hErr := h.handleSubscriptionCancelled(ctx, c, event); hErr != nil {
+		// F12: subscription.completed fires when a subscription consumes its
+		// agreed total_count of billing cycles. Routing this straight to
+		// handleSubscriptionCancelled (the pre-fix behaviour) DOWNGRADED a
+		// customer who had paid every single cycle and never asked to leave —
+		// punishing a loyal paying customer and emailing them a "canceled"
+		// notice. handleSubscriptionCompleted instead keeps a healthy paying
+		// customer on their plan; only a genuinely non-paying completion
+		// (paid_count == 0) downgrades. New subscriptions also no longer cap
+		// at 12 cycles (see monthlyOngoingTotalCount) so this event becomes
+		// rare — but legacy 12-count subscriptions still reach it.
+		if hErr := h.handleSubscriptionCompleted(ctx, c, event); hErr != nil {
 			slog.Error("billing.webhook.subscription_completed.failed",
 				"error", hErr, "event_id", eventID)
 			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
@@ -929,27 +987,79 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 
 	teamID, err := resolveTeamFromNotes(ctx, h, sub)
 	if err != nil {
-		slog.Error("billing.subscription.charged.team_resolve_failed",
-			"error", err, "sub_id", sub.ID)
-		return nil // team not found — retrying won't help; swallow
+		// F2: discriminate a transient DB error from a genuinely
+		// unresolvable payload — mirror handleSubscriptionCancelled's
+		// teamResolveUnretryable contract. Previously this returned nil for
+		// EVERY error, so a transient DB blip during team lookup → 200 →
+		// Razorpay never retries → a real charge is permanently lost.
+		if !teamResolveUnretryable(err) {
+			// Transient/DB error — retryable. Return it so RazorpayWebhook
+			// releases the dedup claim and 500s; Razorpay redelivers.
+			slog.Error("billing.subscription.charged.team_resolve_failed",
+				"error", err, "sub_id", sub.ID)
+			return fmt.Errorf("subscription.charged team resolve: %w", err)
+		}
+		// F8: genuinely unresolvable team (bad/missing notes) — the card was
+		// charged but the upgrade can NEVER be delivered by retrying.
+		// Record it loudly as a make-good worklist item; do NOT 500 (a retry
+		// would just re-burn the claim for a payload that will never resolve).
+		slog.Error("billing.subscription.charged.team_unresolvable",
+			"error", err, "sub_id", sub.ID,
+			"action", "Charge confirmed but team is unresolvable — operator must reconcile/refund this charge in the Razorpay dashboard")
+		emitChargeUndeliverableAudit(ctx, h.db, uuid.Nil, sub, event,
+			chargeUndeliverableReasonTeamUnresolvable, "")
+		return nil
 	}
 
 	tier := h.planIDToTier(sub.PlanID)
 
-	// Tier validation guard: verify the resolved tier exists in the plans
-	// registry before writing it to the DB. A tier rename or a future
-	// plans.yaml change could otherwise introduce an unknown string into
-	// teams.plan_tier, breaking limits resolution everywhere.
-	// Fail-safe: log Error + return nil (swallow). Razorpay retrying won't
-	// help — the fix is an env-var or plans.yaml update by the operator.
-	if _, tierKnown := plans.Default().All()[tier]; !tierKnown {
+	// F3 — unknown / unrecognised plan_id is no longer SILENTLY swallowed.
+	// Two distinct miss conditions are make-good cases (the card was charged,
+	// likely at a higher price, but the platform cannot be sure it is granting
+	// the tier the customer paid for):
+	//
+	//   1. planIDRecognised(sub.PlanID) == false — the plan_id matches no
+	//      configured RAZORPAY_PLAN_ID_* value (an env-var typo, or a plan
+	//      created in the Razorpay dashboard but never wired). planIDToTier
+	//      returns the SAFE fallback tier here to cap blast radius, but the
+	//      charge MUST still be flagged: we are guessing.
+	//   2. The resolved tier is not in plans.yaml — a tier rename / removed
+	//      tier would otherwise write an unknown string into teams.plan_tier
+	//      and break limits resolution everywhere.
+	//
+	// Either condition: loud slog.Error + a billing.charge_undeliverable
+	// audit row (F8) so an operator reconciles the charge. We do NOT 500
+	// (Razorpay retrying cannot help — the fix is an operator env-var /
+	// plans.yaml change). For condition 2 we also stop before writing the
+	// bad tier; for condition 1 the safe fallback tier is still applied below
+	// so the customer is not left on free after paying.
+	_, tierKnown := plans.Default().All()[tier]
+	planRecognised := h.planIDRecognised(sub.PlanID)
+	if !tierKnown {
 		slog.Error("billing.subscription.charged.unknown_tier",
 			"plan_id", sub.PlanID,
 			"resolved_tier", tier,
 			"team_id", teamID,
-			"action", "Resolved tier is not in plans.yaml — check RAZORPAY_PLAN_ID_* env vars and plans.yaml",
+			"action", "Charge confirmed but resolved tier is not in plans.yaml — check RAZORPAY_PLAN_ID_* env vars and plans.yaml, then reconcile/refund this charge",
 		)
+		emitChargeUndeliverableAudit(ctx, h.db, teamID, sub, event,
+			chargeUndeliverableReasonUnknownTier, tier)
 		return nil
+	}
+	if !planRecognised {
+		// The plan_id is not one we configured — we are granting the safe
+		// fallback tier as a guess. Flag the charge for operator make-good but
+		// still proceed with the fallback upgrade so the customer is not
+		// stranded on free after paying.
+		slog.Error("billing.subscription.charged.unrecognised_plan_id",
+			"plan_id", sub.PlanID,
+			"fallback_tier", tier,
+			"team_id", teamID,
+			"action", "Charge confirmed for an unrecognised plan_id — granted the fallback tier as a guess; operator must verify the customer's intended tier and reconcile/refund if wrong",
+		)
+		emitChargeUndeliverableAudit(ctx, h.db, teamID, sub, event,
+			chargeUndeliverableReasonUnknownTier, tier)
+		// fall through — apply the fallback tier upgrade.
 	}
 
 	// Snapshot the prior tier BEFORE the update so we can classify the
@@ -999,6 +1109,16 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 	// Best-effort audit emit for the Loops forwarder. Fail-open: an audit
 	// error must not undo the tier update we already committed.
 	emitSubscriptionChangeAudit(ctx, h.db, teamID, fromTier, tier, sub.ID)
+
+	// F4: send the customer their payment receipt. Fires on EVERY successful
+	// charge — the first paid upgrade AND every monthly/yearly renewal — so a
+	// paying customer always has an artifact confirming money left their
+	// account (renewals were previously completely silent). isRenewal is
+	// derived from the tier transition: a strict tier change is the upgrade
+	// receipt, a same-tier charge is the renewal receipt. Fail-open: a receipt
+	// send failure must NOT undo the committed upgrade or 500 the webhook —
+	// the customer is upgraded regardless of email delivery.
+	h.sendPaymentReceipt(ctx, teamID, tier, fromTier, event)
 
 	// Dunning recovery path: a successful charge during an active grace
 	// window means the customer's card recovered before the 7-day clock
@@ -1143,6 +1263,70 @@ func (h *BillingHandler) handleSubscriptionCancelled(ctx context.Context, c *fib
 	// an audit failure.
 	emitSubscriptionCanceledAudit(ctx, h.db, teamID, fromTier, tier, sub.ID)
 	return nil
+}
+
+// handleSubscriptionCompleted processes subscription.completed events (F12).
+//
+// subscription.completed fires when a Razorpay subscription consumes its
+// agreed total_count of billing cycles. The pre-fix code routed this straight
+// to handleSubscriptionCancelled, which DOWNGRADED the team — so a customer
+// who paid every single cycle of a (legacy) 12-count monthly subscription was
+// silently dropped to hobby at month 13 and emailed a "canceled" notice they
+// never asked for.
+//
+// The corrected policy: a completion on a HEALTHY paying subscription
+// (paid_count > 0) is NOT a cancellation. The customer kept paying; keep them
+// on their plan. We deliberately do NOT downgrade and do NOT emit the
+// cancellation audit/email. (New subscriptions no longer cap at 12 cycles —
+// see monthlyOngoingTotalCount — so a completion on a healthy subscription
+// becomes vanishingly rare; this branch protects the legacy 12-count
+// subscriptions still in flight.)
+//
+// A completion with paid_count == 0 means the subscription ended without a
+// single successful payment — there is nothing to protect, so it downgrades
+// exactly like a zero-paid cancellation (handleSubscriptionCancelled already
+// maps paid_count == 0 → the 'free' floor).
+//
+// Error contract mirrors handleSubscriptionCancelled: a parse failure is
+// non-retryable (nil); a real DB error is retryable (returned → 500 → retry).
+func (h *BillingHandler) handleSubscriptionCompleted(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) error {
+	sub, ok := parseSubscriptionEntity(event)
+	if !ok {
+		slog.Error("billing.subscription.completed.parse_failed")
+		return nil
+	}
+
+	// A healthy paying subscription that simply reached its term ceiling must
+	// keep its plan — downgrading a loyal paying customer is the F12 bug.
+	// paid_count == 0 (or absent) is the only completion we treat as a
+	// genuine end-of-relationship and route to the downgrade path.
+	if sub.PaidCount == nil || *sub.PaidCount > 0 {
+		teamID, err := resolveTeamFromNotes(ctx, h, sub)
+		if err != nil {
+			if teamResolveUnretryable(err) {
+				slog.Warn("billing.subscription.completed.team_unresolvable",
+					"error", err, "sub_id", sub.ID)
+				return nil
+			}
+			slog.Error("billing.subscription.completed.team_resolve_failed",
+				"error", err, "sub_id", sub.ID)
+			return fmt.Errorf("subscription.completed team resolve: %w", err)
+		}
+		// Loud, intentional no-op: the customer paid every cycle; their plan
+		// is untouched. An operator may want to re-create an ongoing
+		// subscription, but the platform must NEVER auto-downgrade them here.
+		slog.Info("billing.subscription.completed.healthy_kept_on_plan",
+			"team_id", teamID, "subscription_id", sub.ID,
+			"paid_count_known", sub.PaidCount != nil,
+			"action", "subscription reached its term ceiling while paying — team kept on plan, not downgraded (F12)")
+		return nil
+	}
+
+	// paid_count == 0 — the subscription ended without ever charging the
+	// card. Downgrade exactly as a never-paid cancellation would.
+	slog.Info("billing.subscription.completed.unpaid_downgrading",
+		"subscription_id", sub.ID)
+	return h.handleSubscriptionCancelled(ctx, c, event)
 }
 
 // handlePaymentFailed processes payment.failed events.
@@ -1899,6 +2083,162 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 		"effective_date": res.EffectiveDate.UTC().Format(time.RFC3339Nano),
 		"short_url":      res.CheckoutShort,
 	})
+}
+
+// chargeUndeliverableReason* are the canonical `reason` values stamped into a
+// billing.charge_undeliverable audit row's metadata. Named constants (project
+// convention) so the emit site and any operator dashboard/alert filter cannot
+// drift.
+const (
+	// chargeUndeliverableReasonTeamUnresolvable — F2/F8: the charged
+	// subscription's notes carry no resolvable team and no subscription_id
+	// maps to one. The charge cannot be matched to an account.
+	chargeUndeliverableReasonTeamUnresolvable = "team_unresolvable"
+	// chargeUndeliverableReasonUnknownTier — F3/F8: the team resolved but the
+	// plan_id maps to a tier that is not in plans.yaml, so no entitlement can
+	// be granted.
+	chargeUndeliverableReasonUnknownTier = "unknown_tier"
+)
+
+// chargedPaymentMeta extracts the payment id, amount (in the currency's minor
+// unit — paise/cents), and currency from a subscription.charged event's
+// optional payload.payment entity. Razorpay bundles the successful payment
+// alongside the subscription on a charged event; when it is absent every
+// field is the zero value and callers fall back accordingly.
+func chargedPaymentMeta(event rzpWebhookEvent) (paymentID string, amountMinor int64, currency string) {
+	if event.Payload.Payment == nil {
+		return "", 0, ""
+	}
+	var pay rzpPaymentEntity
+	if err := json.Unmarshal(event.Payload.Payment.Entity, &pay); err != nil {
+		return "", 0, ""
+	}
+	return pay.ID, pay.Amount, pay.Currency
+}
+
+// formatChargedAmount turns a Razorpay minor-unit amount + currency code into
+// a display string for the receipt email. Razorpay amounts are always in the
+// currency's smallest unit (paise for INR, cents for USD), so we divide by 100
+// for the major unit. An unknown/empty currency still renders the numeric
+// amount so the receipt is never blank. A zero amount (payment entity absent
+// on the event) renders the honest "see your billing dashboard" fallback
+// rather than a misleading "0.00".
+func formatChargedAmount(amountMinor int64, currency string) string {
+	currency = strings.ToUpper(strings.TrimSpace(currency))
+	if amountMinor <= 0 {
+		return "see your billing dashboard"
+	}
+	major := float64(amountMinor) / 100.0
+	switch currency {
+	case "INR":
+		return fmt.Sprintf("₹%.2f", major)
+	case "USD":
+		return fmt.Sprintf("$%.2f", major)
+	case "":
+		return fmt.Sprintf("%.2f", major)
+	default:
+		return fmt.Sprintf("%s %.2f", currency, major)
+	}
+}
+
+// sendPaymentReceipt sends the F4 payment-success receipt email to the team
+// owner after a successful subscription.charged. It is fully fail-open: every
+// failure (no owner row, no email on file, email-send error) is logged at WARN
+// and swallowed — a receipt-delivery problem must never undo the committed
+// upgrade or turn the webhook into a 500.
+//
+// isRenewal is derived from the tier transition: fromTier == toTier means the
+// customer was already on this tier (a renewal charge); a strict change means
+// this charge upgraded them. Either way a receipt is sent — renewals are no
+// longer silent.
+func (h *BillingHandler) sendPaymentReceipt(ctx context.Context, teamID uuid.UUID, toTier, fromTier string, event rzpWebhookEvent) {
+	if h.email == nil {
+		return
+	}
+	owner, ownerErr := models.GetUserByTeamID(ctx, h.db, teamID)
+	if ownerErr != nil || owner == nil || owner.Email == "" {
+		slog.Warn("billing.subscription.charged.receipt_no_email",
+			"error", ownerErr, "team_id", teamID)
+		return
+	}
+
+	_, amountMinor, currency := chargedPaymentMeta(event)
+
+	reg := plans.Default()
+	planLabel := reg.DisplayName(toTier)
+	if strings.TrimSpace(planLabel) == "" {
+		planLabel = toTier
+	}
+	period := reg.BillingPeriod(toTier)
+	if strings.TrimSpace(period) == "" {
+		period = "monthly"
+	}
+
+	receipt := email.PaymentReceipt{
+		Plan:          planLabel,
+		AmountDisplay: formatChargedAmount(amountMinor, currency),
+		Period:        period,
+		IsRenewal:     strings.EqualFold(strings.TrimSpace(fromTier), strings.TrimSpace(toTier)),
+	}
+	if err := h.email.SendPaymentSucceeded(ctx, owner.Email, receipt); err != nil {
+		slog.Warn("billing.subscription.charged.receipt_send_failed",
+			"error", err, "team_id", teamID, "to", owner.Email)
+		return
+	}
+	slog.Info("billing.subscription.charged.receipt_sent",
+		"team_id", teamID, "to", owner.Email, "plan", toTier, "is_renewal", receipt.IsRenewal)
+}
+
+// emitChargeUndeliverableAudit writes a high-severity
+// billing.charge_undeliverable audit row (F8) — the make-good worklist signal
+// for a charge that was confirmed by Razorpay but that the platform cannot
+// turn into a delivered upgrade (an unresolvable team, F2/F8; or an unknown
+// plan tier, F3). It carries the subscription_id, payment_id, and reason so an
+// operator can locate the charge in the Razorpay dashboard and reconcile it
+// (refund or hand-grant). It does NOT issue an automatic refund — that stays a
+// deliberate operator action; the deliverable here is that the event is loudly
+// and durably recorded, never silent.
+//
+// teamID may be uuid.Nil when the team itself could not be resolved —
+// InsertAuditEvent stores uuid.Nil as SQL NULL, so the row still lands as an
+// admin-only (no team) audit entry. Best-effort: an audit-write failure logs
+// at Error (the slog line is the second, independent alert surface) but never
+// surfaces to the webhook caller.
+func emitChargeUndeliverableAudit(ctx context.Context, db *sql.DB, teamID uuid.UUID, sub rzpSubscriptionEntity, event rzpWebhookEvent, reason, resolvedTier string) {
+	if db == nil {
+		return
+	}
+	paymentID, amountMinor, currency := chargedPaymentMeta(event)
+	meta := map[string]any{
+		"reason":          reason,
+		"subscription_id": sub.ID,
+		"payment_id":      paymentID,
+		"plan_id":         sub.PlanID,
+	}
+	if resolvedTier != "" {
+		meta["resolved_tier"] = resolvedTier
+	}
+	if amountMinor > 0 {
+		meta["amount_minor"] = amountMinor
+		meta["currency"] = currency
+	}
+	metaBlob, _ := json.Marshal(meta)
+
+	if err := models.InsertAuditEvent(ctx, db, models.AuditEvent{
+		TeamID:   teamID,
+		Actor:    "system",
+		Kind:     models.AuditKindBillingChargeUndeliverable,
+		Summary:  "charge confirmed but undeliverable (" + reason + ") — operator must reconcile/refund",
+		Metadata: metaBlob,
+	}); err != nil {
+		slog.Error("billing.charge_undeliverable.audit_emit_failed",
+			"kind", models.AuditKindBillingChargeUndeliverable,
+			"team_id", teamID,
+			"subscription_id", sub.ID,
+			"reason", reason,
+			"error", err,
+		)
+	}
 }
 
 // emitSubscriptionChangeAudit writes a subscription.upgraded or

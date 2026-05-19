@@ -414,6 +414,88 @@ https://instant.dev/billing/checkout
 	return c.send(ctx, to, subject, plain, html)
 }
 
+// PaymentReceipt carries the fields rendered into the payment-success
+// (receipt) email. All amounts are display-ready strings — the caller
+// formats currency + minor units so this package stays currency-agnostic.
+//
+// Plan is the canonical tier label shown to the customer ("Pro", "Hobby").
+// AmountDisplay is the charged amount already formatted with its currency
+// symbol/code (e.g. "₹4,900.00" or "$49.00"). Period is a human-readable
+// billing cycle ("monthly" / "yearly"). IsRenewal toggles the copy between
+// a first-charge "thanks for upgrading" receipt and a recurring
+// "your subscription renewed" receipt — both are still a receipt and both
+// always send (renewals are NOT silent: F4).
+type PaymentReceipt struct {
+	Plan          string
+	AmountDisplay string
+	Period        string
+	IsRenewal     bool
+}
+
+// SendPaymentSucceeded sends the customer's payment receipt — fired on every
+// successful Razorpay subscription charge (first upgrade AND every monthly
+// renewal). This is the artifact that confirms money left the customer's
+// account; before it existed (audit finding F4) a paying customer could get
+// zero communication that they were charged.
+//
+// Go-rendered in full (CLAUDE.md rule 70 — all email kinds Go-rendered, no
+// Brevo template dependency) so the receipt copy can never silently break
+// on a template-id drift.
+func (c *Client) SendPaymentSucceeded(ctx context.Context, to string, receipt PaymentReceipt) error {
+	headline := "Payment received — your instanode.dev plan is active"
+	leadPlain := fmt.Sprintf("Thank you for upgrading to %s. Your payment was successful and your plan is now active.", receipt.Plan)
+	leadHTML := fmt.Sprintf("Thank you for upgrading to <strong>%s</strong>. Your payment was successful and your plan is now active.", htmlEscape(receipt.Plan))
+	if receipt.IsRenewal {
+		headline = "Payment received — your instanode.dev subscription renewed"
+		leadPlain = fmt.Sprintf("Your %s subscription renewed successfully. Thanks for staying with instanode.dev.", receipt.Plan)
+		leadHTML = fmt.Sprintf("Your <strong>%s</strong> subscription renewed successfully. Thanks for staying with instanode.dev.", htmlEscape(receipt.Plan))
+	}
+	subject := headline
+
+	plain := fmt.Sprintf(`%s
+
+%s
+
+Receipt
+  Plan:    %s
+  Amount:  %s
+  Billing: %s
+
+View your billing details: https://instanode.dev/app/billing
+
+Need help? Reply to this email or contact support@instanode.dev.
+
+— The instanode.dev team
+`, headline, leadPlain, receipt.Plan, receipt.AmountDisplay, receipt.Period)
+
+	htmlBody := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#111;">
+  <h2>%s</h2>
+  <p>%s</p>
+  <table style="margin-top:16px;border-collapse:collapse;background:#f5f5f5;border-radius:6px;width:100%%;">
+    <tr><td style="padding:10px 16px;color:#666;">Plan</td><td style="padding:10px 16px;font-weight:bold;">%s</td></tr>
+    <tr><td style="padding:10px 16px;color:#666;">Amount</td><td style="padding:10px 16px;font-weight:bold;">%s</td></tr>
+    <tr><td style="padding:10px 16px;color:#666;">Billing</td><td style="padding:10px 16px;font-weight:bold;">%s</td></tr>
+  </table>
+  <p style="margin-top:32px;">
+    <a href="https://instanode.dev/app/billing"
+       style="background:#111;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:bold;">
+      View billing details &rarr;
+    </a>
+  </p>
+  <p style="margin-top:24px;color:#666;font-size:13px;">
+    Need help? Reply to this email or contact
+    <a href="mailto:support@instanode.dev" style="color:#444;">support@instanode.dev</a>.
+  </p>
+  <p style="margin-top:40px;color:#666;font-size:13px;">— The instanode.dev team</p>
+</body>
+</html>`, headline, leadHTML, htmlEscape(receipt.Plan), htmlEscape(receipt.AmountDisplay), htmlEscape(receipt.Period))
+
+	return c.send(ctx, to, subject, plain, htmlBody)
+}
+
 // SendMagicLink emails a one-click sign-in link to the user. The link MUST
 // already point at the API's /auth/email/callback endpoint — this function
 // does not construct it.
