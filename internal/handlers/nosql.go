@@ -281,6 +281,11 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 		"upgrade":        upgradeURL,
 		"upgrade_jwt":    jwtToken,
 	}
+	// T19 P0-2 (BugHunt 2026-05-20): emit top-level expires_at for
+	// shape parity with storage/webhook responses; see db.go for rationale.
+	if resource.ExpiresAt.Valid {
+		nosqlResp["expires_at"] = resource.ExpiresAt.Time.Format(time.RFC3339)
+	}
 	if nosqlStorageExceeded {
 		nosqlResp["warning"] = "Storage limit reached. Upgrade to continue."
 		c.Set("X-Instant-Notice", "storage_limit_reached")
@@ -470,7 +475,10 @@ func (h *NoSQLHandler) ProvisionForTwin(c *fiber.Ctx, in ProvisionForTwinInput) 
 	ctx := c.UserContext()
 	res, err := h.ProvisionForTwinCore(ctx, in)
 	if err != nil {
-		return respondProvisionFailed(c, err, err.Error())
+		// T12 P1-1 (BugBash 2026-05-20): use a static message, never err.Error(),
+		// to avoid leaking the admin DSN (which contains the admin password) into
+		// the response body. Matches the non-twin path's static phrasing.
+		return respondProvisionFailed(c, err, "Failed to provision MongoDB database")
 	}
 
 	resp := fiber.Map{

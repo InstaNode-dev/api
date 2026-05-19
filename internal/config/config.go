@@ -54,6 +54,19 @@ type Config struct {
 	GoogleRedirectURI        string // optional default redirect_uri for GET /auth/google/url
 	EnabledServices          string
 	Environment              string
+	// TrustedProxyCIDRs is the comma-separated list of CIDR ranges that the
+	// API will trust the X-Forwarded-For header from. Set this to the
+	// load-balancer egress CIDRs (e.g. DOKS NodePool subnet) so that XFF is
+	// only honoured from infra-internal hops, not from arbitrary public
+	// callers. T13 P1-1 fix (BugHunt 2026-05-20).
+	//
+	// If empty, the API still reads c.IP() but Fiber falls back to
+	// RemoteAddr (the direct TCP peer) for ratelimit / fingerprint /
+	// audit — which is the safe default for a directly-internet-facing
+	// deployment.
+	//
+	// Format examples: "10.0.0.0/8" or "10.244.0.0/16,10.245.0.0/16".
+	TrustedProxyCIDRs        string
 	RedisProvisionBackend    string // "local" or "upstash", default "local"
 	RedisProvisionHost       string // Redis host for building connection strings, default "localhost"
 	MongoAdminURI            string // MONGO_ADMIN_URI, e.g. mongodb://root:root@localhost:27017
@@ -258,6 +271,7 @@ func Load() *Config {
 		GoogleRedirectURI:        os.Getenv("GOOGLE_REDIRECT_URI"),
 		EnabledServices:          getenv("INSTANT_ENABLED_SERVICES", "redis,postgres,mongodb,queue"),
 		Environment:              getenv("ENVIRONMENT", "development"),
+		TrustedProxyCIDRs:        os.Getenv("TRUSTED_PROXY_CIDRS"),
 		RedisProvisionBackend:    getenv("REDIS_PROVISION_BACKEND", "local"),
 		RedisProvisionHost:       getenv("REDIS_PROVISION_HOST", "localhost"),
 		MongoAdminURI:            getenv("MONGO_ADMIN_URI", "mongodb://root:root@localhost:27017"),

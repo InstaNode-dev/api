@@ -235,14 +235,21 @@ func loadEnvPolicy(parent context.Context, db *sql.DB, teamID uuid.UUID) (map[st
 }
 
 // defaultEnvLookup reads the env scope from, in order:
-//  1. c.Query("env")
-//  2. JSON body field "env"
-//  3. JSON body field "to" (used by /promote and /vault/copy)
+//  1. c.Params("env") — route param on /vault/:env/* routes
+//     (T11 P3-1 / P1-1, BugHunt 2026-05-20: previously omitted, so any
+//     future RequireEnvAccess placed on a /:env-shaped route silently
+//     resolved to the development default and never enforced the real env)
+//  2. c.Query("env")
+//  3. JSON body field "env"
+//  4. JSON body field "to" (used by /promote and /vault/copy)
 //
 // Falls back to "" so the caller substitutes envPolicyDefaultEnv. Body
 // parsing is best-effort — a malformed body short-circuits to "" and the
 // downstream handler will reject with its own 400.
 func defaultEnvLookup(c *fiber.Ctx) (string, error) {
+	if p := strings.TrimSpace(c.Params("env")); p != "" {
+		return p, nil
+	}
 	if q := strings.TrimSpace(c.Query("env")); q != "" {
 		return q, nil
 	}

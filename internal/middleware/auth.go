@@ -385,10 +385,41 @@ func GetImpersonatedBy(c *fiber.Ctx) string {
 // OptionalAuth is like RequireAuth but does not return 401 when the header is absent or invalid.
 // If a valid bearer token is present it populates the same Fiber locals as RequireAuth.
 // Use on routes where anonymous access is allowed but authenticated users get elevated behaviour.
+//
+// T19 P1-7 (BugHunt 2026-05-20): the variant OptionalAuthStrict (below)
+// rejects malformed/expired bearer tokens with 401 instead of silently
+// downgrading to anonymous. Wired on the provisioning routes so an agent
+// with an expired/typo'd token sees "your token is bad" rather than
+// silently getting anonymous limits with no signal.
 func OptionalAuth(cfg *config.Config) fiber.Handler {
+	return optionalAuthImpl(cfg, false)
+}
+
+// OptionalAuthStrict is like OptionalAuth but returns 401 when the
+// Authorization header is PRESENT but the bearer token is invalid /
+// expired / malformed. A missing Authorization header still passes
+// through as anonymous (the route is opt-in for both anonymous and
+// authenticated callers).
+//
+// T19 P1-7 (BugHunt 2026-05-20). Used on /db/new, /cache/new,
+// /nosql/new, /queue/new, /storage/new, /vector/new, /webhook/new
+// so a bad bearer doesn't silently produce anonymous-tier resources
+// for an agent that thinks it's authenticated.
+func OptionalAuthStrict(cfg *config.Config) fiber.Handler {
+	return optionalAuthImpl(cfg, true)
+}
+
+func optionalAuthImpl(cfg *config.Config, strict bool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		header := c.Get("Authorization")
+		if header == "" {
+			// No header at all — anonymous, by design.
+			return c.Next()
+		}
 		if len(header) < 8 || header[:7] != "Bearer " {
+			if strict {
+				return respondUnauthorized(c)
+			}
 			return c.Next()
 		}
 		tokenStr := header[7:]
@@ -407,7 +438,12 @@ func OptionalAuth(cfg *config.Config) fiber.Handler {
 			return []byte(cfg.JWTSecret), nil
 		})
 		if err != nil || !parsed.Valid || claims.UserID == "" || claims.TeamID == "" {
-			// Invalid or expired token — continue as anonymous, don't block.
+			if strict {
+				// Header present but JWT is bad — reject so the caller
+				// learns their token is the problem instead of silently
+				// downgrading to anonymous. T19 P1-7.
+				return respondUnauthorized(c)
+			}
 			return c.Next()
 		}
 

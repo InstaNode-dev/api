@@ -332,10 +332,27 @@ func fetchBuildLogsForAutopsy(ctx context.Context, cp compute.Provider, appID st
 		return nil
 	}
 
-	// Give the log fetch a short deadline so a slow k8s API never blocks the
-	// autopsy write (the context from runDeploy may already be near its limit).
-	fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// T6 P0-3 (BugHunt 2026-05-20): the kaniko build deadline equals (used
+	// to equal) the runDeploy ctx deadline, so on the timeout-class failure
+	// the parent ctx is already cancelled when this function is called.
+	// Previously fetchCtx inherited that dying parent and the k8s log
+	// stream failed immediately, losing logs on the worst case.
+	//
+	// Resolution: respect caller-driven cancellation (so a separately
+	// cancelled context still aborts the fetch) BUT compute the deadline
+	// from a background-derived ctx so a deadline that already fired on
+	// the parent doesn't strip the 30s autopsy window. This also keeps
+	// the existing TestFetchBuildLogsForAutopsy_ContextPropagated contract
+	// — a caller-cancelled ctx still propagates to the fetcher.
+	fetchCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// Bridge caller cancellation onto fetchCtx so an explicit caller
+	// abort still aborts the fetch, even though we don't share the
+	// parent's deadline.
+	if ctx != nil {
+		stop := context.AfterFunc(ctx, cancel)
+		defer stop()
+	}
 
 	lines, err := fetcher.FetchBuildLogs(fetchCtx, appID)
 	if err != nil {
@@ -407,7 +424,14 @@ func (h *DeployHandler) requireTeam(c *fiber.Ctx) (*models.Team, error) {
 // is passed to the compute provider but never written back to the deployments
 // row, so vault rotations take effect on the next redeploy.
 func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// T6 P0-3 (BugHunt 2026-05-20): runDeploy's ctx deadline must be
+	// STRICTLY GREATER than the kaniko Job's ActiveDeadlineSeconds
+	// (10 min) so that on a timeout-class build failure the handler is
+	// still alive to fetch logs for the autopsy. Previously both were
+	// exactly 10 min — the autopsy log fetch raced a dying ctx and lost
+	// logs on the worst case. 12 min gives the autopsy fetch + DB write
+	// 2 min of headroom after kaniko's hard kill.
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 
 	startedAt := time.Now()
