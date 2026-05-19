@@ -1,4 +1,4 @@
-.PHONY: run build build-cli test test-unit test-db-up test-db-down test-db-reset \
+.PHONY: run build build-cli test test-unit gate test-db-up test-db-down test-db-reset \
         docker-up docker-down docker-logs \
         migrate migrate-platform migrate-customers \
         docker-build smoke-buildinfo \
@@ -50,6 +50,22 @@ test-unit: test-db-up
 	  TEST_DATABASE_URL="$(TEST_DB_URL)" go test "$$pkg" -short -count=1 -timeout 90s || exit 1; \
 	done
 	@echo "test-unit: all packages green"
+
+# PR/deploy gate: runs EXACTLY what .github/workflows/deploy.yml runs as its
+# test gate, so a green `make gate` locally == a green CI test step. The
+# deploy.yml gate is `go build ./... && go vet ./... && go test ./... -short
+# -count=1 -p 1` against a real Postgres + Redis (see the deploy.yml
+# "Run unit tests" step). `-p 1` is load-bearing — every package shares the
+# single instant_dev_test DB + redis/15 and the suite corrupts itself under
+# default parallelism. test-db-up provides the DB; the customer-DB admin
+# target (TEST_POSTGRES_CUSTOMERS_URL) defaults to an unreachable localhost
+# instance locally, so a handful of postgres-provisioning tests may 503 on a
+# bare laptop — that is the known local-only gap, CI provides that DB.
+gate: test-db-up
+	@TEST_DATABASE_URL="$(TEST_DB_URL)" go build ./...
+	@TEST_DATABASE_URL="$(TEST_DB_URL)" go vet ./...
+	@TEST_DATABASE_URL="$(TEST_DB_URL)" go test ./... -short -count=1 -p 1
+	@echo "gate: green — matches deploy.yml test step"
 
 # ── Local development ─────────────────────────────────────────────────────────
 
