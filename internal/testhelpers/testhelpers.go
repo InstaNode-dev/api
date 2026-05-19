@@ -101,6 +101,11 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS deletion_requested_at TIMESTAMPTZ`,
 		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS tombstoned_at TIMESTAMPTZ`,
 		`CREATE INDEX IF NOT EXISTS idx_teams_pending_deletion ON teams(deletion_requested_at) WHERE status = 'deletion_requested'`,
+		// 054_team_deletion_pending — 'deletion_pending' intermediate status
+		// + its partial index. The CHECK enum is still omitted (see note
+		// above); only the index is mirrored so the anti-drift guard stays
+		// green.
+		`CREATE INDEX IF NOT EXISTS idx_teams_deletion_pending ON teams(deletion_requested_at) WHERE status = 'deletion_pending'`,
 		`CREATE TABLE IF NOT EXISTS users (
 			id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			team_id     UUID REFERENCES teams(id) ON DELETE CASCADE,

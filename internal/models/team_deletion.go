@@ -4,20 +4,36 @@ package models
 // helpers backing DELETE /api/v1/team, POST /api/v1/team/restore, and the
 // worker's team_deletion_executor sweep.
 //
-// The state machine has three statuses on teams.status:
+// The state machine has four statuses on teams.status:
 //
 //	active              — normal team, the default for every row.
 //	deletion_requested  — owner has asked for deletion; 30-day grace clock
 //	                      runs from deletion_requested_at. Resources are
-//	                      paused; the Razorpay subscription is best-effort
-//	                      cancelled at request time. Restorable.
-//	tombstoned          — worker has destroyed customer DBs / S3 backups /
-//	                      PII fields. NOT restorable. Row stub retained for
-//	                      foreign-key integrity on historical audit_log
-//	                      entries.
+//	                      paused. The Razorpay subscription is cancelled
+//	                      BEFORE the row is flipped (DELETE /api/v1/team
+//	                      aborts if the cancel fails — see team_deletion.go
+//	                      handler) so a pending-deletion team can never
+//	                      keep getting charged. Restorable.
+//	deletion_pending    — the worker's executor has BEGUN post-grace
+//	                      destruction (drop customer DBs / k8s namespaces /
+//	                      S3 backups). The row sits here for the duration of
+//	                      the teardown. A mid-pipeline failure leaves the row
+//	                      HERE — not half-tombstoned — so the orphan-sweep
+//	                      reconciler can resume and finish. NOT restorable:
+//	                      destruction has started.
+//	tombstoned          — worker has destroyed customer DBs / k8s / S3
+//	                      backups / PII fields. NOT restorable. Row stub
+//	                      retained for foreign-key integrity on historical
+//	                      audit_log entries.
 //
-// All three transitions live here so the producers (handler + worker) and
-// the readers (dashboard) hit the same atomic predicates.
+// Lifecycle:
+//
+//	active → deletion_requested → deletion_pending → tombstoned
+//	               │                     │
+//	               └─(restore)           └─(reconciler retries on failure)
+//
+// All transitions live here so the producers (handler + worker) and the
+// readers (dashboard) hit the same atomic predicates.
 
 import (
 	"context"
@@ -33,9 +49,14 @@ import (
 // teams.status enum. Kept as Go consts rather than scattered string literals
 // so the handler, the worker, and the dashboard all match exactly.
 const (
-	TeamStatusActive             = "active"
-	TeamStatusDeletionRequested  = "deletion_requested"
-	TeamStatusTombstoned         = "tombstoned"
+	TeamStatusActive            = "active"
+	TeamStatusDeletionRequested = "deletion_requested"
+	// TeamStatusDeletionPending marks a team whose post-grace destruction
+	// is in flight. The worker's executor flips deletion_requested →
+	// deletion_pending the instant it begins teardown; a crash mid-teardown
+	// leaves the row here, and the orphan-sweep reconciler resumes it.
+	TeamStatusDeletionPending = "deletion_pending"
+	TeamStatusTombstoned      = "tombstoned"
 
 	// TeamDeletionGraceDays is the right-to-be-forgotten grace window. 30
 	// days matches the GDPR Article 17 "without undue delay" guidance and
@@ -130,6 +151,36 @@ func RestoreTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) error {
 	// a pending-deletion row with no timestamp is corrupt and should not
 	// be restorable).
 	return ErrTeamRestoreGraceExpired
+}
+
+// MarkTeamDeletionPending atomically flips teams.status from
+// 'deletion_requested' to 'deletion_pending'. The worker's executor calls
+// this the instant it begins post-grace destruction, so:
+//
+//   - a mid-teardown crash leaves the row in deletion_pending (visibly
+//     "destruction in flight, did not finish") rather than indistinguishable
+//     from a team still inside its grace window;
+//   - the restore endpoint, which only matches status='deletion_requested',
+//     automatically refuses once destruction has started;
+//   - the operation is idempotent: a re-run of the executor over a row
+//     already flipped to deletion_pending gets 0 rows affected and
+//     returns ErrTeamNotPendingDeletion, which the caller treats as
+//     "already in the destruction phase, proceed".
+//
+// deletionRequestedAt is the timestamp the candidate scan already read; we
+// keep it in the WHERE clause so a row whose grace window was somehow reset
+// (an out-of-band UPDATE) is not swept by a stale candidate list.
+func MarkTeamDeletionPending(ctx context.Context, db *sql.DB, teamID uuid.UUID) (bool, error) {
+	res, err := db.ExecContext(ctx, `
+		UPDATE teams
+		   SET status = 'deletion_pending'
+		 WHERE id = $1 AND status = 'deletion_requested'
+	`, teamID)
+	if err != nil {
+		return false, fmt.Errorf("models.MarkTeamDeletionPending: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
 }
 
 // TeamDeletionStatus is the snapshot the dashboard and the handler's 200

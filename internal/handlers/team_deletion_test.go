@@ -15,8 +15,12 @@ package handlers_test
 //   5. Restore inside grace → 200, row back to active.
 //   6. Restore after grace expired → 410.
 //   7. Audit emit shape (kind + metadata keys).
-//   8. Razorpay cancel error path — handler still 202s, audit metadata
-//      records the failure.
+//   8. Razorpay cancel FAILURE — handler ABORTS with 502, team left fully
+//      active, a team.deletion_failed audit row records the aborted
+//      attempt. "Stop the money" runs first and is a hard gate (atomic-
+//      deletion hardening, 2026-05-19).
+//   9. Razorpay-abort idempotency — re-running DELETE after an aborted
+//      attempt behaves identically (502, still active).
 
 import (
 	"bytes"
@@ -298,44 +302,84 @@ func TestTeamDelete_AuditEmitted(t *testing.T) {
 		"razorpay_cancel_result should be 'ok' or 'skipped' (no live sub in test)")
 }
 
-// TestTeamDelete_RazorpayError_Still202 — scenario 8.
-// An injected canceler that returns a non-nil error must NOT block the
-// 202. The audit metadata records the failure for ops follow-up.
+// TestTeamDelete_RazorpayCancelFails_Aborts — atomic-deletion scenario (d).
+//
+// CONTRACT (changed 2026-05-19, atomic-deletion hardening): a Razorpay
+// subscription-cancel failure ABORTS the whole deletion. "Stop the money"
+// runs FIRST and is a hard gate — a team must never be marked for deletion
+// while its card can still be charged. The previous behaviour (202 + best-
+// effort) is replaced.
+//
+// This test asserts:
+//   - the response is 502 (not 202),
+//   - the team is left FULLY 'active' — no state change, no paused
+//     resources,
+//   - a team.deletion_failed audit row records the aborted attempt.
 //
 // We exercise the handler directly (skipping the test app's route
 // registration) so we can inject failingCanceler without adding a new
-// testhelpers seam. The handler still goes through the same model
-// helpers — DB-side behaviour is identical to the routed path.
-func TestTeamDelete_RazorpayError_Still202(t *testing.T) {
+// testhelpers seam.
+func TestTeamDelete_RazorpayCancelFails_Aborts(t *testing.T) {
 	f := setupTeamDelFixture(t, "pro", "owner")
 
-	// Build a standalone Fiber app, register the handler with the failing
-	// canceler injected, and mount the route under the same /api/v1 group
-	// shape as production. The middleware chain (RequireAuth + RequireRole)
-	// matches the production wiring.
 	h := handlers.NewTeamDeletionHandler(f.db, nil)
 	h.CancelSubscription = failingCanceler{}
 
 	resp := callTeamDeleteWithHandler(t, h, f.jwt,
 		`{"confirm_team_slug":"`+f.slug+`"}`, f.teamID, f.userID)
 	defer resp.Body.Close()
-	assert.Equal(t, http.StatusAccepted, resp.StatusCode,
-		"razorpay error must not block 202")
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode,
+		"a Razorpay cancel failure must abort the deletion with 502")
 
-	// Audit metadata records the failure verbatim.
+	// The team must be left UNTOUCHED — still 'active', destruction not
+	// initiated. This is the core safety property: no half-deletion.
+	var status string
+	require.NoError(t, f.db.QueryRowContext(context.Background(),
+		`SELECT status FROM teams WHERE id = $1::uuid`, f.teamID,
+	).Scan(&status))
+	assert.Equal(t, models.TeamStatusActive, status,
+		"team must remain active after an aborted deletion")
+
+	// A team.deletion_failed audit row records the aborted attempt so the
+	// operator and the customer can see the cancel failed loudly.
 	var metaStr sql.NullString
 	require.NoError(t, f.db.QueryRowContext(context.Background(), `
 		SELECT metadata::text FROM audit_log
 		 WHERE team_id = $1::uuid AND kind = $2
 		 ORDER BY created_at DESC LIMIT 1
-	`, f.teamID, models.AuditKindTeamDeletionRequested,
+	`, f.teamID, models.AuditKindTeamDeletionFailed,
 	).Scan(&metaStr))
-	require.True(t, metaStr.Valid)
+	require.True(t, metaStr.Valid, "an aborted deletion must emit a team.deletion_failed audit row")
 
 	var meta map[string]any
 	require.NoError(t, json.Unmarshal([]byte(metaStr.String), &meta))
 	got, _ := meta["razorpay_cancel_result"].(string)
 	assert.Contains(t, got, "failed:", "audit must record the failure cause")
+	aborted, _ := meta["aborted"].(bool)
+	assert.True(t, aborted, "audit metadata must flag the abort")
+}
+
+// TestTeamDelete_RazorpayCancelFails_Idempotent — atomic-deletion scenario.
+// Re-running DELETE after an aborted attempt must behave identically (still
+// 502, still active) — the abort path is itself idempotent because it makes
+// no state change.
+func TestTeamDelete_RazorpayCancelFails_Idempotent(t *testing.T) {
+	f := setupTeamDelFixture(t, "pro", "owner")
+	h := handlers.NewTeamDeletionHandler(f.db, nil)
+	h.CancelSubscription = failingCanceler{}
+
+	for i := 0; i < 3; i++ {
+		resp := callTeamDeleteWithHandler(t, h, f.jwt,
+			`{"confirm_team_slug":"`+f.slug+`"}`, f.teamID, f.userID)
+		assert.Equal(t, http.StatusBadGateway, resp.StatusCode,
+			"abort path must be idempotent across retries (attempt %d)", i+1)
+		resp.Body.Close()
+	}
+	var status string
+	require.NoError(t, f.db.QueryRowContext(context.Background(),
+		`SELECT status FROM teams WHERE id = $1::uuid`, f.teamID).Scan(&status))
+	assert.Equal(t, models.TeamStatusActive, status,
+		"team still active after repeated aborted deletions")
 }
 
 // failingCanceler is a SubscriptionCanceler that always returns an error,
@@ -389,8 +433,8 @@ func callTeamDeleteWithHandler(t *testing.T, h *handlers.TeamDeletionHandler, jw
 // still validates through RequireAuth.
 func newTestConfigForDeletionHandler() *config.Config {
 	return &config.Config{
-		JWTSecret:                testhelpers.TestJWTSecret,
-		EnabledServices:          "redis",
+		JWTSecret:       testhelpers.TestJWTSecret,
+		EnabledServices: "redis",
 	}
 }
 

@@ -21,17 +21,26 @@ package handlers
 //     slug. Mistype / copy-paste of the wrong slug short-circuits before
 //     any state change.
 //
-// All three gates fire BEFORE any mutation. After the gates pass:
+// All three gates fire BEFORE any mutation. After the gates pass, the
+// ordering is deliberate — money first, state second:
 //
-//  - Mark team status='deletion_requested' (atomic, ErrTeamNotPendingDeletion
-//    on retry).
-//  - Pause all team resources (status='paused' + paused_at).
-//  - Best-effort cancel Razorpay subscription via CancelImmediately. Failure
-//    is logged + recorded in audit metadata; the row state still flips so
-//    the dangling subscription becomes an ops-team cleanup task, not a
-//    blocker for the customer's GDPR request.
-//  - Emit team.deletion_requested audit row.
-//  - Respond 202 Accepted with deletion_at = now() + 30d.
+//  1. Cancel the Razorpay subscription via CancelImmediately. This runs
+//     BEFORE any state change. If the cancel FAILS, the handler ABORTS with
+//     a loud 502 and the team is left fully 'active' — we never mark a team
+//     for deletion while its card can still be charged. The customer can
+//     retry; the failure is surfaced, not swallowed. A free / claimed-but-
+//     unpaid team has no subscription, so the canceler returns nil and we
+//     proceed normally.
+//  2. Mark team status='deletion_requested' (atomic, ErrTeamNotPendingDeletion
+//     on a redelivered call).
+//  3. Pause all team resources (status='paused' + paused_at). Best-effort —
+//     the worker re-pauses at execution time as a backstop.
+//  4. Emit team.deletion_requested audit row.
+//  5. Respond 202 Accepted with deletion_at = now() + 30d.
+//
+// Steps 2-5 are idempotent: a retried DELETE after a partial failure flips
+// nothing twice (the WHERE status='active' guard) and re-pausing already-
+// paused resources is a no-op.
 
 import (
 	"context"
@@ -102,8 +111,8 @@ type SubscriptionCanceler interface {
 // (razorpaybilling/portal.go) — same CancelImmediately call the admin demote
 // flow uses.
 type TeamDeletionHandler struct {
-	db                *sql.DB
-	cfg               *config.Config
+	db                 *sql.DB
+	cfg                *config.Config
 	CancelSubscription SubscriptionCanceler
 }
 
@@ -179,8 +188,60 @@ func (h *TeamDeletionHandler) Delete(c *fiber.Ctx) error {
 			"")
 	}
 
-	// State-machine flip. Atomic against the WHERE status='active' guard;
-	// a redelivered call hits ErrTeamNotPendingDeletion and 409s.
+	// STEP 1 — Razorpay subscription cancel, BEFORE any state change.
+	//
+	// This is the "stop the money" gate. A team deletion that proceeds
+	// while the customer's card can still be charged is the single worst
+	// outcome of this flow — so a cancel FAILURE aborts the whole request.
+	// The team is left fully 'active', the customer sees a loud 502, and
+	// they (or an operator) can retry once Razorpay is reachable again.
+	//
+	// CancelForTeam returns nil for a free / claimed-but-unpaid team (no
+	// subscription to cancel) — those proceed straight through. A non-nil
+	// error is a genuine cancel failure (Razorpay HTTP error, partial
+	// outage) and is the abort trigger.
+	//
+	// cancelResult feeds the audit metadata so the post-hoc trail records
+	// whether money was actually stopped.
+	cancelResult := "skipped" // no canceler injected (tests, free team paths)
+	if h.CancelSubscription != nil {
+		if cerr := h.CancelSubscription.CancelForTeam(ctx, teamID); cerr != nil {
+			// ABORT — do not flip the team. Emit a failure audit so the
+			// attempt is visible, then surface a loud 502.
+			slog.Error("team.deletion.razorpay_cancel_failed_abort",
+				"error", cerr,
+				"team_id", teamID,
+				"request_id", requestID,
+			)
+			abortMeta, _ := json.Marshal(map[string]any{
+				"requested_by_user_id":   userID.String(),
+				"razorpay_cancel_result": "failed: " + cerr.Error(),
+				"aborted":                true,
+			})
+			if auditErr := models.InsertAuditEvent(ctx, h.db, models.AuditEvent{
+				TeamID:   teamID,
+				UserID:   uuid.NullUUID{UUID: userID, Valid: true},
+				Actor:    "user",
+				Kind:     models.AuditKindTeamDeletionFailed,
+				Summary:  "team deletion aborted — Razorpay subscription cancel failed; team left active",
+				Metadata: abortMeta,
+			}); auditErr != nil {
+				slog.Warn("team.deletion.abort_audit_emit_failed",
+					"error", auditErr, "team_id", teamID, "request_id", requestID)
+			}
+			return respondErrorWithAgentAction(c, fiber.StatusBadGateway,
+				"subscription_cancel_failed",
+				"Could not cancel the team's billing subscription. Team deletion was aborted — your card is NOT scheduled for any further charge changes, and the team is still active.",
+				"Tell the user the deletion did NOT proceed because the billing subscription could not be cancelled, so the team is still fully active and untouched. This is a transient billing-provider error — have them retry DELETE /api/v1/team in a few minutes. If it keeps failing, they should contact support to cancel the subscription manually before deletion.",
+				"")
+		}
+		cancelResult = "ok"
+	}
+
+	// STEP 2 — state-machine flip. Atomic against the WHERE status='active'
+	// guard; a redelivered call hits ErrTeamNotPendingDeletion and 409s.
+	// The subscription is already cancelled at this point, so a retry
+	// hitting the 409 is harmless — the money was stopped on the first call.
 	if err := models.RequestTeamDeletion(ctx, h.db, teamID); err != nil {
 		if errors.Is(err, models.ErrTeamNotPendingDeletion) {
 			return respondError(c, fiber.StatusConflict, "already_pending",
@@ -191,7 +252,7 @@ func (h *TeamDeletionHandler) Delete(c *fiber.Ctx) error {
 			"Failed to record deletion request. Retry in a few seconds.")
 	}
 
-	// Pause all resources — stop accepting new traffic immediately.
+	// STEP 3 — pause all resources, stop accepting new traffic immediately.
 	pausedCount, pauseErr := models.PauseAllTeamResources(ctx, h.db, teamID)
 	if pauseErr != nil {
 		// Pause failure does NOT block the request — the worker can pause
@@ -203,32 +264,15 @@ func (h *TeamDeletionHandler) Delete(c *fiber.Ctx) error {
 		)
 	}
 
-	// Best-effort Razorpay subscription cancel. Failure logged + recorded
-	// in audit metadata. The row state is already flipped — a dangling
-	// subscription is an ops cleanup task, not a customer-blocking issue.
-	cancelResult := "skipped" // no canceler injected (tests, free team paths)
-	if h.CancelSubscription != nil {
-		if cerr := h.CancelSubscription.CancelForTeam(ctx, teamID); cerr != nil {
-			cancelResult = "failed: " + cerr.Error()
-			slog.Warn("team.deletion.razorpay_cancel_failed",
-				"error", cerr,
-				"team_id", teamID,
-				"request_id", requestID,
-			)
-		} else {
-			cancelResult = "ok"
-		}
-	}
-
 	// Emit audit. Best-effort — InsertAuditEvent failures never block the
 	// response. Run inline (not goroutine) so the test asserting the row
 	// shape doesn't race with the response write.
 	meta := map[string]any{
-		"requested_by_user_id":     userID.String(),
-		"confirm_slug_provided":    provided,
-		"razorpay_cancel_result":   cancelResult,
-		"paused_resource_count":    pausedCount,
-		"grace_window_days":        models.TeamDeletionGraceDays,
+		"requested_by_user_id":   userID.String(),
+		"confirm_slug_provided":  provided,
+		"razorpay_cancel_result": cancelResult,
+		"paused_resource_count":  pausedCount,
+		"grace_window_days":      models.TeamDeletionGraceDays,
 	}
 	metaBytes, _ := json.Marshal(meta)
 	if auditErr := models.InsertAuditEvent(ctx, h.db, models.AuditEvent{

@@ -256,10 +256,26 @@ const (
 
 	// AuditKindTeamDeletionFailed fires when the worker's executor sees
 	// a per-team error (one resource fails to deprovision, S3 delete
-	// errors, etc.) — the team stays in deletion_requested state so an
-	// operator can investigate and re-run. Metadata: {error,
-	// failed_at_step, resource_id (when applicable)}.
+	// errors, etc.) — the team stays in deletion_pending state so an
+	// operator and the orphan-sweep reconciler can investigate and
+	// retry. Metadata: {error, failed_at_step, resource_id (when
+	// applicable)}.
 	AuditKindTeamDeletionFailed = "team.deletion_failed"
+
+	// AuditKindOrphanSweepReclaimed fires when the worker's orphan-sweep
+	// reconciler detects and completes the teardown of an orphan — a
+	// customer DB, k8s namespace, storage prefix, or Razorpay subscription
+	// whose owning team is gone or tombstoned. This is the eventually-
+	// consistent safety net that finishes any partial team deletion.
+	// Metadata: {orphan_kind, identifier, action}. Producer: the worker
+	// module (see worker/internal/jobs/orphan_sweep_reconciler.go).
+	AuditKindOrphanSweepReclaimed = "team.orphan_reclaimed"
+
+	// AuditKindOrphanSweepFailed fires when the orphan-sweep reconciler
+	// finds an orphan it cannot reclaim (provider error, cancel failure).
+	// The orphan stays for the next sweep; this row is the operator
+	// alert. Metadata: {orphan_kind, identifier, error}.
+	AuditKindOrphanSweepFailed = "team.orphan_sweep_failed"
 
 	// AuditKindResourceMetricsQueried fires when a caller successfully fetches
 	// GET /api/v1/resources/:id/metrics. The audit row's metadata records the
