@@ -8,12 +8,17 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/gofiber/fiber/v2"
 	"github.com/newrelic/go-agent/v3/newrelic"
 	"google.golang.org/grpc"
 	"instant.dev/common/buildinfo"
@@ -159,10 +164,77 @@ func main() {
 		"build_time", buildinfo.BuildTime,
 		"version", buildinfo.Version,
 	)
-	if err := app.Listen(":" + cfg.Port); err != nil {
+	if err := runServerWithGracefulShutdown(app, ":"+cfg.Port, gracefulShutdownTimeout); err != nil {
 		slog.Error("server.fatal", "error", err)
 		os.Exit(1)
 	}
+}
+
+// gracefulShutdownTimeout is the budget Fiber gets to drain in-flight requests
+// after SIGTERM. The Kubernetes Deployment sets terminationGracePeriodSeconds
+// to 30s; we leave a 5s margin so a stuck shutdown does not collide with
+// SIGKILL. Mirror of the provisioner's 5s healthz drain + grpc.GracefulStop —
+// the api needs more because its longest in-flight request is a multi-minute
+// provision.
+const gracefulShutdownTimeout = 25 * time.Second
+
+// runServerWithGracefulShutdown is the MR-P0-7 fix (BugBash 2026-05-20):
+// before this, `app.Listen(":"+cfg.Port)` blocked with no signal handler,
+// so SIGTERM (every rolling deploy, every HPA scale-down, every node drain)
+// killed the process immediately — RSTing every in-flight request including
+// multi-minute provisions. Now we:
+//
+//  1. Serve in a goroutine so main() can also wait on SIGINT/SIGTERM.
+//  2. Trap SIGTERM (kubelet sends it before SIGKILL); on receipt
+//     call app.ShutdownWithTimeout to drain in-flight handlers within the
+//     pod's terminationGracePeriodSeconds.
+//
+// Returns a non-nil error only when the serve goroutine reports a fatal
+// listener error (port bind failure etc.); a clean shutdown via SIGTERM
+// returns nil. Extracted as a free function so unit tests can verify the
+// drain contract (TestRunServerWithGracefulShutdown_DrainsInflight).
+func runServerWithGracefulShutdown(app *fiber.App, addr string, shutdownTimeout time.Duration) error {
+	serveErr := make(chan error, 1)
+	go func() {
+		// Listener errors include ErrServerClosed when ShutdownWithTimeout
+		// fires; we swallow that here and surface only genuine fatal errors.
+		if err := app.Listen(addr); err != nil && !errors.Is(err, net.ErrClosed) {
+			serveErr <- err
+			return
+		}
+		serveErr <- nil
+	}()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	select {
+	case sErr := <-serveErr:
+		// Listener returned before any signal — bind failure or comparable
+		// fatal error. Surface it to main() so the pod CrashLoopBackoffs
+		// instead of going green with no listener.
+		return sErr
+	case <-ctx.Done():
+		slog.Info("server.shutdown_signal_received",
+			"timeout_seconds", int(shutdownTimeout.Seconds()))
+	}
+
+	// Drain in-flight requests within shutdownTimeout. Fiber's
+	// ShutdownWithTimeout stops accepting new connections and waits for
+	// existing handlers to finish (up to the timeout) before returning.
+	if err := app.ShutdownWithTimeout(shutdownTimeout); err != nil {
+		slog.Error("server.graceful_shutdown_failed", "error", err)
+		return err
+	}
+
+	// Wait for the Listen goroutine to fully exit so we don't race a still-
+	// running serve loop with main()'s defers (telemetry, NR app shutdown,
+	// DB pool close).
+	if sErr := <-serveErr; sErr != nil {
+		slog.Warn("server.serve_exit_after_shutdown", "error", sErr)
+	}
+	slog.Info("server.graceful_shutdown_complete")
+	return nil
 }
 
 // initNewRelic constructs the NR Go agent. Returns nil (and logs a

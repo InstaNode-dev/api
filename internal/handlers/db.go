@@ -247,25 +247,15 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 		return respondProvisionFailed(c, err, "Failed to provision Postgres database")
 	}
 
-	// Encrypt and persist the connection URL.
-	aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey)
-	if keyErr != nil {
-		slog.Error("db.new.aes_key_parse_failed", "error", keyErr, "request_id", requestID)
-		// Fail open — resource is still usable, URL just won't be stored.
-	} else {
-		encryptedURL, encErr := crypto.Encrypt(aesKey, creds.URL)
-		if encErr != nil {
-			slog.Error("db.new.encrypt_url_failed", "error", encErr, "request_id", requestID)
-		} else {
-			if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
-				slog.Error("db.new.update_connection_url_failed", "error", upErr, "request_id", requestID)
-			}
-		}
-	}
-
-	// Persist provider_resource_id (Neon project ID, or empty for local).
-	if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
-		slog.Error("db.new.update_provider_resource_id_failed", "error", upErr, "request_id", requestID)
+	// MR-P0-2 / MR-P0-3: persist the connection URL + provider_resource_id and
+	// flip the row pending→active atomically. Any persistence failure tears
+	// down the backend DB and returns 503 — never a 201 for a resource the
+	// platform can't address.
+	if finErr := h.finalizeProvision(ctx, resource, creds.URL, "", creds.ProviderResourceID, requestID, "db.new",
+		func() { deprovisionBestEffort(ctx, h.provClient, tokenStr, creds.ProviderResourceID, "postgres", "db.new") },
+	); finErr != nil {
+		metrics.ProvisionFailures.WithLabelValues("postgres", "persist_error").Inc()
+		return respondProvisionFailed(c, finErr, "Failed to persist Postgres resource")
 	}
 
 	jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "postgres", []string{tokenStr})
@@ -417,24 +407,13 @@ func (h *DBHandler) newDBAuthenticated(
 		return respondProvisionFailed(c, err, "Failed to provision Postgres database")
 	}
 
-	// Encrypt and persist the connection URL.
-	aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey)
-	if keyErr != nil {
-		slog.Error("db.new.aes_key_parse_failed_auth", "error", keyErr, "request_id", requestID)
-	} else {
-		encryptedURL, encErr := crypto.Encrypt(aesKey, creds.URL)
-		if encErr != nil {
-			slog.Error("db.new.encrypt_url_failed_auth", "error", encErr, "request_id", requestID)
-		} else {
-			if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
-				slog.Error("db.new.update_connection_url_failed_auth", "error", upErr, "request_id", requestID)
-			}
-		}
-	}
-
-	// Persist provider_resource_id.
-	if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
-		slog.Error("db.new.update_provider_resource_id_failed_auth", "error", upErr, "request_id", requestID)
+	// MR-P0-2 / MR-P0-3: persist + flip pending→active; a persistence failure
+	// tears down the backend DB and returns 503, never a 201.
+	if finErr := h.finalizeProvision(ctx, resource, creds.URL, "", creds.ProviderResourceID, requestID, "db.new.auth",
+		func() { deprovisionBestEffort(ctx, h.provClient, tokenStr, creds.ProviderResourceID, "postgres", "db.new.auth") },
+	); finErr != nil {
+		metrics.ProvisionFailures.WithLabelValues("postgres", "persist_error").Inc()
+		return respondProvisionFailed(c, finErr, "Failed to persist Postgres resource")
 	}
 
 	slog.Info("provision.success",
@@ -617,16 +596,12 @@ func (h *DBHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionForTwi
 		return TwinProvisionResult{}, twinCoreErr("Failed to provision Postgres twin")
 	}
 
-	if aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey); keyErr != nil {
-		slog.Error("twin.db.aes_key_parse_failed", "error", keyErr, "request_id", in.RequestID)
-	} else if encryptedURL, encErr := crypto.Encrypt(aesKey, creds.URL); encErr != nil {
-		slog.Error("twin.db.encrypt_url_failed", "error", encErr, "request_id", in.RequestID)
-	} else if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
-		slog.Error("twin.db.update_connection_url_failed", "error", upErr, "request_id", in.RequestID)
-	}
-
-	if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
-		slog.Error("twin.db.update_provider_resource_id_failed", "error", upErr, "request_id", in.RequestID)
+	// MR-P0-2 / MR-P0-3: persist + flip pending→active; a persistence failure
+	// tears down the backend DB and surfaces a hard error, never a success.
+	if finErr := h.finalizeProvision(ctx, resource, creds.URL, "", creds.ProviderResourceID, in.RequestID, "twin.db",
+		func() { deprovisionBestEffort(ctx, h.provClient, tokenStr, creds.ProviderResourceID, "postgres", "twin.db") },
+	); finErr != nil {
+		return TwinProvisionResult{}, twinCoreErr("Failed to persist Postgres twin")
 	}
 
 	slog.Info("twin.provision.success",

@@ -222,34 +222,14 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 		return respondProvisionFailed(c, err, "Failed to provision Redis namespace")
 	}
 
-	// Persist the key_prefix so the dedup path can return the correct ACL namespace.
-	if creds.KeyPrefix != "" {
-		if kpErr := models.UpdateKeyPrefix(ctx, h.db, resource.ID, creds.KeyPrefix); kpErr != nil {
-			slog.Error("cache.new.update_key_prefix_failed", "error", kpErr, "request_id", requestID)
-		}
-	}
-
-	// Encrypt and persist the connection URL.
-	aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey)
-	if keyErr != nil {
-		slog.Error("cache.new.aes_key_parse_failed", "error", keyErr, "request_id", requestID)
-		// Fail open — resource is still usable, URL just won't be stored.
-	} else {
-		encryptedURL, encErr := crypto.Encrypt(aesKey, creds.URL)
-		if encErr != nil {
-			slog.Error("cache.new.encrypt_url_failed", "error", encErr, "request_id", requestID)
-		} else {
-			if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
-				slog.Error("cache.new.update_connection_url_failed", "error", upErr, "request_id", requestID)
-			}
-		}
-	}
-
-	// Persist provider_resource_id (k8s namespace for dedicated Redis pods).
-	if creds.ProviderResourceID != "" {
-		if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
-			slog.Error("cache.new.update_provider_resource_id_failed", "error", upErr, "request_id", requestID)
-		}
+	// MR-P0-2 / MR-P0-3: persist key_prefix + connection URL + PRID and flip
+	// the row pending→active. Any persistence failure tears down the backend
+	// Redis namespace and returns 503, never a 201.
+	if finErr := h.finalizeProvision(ctx, resource, creds.URL, creds.KeyPrefix, creds.ProviderResourceID, requestID, "cache.new",
+		func() { deprovisionBestEffort(ctx, h.provClient, tokenStr, creds.ProviderResourceID, "redis", "cache.new") },
+	); finErr != nil {
+		metrics.ProvisionFailures.WithLabelValues("redis", "persist_error").Inc()
+		return respondProvisionFailed(c, finErr, "Failed to persist Redis resource")
 	}
 
 	jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "redis", []string{tokenStr})
@@ -393,33 +373,13 @@ func (h *CacheHandler) newCacheAuthenticated(
 		return respondProvisionFailed(c, err, "Failed to provision Redis namespace")
 	}
 
-	// Persist the key_prefix so the dedup path can return the correct ACL namespace.
-	if creds.KeyPrefix != "" {
-		if kpErr := models.UpdateKeyPrefix(ctx, h.db, resource.ID, creds.KeyPrefix); kpErr != nil {
-			slog.Error("cache.new.update_key_prefix_failed_auth", "error", kpErr, "request_id", requestID)
-		}
-	}
-
-	// Encrypt and persist the connection URL.
-	aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey)
-	if keyErr != nil {
-		slog.Error("cache.new.aes_key_parse_failed_auth", "error", keyErr, "request_id", requestID)
-	} else {
-		encryptedURL, encErr := crypto.Encrypt(aesKey, creds.URL)
-		if encErr != nil {
-			slog.Error("cache.new.encrypt_url_failed_auth", "error", encErr, "request_id", requestID)
-		} else {
-			if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
-				slog.Error("cache.new.update_connection_url_failed_auth", "error", upErr, "request_id", requestID)
-			}
-		}
-	}
-
-	// Persist provider_resource_id (k8s namespace for dedicated Redis pods).
-	if creds.ProviderResourceID != "" {
-		if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
-			slog.Error("cache.new.update_provider_resource_id_failed_auth", "error", upErr, "request_id", requestID)
-		}
+	// MR-P0-2 / MR-P0-3: persist + flip pending→active; a persistence failure
+	// tears down the backend Redis namespace and returns 503, never a 201.
+	if finErr := h.finalizeProvision(ctx, resource, creds.URL, creds.KeyPrefix, creds.ProviderResourceID, requestID, "cache.new.auth",
+		func() { deprovisionBestEffort(ctx, h.provClient, tokenStr, creds.ProviderResourceID, "redis", "cache.new.auth") },
+	); finErr != nil {
+		metrics.ProvisionFailures.WithLabelValues("redis", "persist_error").Inc()
+		return respondProvisionFailed(c, finErr, "Failed to persist Redis resource")
 	}
 
 	slog.Info("provision.success",
@@ -584,24 +544,12 @@ func (h *CacheHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 		return TwinProvisionResult{}, twinCoreErr("Failed to provision Redis twin")
 	}
 
-	if creds.KeyPrefix != "" {
-		if kpErr := models.UpdateKeyPrefix(ctx, h.db, resource.ID, creds.KeyPrefix); kpErr != nil {
-			slog.Error("twin.cache.update_key_prefix_failed", "error", kpErr, "request_id", in.RequestID)
-		}
-	}
-
-	if aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey); keyErr != nil {
-		slog.Error("twin.cache.aes_key_parse_failed", "error", keyErr, "request_id", in.RequestID)
-	} else if encryptedURL, encErr := crypto.Encrypt(aesKey, creds.URL); encErr != nil {
-		slog.Error("twin.cache.encrypt_url_failed", "error", encErr, "request_id", in.RequestID)
-	} else if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
-		slog.Error("twin.cache.update_connection_url_failed", "error", upErr, "request_id", in.RequestID)
-	}
-
-	if creds.ProviderResourceID != "" {
-		if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
-			slog.Error("twin.cache.update_provider_resource_id_failed", "error", upErr, "request_id", in.RequestID)
-		}
+	// MR-P0-2 / MR-P0-3: persist + flip pending→active; a persistence failure
+	// tears down the backend Redis namespace and surfaces a hard error.
+	if finErr := h.finalizeProvision(ctx, resource, creds.URL, creds.KeyPrefix, creds.ProviderResourceID, in.RequestID, "twin.cache",
+		func() { deprovisionBestEffort(ctx, h.provClient, tokenStr, creds.ProviderResourceID, "redis", "twin.cache") },
+	); finErr != nil {
+		return TwinProvisionResult{}, twinCoreErr("Failed to persist Redis twin")
 	}
 
 	slog.Info("twin.provision.success",

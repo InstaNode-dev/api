@@ -514,19 +514,32 @@ func TestBillingWebhook_SubscriptionUpgraded_EmitsAuditRow(t *testing.T) {
 	assert.Equal(t, "pro", meta["to_tier"])
 }
 
-// TestBillingWebhook_SubscriptionDowngraded_EmitsAuditRow covers the
-// downgrade direction: a pro team receives a charged-webhook for the hobby
-// plan (the eventual delivery after ChangePlan settles), and the handler
-// writes a subscription.downgraded audit row.
-func TestBillingWebhook_SubscriptionDowngraded_EmitsAuditRow(t *testing.T) {
+// TestBillingWebhook_SubscriptionCharged_LowerTier_DoesNotDowngrade is the
+// MR-P0-6 regression guard (BugBash 2026-05-20). A subscription.charged event
+// carrying a LOWER-tier plan_id than the team currently holds must NOT demote
+// the paying customer.
+//
+// Real-world trigger: Razorpay re-fires / late-delivers `charged` events for
+// ANY subscription a team ever held. A customer who upgraded hobby→pro still
+// has the stale hobby subscription object in Razorpay; a renewal/retry/late
+// `charged` for it previously ran a blind `UPDATE teams SET plan_tier='hobby'`
+// — silently demoting the paying customer and emitting a spurious
+// subscription.downgraded ("your plan was downgraded") email.
+//
+// Genuine downgrades flow through subscription.cancelled / explicit
+// plan-change paths, never through `charged`. This test fails without the
+// rank guard in handleSubscriptionCharged.
+func TestBillingWebhook_SubscriptionCharged_LowerTier_DoesNotDowngrade(t *testing.T) {
 	db, cleanDB := billingStateNeedsDB(t)
 	defer cleanDB()
 
 	app, cfg := billingWebhookDBApp(t, db)
 
+	// A paying pro customer.
 	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
 	defer db.Exec(`DELETE FROM teams WHERE id = $1::uuid`, teamID)
 
+	// A stale / re-fired charged event for the customer's OLD hobby plan.
 	payload := makeSubscriptionChargedPayloadWithPlan(
 		t, teamID, "sub_test_"+uuid.NewString(), cfg.RazorpayPlanIDHobby,
 	)
@@ -536,22 +549,29 @@ func TestBillingWebhook_SubscriptionDowngraded_EmitsAuditRow(t *testing.T) {
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
+	// The team MUST remain on pro — a lower-tier charged event is never a
+	// downgrade signal.
 	var newTier string
 	require.NoError(t, db.QueryRow(`SELECT plan_tier FROM teams WHERE id = $1::uuid`, teamID).Scan(&newTier))
-	assert.Equal(t, "hobby", newTier)
+	assert.Equal(t, "pro", newTier, "a lower-tier subscription.charged must not downgrade a paying customer")
 
-	var kind, metaText string
+	// No spurious subscription.downgraded audit row (would trigger a
+	// "your plan was downgraded" email the customer never asked for).
+	var downgradeCount int
 	require.NoError(t, db.QueryRow(`
-		SELECT kind, metadata::text
-		  FROM audit_log
-		 WHERE team_id = $1::uuid AND kind = 'subscription.downgraded'
-		 ORDER BY created_at DESC
-		 LIMIT 1`, teamID).Scan(&kind, &metaText))
-	assert.Equal(t, "subscription.downgraded", kind)
+		SELECT count(*) FROM audit_log
+		 WHERE team_id = $1::uuid AND kind = 'subscription.downgraded'`, teamID).Scan(&downgradeCount))
+	assert.Equal(t, 0, downgradeCount, "lower-tier charged must not emit subscription.downgraded")
 
-	meta := decodeAuditMetadata(t, metaText)
-	assert.Equal(t, "pro", meta["from_tier"])
-	assert.Equal(t, "hobby", meta["to_tier"])
+	// Instead, the charge is flagged for operator reconciliation via a
+	// billing.charge_undeliverable audit row carrying the lower_tier_charge
+	// reason.
+	var reason string
+	require.NoError(t, db.QueryRow(`
+		SELECT metadata->>'reason' FROM audit_log
+		 WHERE team_id = $1::uuid AND kind = 'billing.charge_undeliverable'
+		 ORDER BY created_at DESC LIMIT 1`, teamID).Scan(&reason))
+	assert.Equal(t, "lower_tier_charge", reason)
 }
 
 // TestBillingWebhook_SubscriptionCharged_SameTier_EmitsNoTransitionRow

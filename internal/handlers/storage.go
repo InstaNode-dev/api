@@ -256,30 +256,22 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision R2 storage credentials")
 	}
 
-	// Encrypt and persist the connection URL (BucketURL).
-	aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey)
-	if keyErr != nil {
-		slog.Error("storage.new.aes_key_parse_failed", "error", keyErr, "request_id", requestID)
-		// Fail open — resource is still usable, URL just won't be stored.
-	} else {
-		encryptedURL, encErr := crypto.Encrypt(aesKey, creds.BucketURL)
-		if encErr != nil {
-			slog.Error("storage.new.encrypt_url_failed", "error", encErr, "request_id", requestID)
-		} else {
-			if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
-				slog.Error("storage.new.update_connection_url_failed", "error", upErr, "request_id", requestID)
+	// MR-P0-2 / MR-P0-3: persist the connection URL (BucketURL) + the canonical
+	// object prefix (provider_resource_id) and flip the row pending→active. Any
+	// persistence failure tears down the backend bucket prefix and returns 503,
+	// never a 201 — a stored PRID also closes the token-truncation cross-tenant
+	// class for storage.
+	if finErr := h.finalizeProvision(ctx, resource, creds.BucketURL, "", creds.ProviderResourceID, requestID, "storage.new",
+		func() {
+			if h.storageProvider != nil {
+				if dErr := h.storageProvider.Deprovision(ctx, tokenStr, creds.ProviderResourceID); dErr != nil {
+					slog.Warn("storage.new.cleanup_deprovision_failed", "error", dErr, "token", tokenStr)
+				}
 			}
-		}
-	}
-
-	// Persist the canonical object prefix (provider_resource_id) so teardown
-	// and the worker's storage scanner resolve the prefix from the stored
-	// value, never re-derive it from the token. Closes the token-truncation
-	// class for storage (cross-tenant object access in shared-key mode).
-	if creds.ProviderResourceID != "" {
-		if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
-			slog.Error("storage.new.update_provider_resource_id_failed", "error", upErr, "request_id", requestID)
-		}
+		},
+	); finErr != nil {
+		metrics.ProvisionFailures.WithLabelValues("storage", "persist_error").Inc()
+		return respondProvisionFailed(c, finErr, "Failed to persist storage resource")
 	}
 
 	jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "storage", []string{tokenStr})
@@ -418,27 +410,19 @@ func (h *StorageHandler) newStorageAuthenticated(
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision R2 storage credentials")
 	}
 
-	// Encrypt and persist the connection URL.
-	aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey)
-	if keyErr != nil {
-		slog.Error("storage.new.aes_key_parse_failed_auth", "error", keyErr, "request_id", requestID)
-	} else {
-		encryptedURL, encErr := crypto.Encrypt(aesKey, creds.BucketURL)
-		if encErr != nil {
-			slog.Error("storage.new.encrypt_url_failed_auth", "error", encErr, "request_id", requestID)
-		} else {
-			if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
-				slog.Error("storage.new.update_connection_url_failed_auth", "error", upErr, "request_id", requestID)
+	// MR-P0-2 / MR-P0-3: persist + flip pending→active; a persistence failure
+	// tears down the bucket prefix and returns 503, never a 201.
+	if finErr := h.finalizeProvision(ctx, resource, creds.BucketURL, "", creds.ProviderResourceID, requestID, "storage.new.auth",
+		func() {
+			if h.storageProvider != nil {
+				if dErr := h.storageProvider.Deprovision(ctx, tokenStr, creds.ProviderResourceID); dErr != nil {
+					slog.Warn("storage.new.auth.cleanup_deprovision_failed", "error", dErr, "token", tokenStr)
+				}
 			}
-		}
-	}
-
-	// Persist the canonical object prefix (provider_resource_id) — see the
-	// anonymous path above. Closes the token-truncation class for storage.
-	if creds.ProviderResourceID != "" {
-		if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
-			slog.Error("storage.new.update_provider_resource_id_failed_auth", "error", upErr, "request_id", requestID)
-		}
+		},
+	); finErr != nil {
+		metrics.ProvisionFailures.WithLabelValues("storage", "persist_error").Inc()
+		return respondProvisionFailed(c, finErr, "Failed to persist storage resource")
 	}
 
 	slog.Info("provision.success",

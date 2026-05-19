@@ -314,14 +314,19 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 	}
 	tokenStr = resource.Token.String()
 
-	// Build the receive URL and encrypt it for storage. The base is a fixed
-	// server-controlled value — never the client Host header.
+	// Build the receive URL. The base is a fixed server-controlled value —
+	// never the client Host header.
 	rURL := receiveURL(h.webhookReceiveBaseURL(c), tokenStr)
 	provCtx, span := h.startProvisionSpan(ctx, "webhook", "anonymous", "", fp, tokenStr)
-	keyErr := h.storeEncryptedURL(provCtx, resource.ID, rURL, requestID)
-	finishProvisionSpan(span, keyErr)
-	if keyErr != nil {
-		slog.Error("webhook.new.store_url_failed", "error", keyErr, "token", tokenStr, "request_id", requestID)
+	// MR-P0-2 / MR-P0-3: encrypt + persist the receive URL and flip the row
+	// pending→active. A persistence failure returns 503, never a 201 with an
+	// unrecoverable receive URL. Webhook is status-only — there is no backend
+	// object to tear down beyond the soft-deleted row (cleanup=nil).
+	finErr := h.finalizeProvision(provCtx, resource, rURL, "", "", requestID, "webhook.new", nil)
+	finishProvisionSpan(span, finErr)
+	if finErr != nil {
+		metrics.ProvisionFailures.WithLabelValues("webhook", "persist_error").Inc()
+		return respondProvisionFailed(c, finErr, "Failed to persist webhook resource")
 	}
 
 	jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "webhook", []string{tokenStr})
@@ -427,10 +432,14 @@ func (h *WebhookHandler) newWebhookAuthenticated(
 	rURL := receiveURL(h.webhookReceiveBaseURL(c), tokenStr)
 
 	provCtx, span := h.startProvisionSpan(ctx, "webhook", team.PlanTier, teamIDStr, fp, tokenStr)
-	keyErr := h.storeEncryptedURL(provCtx, resource.ID, rURL, requestID)
-	finishProvisionSpan(span, keyErr)
-	if keyErr != nil {
-		slog.Error("webhook.new.store_url_failed_auth", "error", keyErr, "token", tokenStr, "request_id", requestID)
+	// MR-P0-2 / MR-P0-3: encrypt + persist the receive URL and flip the row
+	// pending→active. A persistence failure returns 503, never a 201 with an
+	// unrecoverable receive URL.
+	finErr := h.finalizeProvision(provCtx, resource, rURL, "", "", requestID, "webhook.new.auth", nil)
+	finishProvisionSpan(span, finErr)
+	if finErr != nil {
+		metrics.ProvisionFailures.WithLabelValues("webhook", "persist_error").Inc()
+		return respondProvisionFailed(c, finErr, "Failed to persist webhook resource")
 	}
 
 	slog.Info("provision.success",

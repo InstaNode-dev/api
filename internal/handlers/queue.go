@@ -229,20 +229,14 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		return respondProvisionFailed(c, err, "Failed to provision NATS credentials")
 	}
 
-	// Encrypt and persist the connection URL.
-	aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey)
-	if keyErr != nil {
-		slog.Error("queue.new.aes_key_parse_failed", "error", keyErr, "request_id", requestID)
-		// Fail open — resource is still usable, URL just won't be stored.
-	} else {
-		encryptedURL, encErr := crypto.Encrypt(aesKey, creds.URL)
-		if encErr != nil {
-			slog.Error("queue.new.encrypt_url_failed", "error", encErr, "request_id", requestID)
-		} else {
-			if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
-				slog.Error("queue.new.update_connection_url_failed", "error", upErr, "request_id", requestID)
-			}
-		}
+	// MR-P0-2 / MR-P0-3: persist connection URL + PRID and flip the row
+	// pending→active. Any persistence failure tears down the backend NATS
+	// resource and returns 503, never a 201.
+	if finErr := h.finalizeProvision(ctx, resource, creds.URL, "", creds.ProviderResourceID, requestID, "queue.new",
+		func() { deprovisionBestEffort(ctx, h.provClient, tokenStr, creds.ProviderResourceID, "queue", "queue.new") },
+	); finErr != nil {
+		metrics.ProvisionFailures.WithLabelValues("queue", "persist_error").Inc()
+		return respondProvisionFailed(c, finErr, "Failed to persist queue resource")
 	}
 
 	jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "queue", []string{tokenStr})
@@ -392,26 +386,13 @@ func (h *QueueHandler) newQueueAuthenticated(
 		return respondProvisionFailed(c, err, "Failed to provision NATS credentials")
 	}
 
-	// Encrypt and persist the connection URL.
-	aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey)
-	if keyErr != nil {
-		slog.Error("queue.new.aes_key_parse_failed_auth", "error", keyErr, "request_id", requestID)
-	} else {
-		encryptedURL, encErr := crypto.Encrypt(aesKey, creds.URL)
-		if encErr != nil {
-			slog.Error("queue.new.encrypt_url_failed_auth", "error", encErr, "request_id", requestID)
-		} else {
-			if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
-				slog.Error("queue.new.update_connection_url_failed_auth", "error", upErr, "request_id", requestID)
-			}
-		}
-	}
-
-	// Persist provider_resource_id (k8s namespace for dedicated NATS pods).
-	if creds.ProviderResourceID != "" {
-		if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
-			slog.Error("queue.new.update_provider_resource_id_failed", "error", upErr, "request_id", requestID)
-		}
+	// MR-P0-2 / MR-P0-3: persist + flip pending→active; a persistence failure
+	// tears down the backend NATS resource and returns 503, never a 201.
+	if finErr := h.finalizeProvision(ctx, resource, creds.URL, "", creds.ProviderResourceID, requestID, "queue.new.auth",
+		func() { deprovisionBestEffort(ctx, h.provClient, tokenStr, creds.ProviderResourceID, "queue", "queue.new.auth") },
+	); finErr != nil {
+		metrics.ProvisionFailures.WithLabelValues("queue", "persist_error").Inc()
+		return respondProvisionFailed(c, finErr, "Failed to persist queue resource")
 	}
 
 	slog.Info("provision.success",
