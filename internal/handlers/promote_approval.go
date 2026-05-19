@@ -261,7 +261,12 @@ func (h *PromoteApprovalHandler) Reject(c *fiber.Ctx) error {
 			"approval is no longer pending — somebody beat us to it")
 	}
 
-	// Audit row — best-effort.
+	// Audit row — best-effort. Snapshot the admin email out of the fiber Ctx
+	// on the handler goroutine BEFORE spawning the background goroutine:
+	// fiber recycles *fiber.Ctx into a pool the instant this handler returns,
+	// so reading middleware.GetEmail(c) inside the closure races with — and
+	// can mis-attribute the audit to — a later request that reused the Ctx.
+	rejectedBy := middleware.GetEmail(c)
 	safego.Go("promote_approval.rejected_audit", func() {
 		emitPromoteAuditEvent(context.Background(), h.db, row, models.AuditKindPromoteRejected,
 			"Promote approval rejected by admin for "+row.FromEnv+" → "+row.ToEnv,
@@ -270,7 +275,7 @@ func (h *PromoteApprovalHandler) Reject(c *fiber.Ctx) error {
 				"from_env":    row.FromEnv,
 				"to_env":      row.ToEnv,
 				"kind":        row.PromoteKind,
-				"rejected_by": middleware.GetEmail(c),
+				"rejected_by": rejectedBy,
 			})
 	})
 

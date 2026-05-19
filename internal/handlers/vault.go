@@ -205,6 +205,18 @@ func (h *VaultHandler) audit(c *fiber.Ctx, teamID uuid.UUID, userID uuid.NullUUI
 // kind is one of models.AuditKindVaultRead / AuditKindVaultWrite. operation
 // is one of "create" | "update" | "delete" | "" — empty for reads.
 func (h *VaultHandler) emitAuditEvent(teamID uuid.UUID, userID uuid.NullUUID, kind, env, key, operation string) {
+	// Data-race fix: env and key reach this method as substrings of c.Params(),
+	// whose backing bytes live inside the fasthttp request Ctx. fiber recycles
+	// that Ctx into a pool the instant the handler returns — a later request
+	// reuses (and overwrites) the same buffer. The background goroutine below
+	// reads env/key after the handler has returned, so it MUST capture
+	// heap-owned copies, never aliases into the recycled Ctx. strings.Clone
+	// forces a fresh backing array. teamID/userID are value types (already
+	// copied); kind is a package-level const string but cloned for symmetry.
+	kind = strings.Clone(kind)
+	env = strings.Clone(env)
+	key = strings.Clone(key)
+	operation = strings.Clone(operation)
 	safego.Go("vault.bg", func() {
 		meta := map[string]string{
 			"env":      env,
