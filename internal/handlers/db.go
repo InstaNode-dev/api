@@ -148,6 +148,13 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 				return respondError(c, fiber.StatusTooManyRequests, "provision_limit_reached",
 					"Daily anonymous provisioning limit reached for this network. Sign up at "+urls.StartURLPrefix)
 			}
+			// F2 TOCTOU fix (2026-05-19): both lookups missed. checkProvisionLimit's
+			// atomic INCR already proved this caller is over the cap; the absent
+			// row only means the ≤5 winning provisions in this burst have claimed
+			// their slots but not yet committed. An over-cap caller must NEVER
+			// fall through to CreateResource — that is exactly the race that let
+			// a 30-way burst mint 22–29 tokens. Hard-deny with 429.
+			return h.denyProvisionOverCap(c, fp, "postgres")
 		}
 		if err == nil {
 			jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "postgres", []string{existing.Token.String()})

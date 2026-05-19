@@ -142,19 +142,51 @@ func finishProvisionSpan(span trace.Span, err error) {
 	span.End()
 }
 
-// checkProvisionLimit checks the per-fingerprint daily provisioning rate limit.
-// The limit is shared across ALL service types.
+// provisionCapExpiry is the TTL on the per-fingerprint daily provision
+// counter. 25h (not 24h) so a counter set just before midnight still
+// covers a full UTC day and avoids a midnight thundering-herd reset.
+const provisionCapExpiry = 25 * time.Hour
+
+// provisionLimitTier is the tier whose provisions_per_day cap governs the
+// anonymous provisioning path. All anonymous provisions — across every
+// service type — share this single per-fingerprint daily counter.
+const provisionLimitTier = "anonymous"
+
+// overCapErrorCode is the machine-stable error code returned when an
+// anonymous caller is over the per-fingerprint daily provisioning cap and
+// no existing resource is available to dedup against (the burst-race case:
+// the winning provisions have claimed their slots via the atomic INCR but
+// have not yet committed a `resources` row). Programmatic clients branch
+// on this exact string.
+const overCapErrorCode = "provision_limit_reached"
+
+// checkProvisionLimit atomically claims a per-fingerprint provisioning slot
+// for the current UTC day and reports whether the daily cap is exceeded.
+// The cap is shared across ALL service types.
 //
-// Returns (true, nil)  when limit is exceeded.
-// Returns (false, nil) when the provision is allowed.
-// Returns (false, err) when Redis is unavailable; caller must fail open.
+// CONCURRENCY (load-test finding F2 / TOCTOU fix 2026-05-19): the gate is
+// the atomic Redis INCR itself — the value INCR returns *is* the caller's
+// claimed slot number. N concurrent callers from one fingerprint receive N
+// distinct, monotonically-increasing slot numbers (1, 2, 3, …) with no
+// interleaving, because INCR is single-threaded server-side. Callers whose
+// slot number is ≤ cap are cleared to provision; callers whose slot number
+// is > cap are over the cap. There is NO check-then-act window: the count
+// is never read separately from the increment. Before this fix the
+// downstream dedup branch *did* have a TOCTOU window — see
+// denyProvisionOverCap for the second half of the fix.
+//
+// Returns (true, nil)  when this caller's claimed slot is over the cap.
+// Returns (false, nil) when this caller's slot is within the cap.
+// Returns (false, err) when Redis is unavailable; caller must fail open
+//
+//	(CLAUDE.md convention #6 — a Redis outage must never block provisioning).
 func (h *provisionHelper) checkProvisionLimit(ctx context.Context, fp string) (bool, error) {
 	date := time.Now().UTC().Format("2006-01-02")
 	key := fmt.Sprintf("prov:%s:%s", fp, date)
 
 	pipe := h.rdb.Pipeline()
 	incrCmd := pipe.Incr(ctx, key)
-	pipe.Expire(ctx, key, 25*time.Hour) // 25h avoids midnight thundering-herd
+	pipe.Expire(ctx, key, provisionCapExpiry)
 
 	if _, err := pipe.Exec(ctx); err != nil {
 		return false, fmt.Errorf("checkProvisionLimit redis pipeline: %w", err)
@@ -164,7 +196,44 @@ func (h *provisionHelper) checkProvisionLimit(ctx context.Context, fp string) (b
 	if err != nil {
 		return false, fmt.Errorf("checkProvisionLimit incr result: %w", err)
 	}
-	return count > int64(h.plans.ProvisionLimit("anonymous")), nil
+	return count > int64(h.plans.ProvisionLimit(provisionLimitTier)), nil
+}
+
+// denyProvisionOverCap writes the canonical 429 response for an anonymous
+// caller that is over the per-fingerprint daily provisioning cap AND for
+// which no existing resource could be found to dedup against.
+//
+// WHY THIS EXISTS (load-test finding F2 — TOCTOU fix 2026-05-19):
+// checkProvisionLimit's atomic INCR correctly hands every burst caller a
+// distinct slot number, so callers 6..N all see limitExceeded == true.
+// The over-cap branch in each handler then tries to look up an existing
+// anonymous resource to return instead of provisioning fresh. But during a
+// *simultaneous* burst the ≤5 winning callers have not yet committed their
+// `resources` rows — so GetActiveResourceByFingerprintType AND the
+// cross-service GetActiveResourceByFingerprint both return ErrResourceNotFound.
+// Before this fix, when both lookups missed, control FELL THROUGH the
+// limitExceeded block to CreateResource — and every one of the 30 burst
+// callers minted a fresh token, blowing the cap (observed: 22–29 tokens
+// instead of 5).
+//
+// The fix closes the fall-through: an over-cap caller that finds no
+// existing resource is genuinely over the cap (its slot number proved it)
+// — the absence of a committed row only means the winners are still
+// in-flight. Such a caller MUST be rejected with 429, never allowed to
+// provision fresh. Handlers call this on the no-existing-resource path
+// instead of falling through.
+//
+// The atomic INCR (the slot claim) plus this hard deny (no fall-through)
+// together make the cap race-safe: at most `cap` callers ever reach
+// CreateResource; callers 6..N either dedup onto a committed winner or get
+// a clean 429 here.
+func (h *provisionHelper) denyProvisionOverCap(c *fiber.Ctx, fp, resourceType string) error {
+	metrics.FingerprintAbuseBlocked.Inc()
+	slog.Info("provision.cap_reached.no_existing_resource",
+		"fingerprint", fp, "resource_type", resourceType,
+		"cap", h.plans.ProvisionLimit(provisionLimitTier))
+	return respondError(c, fiber.StatusTooManyRequests, overCapErrorCode,
+		"Daily anonymous provisioning limit reached for this network. Sign up at "+urls.StartURLPrefix)
 }
 
 // recycleSeen returns true if the recycle_seen:<fp> marker exists for this

@@ -267,6 +267,10 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 				return respondError(c, fiber.StatusTooManyRequests, "provision_limit_reached",
 					"Daily anonymous provisioning limit reached for this network. Sign up at "+urls.StartURLPrefix)
 			}
+			// F2 TOCTOU fix (2026-05-19): over-cap caller, both lookups missed
+			// (burst winners not yet committed). Hard-deny — never fall through
+			// to a fresh provision. See denyProvisionOverCap for the full rationale.
+			return h.denyProvisionOverCap(c, fp, models.ResourceTypeVector)
 		}
 		if lookupErr == nil {
 			jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, models.ResourceTypeVector, []string{existing.Token.String()})
