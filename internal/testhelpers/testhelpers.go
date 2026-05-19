@@ -414,6 +414,17 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			received_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_razorpay_webhook_events_received_at ON razorpay_webhook_events(received_at)`,
+		// 056_email_send_dedup — per-billing-cycle dedup ledger for api-side
+		// transactional emails (EMAIL-BUGBASH C4/C5). Collapses the two
+		// Razorpay events of one cycle (activated+charged / failed+pending)
+		// to a single email send. Mirrored so billing handler tests can
+		// exercise the claim path.
+		`CREATE TABLE IF NOT EXISTS email_send_dedup (
+			dedup_key   TEXT PRIMARY KEY,
+			email_kind  TEXT NOT NULL,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_email_send_dedup_created_at ON email_send_dedup(created_at)`,
 		// 053_pending_checkouts — payment-failure coverage gap. Records every
 		// subscription /api/v1/billing/checkout creates; the webhook marks it
 		// resolved on activate/charge; the worker reconciler notifies rows that
@@ -594,6 +605,13 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			ON pending_deletions (resource_id, resource_type) WHERE status = 'pending'`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_deletions_expires
 			ON pending_deletions (expires_at) WHERE status = 'pending'`,
+		// 055_forwarder_sent — worker-side send ledger for the event-email
+		// forwarder. Mirrored so a bare-Postgres CI run has the table the
+		// forwarder INSERTs into (ON CONFLICT DO NOTHING) for idempotency.
+		`CREATE TABLE IF NOT EXISTS forwarder_sent (
+			audit_id TEXT PRIMARY KEY,
+			sent_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
 		// 050_deployment_events — failure-autopsy records read by
 		// GET /deploy/:id as the top-level "failure" object.
 		`CREATE TABLE IF NOT EXISTS deployment_events (
