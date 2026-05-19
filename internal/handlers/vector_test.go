@@ -138,7 +138,7 @@ func TestVectorNew_EnabledViaPostgres_AcceptsRequest(t *testing.T) {
 	app, cleanApp := testhelpers.NewTestAppWithServices(t, db, rdb, "postgres,redis,mongodb,queue,webhook,storage")
 	defer cleanApp()
 
-	resp := postVector(t, app, "10.40.0.2", "")
+	resp := postVector(t, app, "10.40.0.2", `{"name":"vec-enabled"}`)
 	maybeSkipProvisionFailed(t, resp)
 	v := decodeVectorResponse(t, resp)
 	assert.True(t, v.OK)
@@ -157,7 +157,7 @@ func TestVectorNew_Returns201WithRequiredFields(t *testing.T) {
 	app, cleanApp := testhelpers.NewTestAppWithServices(t, db, rdb, "vector,postgres,redis,mongodb,queue,webhook,storage")
 	defer cleanApp()
 
-	resp := postVector(t, app, "10.40.1.1", "")
+	resp := postVector(t, app, "10.40.1.1", `{"name":"vec-required"}`)
 	maybeSkipProvisionFailed(t, resp)
 	v := decodeVectorResponse(t, resp)
 
@@ -184,7 +184,7 @@ func TestVectorNew_StoresResourceTypeVector(t *testing.T) {
 	app, cleanApp := testhelpers.NewTestAppWithServices(t, db, rdb, "vector,postgres,redis,mongodb,queue,webhook,storage")
 	defer cleanApp()
 
-	resp := postVector(t, app, "10.40.1.2", "")
+	resp := postVector(t, app, "10.40.1.2", `{"name":"vec-type"}`)
 	maybeSkipProvisionFailed(t, resp)
 	v := decodeVectorResponse(t, resp)
 	defer db.Exec(`DELETE FROM resources WHERE token = $1::uuid`, v.Token)
@@ -212,7 +212,7 @@ func TestVectorNew_CustomDimensionsEchoed(t *testing.T) {
 	app, cleanApp := testhelpers.NewTestAppWithServices(t, db, rdb, "vector,postgres,redis,mongodb,queue,webhook,storage")
 	defer cleanApp()
 
-	resp := postVector(t, app, "10.40.2.1", `{"dimensions":3072}`)
+	resp := postVector(t, app, "10.40.2.1", `{"name":"vec-dim","dimensions":3072}`)
 	maybeSkipProvisionFailed(t, resp)
 	v := decodeVectorResponse(t, resp)
 	assert.Equal(t, 3072, v.Dimensions, "custom dimensions must be echoed (3072 = text-embedding-3-large)")
@@ -226,8 +226,8 @@ func TestVectorNew_InvalidDimensions_Returns400(t *testing.T) {
 		name string
 		body string
 	}{
-		{"negative", `{"dimensions":-1}`},
-		{"too_large", `{"dimensions":16001}`},
+		{"negative", `{"name":"vec-neg","dimensions":-1}`},
+		{"too_large", `{"name":"vec-big","dimensions":16001}`},
 		// dimensions:0 is treated as "unset" and defaults to 1536 — see
 		// parseDimensions. That's intentional so callers can send the
 		// JSON zero value without hitting an error.
@@ -268,7 +268,7 @@ func TestVectorNew_AnonymousTierLimits(t *testing.T) {
 	app, cleanApp := testhelpers.NewTestAppWithServices(t, db, rdb, "vector,postgres,redis,mongodb,queue,webhook,storage")
 	defer cleanApp()
 
-	resp := postVector(t, app, "10.40.4.1", "")
+	resp := postVector(t, app, "10.40.4.1", `{"name":"vec-anon"}`)
 	maybeSkipProvisionFailed(t, resp)
 	v := decodeVectorResponse(t, resp)
 	assert.Equal(t, 10, v.Limits.StorageMB, "anonymous vector storage_mb must be 10")
@@ -329,7 +329,7 @@ func TestVectorNew_PgvectorExtensionInstalled(t *testing.T) {
 	app, cleanApp := testhelpers.NewTestAppWithServices(t, db, rdb, "vector,postgres,redis,mongodb,queue,webhook,storage")
 	defer cleanApp()
 
-	resp := postVector(t, app, "10.40.5.1", "")
+	resp := postVector(t, app, "10.40.5.1", `{"name":"vec-pgv"}`)
 	maybeSkipProvisionFailed(t, resp)
 	v := decodeVectorResponse(t, resp)
 	defer db.Exec(`DELETE FROM resources WHERE token = $1::uuid`, v.Token)

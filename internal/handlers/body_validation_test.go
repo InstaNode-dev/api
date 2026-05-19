@@ -202,8 +202,14 @@ func TestProvisioningBodyValidation_EmptyBody_StillWorks(t *testing.T) {
 }
 
 // TestProvisioningBodyValidation_EmptyJSONObject_StillWorks pins the other
-// documented happy path: `{}` is valid JSON and must not change behaviour
-// vs no body at all. Same 503-tolerance as TestProvisioningBodyValidation_EmptyBody.
+// documented happy path: a valid JSON body must not change behaviour vs no
+// body at all. Same 503-tolerance as TestProvisioningBodyValidation_EmptyBody.
+//
+// 2026-05-20: every provisioning endpoint is now naming-mandatory (`requireName`
+// — T14-P1-1 wired `/vector/new` so the seven anonymous handlers + storage match).
+// A bare `{}` therefore 400s `name_required` by design; this test's intent
+// is "valid JSON parses cleanly" so we send a minimal `{"name":"…"}` — still
+// a "happy path" JSON object, no other fields, just with the required label.
 func TestProvisioningBodyValidation_EmptyJSONObject_StillWorks(t *testing.T) {
 	for _, ep := range allProvisioningEndpoints {
 		ep := ep
@@ -216,7 +222,7 @@ func TestProvisioningBodyValidation_EmptyJSONObject_StillWorks(t *testing.T) {
 			app, cleanApp := testhelpers.NewTestAppWithServices(t, db, rdb, ep.enable)
 			defer cleanApp()
 
-			req := httptest.NewRequest(http.MethodPost, ep.path, strings.NewReader(`{}`))
+			req := httptest.NewRequest(http.MethodPost, ep.path, strings.NewReader(`{"name":"bv-test"}`))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("X-Forwarded-For", strings.Replace(ep.ip, "10.99.", "10.96.", 1))
 
@@ -226,7 +232,7 @@ func TestProvisioningBodyValidation_EmptyJSONObject_StillWorks(t *testing.T) {
 			resp.Body.Close()
 
 			assert.NotEqual(t, http.StatusBadRequest, resp.StatusCode,
-				"%s must NOT 400 on empty JSON object {}", ep.path)
+				"%s must NOT 400 on minimal valid JSON body", ep.path)
 		})
 	}
 }
