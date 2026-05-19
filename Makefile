@@ -4,7 +4,8 @@
         docker-build smoke-buildinfo \
         k8s-deploy k8s-delete k8s-status k8s-regen-migrations \
         gen-secrets install-cli \
-        storage-verify-isolation
+        storage-verify-isolation \
+        loadtest chaostest
 
 # Build-time metadata injected into instant.dev/common/buildinfo via -ldflags.
 # Override on the make line if needed. GIT_SHA falls back to "dev" when not
@@ -239,3 +240,55 @@ storage-verify-isolation:
 	    aws --endpoint-url $$S3_ENDPOINT s3 cp s3://instant-shared/$${PRE_A}probe.txt /tmp/.steal.txt 2>&1 | grep -q 'AccessDenied\|403' \
 	    && echo "PASS isolation enforced — cross-prefix read returned 403" \
 	    || (echo "FAIL cross-prefix read succeeded — shared-key loophole is OPEN"; exit 1)
+
+# ── Load & chaos harness ──────────────────────────────────────────────────────
+#
+# The load/chaos harness lives in e2e/loadtest_*.go behind the build
+# constraint `//go:build loadtest && e2e`. The normal PR/deploy gate uses NO
+# tag and the standard E2E gate uses `-tags e2e` only — so neither ever
+# compiles or runs this harness. Only `make loadtest` / `make chaostest`
+# pass both tags.
+#
+# Both targets run against a LIVE deployment (prod or local). They are
+# free-tier-only and cost-safe: no Razorpay, no deploy/kaniko builds, and
+# every provisioned resource is tracked in a ledger and torn down (per-
+# resource defer + mid-run batch sweeps + final sweep + zero-leak assertion).
+#
+# ── loadtest ──
+# Concurrency / dedup / rate-limit load. Two lanes:
+#   Lane A (authenticated): claims ONE free-tier team, mints a session JWT,
+#           and drives concurrent provisioning through the authenticated
+#           path (which bypasses the free-tier recycle gate). Requires
+#           E2E_JWT_SECRET. If unavailable, Lane A self-skips.
+#   Lane B (anonymous): load-tests the 402 recycle gate + dedup + rate
+#           limiting directly, asserting clean 402/429s and no 5xx.
+#
+# Required: E2E_BASE_URL.   Recommended: E2E_JWT_SECRET (enables Lane A).
+# Optional: LOAD_CONCURRENCY (default 20).
+#
+#   E2E_BASE_URL=https://api.instanode.dev \
+#   E2E_JWT_SECRET=$$(kubectl get secret instant-secrets -n instant \
+#     -o jsonpath='{.data.JWT_SECRET}' | base64 -d) \
+#   make loadtest
+loadtest:
+	@: $${E2E_BASE_URL:?set E2E_BASE_URL to the live API root, e.g. https://api.instanode.dev}
+	go test ./e2e/... -tags 'e2e loadtest' -v -count=1 -timeout 600s \
+	  -run 'TestLoad_'
+
+# ── chaostest ──
+# Safe, non-destructive chaos: kills ONE replica at a time of instant-api,
+# instant-worker, instant-provisioner (`kubectl delete pod`), waits for full
+# self-heal, and asserts /healthz stays serving with no 5xx / no silent
+# drops. Stateless deployments only — instant-data stateful pods are never
+# touched, nothing is scaled to zero, no DB failover.
+#
+# Required: E2E_BASE_URL + working kubectl context (do-nyc3-instant-prod).
+# Optional: CHAOS_NAMESPACE_APP (default instant),
+#           CHAOS_NAMESPACE_INFRA (default instant-infra),
+#           CHAOS_RECOVER_TIMEOUT (default 120s).
+#
+#   E2E_BASE_URL=https://api.instanode.dev make chaostest
+chaostest:
+	@: $${E2E_BASE_URL:?set E2E_BASE_URL to the live API root, e.g. https://api.instanode.dev}
+	go test ./e2e/... -tags 'e2e loadtest' -v -count=1 -timeout 600s \
+	  -run 'TestChaos_'
