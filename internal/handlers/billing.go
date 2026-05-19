@@ -1292,6 +1292,49 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 		fromTier = team.PlanTier
 	}
 
+	// MR-P0-6 (BugBash 2026-05-20): a subscription.charged event must NEVER
+	// LOWER a team's tier. Razorpay re-fires / late-delivers `charged` events
+	// for ANY subscription a team has ever held — a customer who upgraded
+	// hobby→pro still has the stale hobby subscription object in Razorpay, and
+	// a renewal/retry/late `charged` for it would otherwise demote the paying
+	// customer to hobby and emit a spurious subscription.downgraded email.
+	//
+	// Genuine downgrades flow through subscription.cancelled / explicit
+	// plan-change paths, NOT through `charged`. So: if the charged plan's tier
+	// ranks BELOW the team's current tier, skip the tier update entirely, log
+	// a loud WARN + a billing.charge_undeliverable audit row for operator
+	// reconciliation, and keep the higher tier. Same-tier renewals and genuine
+	// upgrades (rank >= current) still flow through unchanged.
+	if fromTier != "" && plans.Rank(tier) < plans.Rank(fromTier) {
+		slog.Warn("billing.subscription.charged.lower_tier_charge",
+			"team_id", teamID,
+			"current_tier", fromTier,
+			"charged_tier", tier,
+			"plan_id", sub.PlanID,
+			"subscription_id", sub.ID,
+			"action", "subscription.charged carried a lower-tier plan_id than the team currently holds — "+
+				"NOT downgrading (charged is never a downgrade signal). Operator: verify whether this is a "+
+				"stale/re-fired event for an old subscription or a genuine plan change that should go through "+
+				"the cancellation/change path, then reconcile/refund if needed",
+		)
+		emitChargeUndeliverableAudit(ctx, h.db, teamID, sub, event,
+			chargeUndeliverableReasonLowerTierCharge, tier)
+		// Still resolve any pending checkout / store the subscription id so the
+		// checkout reconciler does not later flag this as a failure, but do
+		// NOT touch the team tier.
+		if sub.ID != "" {
+			if updateErr := models.UpdateRazorpaySubscriptionID(ctx, h.db, teamID, sub.ID); updateErr != nil {
+				slog.Error("billing.subscription.charged.update_sub_id_failed_lower_tier",
+					"error", updateErr, "team_id", teamID)
+			}
+			if resolveErr := models.ResolvePendingCheckout(ctx, h.db, sub.ID); resolveErr != nil {
+				slog.Warn("billing.subscription.charged.pending_checkout_resolve_failed_lower_tier",
+					"error", resolveErr, "team_id", teamID, "subscription_id", sub.ID)
+			}
+		}
+		return nil
+	}
+
 	// Atomically upgrade the team tier + all resources, deployments, and stacks.
 	// Returns an error on failure — caller will return HTTP 500 so Razorpay retries.
 	if upgradeErr := models.UpgradeTeamAllTiers(ctx, h.db, teamID, tier); upgradeErr != nil {
@@ -2436,6 +2479,12 @@ const (
 	// plan_id maps to a tier that is not in plans.yaml, so no entitlement can
 	// be granted.
 	chargeUndeliverableReasonUnknownTier = "unknown_tier"
+	// chargeUndeliverableReasonLowerTierCharge — MR-P0-6 (BugBash 2026-05-20):
+	// a subscription.charged event carried a plan_id that ranks BELOW the
+	// team's current tier. `charged` is never a downgrade signal (genuine
+	// downgrades flow through cancellation/plan-change), so the tier was kept
+	// and the charge flagged for operator reconciliation.
+	chargeUndeliverableReasonLowerTierCharge = "lower_tier_charge"
 )
 
 // F11 (billing-trust audit 2026-05-19) — cancellation copy.

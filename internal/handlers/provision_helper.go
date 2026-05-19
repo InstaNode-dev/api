@@ -36,7 +36,9 @@ import (
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
+	"instant.dev/internal/provisioner"
 	"instant.dev/internal/urls"
+	commonv1 "instant.dev/proto/common/v1"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -325,6 +327,133 @@ func (h *provisionHelper) recycleGate(c *fiber.Ctx, fp, resourceType string) boo
 	_ = respondRecycleGate(c, RecycleGateErrorCode, RecycleGateMessage,
 		RecycleGateAgentAction, RecycleGateClaimURL)
 	return true
+}
+
+// deprovisionBestEffort tears down a just-provisioned backend object after a
+// post-RPC persistence failure (MR-P0-3 cleanup path). Best-effort: a failure
+// is logged at WARN and swallowed — the soft-delete + 503 still happen. A nil
+// provClient (local-provider mode) is a no-op; the local providers have no
+// async backend object that outlives the request.
+func deprovisionBestEffort(ctx context.Context, provClient *provisioner.Client, token, providerResourceID, resourceType, logPrefix string) {
+	if provClient == nil {
+		return
+	}
+	resType := resourceTypeToProto(resourceType)
+	if resType == commonv1.ResourceType_RESOURCE_TYPE_UNSPECIFIED {
+		return
+	}
+	if err := provClient.DeprovisionResource(ctx, token, providerResourceID, resType); err != nil {
+		slog.Warn(logPrefix+".cleanup_deprovision_failed",
+			"error", err, "token", token, "resource_type", resourceType)
+	}
+}
+
+// errProvisionPersistFailed is the sentinel finalizeProvision returns when a
+// post-RPC persistence step (connection-URL encrypt/store, provider-resource-id
+// store) or the pending→active flip failed. The handler maps it to a 503 via
+// respondProvisionFailed — never a 201. See MR-P0-3.
+var errProvisionPersistFailed = errors.New("provision persistence failed")
+
+// finalizeProvision is the second phase of the MR-P0-2 / MR-P0-3 two-phase
+// provision lifecycle. The caller runs it AFTER the backend provision RPC has
+// succeeded; it:
+//
+//  1. Encrypts and persists the connection URL.
+//  2. Persists the provider_resource_id.
+//  3. Flips the resource row from 'pending' → 'active' (models.MarkResourceActive).
+//
+// If ANY of those steps fails the resource is NOT addressable by the platform
+// (no stored URL → the customer can never recover credentials; no PRID → the
+// platform can't deprovision; still 'pending' → it is not usable) — returning a
+// 201 for such a row is the MR-P0-3 orphan-generator bug. So on any failure
+// this helper:
+//
+//   - runs the caller-supplied cleanup closure (best-effort backend deprovision),
+//   - soft-deletes the resource row,
+//   - returns errProvisionPersistFailed.
+//
+// The caller treats a non-nil return as a hard provision failure
+// (respondProvisionFailed → 503), never a success.
+//
+// keyPrefix is the optional provisioner ACL namespace (Redis); pass "" for
+// resource types that have none. cleanup may be nil for status-only resources
+// (webhook) that have no backend object to tear down. logPrefix is the
+// per-handler slog key prefix (e.g. "db.new", "cache.new") so log lines stay
+// attributable.
+func (h *provisionHelper) finalizeProvision(
+	ctx context.Context,
+	resource *models.Resource,
+	connectionURL, keyPrefix, providerResourceID, requestID, logPrefix string,
+	cleanup func(),
+) error {
+	persistFailed := false
+
+	// 0. Persist the provisioner key_prefix (Redis ACL namespace). A missing
+	//    key_prefix breaks the dedup path's ability to return the correct
+	//    namespace — hard failure.
+	if !persistFailed && keyPrefix != "" {
+		if kpErr := models.UpdateKeyPrefix(ctx, h.db, resource.ID, keyPrefix); kpErr != nil {
+			slog.Error(logPrefix+".update_key_prefix_failed", "error", kpErr, "request_id", requestID,
+				"resource_id", resource.ID)
+			persistFailed = true
+		}
+	}
+
+	// 1. Encrypt + persist the connection URL. A missing stored URL means the
+	//    customer can never recover credentials beyond the single 201 body —
+	//    treat any failure here as a hard provision failure.
+	if !persistFailed && connectionURL != "" {
+		aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey)
+		if keyErr != nil {
+			slog.Error(logPrefix+".aes_key_parse_failed", "error", keyErr, "request_id", requestID,
+				"resource_id", resource.ID)
+			persistFailed = true
+		} else if encryptedURL, encErr := crypto.Encrypt(aesKey, connectionURL); encErr != nil {
+			slog.Error(logPrefix+".encrypt_url_failed", "error", encErr, "request_id", requestID,
+				"resource_id", resource.ID)
+			persistFailed = true
+		} else if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
+			slog.Error(logPrefix+".update_connection_url_failed", "error", upErr, "request_id", requestID,
+				"resource_id", resource.ID)
+			persistFailed = true
+		}
+	}
+
+	// 2. Persist provider_resource_id. A missing PRID means Deprovision /
+	//    StorageBytes target the wrong backend object — the resource becomes
+	//    un-droppable. Hard failure.
+	if !persistFailed {
+		if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, providerResourceID); upErr != nil {
+			slog.Error(logPrefix+".update_provider_resource_id_failed", "error", upErr, "request_id", requestID,
+				"resource_id", resource.ID)
+			persistFailed = true
+		}
+	}
+
+	// 3. Flip pending → active. Only a fully-persisted resource becomes usable.
+	if !persistFailed {
+		if actErr := models.MarkResourceActive(ctx, h.db, resource.ID); actErr != nil {
+			slog.Error(logPrefix+".mark_active_failed", "error", actErr, "request_id", requestID,
+				"resource_id", resource.ID)
+			persistFailed = true
+		}
+	}
+
+	if !persistFailed {
+		return nil
+	}
+
+	// Persistence failed — the resource is unreachable / un-addressable. Tear
+	// down the backend object (best-effort) and soft-delete the row so the
+	// platform is not left billing an orphan, then signal a hard failure.
+	if cleanup != nil {
+		cleanup()
+	}
+	if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+		slog.Error(logPrefix+".cleanup_soft_delete_failed", "error", delErr,
+			"resource_id", resource.ID, "request_id", requestID)
+	}
+	return errProvisionPersistFailed
 }
 
 // issueOnboardingJWT signs a short-lived JWT for the upgrade CTA.

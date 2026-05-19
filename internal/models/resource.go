@@ -176,7 +176,27 @@ func scanResource(row interface {
 	return r, nil
 }
 
+// StatusPending is the transient status a resource row carries between the
+// CreateResource INSERT and the backend provision RPC + connection-URL
+// persistence completing. CreateResource inserts this value explicitly (NOT
+// the column DEFAULT 'active') so an api crash mid-provision leaves a
+// 'pending' row the worker's provisioner_reconciler can sweep and recover or
+// abandon. MarkResourceActive flips it to 'active' only after every backend
+// + persistence step succeeds. See migration 057 + MR-P0-2 (BugBash 2026-05-20).
+const StatusPending = "pending"
+
+// StatusActive is the canonical "provisioned and usable" status.
+const StatusActive = "active"
+
 // CreateResource inserts a new resource row and returns it.
+//
+// MR-P0-2 (BugBash 2026-05-20): the row is inserted with status='pending', NOT
+// the column DEFAULT 'active'. The caller MUST call MarkResourceActive after
+// the backend provision RPC and all connection-URL / provider-resource-id
+// persistence have succeeded. A row left 'pending' by an api crash mid-provision
+// is recoverable by the worker's provisioner_reconciler (it sweeps
+// WHERE status='pending'); a row stranded 'active' with connection_url=NULL was
+// invisible to that sweep — the bug this two-phase lifecycle fixes.
 func CreateResource(ctx context.Context, db *sql.DB, p CreateResourceParams) (*Resource, error) {
 	var teamID interface{}
 	if p.TeamID != nil {
@@ -198,11 +218,11 @@ func CreateResource(ctx context.Context, db *sql.DB, p CreateResourceParams) (*R
 
 	row := db.QueryRowContext(ctx, `
 		INSERT INTO resources
-			(team_id, resource_type, name, tier, env, fingerprint, cloud_vendor, country_code, expires_at, created_request_id, parent_resource_id)
-		VALUES ($1, $2, NULLIF($3,''), $4, $5, NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), $9, NULLIF($10,''), $11)
+			(team_id, resource_type, name, tier, env, fingerprint, cloud_vendor, country_code, expires_at, created_request_id, parent_resource_id, status)
+		VALUES ($1, $2, NULLIF($3,''), $4, $5, NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), $9, NULLIF($10,''), $11, $12)
 		RETURNING `+resourceColumns,
 		teamID, p.ResourceType, p.Name, p.Tier, env, p.Fingerprint, p.CloudVendor, p.CountryCode,
-		expiresAt, p.CreatedRequestID, parentID,
+		expiresAt, p.CreatedRequestID, parentID, StatusPending,
 	)
 
 	r, err := scanResource(row)
@@ -211,6 +231,36 @@ func CreateResource(ctx context.Context, db *sql.DB, p CreateResourceParams) (*R
 	}
 	return r, nil
 }
+
+// MarkResourceActive flips a resource from 'pending' → 'active'. It is the
+// second phase of the MR-P0-2 two-phase provision lifecycle: the caller runs
+// it ONLY after the backend provision RPC and every connection-URL /
+// provider-resource-id persistence step has succeeded.
+//
+// The atomic `WHERE id=$1 AND status='pending'` guard means: a row already
+// flipped (a duplicate call) is a no-op, and a row that some other path moved
+// out of 'pending' (e.g. a reconciler abandon, a soft-delete) is NOT silently
+// resurrected. Returns ErrResourceNotPending when no 'pending' row matched so
+// the caller can treat that as a hard provision failure rather than reporting
+// a success for a resource that is not in the expected state.
+func MarkResourceActive(ctx context.Context, db *sql.DB, id uuid.UUID) error {
+	res, err := db.ExecContext(ctx, `
+		UPDATE resources SET status = 'active' WHERE id = $1 AND status = 'pending'
+	`, id)
+	if err != nil {
+		return fmt.Errorf("models.MarkResourceActive: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrResourceNotPending
+	}
+	return nil
+}
+
+// ErrResourceNotPending is returned by MarkResourceActive when the row is
+// missing or not in 'pending' status — the caller asked to activate a row
+// that is not in the expected mid-provision state.
+var ErrResourceNotPending = fmt.Errorf("models: resource is not pending")
 
 // CountActiveResourcesByTeamAndType returns the number of active (non-deleted)
 // resources of the given type owned by a team. Used for plan limit enforcement.

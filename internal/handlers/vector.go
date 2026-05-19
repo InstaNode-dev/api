@@ -355,23 +355,13 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 		return respondProvisionFailed(c, err, "Failed to provision vector database")
 	}
 
-	// Encrypt and persist the connection URL. Same pattern as db.go.
-	aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey)
-	if keyErr != nil {
-		slog.Error("vector.new.aes_key_parse_failed", "error", keyErr, "request_id", requestID)
-	} else {
-		encryptedURL, encErr := crypto.Encrypt(aesKey, creds.URL)
-		if encErr != nil {
-			slog.Error("vector.new.encrypt_url_failed", "error", encErr, "request_id", requestID)
-		} else {
-			if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
-				slog.Error("vector.new.update_connection_url_failed", "error", upErr, "request_id", requestID)
-			}
-		}
-	}
-
-	if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
-		slog.Error("vector.new.update_provider_resource_id_failed", "error", upErr, "request_id", requestID)
+	// MR-P0-2 / MR-P0-3: persist + flip pending→active; a persistence failure
+	// tears down the backend Postgres database and returns 503, never a 201.
+	if finErr := h.finalizeProvision(ctx, resource, creds.URL, "", creds.ProviderResourceID, requestID, "vector.new",
+		func() { deprovisionBestEffort(ctx, h.provClient, tokenStr, creds.ProviderResourceID, "postgres", "vector.new") },
+	); finErr != nil {
+		metrics.ProvisionFailures.WithLabelValues("vector", "persist_error").Inc()
+		return respondProvisionFailed(c, finErr, "Failed to persist vector resource")
 	}
 
 	jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, models.ResourceTypeVector, []string{tokenStr})
@@ -512,22 +502,13 @@ func (h *VectorHandler) newVectorAuthenticated(
 		return respondProvisionFailed(c, err, "Failed to provision vector database")
 	}
 
-	aesKey, keyErr := crypto.ParseAESKey(h.cfg.AESKey)
-	if keyErr != nil {
-		slog.Error("vector.new.aes_key_parse_failed_auth", "error", keyErr, "request_id", requestID)
-	} else {
-		encryptedURL, encErr := crypto.Encrypt(aesKey, creds.URL)
-		if encErr != nil {
-			slog.Error("vector.new.encrypt_url_failed_auth", "error", encErr, "request_id", requestID)
-		} else {
-			if upErr := models.UpdateConnectionURL(ctx, h.db, resource.ID, encryptedURL); upErr != nil {
-				slog.Error("vector.new.update_connection_url_failed_auth", "error", upErr, "request_id", requestID)
-			}
-		}
-	}
-
-	if upErr := models.UpdateProviderResourceID(ctx, h.db, resource.ID, creds.ProviderResourceID); upErr != nil {
-		slog.Error("vector.new.update_provider_resource_id_failed_auth", "error", upErr, "request_id", requestID)
+	// MR-P0-2 / MR-P0-3: persist + flip pending→active; a persistence failure
+	// tears down the backend Postgres database and returns 503, never a 201.
+	if finErr := h.finalizeProvision(ctx, resource, creds.URL, "", creds.ProviderResourceID, requestID, "vector.new.auth",
+		func() { deprovisionBestEffort(ctx, h.provClient, tokenStr, creds.ProviderResourceID, "postgres", "vector.new.auth") },
+	); finErr != nil {
+		metrics.ProvisionFailures.WithLabelValues("vector", "persist_error").Inc()
+		return respondProvisionFailed(c, finErr, "Failed to persist vector resource")
 	}
 
 	slog.Info("provision.success",
