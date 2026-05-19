@@ -1082,7 +1082,18 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 		// Razorpay's documented event name for a failed subscription
 		// charge. Triggers the dunning state machine — see
 		// handleSubscriptionChargeFailed for the 7-day grace contract.
-		h.handleSubscriptionChargeFailed(ctx, c, event)
+		// F10: on a retryable failure release the claim and 500 so
+		// Razorpay redelivers — identical to the pending / payment.failed
+		// branches. Without this a transient failure suppressed the
+		// redelivery and the first dunning email was ~15 min late.
+		if hErr := h.handleSubscriptionChargeFailed(ctx, c, event); hErr != nil {
+			slog.Error("billing.webhook.subscription_charged_failed.failed",
+				"error", hErr, "event_id", eventID)
+			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"ok": false, "error": "subscription_charged_failed_handler_failed",
+			})
+		}
 	case "subscription.pending":
 		// Razorpay fires subscription.pending when a charge fails and the
 		// subscription is awaiting retry. Unlike payment.failed there may be
@@ -1657,22 +1668,34 @@ func (h *BillingHandler) handleSubscriptionPending(ctx context.Context, c *fiber
 //  3. Emit the payment.grace_started audit row so the worker's Brevo
 //     forwarder kicks off the first reminder email. Best-effort.
 //
-// Fail-open everywhere: the webhook always returns 200 to Razorpay even
-// when team resolution / INSERT / audit emit fails. Razorpay re-fires
-// charge_failed on every retry attempt anyway, so a single missed event
-// gets fixed on the next attempt.
-func (h *BillingHandler) handleSubscriptionChargeFailed(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) {
+// F10 (billing-trust audit 2026-05-19): error contract now mirrors
+// handleSubscriptionPending / handlePaymentFailed. A RETRYABLE failure (a
+// real DB error during team resolve, or a grace-row INSERT that errored)
+// returns an error so RazorpayWebhook releases the dedup claim and 500s,
+// and Razorpay redelivers — without this the up-front dedup claim would
+// suppress redelivery and the customer's first dunning email could be
+// delayed by ~15 min until the reconciler independently opened a grace
+// period. NON-RETRYABLE conditions (malformed payload, unresolvable team)
+// return nil — a retry would just re-burn the claim for nothing.
+func (h *BillingHandler) handleSubscriptionChargeFailed(ctx context.Context, c *fiber.Ctx, event rzpWebhookEvent) error {
 	sub, ok := parseSubscriptionEntity(event)
 	if !ok {
 		slog.Error("billing.subscription.charged_failed.parse_failed")
-		return
+		return nil // malformed payload — retrying won't help; swallow
 	}
 
 	teamID, err := resolveTeamFromNotes(ctx, h, sub)
 	if err != nil {
+		// Missing/unknown-team payload → non-retryable. Real DB error →
+		// retryable: return it so dispatch releases the claim and 500s.
+		if teamResolveUnretryable(err) {
+			slog.Warn("billing.subscription.charged_failed.team_unresolvable",
+				"error", err, "sub_id", sub.ID)
+			return nil
+		}
 		slog.Error("billing.subscription.charged_failed.team_resolve_failed",
 			"error", err, "sub_id", sub.ID)
-		return
+		return fmt.Errorf("subscription.charged_failed team resolve: %w", err)
 	}
 
 	// Extract attempted-amount metadata from the optional payment entity
@@ -1687,7 +1710,14 @@ func (h *BillingHandler) handleSubscriptionChargeFailed(ctx context.Context, c *
 		}
 	}
 
-	startGracePeriodForTeam(ctx, h.db, teamID, sub.ID, attemptedAmount)
+	// startGracePeriodForTeam returns a non-nil error only on a retryable
+	// grace-row INSERT failure; an idempotent redelivery or a successful
+	// start returns nil. Propagate it so the webhook 500s and Razorpay
+	// redelivers — the grace period still gets opened on the retry.
+	if graceErr := startGracePeriodForTeam(ctx, h.db, teamID, sub.ID, attemptedAmount); graceErr != nil {
+		return fmt.Errorf("subscription.charged_failed grace start: %w", graceErr)
+	}
+	return nil
 }
 
 // handleSubscriptionPaused processes subscription.paused events (P1-F).
@@ -1725,7 +1755,12 @@ func (h *BillingHandler) handleSubscriptionPaused(ctx context.Context, c *fiber.
 
 	slog.Info("billing.subscription.paused", "team_id", teamID, "subscription_id", sub.ID)
 	// attemptedAmount is unknown for a pause (no failed charge) — pass 0.
-	startGracePeriodForTeam(ctx, h.db, teamID, sub.ID, 0)
+	// A retryable grace-INSERT failure here is propagated so the paused
+	// event 500s and Razorpay redelivers, mirroring the charged_failed
+	// contract (F10) — the grace period still gets opened on the retry.
+	if graceErr := startGracePeriodForTeam(ctx, h.db, teamID, sub.ID, 0); graceErr != nil {
+		return fmt.Errorf("subscription.paused grace start: %w", graceErr)
+	}
 	return nil
 }
 
@@ -1777,9 +1812,17 @@ func (h *BillingHandler) handleSubscriptionResumed(ctx context.Context, c *fiber
 // attemptedAmount is in paise (Razorpay's smallest unit). Zero means
 // "unknown / not present in the event payload" — surfaced as `null` in
 // the audit metadata.
-func startGracePeriodForTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID, subscriptionID string, attemptedAmount int64) {
+//
+// F10 (billing-trust audit 2026-05-19): returns a non-nil error ONLY on a
+// retryable grace-row INSERT failure (a real DB error). An idempotent
+// redelivery (ErrPaymentGraceAlreadyActive), a successful start, or a
+// no-op guard return all return nil. Callers that participate in the
+// webhook retry contract (handleSubscriptionChargeFailed) propagate this
+// so a transient DB failure 500s the webhook and Razorpay redelivers; the
+// audit emit remains best-effort and never affects the return value.
+func startGracePeriodForTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID, subscriptionID string, attemptedAmount int64) error {
 	if db == nil || teamID == uuid.Nil || strings.TrimSpace(subscriptionID) == "" {
-		return
+		return nil
 	}
 
 	startedAt := time.Now().UTC()
@@ -1793,14 +1836,17 @@ func startGracePeriodForTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID, 
 	})
 	if err != nil {
 		if errors.Is(err, models.ErrPaymentGraceAlreadyActive) {
-			// Idempotent redelivery — grace clock already started.
+			// Idempotent redelivery — grace clock already started. Not an
+			// error: the grace period the caller wanted already exists.
 			slog.Info("billing.subscription.charged_failed.grace_already_active",
 				"team_id", teamID, "subscription_id", subscriptionID)
-			return
+			return nil
 		}
+		// A real DB failure — retryable. Return it so the caller can 500
+		// the webhook and let Razorpay redeliver charged_failed.
 		slog.Error("billing.subscription.charged_failed.grace_create_failed",
 			"error", err, "team_id", teamID, "subscription_id", subscriptionID)
-		return
+		return fmt.Errorf("create payment grace period: %w", err)
 	}
 
 	slog.Info("billing.subscription.charged_failed.grace_started",
@@ -1811,6 +1857,7 @@ func startGracePeriodForTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID, 
 	)
 
 	emitPaymentGraceStartedAudit(ctx, db, teamID, subscriptionID, grace, attemptedAmount)
+	return nil
 }
 
 // maybeRecoverPaymentGrace is the dual of startGracePeriodForTeam — it
@@ -2300,6 +2347,47 @@ const (
 	chargeUndeliverableReasonUnknownTier = "unknown_tier"
 )
 
+// F11 (billing-trust audit 2026-05-19) — cancellation copy.
+//
+// The pre-fix subscription.canceled audit row carried a bare
+// Summary = "subscription canceled". That string is rendered verbatim by
+// the dashboard's Recent Activity feed and is the api-side source of truth
+// the worker's cancellation email derives its wording from. It was
+// misleading by omission: it gave the customer NO indication that (a) the
+// account is NOT cut off — it falls back to a courtesy tier and existing
+// resources keep their limits — and (b) a final billing-cycle charge
+// already in flight is expected, not an error. A customer reading "canceled"
+// could reasonably dispute the next charge as fraudulent.
+//
+// These constants spell out the accurate outcome. subscriptionCanceledSummary*
+// are chosen by the resulting fall-back tier so the copy never claims
+// "courtesy access" for a never-paid cancellation that genuinely drops to
+// the free floor.
+const (
+	// subscriptionCanceledSummaryCourtesy — used when the cancellation kept
+	// the customer on the 'hobby' courtesy floor (they paid at least one
+	// invoice). States the access reality so a still-pending cycle charge
+	// is not mistaken for an error.
+	subscriptionCanceledSummaryCourtesy = "Subscription cancelled — your account stays active on the hobby plan and existing resources keep their current limits. Any charge already in progress for the current billing cycle will still complete."
+	// subscriptionCanceledSummaryFree — used when the cancellation dropped
+	// the customer to the 'free' floor (no paid invoice ever posted). No
+	// in-flight charge claim is made here because none was ever taken.
+	subscriptionCanceledSummaryFree = "Subscription cancelled — your account moved to the free plan. Existing resources keep their current limits; resubscribe any time to restore full access."
+	// subscriptionCanceledMetaEffectiveNote is stamped into the audit
+	// metadata so the worker's cancellation email can render an accurate
+	// effective-state line instead of implying access ended immediately.
+	subscriptionCanceledMetaEffectiveNote = "effective_note"
+)
+
+// subscriptionCanceledSummary returns the accurate, non-misleading
+// cancellation summary copy (F11) for the resulting fall-back tier.
+func subscriptionCanceledSummary(toTier string) string {
+	if strings.EqualFold(strings.TrimSpace(toTier), "free") {
+		return subscriptionCanceledSummaryFree
+	}
+	return subscriptionCanceledSummaryCourtesy
+}
+
 // chargedPaymentMeta extracts the payment id, amount (in the currency's minor
 // unit — paise/cents), and currency from a subscription.charged event's
 // optional payload.payment entity. Razorpay bundles the successful payment
@@ -2447,6 +2535,16 @@ func emitChargeUndeliverableAudit(ctx context.Context, db *sql.DB, teamID uuid.U
 // monthly Pro→Pro re-charge case) emit nothing — Loops shouldn't send an
 // upgrade email on every renewal.
 //
+// F9 (billing-trust audit 2026-05-19): the emit is idempotent on
+// (team_id, kind, subscription_id). If an identical subscription-change
+// audit row already exists, this returns early WITHOUT inserting a second
+// one — so the rare fail-open dedup-claim edge (claim INSERT errors during
+// a DB brownout → two concurrent deliveries of the same charged event both
+// dispatch) can no longer produce a duplicate upgrade-confirmation email.
+// The pre-flight check is skipped when subID is empty (no stable dedup key)
+// and on a lookup error (fail-open — better a possible duplicate email than
+// a swallowed audit row), preserving the prior always-emit behaviour there.
+//
 // Best-effort: a write failure logs but never surfaces. Called synchronously
 // from the webhook handler because the handler already runs in a request
 // goroutine that completes before Razorpay sees a 200.
@@ -2463,6 +2561,20 @@ func emitSubscriptionChangeAudit(ctx context.Context, db *sql.DB, teamID uuid.UU
 	if fromR > toR {
 		kind = models.AuditKindSubscriptionDowngraded
 		summary = "team downgraded from " + fromTier + " to " + toTier
+	}
+
+	// F9 idempotency guard: skip the insert when a row for this exact
+	// (team_id, kind, subscription_id) is already present. A lookup error
+	// is fail-open — fall through and insert, the prior behaviour.
+	if db != nil {
+		if exists, lookupErr := models.SubscriptionChangeAuditExists(ctx, db, teamID, kind, subID); lookupErr != nil {
+			slog.Warn("audit.emit.dedup_lookup_failed",
+				"kind", kind, "team_id", teamID, "subscription_id", subID, "error", lookupErr)
+		} else if exists {
+			slog.Info("audit.emit.deduped",
+				"kind", kind, "team_id", teamID, "subscription_id", subID)
+			return
+		}
 	}
 
 	meta := map[string]string{
@@ -2491,13 +2603,24 @@ func emitSubscriptionChangeAudit(ctx context.Context, db *sql.DB, teamID uuid.UU
 
 // emitSubscriptionCanceledAudit writes the subscription.canceled audit row.
 // Always emits on cancellation (regardless of the courtesy fall-back tier)
-// because the Loops cancellation email is about the cancellation event
-// itself, not the resulting tier delta. Best-effort: failures log only.
+// because the cancellation email is about the cancellation event itself,
+// not the resulting tier delta. Best-effort: failures log only.
+//
+// F11 (billing-trust audit 2026-05-19): the Summary is no longer the bare,
+// misleading "subscription canceled". It now states the accurate outcome —
+// the account stays active on a courtesy floor (or moves to free if never
+// paid), existing resources keep their limits, and an in-flight cycle
+// charge will still complete — so the customer does not mistake a pending
+// charge for fraud. The same accurate text is duplicated into the audit
+// metadata under effective_note so the worker's cancellation email can
+// render it verbatim. summary is selected by the resulting toTier.
 func emitSubscriptionCanceledAudit(ctx context.Context, db *sql.DB, teamID uuid.UUID, fromTier, toTier, subID string) {
+	summary := subscriptionCanceledSummary(toTier)
 	meta := map[string]string{
-		"from_tier":       fromTier,
-		"to_tier":         toTier,
-		"subscription_id": subID,
+		"from_tier":                           fromTier,
+		"to_tier":                             toTier,
+		"subscription_id":                     subID,
+		subscriptionCanceledMetaEffectiveNote: summary,
 	}
 	metaBlob, _ := json.Marshal(meta)
 
@@ -2505,7 +2628,7 @@ func emitSubscriptionCanceledAudit(ctx context.Context, db *sql.DB, teamID uuid.
 		TeamID:   teamID,
 		Actor:    "system",
 		Kind:     models.AuditKindSubscriptionCanceled,
-		Summary:  "subscription canceled",
+		Summary:  summary,
 		Metadata: metaBlob,
 	}); err != nil {
 		slog.Warn("audit.emit.failed",
