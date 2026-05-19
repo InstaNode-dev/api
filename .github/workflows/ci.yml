@@ -76,11 +76,21 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
           path: _proto_ci
 
       - name: Place ../proto for Go replace directive
         run: mv _proto_ci ../proto
+
+      - name: Checkout common sibling (for go.mod replace ../common)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          path: _common_ci
+
+      - name: Place ../common for Go replace directive
+        run: mv _common_ci ../common
 
       - uses: actions/setup-go@v5
         with:
@@ -102,10 +112,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
           path: _proto_ci
 
       - run: mv _proto_ci ../proto
+
+      - name: Checkout common sibling
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          path: _common_ci
+      - run: mv _common_ci ../common
 
       - uses: actions/setup-go@v5
         with:
