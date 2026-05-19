@@ -120,6 +120,42 @@ func InsertAuditEvent(ctx context.Context, db *sql.DB, ev AuditEvent) error {
 	return nil
 }
 
+// SubscriptionChangeAuditExists reports whether a subscription-change
+// audit row (subscription.upgraded / subscription.downgraded) already
+// exists for the given (team_id, kind, subscription_id) triple.
+//
+// F9 (billing-trust audit 2026-05-19): the Razorpay webhook's up-front
+// dedup claim is fail-open — if the claim INSERT itself errors during a
+// DB brownout, two concurrent deliveries of the same subscription.charged
+// event can both dispatch, each emitting a subscription.upgraded audit row
+// and so triggering a duplicate upgrade-confirmation email. This lookup
+// lets emitSubscriptionChangeAudit skip the second insert when an
+// identical row is already present, making the audit emit idempotent on
+// (team_id, kind, subscription_id) and suppressing the duplicate email.
+//
+// subscriptionID is matched against metadata->>'subscription_id' (the key
+// emitSubscriptionChangeAudit writes). An empty subscriptionID always
+// returns false: with no stable key there is nothing to dedup on, so the
+// caller falls back to the prior always-insert behaviour.
+func SubscriptionChangeAuditExists(ctx context.Context, db *sql.DB, teamID uuid.UUID, kind, subscriptionID string) (bool, error) {
+	if subscriptionID == "" {
+		return false, nil
+	}
+	var exists bool
+	err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM audit_log
+			 WHERE team_id = $1
+			   AND kind = $2
+			   AND metadata->>'subscription_id' = $3
+		)
+	`, teamID, kind, subscriptionID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("models.SubscriptionChangeAuditExists: %w", err)
+	}
+	return exists, nil
+}
+
 // AuditCustomerExportQuery is the parameter bundle for
 // ListAuditEventsForCustomerExport. Carries every dial the public
 // GET /api/v1/audit endpoint exposes — kept as a struct (not positional
