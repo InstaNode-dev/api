@@ -154,3 +154,63 @@ func TestCountActiveDeploymentsByTeam_IsolatesByTeam(t *testing.T) {
 	assert.Equal(t, 2, nA, "team A count must include only team A's rows")
 	assert.Equal(t, 1, nB, "team B count must include only team B's rows")
 }
+
+// TestVisibleDeploymentCount_MatchesListForEveryStatus is the S5-F4 regression
+// guard. The bug: GET /api/v1/billing/usage reported usage.deployments.count=1
+// for a team whose GET /api/v1/deployments list was empty — the usage count
+// (CountActiveDeploymentsByTeam, building/deploying/healthy only) and the list
+// (GetDeploymentsByTeam, no status filter at all) counted different row sets,
+// so a stale terminal row landed in one but not the other.
+//
+// This test seeds one deployment per known status — including the terminal
+// 'deleted' / 'expired' rows that triggered the bug — and asserts the billing
+// counter and the list query, which both now resolve through
+// models.deploymentVisibleClause, return the IDENTICAL row set. It exercises
+// BOTH code paths against the SAME fixture, so any future change that filters
+// one query without the other breaks this test.
+func TestVisibleDeploymentCount_MatchesListForEveryStatus(t *testing.T) {
+	requireDB(t)
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+
+	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, db, "pro"))
+	defer db.Exec(`DELETE FROM teams WHERE id = $1`, teamID)
+
+	ctx := context.Background()
+
+	// One deployment per status. building/deploying/healthy/failed/stopped are
+	// user-visible; deleted/expired are terminal and must be excluded.
+	statuses := []string{"building", "deploying", "healthy", "failed", "stopped", "deleted", "expired"}
+	for _, st := range statuses {
+		d, err := models.CreateDeployment(ctx, db, models.CreateDeploymentParams{
+			TeamID: teamID,
+			AppID:  "app-s5f4-" + uuid.NewString()[:8],
+			Tier:   "pro",
+		})
+		require.NoError(t, err)
+		defer db.Exec(`DELETE FROM deployments WHERE id = $1`, d.ID)
+		_, err = db.ExecContext(ctx, `UPDATE deployments SET status = $1 WHERE id = $2`, st, d.ID)
+		require.NoError(t, err)
+	}
+
+	// Path A — what GET /api/v1/deployments returns.
+	list, err := models.GetDeploymentsByTeam(ctx, db, teamID)
+	require.NoError(t, err)
+
+	// Path B — what GET /api/v1/billing/usage's deployment count returns.
+	count, err := models.CountVisibleDeploymentsByTeam(ctx, db, teamID)
+	require.NoError(t, err)
+
+	// The whole point of S5-F4: the two MUST agree.
+	assert.Equal(t, len(list), count,
+		"billing/usage deployment count must equal the /api/v1/deployments list length")
+
+	// And the agreed value is exactly the non-terminal set: 5 of the 7 rows
+	// (deleted + expired are excluded).
+	assert.Equal(t, 5, count,
+		"only non-terminal deployments are user-visible (deleted + expired excluded)")
+	for _, d := range list {
+		assert.NotContains(t, []string{"deleted", "expired"}, d.Status,
+			"terminal deployment must not appear in the list")
+	}
+}

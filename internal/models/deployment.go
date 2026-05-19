@@ -339,13 +339,17 @@ func GetDeploymentByID(ctx context.Context, db *sql.DB, id uuid.UUID) (*Deployme
 	return d, nil
 }
 
-// GetDeploymentsByTeam returns all deployments for a team across every environment,
-// ordered by creation time descending.
+// GetDeploymentsByTeam returns the user-visible deployments for a team across
+// every environment, ordered by creation time descending. Terminal rows
+// (deploymentVisibleClause — 'deleted' / 'expired') are excluded so the list
+// reflects only deployments the user can still act on. This is the canonical
+// "user-visible deployments" row set; GET /api/v1/billing/usage counts the
+// exact same set via CountVisibleDeploymentsByTeam.
 func GetDeploymentsByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]*Deployment, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT `+deploymentColumns+`
 		FROM deployments
-		WHERE team_id = $1
+		WHERE team_id = $1 AND `+deploymentVisibleClause+`
 		ORDER BY created_at DESC
 	`, teamID)
 	if err != nil {
@@ -367,9 +371,12 @@ func GetDeploymentsByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]
 	return results, nil
 }
 
-// GetDeploymentsByTeamAndEnv returns deployments for a team scoped to a single
-// environment. Empty env is normalised to EnvDefault ("development") to match
-// the post-migration-026 default for POST /deploy/new.
+// GetDeploymentsByTeamAndEnv returns the user-visible deployments for a team
+// scoped to a single environment. Empty env is normalised to EnvDefault
+// ("development") to match the post-migration-026 default for POST /deploy/new.
+// Terminal rows are excluded via deploymentVisibleClause, the same filter
+// GetDeploymentsByTeam applies, so a ?env= filter cannot drift from the
+// unfiltered list.
 func GetDeploymentsByTeamAndEnv(ctx context.Context, db *sql.DB, teamID uuid.UUID, env string) ([]*Deployment, error) {
 	if env == "" {
 		env = EnvDefault
@@ -377,7 +384,7 @@ func GetDeploymentsByTeamAndEnv(ctx context.Context, db *sql.DB, teamID uuid.UUI
 	rows, err := db.QueryContext(ctx, `
 		SELECT `+deploymentColumns+`
 		FROM deployments
-		WHERE team_id = $1 AND env = $2
+		WHERE team_id = $1 AND env = $2 AND `+deploymentVisibleClause+`
 		ORDER BY created_at DESC
 	`, teamID, env)
 	if err != nil {
@@ -531,7 +538,7 @@ func ElevateDeploymentTiersByTeam(ctx context.Context, db *sql.DB, teamID uuid.U
 		    last_reminder_at = NULL,
 		    updated_at       = now()
 		WHERE team_id = $2
-		  AND status NOT IN ('deleted', 'expired')
+		  AND `+deploymentVisibleClause+`
 	`, newTier, teamID)
 	if err != nil {
 		return fmt.Errorf("models.ElevateDeploymentTiersByTeam: %w", err)
@@ -739,9 +746,35 @@ const (
 )
 
 // activeDeploymentStatusesSQL is the SQL IN-list of deployment statuses that
-// occupy a tier slot. Used verbatim by CountActiveDeploymentsByTeam and the
-// dashboard-facing usage counter so the two counts are always identical.
+// occupy a tier slot. Used verbatim by CountActiveDeploymentsByTeam (the
+// POST /deploy/new tier-cap gate) — a slot is only consumed while a pod runs.
 const activeDeploymentStatusesSQL = `('building', 'deploying', 'healthy')`
+
+// terminalDeploymentStatusesSQL is the SQL IN-list of deployment statuses that
+// are terminal at the user's surface: the row's compute has been reaped and
+// the deployment is gone from the user's point of view.
+//
+//   - deleted — compute torn down (teardown reconciler advanced an expired row,
+//     or a hard DELETE that didn't drop the row); nothing left to act on.
+//   - expired — 24h TTL elapsed; the teardown reconciler will reap it shortly.
+//
+// 'failed' and 'stopped' are deliberately NOT terminal here: a failed build
+// and a user-paused app are still real, user-visible deployments that the
+// dashboard lists. This constant is the single source of truth for the
+// "user-visible deployments" row set — see deploymentVisibleClause.
+const terminalDeploymentStatusesSQL = `('deleted', 'expired')`
+
+// deploymentVisibleClause is the shared WHERE predicate for "deployments the
+// user sees" — i.e. every non-terminal row. GET /api/v1/deployments (the list)
+// and GET /api/v1/billing/usage's deployment count MUST use this same clause
+// so the list length and the usage count can never drift (S5-F4: the usage
+// count once used the narrower activeDeploymentStatusesSQL filter while the
+// list applied no status filter at all, so a terminal row reported count=1
+// against an empty list).
+//
+// It is a clause fragment, not a full WHERE — callers prepend their own
+// `team_id = $N AND` (and optionally `env = $M AND`) scope.
+const deploymentVisibleClause = `status NOT IN ` + terminalDeploymentStatusesSQL
 
 // GetExpiredDeploymentsAwaitingTeardown returns deployments stuck in
 // status='expired' that still have a provider_id — i.e. the worker's
@@ -845,6 +878,33 @@ func CountActiveDeploymentsByTeam(ctx context.Context, db dbExecutor, teamID uui
 	`, teamID).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("models.CountActiveDeploymentsByTeam: %w", err)
+	}
+	return n, nil
+}
+
+// CountVisibleDeploymentsByTeam counts the user-visible deployments for a team —
+// the exact row set GetDeploymentsByTeam returns. It shares deploymentVisibleClause
+// with the list query so the GET /api/v1/billing/usage deployment count and the
+// GET /api/v1/deployments list length can never drift.
+//
+// S5-F4 (bug hunt): the billing/usage panel previously used the narrower
+// activeDeploymentStatusesSQL filter (building/deploying/healthy only) while the
+// list endpoint applied no status filter at all. The two counted different row
+// sets — a stale terminal row could surface as count=1 against an empty list.
+// Both now resolve through deploymentVisibleClause.
+//
+// This is intentionally NOT CountActiveDeploymentsByTeam: that counter answers
+// "how many billable compute slots are consumed?" (the POST /deploy/new tier
+// gate) and must exclude failed/stopped pods. This counter answers "how many
+// deployments does the user see in the dashboard?" and includes them.
+func CountVisibleDeploymentsByTeam(ctx context.Context, db dbExecutor, teamID uuid.UUID) (int, error) {
+	var n int
+	err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM deployments
+		WHERE team_id = $1 AND `+deploymentVisibleClause+`
+	`, teamID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("models.CountVisibleDeploymentsByTeam: %w", err)
 	}
 	return n, nil
 }
