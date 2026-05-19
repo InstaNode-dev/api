@@ -56,8 +56,9 @@ func expectUsageQueries(mock sqlmock.Sqlmock, teamID uuid.UUID) {
 			WillReturnRows(sqlmock.NewRows([]string{"sum"}).AddRow(int64(0)))
 	}
 
-	// 5) deployments count — P1-E: countDeployments now delegates to
-	// models.CountActiveDeploymentsByTeam, whose query uses lowercase
+	// 5) deployments count — S5-F4: countDeployments delegates to
+	// models.CountVisibleDeploymentsByTeam (the same row set the
+	// /api/v1/deployments list returns), whose query uses lowercase
 	// count(*); regex made case-insensitive to match either form.
 	mock.ExpectQuery(`(?i)SELECT count\(\*\)\s+FROM deployments`).
 		WithArgs(teamID).

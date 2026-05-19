@@ -202,16 +202,23 @@ func (h *BillingUsageHandler) tierForTeam(ctx context.Context, teamID uuid.UUID)
 	return team.PlanTier, nil
 }
 
-// countDeployments counts a team's deployments across all envs that occupy a
-// billable tier slot (status building / deploying / healthy).
+// countDeployments counts a team's user-visible deployments across all envs —
+// the exact row set GET /api/v1/deployments returns.
 //
-// P1-E (bug hunt 2026-05-17 round 2): this counter previously used its own
-// negative filter (NOT IN deleted/stopped) which still counted 'failed' and
-// 'expired' deployments, disagreeing with the tier-cap counter
-// (CountActiveDeploymentsByTeam). It now delegates to that single function so
-// the dashboard usage panel and the /deploy/new tier gate can never drift.
+// S5-F4 (bug hunt): this counter previously delegated to
+// CountActiveDeploymentsByTeam, which counts only billable tier slots
+// (building/deploying/healthy). That is the right filter for the
+// POST /deploy/new tier gate but the WRONG one for the usage panel: the panel
+// must mirror what the user sees in the dashboard's deployments list, and the
+// list endpoint includes failed/stopped deployments. The two endpoints counted
+// different row sets, so a team could see usage.deployments.count=1 against an
+// empty /api/v1/deployments list.
+//
+// It now delegates to CountVisibleDeploymentsByTeam, which shares
+// models.deploymentVisibleClause with GetDeploymentsByTeam — the list query —
+// so the usage count and the list length can never drift again.
 func (h *BillingUsageHandler) countDeployments(ctx context.Context, teamID uuid.UUID) (int, error) {
-	return models.CountActiveDeploymentsByTeam(ctx, h.db, teamID)
+	return models.CountVisibleDeploymentsByTeam(ctx, h.db, teamID)
 }
 
 // mbToBytes converts a plans.yaml megabyte value to bytes. -1 (unlimited)
