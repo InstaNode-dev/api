@@ -94,10 +94,20 @@ func TestOpenAPI_ClaimRequestDocumentsUpgradeJWT(t *testing.T) {
 	if !ok {
 		t.Fatal("ClaimRequest schema missing")
 	}
+	// 2026-05-20: canonical field renamed jwt→token; legacy jwt stays as
+	// deprecated alias. The "upgrade_jwt" mention must live on the canonical
+	// (token) description so new callers reading the spec land on the right
+	// field. We still spot-check the deprecated jwt field carries the same
+	// pointer so old callers aren't misled.
+	tok, _ := props["token"].(map[string]any)
+	tokDesc, _ := tok["description"].(string)
+	if !strings.Contains(tokDesc, "upgrade_jwt") {
+		t.Errorf("ClaimRequest.token description must mention the upgrade_jwt response field; got: %s", tokDesc)
+	}
 	jwt, _ := props["jwt"].(map[string]any)
-	desc, _ := jwt["description"].(string)
-	if !strings.Contains(desc, "upgrade_jwt") {
-		t.Errorf("ClaimRequest.jwt description must mention the upgrade_jwt response field; got: %s", desc)
+	jwtDesc, _ := jwt["description"].(string)
+	if !strings.Contains(jwtDesc, "upgrade_jwt") {
+		t.Errorf("ClaimRequest.jwt description (deprecated alias) must still mention upgrade_jwt for old callers; got: %s", jwtDesc)
 	}
 }
 
