@@ -14,6 +14,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gofiber/fiber/v2"
 	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"instant.dev/common/readiness"
@@ -213,4 +214,75 @@ func TestReadyz_ResponseShape(t *testing.T) {
 	require.Equal(t, "instant-api", got["service"])
 	require.Equal(t, "no-store", resp.Header.Get("Cache-Control"),
 		"/readyz responses MUST be no-store to prevent probe staleness")
+}
+
+
+// TestReadyz_DrainingReturns503 — MR-P0-7 contract. Once MarkDraining
+// is called by the graceful-shutdown signal handler, GET /readyz MUST
+// short-circuit to 503 + overall=failed + a single shutting_down
+// check. The kubelet sees 503, pulls the pod from Service endpoints,
+// and new traffic stops landing on a pod about to close its listener.
+//
+// We pre-record NO sqlmock expectations: when draining is set the
+// runner must NOT be consulted. If a future refactor reorders the
+// drain check, the un-met sqlmock pings (or a real upstream call)
+// would surface here.
+func TestReadyz_DrainingReturns503(t *testing.T) {
+	db, _, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
+	require.NoError(t, err)
+	defer db.Close()
+	// Intentionally no mock.ExpectPing() — runner must NOT run.
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	h := handlers.NewReadyzHandler(&config.Config{Environment: "test"}, db, rdb, nil)
+
+	require.False(t, h.IsDraining(), "fresh handler must not start in draining state")
+	h.MarkDraining()
+	require.True(t, h.IsDraining(), "MarkDraining must flip the flag immediately")
+
+	app := fiber.New()
+	app.Get("/readyz", h.Get)
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/readyz", nil))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode,
+		"draining /readyz MUST return 503 so the kubelet pulls the pod from the Service")
+	assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"),
+		"draining response stays no-store — a cached 503 would persist past the next deploy")
+
+	body, _ := io.ReadAll(resp.Body)
+	var got readiness.Response
+	require.NoError(t, json.Unmarshal(body, &got))
+
+	assert.Equal(t, readiness.StatusFailed, got.Overall, "draining overall must be 'failed'")
+	assert.Equal(t, "instant-api", got.Service)
+
+	require.Len(t, got.Checks, 1, "draining must surface a single shutting_down check, not the full registry")
+	assert.Equal(t, "shutting_down", got.Checks[0].Name)
+	assert.Equal(t, readiness.StatusFailed, got.Checks[0].Status)
+	assert.Equal(t, "draining", got.Checks[0].LastError)
+}
+
+// TestReadyz_DrainingIsIdempotent — MarkDraining is single-shot but
+// safe to call multiple times. The graceful-shutdown sequence may, in
+// theory, re-enter (a sibling SIGTERM, a panic-recovered shutdown
+// handler); the second call must no-op rather than panic or double-log.
+func TestReadyz_DrainingIsIdempotent(t *testing.T) {
+	db, _, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
+	require.NoError(t, err)
+	defer db.Close()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	h := handlers.NewReadyzHandler(&config.Config{Environment: "test"}, db, rdb, nil)
+	h.MarkDraining()
+	h.MarkDraining()
+	assert.True(t, h.IsDraining())
 }

@@ -29,12 +29,30 @@ import (
 	"instant.dev/internal/razorpaybilling"
 )
 
+// ShutdownHooks bundles handlers that participate in graceful shutdown
+// (MR-P0-7). Today: Readyz.MarkDraining — flips /readyz to 503 so the
+// kubelet pulls the pod from the Service endpoint list before the
+// listener stops accepting connections.
+type ShutdownHooks struct {
+	Readyz *handlers.ReadyzHandler
+}
+
 // New creates and configures the Fiber application with all middleware and routes registered.
 //
 // nrApp may be nil — the New Relic Go agent fails open when no license
 // key is set (local dev, CI). The NewRelic Fiber middleware degrades to
 // a no-op in that case, so the rest of the chain is unaffected.
+//
+// Legacy entrypoint — existing tests use it. Production main.go uses
+// NewWithHooks so the graceful-shutdown wiring has the ReadyzHandler.
 func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.GeoDBs, emailClient *email.Client, planRegistry *plans.Registry, provClient *provisioner.Client, nrApp *newrelic.Application) *fiber.App {
+	app, _ := NewWithHooks(cfg, db, rdb, geoDbs, emailClient, planRegistry, provClient, nrApp)
+	return app
+}
+
+// NewWithHooks is the production entrypoint — returns both the Fiber
+// app and the ShutdownHooks needed for graceful shutdown.
+func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.GeoDBs, emailClient *email.Client, planRegistry *plans.Registry, provClient *provisioner.Client, nrApp *newrelic.Application) (*fiber.App, ShutdownHooks) {
 	app := fiber.New(fiber.Config{
 		// Disable default error handler — we write our own JSON errors.
 		// Routes that go through respondError write their own body and
@@ -1127,7 +1145,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		internal.Post("/set-tier", handlers.NewSetTierHandler(db))
 	}
 
-	return app
+	return app, ShutdownHooks{Readyz: readyzH}
 }
 
 // isolationLabel maps the storage backend to a human-readable isolation
