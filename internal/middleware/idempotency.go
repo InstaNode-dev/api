@@ -185,6 +185,25 @@ func Idempotency(rdb *redis.Client, endpoint string) fiber.Handler {
 		}
 
 		rawKey := c.Get(idempotencyHeader)
+		// B18-M1 (BugBash 2026-05-20): a literally-empty Idempotency-Key
+		// header value (e.g. `Idempotency-Key:` with nothing after, or
+		// `Idempotency-Key:   `) used to silently fall through to the
+		// fingerprint fallback path — the caller's "I want exactly-once"
+		// intent was discarded without signal. The OpenAPI spec already
+		// documents `invalid_idempotency_key` 400 for malformed keys; an
+		// empty value is the most-common malformed shape. Reject up-front
+		// so the caller learns immediately. We use raw c.Get() (not the
+		// TrimSpace'd value) to detect "header present but empty/blank"
+		// distinctly from "header omitted" — Fiber returns "" for both
+		// cases via c.Get, so we have to look at the raw headers map.
+		headerPresent := len(c.Request().Header.Peek(idempotencyHeader)) > 0
+		if headerPresent && strings.TrimSpace(rawKey) == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"ok":      false,
+				"error":   "invalid_idempotency_key",
+				"message": "Idempotency-Key header is present but its value is empty or blank",
+			})
+		}
 
 		// Compute the scope used to namespace cache keys. team_id when
 		// authenticated, network fingerprint (sha256(/24-subnet + ASN)
