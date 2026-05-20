@@ -136,7 +136,21 @@ plans:
   # hobby_plus — $19/mo mid-step between Hobby ($9) and Pro ($49). W11
   # mid-tier insertion (2026-05-13). Research-backed pricing decoy: a
   # triple-tier $9/$19/$49 lifts conversion ~22% vs $9/$49 by anchoring
-  # against the middle price. The headline differentiators vs hobby:
+  # against the middle price.
+  #
+  # PUBLIC VISIBILITY (intentional, 2026-05-15):
+  # hobby_plus is API-only — it appears on /api/v1/capabilities (so agents
+  # introspecting tiers see the full ladder) but does NOT appear on the
+  # public /pricing page or marketing homepage. The marketing surface stays
+  # Anonymous / Hobby / Pro / Team to keep the customer-facing comparison
+  # uncluttered; hobby_plus is reached only via in-product upsell flows
+  # (quota wall, custom-domain prompts). Dashboard PricingGrid renders it
+  # only inside an authenticated upgrade journey, never on /pricing.
+  # If/when hobby_plus becomes a primary outbound funnel, surface it on
+  # instanode-web/src/pages/PricingPage.tsx (TierKey union + TIERS array
+  # + ROWS column) and dashboard/src/components/PricingGrid.tsx in lock-step.
+  #
+  # The headline differentiators vs hobby:
   #   - 2 deployment apps (vs hobby's 1) — agents that ship two services
   #     (frontend + worker) no longer need to skip-upgrade to Pro for
   #     deployment headroom alone.
@@ -452,6 +466,20 @@ plans:
       custom_domains: true
       sla: true
 
+  # growth — $99/mo. Sits between Pro ($49) and Team ($199) as the
+  # "unlimited supporting services" step for teams whose Postgres/Redis
+  # caps Pro fine but who need unlimited mongo/queue/storage/webhook headroom.
+  #
+  # PUBLIC VISIBILITY (intentional, 2026-05-15):
+  # growth is API-only — it appears on /api/v1/capabilities so agents
+  # introspecting tiers see the full ladder, but does NOT appear on the
+  # public /pricing page, marketing homepage, or dashboard PricingGrid.
+  # The marketing surface stays Anonymous / Hobby / Pro / Team to keep
+  # the comparison uncluttered. Growth is reached only via assisted
+  # sales conversations (support@instanode.dev) — there is no in-product
+  # upsell card for it today. If/when growth becomes a primary outbound
+  # funnel, surface it in instanode-web/PricingPage.tsx and the dashboard
+  # PricingGrid in lock-step with this file.
   growth:
     display_name: "Growth"
     price_monthly_cents: 9900
@@ -461,6 +489,12 @@ plans:
       # storage bump. Growth's identity is still "unlimited supporting
       # services" (mongo/queue/storage/webhook) — the Postgres/Redis bump
       # just preserves tier-ladder ordering.
+      # NOTE (P3 from DOC-REALITY-DELTA-2026-05-20): postgres_connections=20
+      # matches Pro=20. The "preserves tier-ladder ordering" claim above is
+      # about storage_mb (20480 > Pro's 10240), not connections. Growth's
+      # connection bump is intentionally absent — Pro already gets the
+      # highest single-DB connection count under shared infra; further
+      # connection headroom is a Team-tier (dedicated infra) benefit.
       postgres_storage_mb: 20480
       postgres_connections: 20
       vector_storage_mb: 20480
