@@ -25,11 +25,13 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/redis/go-redis/v9"
 
+	"instant.dev/common/buildinfo"
 	"instant.dev/common/readiness"
 	"instant.dev/internal/config"
 	"instant.dev/internal/metrics"
@@ -53,6 +55,8 @@ type ReadyzHandler struct {
 	// probes. Sharing it avoids spinning up a new transport per probe
 	// (each transport leaks an idle connection pool until GC).
 	http *http.Client
+	// draining flips to true on graceful shutdown (MR-P0-7).
+	draining atomic.Bool
 }
 
 // NewReadyzHandler wires the runner. Pass the same db/rdb/cfg/prov the
@@ -184,12 +188,39 @@ func (h *ReadyzHandler) buildChecks() []readiness.Check {
 // hood but adapts the net/http body to Fiber's response writer.
 //
 // Mounted at GET /readyz in router.go.
+//
+// When draining (MarkDraining called during graceful shutdown), Get
+// short-circuits to 503 + overall=failed so the kubelet's readiness
+// probe pulls the pod from Service endpoints before the listener
+// stops accepting new connections (MR-P0-7).
 func (h *ReadyzHandler) Get(c *fiber.Ctx) error {
+	if h.draining.Load() {
+		c.Set("Cache-Control", "no-store")
+		c.Status(http.StatusServiceUnavailable)
+		return c.JSON(readiness.Response{
+			Overall:  readiness.StatusFailed,
+			Service:  "instant-api",
+			CommitID: buildinfo.GitSHA,
+			Checks: []readiness.CheckResult{{
+				Name:        "shutting_down",
+				Status:      readiness.StatusFailed,
+				LastError:   "draining",
+				LastCheckAt: time.Now(),
+			}},
+		})
+	}
 	resp, code := h.runner.Run(c.UserContext())
 	c.Set("Cache-Control", "no-store")
 	c.Status(code)
 	return c.JSON(resp)
 }
+
+// MarkDraining flips the handler into drain mode. Subsequent /readyz
+// probes return 503 + overall=failed. Idempotent.
+func (h *ReadyzHandler) MarkDraining() { h.draining.Store(true) }
+
+// IsDraining reports whether MarkDraining has been called.
+func (h *ReadyzHandler) IsDraining() bool { return h.draining.Load() }
 
 // customerDBCheck builds a CheckFunc that opens a one-shot pool against
 // the customer DB. The pool is closed on every call — the cache window
