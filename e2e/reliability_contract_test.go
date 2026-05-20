@@ -139,6 +139,15 @@ var auditConsumerSpec = map[string]auditConsumerExpectation{
 	// Billing — internal alerts, no customer email
 	"billing.charge_undeliverable": {IntentionallyNoConsumer: true},
 
+	// MR-P0-3 (BugBash 2026-05-20): fires from finalizeProvision when the
+	// backend provision RPC succeeded but a post-RPC persistence step failed.
+	// Internal operator-alert kind, mirroring billing.charge_undeliverable and
+	// propagation.dead_lettered — NOT wired into the customer-email forwarder
+	// because the appropriate response is human-eyes-on, not an automated
+	// template. The emit site (provision_helper.go) accompanies the row with
+	// an ERROR-level slog line so NR alerts can key on either.
+	"provision.persistence_failed": {IntentionallyNoConsumer: true},
+
 	// Promote workflow — admin actions, no customer email
 	"promote.approval_requested": {IntentionallyNoConsumer: true},
 	"promote.approved":           {IntentionallyNoConsumer: true},
