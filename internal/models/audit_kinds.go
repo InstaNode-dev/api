@@ -394,4 +394,62 @@ const (
 	// resource.quota_suspended (resource_id, resource_type, name) so the
 	// "your resource is back" email can name it.
 	AuditKindResourceQuotaUnsuspended = "resource.quota_unsuspended"
+
+	// Pending-propagation lifecycle (migration 058) — the durable retry
+	// queue for "tier elevated in the platform DB but infra regrade not
+	// yet applied" scenarios. The api enqueues `pending_propagations`
+	// rows from handleSubscriptionCharged; the worker's propagation_runner
+	// pulls eligible rows and dispatches by `kind`. These three audit
+	// kinds capture each terminal/transient inflection point so an
+	// operator can reconstruct the full chain.
+	//
+	// AuditKindPropagationApplied fires when the worker successfully
+	// dispatches every per-resource action for a pending_propagations row
+	// and stamps `applied_at`. Metadata: {propagation_id, kind, team_id,
+	// target_tier (for tier_elevation), attempts, duration_ms}. INFO-level
+	// ledger event — no email. The Loops/Brevo forwarder is intentionally
+	// NOT wired for this kind (it would spam a customer with "your upgrade
+	// landed in the infra" every charge); the existing subscription.upgraded
+	// kind is what the customer-facing email keys on.
+	AuditKindPropagationApplied = "propagation.applied"
+
+	// AuditKindPropagationRetrying fires on every failed attempt where the
+	// worker re-schedules with exponential backoff (attempts < maxAttempts).
+	// DEBUG-level — would otherwise spam INFO at the per-tick frequency
+	// of a Razorpay outage. Metadata: {propagation_id, kind, team_id,
+	// attempts, next_attempt_at, last_error}. NOT wired into the email
+	// forwarder — this is operational noise, not a customer event.
+	AuditKindPropagationRetrying = "propagation.retrying"
+
+	// AuditKindPropagationDeadLettered is the alert-able signal. Fires
+	// when the worker exhausts maxAttempts on a pending_propagations row
+	// and stamps `failed_at`. Paired with a structured slog ERROR (so the
+	// NR alert can key on either the audit row OR the log line) and
+	// matches the `billing.charge_undeliverable` pattern: an operator
+	// reconciliation event, NOT a customer-facing email. The kind is
+	// intentionally NOT wired into the worker's event-email forwarder
+	// (supportedAuditKinds) — a customer whose infra cap silently
+	// stayed at hobby after paying for pro deserves a human follow-up,
+	// not an automated template. Metadata: {propagation_id, kind,
+	// team_id, target_tier, attempts, last_error, age_seconds}.
+	AuditKindPropagationDeadLettered = "propagation.dead_lettered"
+)
+
+// PropagationKind* are the discriminator values for pending_propagations.kind.
+// Named constants (not scattered string literals) per CLAUDE.md conventions —
+// a typo in one emit site versus another silently dropped two distinct
+// emitters of the same logical event in the 2026-05-15 expiry-email
+// regression, and rule 16 enumerate-before-edit specifically called this
+// out as the modal failure mode. The worker's propagation_runner registry
+// uses the SAME constants (vendored via the propagation kinds file there)
+// so a missing handler for a registered kind fails the build, not prod.
+const (
+	// PropagationKindTierElevation is the only kind today: a Razorpay
+	// subscription.charged / .activated has committed the upgrade to
+	// teams.plan_tier + resources.tier; the worker must call
+	// provisioner.RegradeResource for every active resource on the team
+	// so the infra cap (ALTER ROLE … CONNECTION LIMIT, Redis CONFIG SET
+	// maxmemory, …) matches the resource.tier snapshot. The row's
+	// target_tier carries the tier the api wants regraded TO.
+	PropagationKindTierElevation = "tier_elevation"
 )
