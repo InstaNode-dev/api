@@ -659,6 +659,16 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			WHERE delivered_at IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_forwarder_sent_provider_provider_id
 			ON forwarder_sent (provider, provider_id)`,
+		// 063_forwarder_sent_audit_link — partial index covering only rows
+		// whose audit_id is a real UUID. Legacy emitters (resource-reminder
+		// builders, propagation drivers) write synthetic placeholder ids
+		// (`reminder-<resource_id>-<stage>`, `provider-<grace_id>`); a
+		// FOREIGN KEY would reject those, so the link stays soft and the
+		// orphan-reconciler scans only this partial index. Regex matches
+		// the canonical 8-4-4-4-12 hex UUID shape.
+		`CREATE INDEX IF NOT EXISTS idx_forwarder_sent_real_audit_id
+			ON forwarder_sent (audit_id)
+			WHERE audit_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'`,
 		// 058_pending_propagations — durable retry queue for "tier elevated
 		// in DB but infra regrade not yet applied" scenarios. The api
 		// enqueues a row inside handleSubscriptionCharged AFTER the atomic

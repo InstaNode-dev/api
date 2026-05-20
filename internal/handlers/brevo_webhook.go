@@ -111,6 +111,7 @@ import (
 	"instant.dev/internal/config"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/models"
+	"instant.dev/internal/safego"
 )
 
 // ── Named constants per CLAUDE.md feedback_no_hardcoded_strings ────────────
@@ -322,15 +323,44 @@ func (h *BrevoTransactionalWebhookHandler) Receive(c *fiber.Ctx) error {
 		// presence booleans. An operator debugging a 401 storm sees
 		// "have_configured_secret:true have_url_param:false" and
 		// knows the Brevo dashboard config is missing the secret.
+		haveConfigured := h.cfg.BrevoWebhookSecret != ""
+		haveParam := gotSecret != ""
 		slog.Warn("webhook.brevo.secret_mismatch",
-			"have_configured_secret", h.cfg.BrevoWebhookSecret != "",
-			"have_url_param", gotSecret != "",
+			"have_configured_secret", haveConfigured,
+			"have_url_param", haveParam,
 		)
 		metrics.BrevoWebhookEventsTotal.WithLabelValues("unauthorized").Inc()
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"ok":    false,
-			"error": "unauthorized",
-		})
+		// B18 wave-3 hardening (2026-05-21): emit an audit_log row on
+		// every unauthorized attempt so an operator dashboard can chart
+		// "N auth failures / hour" without grepping NR logs. Best-effort
+		// via safego.Go — a DB outage MUST NOT block the 401 response we
+		// owe the caller. Metadata carries presence booleans + the masked
+		// source-IP subnet ONLY: never the secret value, never the raw
+		// source IP.
+		if h.db != nil {
+			subnet := maskSourceIP(c.IP())
+			safego.Go("brevo.webhook.unauthorized.audit", func() {
+				meta, _ := json.Marshal(map[string]any{
+					"have_configured_secret": haveConfigured,
+					"have_url_param":         haveParam,
+					"source_ip_subnet":       subnet,
+				})
+				_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+					Actor:    "system",
+					Kind:     models.AuditKindBrevoWebhookUnauthorized,
+					Summary:  "Brevo webhook URL-token compare failed",
+					Metadata: meta,
+				})
+			})
+		}
+		// B13-F7 / B18 wave-3: hydrate the canonical ErrorResponse envelope
+		// (ok/error/message/request_id/retry_after_seconds/agent_action) so
+		// schema validators on the wire see the same 4xx shape every other
+		// handler emits. respondError reads the canonical agent_action from
+		// codeToAgentAction["unauthorized"], so we get a consistent UX
+		// surface without a per-call override.
+		return respondError(c, fiber.StatusUnauthorized, "unauthorized",
+			"Brevo webhook URL secret did not match the configured value.")
 	}
 
 	body := c.Body()
@@ -344,10 +374,10 @@ func (h *BrevoTransactionalWebhookHandler) Receive(c *fiber.Ctx) error {
 			"cap_bytes", brevoMaxBodyBytes,
 		)
 		metrics.BrevoWebhookEventsTotal.WithLabelValues("oversized").Inc()
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"ok":    false,
-			"error": "payload_too_large",
-		})
+		// B13-F7: canonical 4xx envelope on every webhook reject so a
+		// schema validator on the wire sees the documented shape.
+		return respondError(c, fiber.StatusBadRequest, "payload_too_large",
+			"Brevo webhook payload exceeded the 16 KiB cap.")
 	}
 
 	var evt brevoTransactionalEvent
@@ -359,10 +389,9 @@ func (h *BrevoTransactionalWebhookHandler) Receive(c *fiber.Ctx) error {
 		// dashboard's "Single event per webhook call" toggle.
 		slog.Warn("webhook.brevo.parse_failed", "error", err)
 		metrics.BrevoWebhookEventsTotal.WithLabelValues("invalid_payload").Inc()
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"ok":    false,
-			"error": "invalid_payload",
-		})
+		// B13-F7: canonical 4xx envelope on every webhook reject.
+		return respondError(c, fiber.StatusBadRequest, "invalid_payload",
+			"Brevo webhook body is not valid JSON.")
 	}
 
 	normalized := brevoNormalizeEvent(evt.Event)

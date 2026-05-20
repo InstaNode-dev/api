@@ -847,6 +847,18 @@ func requireName(c *fiber.Ctx, raw string) (string, error) {
 		if c != nil {
 			c.Set("X-Instant-Notice", "name_normalized: control/HTML-special characters were stripped from your name input")
 		}
+		// B18 L1 (wave 3, 2026-05-21): also emit a structured slog line so an
+		// operator scanning NR sees the per-request normalisation without
+		// having to inspect the response header. Logged at INFO (not WARN)
+		// because the strip is by-design hardening, not anomalous traffic.
+		// `raw_len` / `clean_len` are byte counts of the pre-strip and
+		// post-strip values; the actual values are NEVER logged (they may
+		// contain CRLF / NUL bytes that would corrupt the log line — that
+		// is precisely why we stripped them).
+		slog.InfoContext(c.UserContext(), "provision.name_normalized",
+			"raw_len", len(raw),
+			"clean_len", len(trimmed),
+		)
 	}
 
 	return trimmed, nil
