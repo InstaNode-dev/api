@@ -81,15 +81,21 @@ func decodeEnvelope(t *testing.T, resp *http.Response) map[string]any {
 }
 
 // TestErrorEnvelope_503_AllFieldsAndHeader covers the canonical 503 case
-// called out in the W7G brief: provisioner failure / transient infra.
-// The envelope must carry request_id, retry_after_seconds=30, the
-// AgentActionContactSupport fallback (because "provision_failed" isn't in
-// codeToAgentAction), AND the matching Retry-After: 30 header.
+// called out in the W7G brief: a transient-infra failure with NO registry
+// entry. The envelope must carry request_id, retry_after_seconds=30, the
+// AgentActionContactSupport fallback, AND the matching Retry-After: 30 header.
+//
+// Uses `db_error` as the fixture code: it's documented in helpers.go's
+// curation principles as deliberately omitted from codeToAgentAction, so
+// the W7G fallback branch fires deterministically. (Previously this test
+// used `provision_failed`, but MR-P0-3 added an explicit retry-with-backoff
+// entry for that code — its 503 must instruct the agent to retry, not
+// contact support.)
 func TestErrorEnvelope_503_AllFieldsAndHeader(t *testing.T) {
 	app := envelopeApp(t)
 	app.Get("/x", func(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable,
-			"provision_failed", "Failed to provision webhook resource")
+			"db_error", "Failed to query platform database")
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/x", nil)
@@ -106,8 +112,8 @@ func TestErrorEnvelope_503_AllFieldsAndHeader(t *testing.T) {
 
 	body := decodeEnvelope(t, resp)
 	assert.Equal(t, false, body["ok"])
-	assert.Equal(t, "provision_failed", body["error"])
-	assert.Equal(t, "Failed to provision webhook resource", body["message"])
+	assert.Equal(t, "db_error", body["error"])
+	assert.Equal(t, "Failed to query platform database", body["message"])
 	assert.Equal(t, "rid-fixed-123", body["request_id"],
 		"request_id must echo X-Request-ID so agents quoting it to support don't have to read headers")
 	assert.Equal(t, float64(30), body["retry_after_seconds"],
