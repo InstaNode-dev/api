@@ -165,7 +165,7 @@ const openAPISpec = `{
   "info": {
     "title": "InstaNode API",
     "version": "1.0.0",
-    "description": "Zero-friction developer infrastructure. Provision real databases, caches, and queues with a single HTTP call — no account, no Docker, no setup.\n\n## Idempotency\n\nEvery POST endpoint that creates a resource is idempotent. Two layered protections cover every retry pattern:\n\n1. Explicit Idempotency-Key header (Stripe-shape, 24h TTL). Pass the same opaque key on each retry of a logical operation and the server replays the first response verbatim. Reusing a key with a different body returns 409.\n2. Body-fingerprint fallback (120s TTL). When the header is absent, the server synthesises a key from sha256(scope, route, canonical-body) and dedups identical retries inside a 120s window. Absorbs double-clicks, mobile double-taps, agent retries on transient 5xx, and reverse-proxy retries on network blips. Use the explicit header for true exactly-once across longer windows.\n\nEvery response from a create endpoint carries:\n- X-Idempotency-Source: explicit | fingerprint | miss — which dedup path matched (explicit = caller passed an Idempotency-Key; fingerprint = the body-fingerprint cache replayed; miss = handler ran fresh).\n- X-Idempotent-Replay: true — present only when the response was served from the cache (either path)."
+    "description": "Zero-friction developer infrastructure. Provision real databases, caches, and queues with a single HTTP call — no account, no Docker, no setup.\n\n## Idempotency\n\nEvery POST endpoint that creates a resource is idempotent. Two layered protections cover every retry pattern:\n\n1. Explicit Idempotency-Key header (Stripe-shape, 24h TTL). Pass the same opaque key on each retry of a logical operation and the server replays the first response verbatim. Reusing a key with a different body returns 409.\n2. Body-fingerprint fallback (120s TTL). When the header is absent, the server synthesises a key from sha256(scope, route, canonical-body) and dedups identical retries inside a 120s window. Absorbs double-clicks, mobile double-taps, agent retries on transient 5xx, and reverse-proxy retries on network blips. Use the explicit header for true exactly-once across longer windows.\n\nEvery response from a create endpoint carries:\n- X-Idempotency-Source: explicit | fingerprint | miss — which dedup path matched (explicit = caller passed an Idempotency-Key; fingerprint = the body-fingerprint cache replayed; miss = handler ran fresh).\n- X-Idempotent-Replay: true — present only when the response was served from the cache (either path).\n\n## Rate limit (applies to every route)\n\nA global per-IP rate limit (100 req/min) is applied to EVERY documented endpoint by the router middleware. Exceeding it returns 429 with the standard ErrorResponse envelope (error=rate_limited), a Retry-After HTTP header, and retry_after_seconds in the JSON body. The per-route response maps below may omit 429 for brevity; the canonical 429 shape is documented under components.responses.TooManyRequests and applies to every path. T19 P1-1 (BugHunt 2026-05-20).\n\n## Payload size (applies to every route)\n\nFiber's global BodyLimit is set to 50 MiB — only /deploy/new and /stacks/new (multipart tarballs) and /webhooks/github/* (push payloads) approach that cap; JSON endpoints are bounded to sub-KB bodies by the per-handler shape. Oversized requests return 413 payload_too_large with the standard JSON ErrorResponse envelope (NOT the upstream nginx HTML 502 the older shape returned — T19 P1-2). The canonical 413 shape is documented under components.responses.PayloadTooLarge."
   },
   "servers": [{ "url": "https://api.instanode.dev", "description": "Production" }],
   "paths": {
@@ -2647,6 +2647,7 @@ const openAPISpec = `{
           "ok": { "type": "boolean" },
           "id": { "type": "string", "format": "uuid", "description": "Resource row id." },
           "token": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "description": "Human-readable label supplied on the request (T19 P1-6 / T14, BugHunt 2026-05-20). Mandatory on input; now echoed in the response so the field is round-trippable." },
           "receive_url": { "type": "string", "description": "Public URL that accepts any HTTP method and stores the payload" },
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
@@ -2676,6 +2677,7 @@ const openAPISpec = `{
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "expires_in": { "type": "string", "description": "Anonymous-only" } } },
           "warning": { "type": "string", "description": "Present only when the bucket is already over its storage limit at provision time — accompanied by the X-Instant-Notice: storage_limit_reached response header." },
           "expires_at": { "type": "string", "format": "date-time", "description": "Anonymous-tier only. RFC3339 timestamp at which the resource auto-expires (24h TTL)." },
+          "note": { "type": "string", "description": "Anonymous-tier upgrade hint emitted on the 201 happy path (T19 P1-5, BugHunt 2026-05-20). Was previously undocumented; the schema only listed credentials_note which only appears on the dedup path." },
           "credentials_note": { "type": "string", "description": "Present only on the rate-limited anonymous dedup response, where access_key_id/secret_access_key are NOT re-emitted (the secret is minted once at provision time and never stored)." },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
           "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
@@ -3176,6 +3178,30 @@ const openAPISpec = `{
           "current_incidents": { "type": "array", "items": { "$ref": "#/components/schemas/Incident" }, "description": "Open incidents at the time of the snapshot. Today this is always empty — the field is reserved for the future incident-feed worker." }
         },
         "required": ["ok", "freshness_seconds", "as_of", "components", "current_incidents"]
+      }
+    },
+    "responses": {
+      "TooManyRequests": {
+        "description": "T19 P1-1 (BugHunt 2026-05-20): shared 429 response. A global 100 req/min/IP rate-limit applies to EVERY route — this component documents the canonical envelope so callers don't have to re-discover it on each path. Per-route 429 entries (deploy daily cap, GitHub-webhook hourly cap, manual_backups_per_day, etc.) override with route-specific guidance but the wire shape stays the same. Retry-After header carries the wait in seconds; retry_after_seconds in the body mirrors it.",
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds the caller should wait before retrying.",
+            "schema": { "type": "integer" }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "PayloadTooLarge": {
+        "description": "T19 P1-2 (BugHunt 2026-05-20): shared 413 response. Fiber's global BodyLimit is 50 MiB — exceeding it returns this JSON envelope (NOT the upstream nginx HTML 502 the older shape returned). Per-route handlers may cap further (e.g. /webhook/receive caps at 1 MiB); the envelope is identical regardless of which layer rejected the body.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
       }
     }
   }

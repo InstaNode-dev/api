@@ -147,14 +147,19 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
 			// Decrypt the stored connection_url to return it in plaintext.
-			connectionURL := h.decryptStorageURL(existing.ConnectionURL.String, requestID)
+			// T1 P1-5 (BugHunt 2026-05-20): fail-closed — see db.go.
+			connectionURL, ok := h.decryptStorageURL(existing.ConnectionURL.String, requestID)
+			if !ok {
+				slog.Warn("storage.new.dedup_decrypt_failed — provisioning fresh",
+					"token", existing.Token, "request_id", requestID)
+			}
 
 			// P2-04: mirror the db/cache/nosql/queue dedup guard — only return
 			// the existing resource when it has a usable connection_url. An
 			// empty URL means provisioning failed mid-flight on the existing
 			// row; fall through to a fresh provision rather than handing the
 			// caller a 200 with an unusable resource.
-			if connectionURL != "" {
+			if ok && connectionURL != "" {
 				metrics.FingerprintAbuseBlocked.Inc()
 				dedupResp := fiber.Map{
 					"ok":             true,
@@ -478,23 +483,24 @@ func (h *StorageHandler) newStorageAuthenticated(
 	})
 }
 
-// decryptStorageURL decrypts an AES-encrypted connection URL stored in the DB.
-// Returns the ciphertext unchanged if decryption fails (fails open — caller must handle).
-func (h *StorageHandler) decryptStorageURL(encrypted, requestID string) string {
+// decryptStorageURL decrypts an AES-encrypted connection URL stored
+// in the DB. T1 P1-5 (BugHunt 2026-05-20): fail-CLOSED — see db.go.
+// (plain, true) / ("", true on empty) / ("", false on decrypt error).
+func (h *StorageHandler) decryptStorageURL(encrypted, requestID string) (string, bool) {
 	if encrypted == "" {
-		return ""
+		return "", true
 	}
 	aesKey, err := crypto.ParseAESKey(h.cfg.AESKey)
 	if err != nil {
 		slog.Error("storage.decrypt_url.aes_key_parse_failed", "error", err, "request_id", requestID)
-		return encrypted
+		return "", false
 	}
 	plain, err := crypto.Decrypt(aesKey, encrypted)
 	if err != nil {
 		slog.Error("storage.decrypt_url.decrypt_failed", "error", err, "request_id", requestID)
-		return encrypted
+		return "", false
 	}
-	return plain
+	return plain, true
 }
 
 func (h *StorageHandler) storageAnonymousLimits() fiber.Map {

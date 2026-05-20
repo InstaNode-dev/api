@@ -452,6 +452,25 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 	// claim. Detached context so the goroutine outlives the request cycle.
 	safego.Go("onboarding.claimed_audit", func() { emitOnboardingClaimedAudit(h.db, team.ID, newUser.ID, len(claimedIDs), body.Email) })
 
+	// T10 P2-4 (BugHunt 2026-05-20): /claim mints a session for an email
+	// the caller never proved they own. The session is still issued so
+	// the dashboard works, but `email_verified=false` (above) already
+	// gates billing actions. To give the rightful inbox-owner a way to
+	// take over, we proactively dispatch a magic-link verification email
+	// — clicking it sets `email_verified=true` via the existing
+	// markEmailVerified path in magic_link.Callback. If the caller is an
+	// attacker squatting victim@example.com, the real victim receives a
+	// verification email and can sign in; their magic-link sign-in finds
+	// the pre-seeded user row (matched by email), consumes the link, and
+	// flips email_verified — which is the moment ownership is proven.
+	//
+	// Best-effort + detached: a dispatch failure is logged but never
+	// fails the claim (the claim's 201 is already returned). The
+	// per-email rate limit applies — see checkEmailRateLimit.
+	safego.Go("onboarding.claim_verification_email", func() {
+		sendClaimVerificationEmail(h.db, h.email, body.Email, h.cfg.DashboardBaseURL+"/app")
+	})
+
 	resp := fiber.Map{
 		"ok":      true,
 		"team_id": team.ID,
@@ -495,4 +514,79 @@ func emitOnboardingClaimedAudit(db *sql.DB, teamID, userID uuid.UUID, resourcesT
 			"error", err,
 		)
 	}
+}
+
+// claimVerificationEmailMailer is the minimum surface from
+// *email.Client that the claim verification helper needs. Extracted to
+// keep the helper testable without spinning up a real mail client.
+type claimVerificationEmailMailer interface {
+	SendMagicLink(ctx context.Context, toEmail, link string) error
+}
+
+// sendClaimVerificationEmail dispatches a magic-link verification email
+// to the address /claim created an account for. T10 P2-4 (BugHunt
+// 2026-05-20): /claim mints a session JWT for an unverified email; this
+// gives the rightful inbox-owner a path to prove control and (via
+// markEmailVerified inside the magic-link callback) flip the
+// email_verified flag that gates billing.
+//
+// Best-effort by design — no error is propagated. The /claim caller
+// already got a 201; this is a side-channel to the inbox.
+//
+// `mailer` MAY be nil (e.g. local dev with no email backend configured)
+// — we no-op in that case.
+//
+// Note we deliberately route the magic-link through the same
+// CreateMagicLink → /auth/email/callback?t= path the regular sign-in
+// flow uses, so the callback's existing markEmailVerified runs and the
+// returnTo lands the user back in the dashboard.
+func sendClaimVerificationEmail(db *sql.DB, mailer claimVerificationEmailMailer, emailAddr, returnTo string) {
+	if mailer == nil || db == nil {
+		return
+	}
+	emailAddr = models.NormalizeEmail(emailAddr)
+	if emailAddr == "" {
+		return
+	}
+	plaintext, err := models.GenerateMagicLinkPlaintext()
+	if err != nil {
+		slog.Warn("onboarding.claim.verification.generate_token_failed", "error", err)
+		return
+	}
+	// Detached context — request ctx has long since been cancelled.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	row, err := models.CreateMagicLink(ctx, db, emailAddr, plaintext, returnTo, magicLinkTTL)
+	if err != nil {
+		slog.Warn("onboarding.claim.verification.create_link_failed",
+			"error", err)
+		return
+	}
+	link := canonicalAPIBase + "/auth/email/callback?t=" + plaintext
+	sendErr := mailer.SendMagicLink(ctx, emailAddr, link)
+	persistMagicLinkSendStatus(ctx, db, row.ID, sendErr, "")
+	if sendErr != nil {
+		slog.Warn("onboarding.claim.verification.send_failed",
+			"error", sendErr,
+			"email_masked", maskEmailForLog(emailAddr))
+		return
+	}
+	slog.Info("onboarding.claim.verification.sent",
+		"email_masked", maskEmailForLog(emailAddr))
+}
+
+// maskEmailForLog returns the first character + "***" + the domain so a
+// claim-verification log entry doesn't leak the full email address.
+func maskEmailForLog(s string) string {
+	at := -1
+	for i, r := range s {
+		if r == '@' {
+			at = i
+			break
+		}
+	}
+	if at <= 0 {
+		return "***"
+	}
+	return s[:1] + "***" + s[at:]
 }

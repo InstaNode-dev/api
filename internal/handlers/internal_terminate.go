@@ -310,11 +310,14 @@ func verifyInternalTerminateJWT(c *fiber.Ctx, secret string, pathTeamID uuid.UUI
 		// Pin to HS256. A token signed with a different alg (e.g.
 		// "none") must NOT verify — otherwise an attacker can drop
 		// the signature and impersonate any team.
+		// T10 P2-1 (BugHunt 2026-05-20): the bare SigningMethodHMAC
+		// type-assert also accepts HS384/HS512 — pair it with
+		// jwt.WithValidMethods to truly pin HS256.
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return []byte(secret), nil
-	})
+	}, jwt.WithValidMethods([]string{"HS256"}))
 	if err != nil {
 		slog.Warn("internal.terminate.auth.parse_failed",
 			"error", err,

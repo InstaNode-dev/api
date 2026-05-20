@@ -623,6 +623,16 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 			return respondError(c, fiber.StatusBadRequest, "invalid_env_vars",
 				"Field 'env_vars' must be a JSON object {KEY:\"value\", ...}")
 		}
+		// T13 P2-T13-04 (BugHunt 2026-05-20): validate env-var key shape
+		// up front. Previously a malformed key (lowercase / hyphen / dot)
+		// passed through to envVarsToK8s and crashed the kaniko apply as
+		// an opaque async build failure with no 4xx in front of the user.
+		// POSIX rule `^[A-Z_][A-Z0-9_]*$` covers every legitimate env
+		// var; reserved `_`-prefix keys are skipped (stripped below).
+		if ok, badKey := validateEnvVarKeys(parsed); !ok {
+			return respondError(c, fiber.StatusBadRequest, "invalid_env_key",
+				"env_vars key "+quoteForError(badKey)+" is not a valid POSIX env var name (must match ^[A-Z_][A-Z0-9_]*$).")
+		}
 		for k, v := range parsed {
 			// Reserved underscore-prefixed keys are internal-only.
 			if strings.HasPrefix(k, "_") {

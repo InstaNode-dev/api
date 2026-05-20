@@ -716,6 +716,17 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 			envVars[k] = v
 		}
 
+		// T13 P2-T13-04 (BugHunt 2026-05-20): reject any non-POSIX
+		// env-var key up front so a malformed key doesn't surface as an
+		// opaque async k8s-apply failure deep in runStackDeploy.
+		// `needsEnvByService` is always well-formed (we emit those
+		// names) — only user-supplied svc.Env keys can be malformed.
+		if ok, badKey := validateEnvVarKeys(svc.Env); !ok {
+			return respondError(c, fiber.StatusBadRequest, "invalid_env_key",
+				"service '"+svcName+"' env key "+quoteForError(badKey)+
+					" is not a valid POSIX env var name (must match ^[A-Z_][A-Z0-9_]*$).")
+		}
+
 		// Resolve vault:// refs (authenticated only).
 		// IMPORTANT: we resolve against the stack's own env, NOT a hardcoded
 		// "production" string. Promoted staging stacks read from the staging

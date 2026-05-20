@@ -178,6 +178,16 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the owner role can't be assigned via PATCH role — ownership transfers atomically. Have them call POST https://instanode.dev/api/v1/team/members/<user_id>/promote-to-primary instead.",
 	},
 
+	// ── Body-validation errors ─────────────────────────────────────────────
+	// T19 P1-3 (BugHunt 2026-05-20): `invalid_body` was the one
+	// request-fix 4xx without an agent_action — every other 4xx
+	// (name_required, invalid_name, missing_token, ...) had one. The
+	// `ErrorResponse` schema description promises agent_action on
+	// "request-fix errors"; matching that contract here.
+	"invalid_body": {
+		AgentAction: "Tell the user the request body is not valid JSON. Have them check for trailing commas, unquoted keys, and the matching Content-Type header — see https://instanode.dev/docs.",
+	},
+
 	// ── Fiber-default 4xx routing errors ───────────────────────────────────
 	// The default Fiber 404/405/413/415 paths flow through the ErrorHandler
 	// in router.go which calls handlers.WriteFiberError -> respondError.

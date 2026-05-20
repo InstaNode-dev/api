@@ -190,12 +190,15 @@ func verifyInternalBackupRefundJWT(c *fiber.Ctx, secret string, pathTeamID uuid.
 		return errors.New("empty bearer token")
 	}
 	claims := &internalBackupRefundClaims{}
+	// T10 P2-1 (BugHunt 2026-05-20): pin alg to HS256 only — see comment
+	// in middleware/auth.go. Internal M2M JWTs share the codebase's alg
+	// posture; downgrade to HS384/HS512 must be uniformly forbidden.
 	tok, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return []byte(secret), nil
-	})
+	}, jwt.WithValidMethods([]string{"HS256"}))
 	if err != nil {
 		slog.Warn("internal.backup_refund.auth.parse_failed",
 			"error", err, "path_team_id", pathTeamID.String())

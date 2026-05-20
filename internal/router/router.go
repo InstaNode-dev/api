@@ -95,6 +95,22 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		ProxyHeader:             "X-Forwarded-For",
 		EnableTrustedProxyCheck: cfg.TrustedProxyCIDRs != "",
 		TrustedProxies:          parseTrustedProxyCIDRs(cfg.TrustedProxyCIDRs),
+		// T13 P2-T13-05 (BugHunt 2026-05-20): set an explicit global
+		// BodyLimit so a single 1 GB JSON body cannot pin a goroutine
+		// across three full passes (Body+utf8.Valid+BodyParser). Fiber's
+		// default is 4 MiB. We set 50 MiB — the size of the largest
+		// legitimate body on any route — so the limit is uniform and
+		// auditable:
+		//   - /deploy/new       — multipart tarball, per-handler 50 MiB
+		//   - /stacks/new       — multipart tarball, per-handler 50 MiB
+		//   - /webhooks/github/* — push payloads, per-handler 25 MiB
+		//   - everything else   — JSON bodies, typically sub-KB
+		// The per-handler `fh.Size > 50<<20` checks in deploy.go /
+		// stack.go / github_deploy.go remain authoritative for their
+		// shapes; this global bounds the absolute worst case.
+		// Anything bigger than 50 MiB hits the Fiber ErrorHandler above
+		// which emits a JSON `payload_too_large` envelope — see T19 P1-2.
+		BodyLimit: 50 * 1024 * 1024,
 	})
 
 	// ── Liveness probe (MUST be registered before any middleware) ────────────

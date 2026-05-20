@@ -266,8 +266,10 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 			url := h.decryptWebhookURL(existing.ConnectionURL.String, requestID)
 
 			resp := fiber.Map{
-				"ok":          true,
-				"id":          existing.ID.String(),
+				"ok": true,
+				"id": existing.ID.String(),
+				// T19 P1-6 / T14 (BugHunt 2026-05-20): echo `name`.
+				"name":        existing.Name.String,
 				"token":       existing.Token.String(),
 				"receive_url": url,
 				"tier":        existing.Tier,
@@ -366,8 +368,12 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 	}
 
 	return respondCreated(c, fiber.Map{
-		"ok":          true,
-		"id":          resource.ID.String(),
+		"ok":   true,
+		"id":   resource.ID.String(),
+		// T19 P1-6 / T14 (BugHunt 2026-05-20): echo `name` so the
+		// mandatory-input field is round-trippable. Was previously
+		// write-only — callers had no way to read back the label they set.
+		"name":        resource.Name.String,
 		"token":       tokenStr,
 		"receive_url": rURL,
 		"tier":        "anonymous",
@@ -455,8 +461,10 @@ func (h *WebhookHandler) newWebhookAuthenticated(
 	middleware.RecordProvisionSuccess("webhook")
 
 	return respondCreated(c, fiber.Map{
-		"ok":          true,
-		"id":          resource.ID.String(),
+		"ok": true,
+		"id": resource.ID.String(),
+		// T19 P1-6 / T14 (BugHunt 2026-05-20): echo `name`.
+		"name":        resource.Name.String,
 		"token":       tokenStr,
 		"receive_url": rURL,
 		"tier":        team.PlanTier,

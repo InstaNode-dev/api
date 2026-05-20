@@ -107,12 +107,15 @@ func (h *LogoutHandler) Logout(c *fiber.Ctx) error {
 	// race between token expiry and the Parse call can't inject a crafted
 	// jti into the revocation set.
 	var claims rawLogoutClaims
+	// T10 P2-1 (BugHunt 2026-05-20): pin alg to HS256 only. The bare
+	// SigningMethodHMAC type-assert accepts HS384/HS512 too — explicitly
+	// forbidden by the crypto package (see crypto/jwt.go header comment).
 	parsed, err := jwt.ParseWithClaims(tokenStr, &claims, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
 		}
 		return []byte(h.cfg.JWTSecret), nil
-	})
+	}, jwt.WithValidMethods([]string{"HS256"}))
 	if err != nil || !parsed.Valid {
 		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Token invalid or expired")
 	}
