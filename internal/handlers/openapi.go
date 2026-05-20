@@ -733,12 +733,13 @@ const openAPISpec = `{
     "/claim": {
       "post": {
         "summary": "Claim anonymous resources to a permanent account",
-        "description": "Converts anonymous resources to hobby tier (no expiry). Sends a magic link to the supplied email; clicking the link sets a session JWT cookie and atomically transfers every resource token in the onboarding JWT to the new team.",
+        "description": "Converts anonymous resources to hobby tier (no expiry). Sends a magic link to the supplied email; clicking the link sets a session JWT cookie and atomically transfers every resource token in the onboarding token to the new team.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClaimRequest" } } } },
         "responses": {
           "200": { "description": "Magic link sent to email", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClaimResponse" } } } },
           "201": { "description": "Account created, resources transferred (legacy direct-claim flow)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClaimResponse" } } } },
-          "409": { "description": "JWT already used (single-use claim)" }
+          "400": { "description": "Validation failure. Possible error codes: missing_token (no token/jwt in body), missing_email (no email), invalid_email_format (email failed RFC 5322 validation), invalid_body (body not valid JSON), invalid_token (token failed signature/expiry check).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "409": { "description": "Onboarding token already used (single-use claim)" }
         }
       }
     },
@@ -2851,10 +2852,13 @@ const openAPISpec = `{
       },
       "ClaimRequest": {
         "type": "object",
-        "required": ["jwt", "email"],
+        "required": ["token", "email"],
+        "description": "Body for POST /claim. The token field is the canonical field name (2026-05-20). The legacy jwt field is still accepted as a deprecated alias for backward compatibility with the dashboard, sdk-go, and existing curl recipes — when both are present, token wins.",
         "properties": {
-          "jwt": { "type": "string", "description": "Onboarding JWT. Read this directly from the upgrade_jwt field of any anonymous provisioning response — no need to string-parse the upgrade URL." },
-          "email": { "type": "string", "format": "email" }
+          "token": { "type": "string", "description": "Onboarding token. Read this directly from the upgrade_jwt field of any anonymous provisioning response — no need to string-parse the upgrade URL." },
+          "jwt": { "type": "string", "deprecated": true, "description": "Deprecated alias for token (kept for backward compatibility). New callers should send token instead." },
+          "team_name": { "type": "string", "description": "Optional human-readable team name. Defaults to the email when omitted." },
+          "email": { "type": "string", "format": "email", "description": "RFC 5322 email address. Validated server-side via net/mail.ParseAddress — invalid syntax returns 400 with error=invalid_email_format." }
         }
       },
       "ClaimResponse": {

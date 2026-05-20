@@ -913,12 +913,22 @@ type rzpSubscriptionEntity struct {
 }
 
 type rzpPaymentEntity struct {
-	ID               string `json:"id"`
-	Amount           int64  `json:"amount"`
-	Currency         string `json:"currency"`
-	Email            string `json:"email"`
-	AttemptCount     int    `json:"attempt_count"`
-	ErrorDescription string `json:"error_description"`
+	ID               string            `json:"id"`
+	Amount           int64             `json:"amount"`
+	Currency         string            `json:"currency"`
+	Email            string            `json:"email"`
+	AttemptCount     int               `json:"attempt_count"`
+	ErrorDescription string            `json:"error_description"`
+	// SubscriptionID + OrderID + Notes (B11-P1, 2026-05-20): used to
+	// resolve the team server-side instead of trusting payload.email
+	// verbatim. A payment.failed entity carries `subscription_id` for
+	// subscription-tied payments, `order_id` for one-shot orders, and
+	// `notes` for any caller-supplied metadata (Razorpay copies notes
+	// from the parent subscription onto the payment). resolveTeamFromPayment
+	// reads these in priority order.
+	SubscriptionID string            `json:"subscription_id"`
+	OrderID        string            `json:"order_id"`
+	Notes          map[string]string `json:"notes"`
 }
 
 // RazorpayWebhook handles POST /razorpay/webhook.
@@ -1027,10 +1037,12 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 			// retry re-claims and re-processes this event. Without this
 			// the up-front claim would permanently swallow the retry.
 			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"ok":    false,
-				"error": "upgrade_failed",
-			})
+			// B11-P1 (2026-05-20): map ErrTeamNotFound to 404. Razorpay
+			// treats 4xx as non-retryable (won't replay the event with
+			// the same payload) — exactly what we want for a synthetic
+			// or stale notes.team_id. Releasing the dedup claim above
+			// still allows a corrected payload to land later.
+			return webhookErrorStatus(c, upgradeErr, "upgrade_failed")
 		}
 	case "subscription.charged":
 		if upgradeErr := h.handleSubscriptionCharged(ctx, c, event); upgradeErr != nil {
@@ -1038,10 +1050,7 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 				"error", upgradeErr, "event_id", eventID)
 			// P4: release the claim on failure — see the activated branch.
 			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"ok":    false,
-				"error": "upgrade_failed",
-			})
+			return webhookErrorStatus(c, upgradeErr, "upgrade_failed")
 		}
 	case "subscription.cancelled":
 		// P1-W3-09: a swallowed downgrade failure used to leave the team on
@@ -1197,6 +1206,37 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 // Best-effort: a delete failure is logged at WARN. Worst case the event is
 // not retried until Razorpay's own redelivery schedule or the billing
 // reconciler corrects the tier — strictly better than a wrong delete.
+// webhookErrorStatus maps a webhook-handler error to the right HTTP status +
+// JSON envelope so the Razorpay redelivery contract works correctly:
+//
+//   - ErrTeamNotFound (B11-P1, 2026-05-20)  → 404 with error="team_not_found".
+//     The webhook carried a notes.team_id pointing at a non-existent team
+//     (typo, deleted-team race, forged synthetic event). Razorpay treats
+//     4xx as non-retryable (won't replay) so the dead event doesn't loop
+//     forever, and our deleteRazorpayWebhookClaim caller releases the
+//     dedup claim so a future event with the corrected team_id can land.
+//   - any other error                       → 500 with the caller-supplied
+//     error code. Razorpay retries 5xx — appropriate for transient DB or
+//     gRPC failures where redelivery may succeed.
+//
+// The `errorCode` argument is the per-callsite slug used in the response
+// envelope (e.g. "upgrade_failed", "subscription_cancelled_failed"). It is
+// echoed verbatim in the 500 envelope; on a 404 it is overridden to the
+// stable "team_not_found" code so consumers can identify the case.
+func webhookErrorStatus(c *fiber.Ctx, err error, errorCode string) error {
+	var notFound *models.ErrTeamNotFound
+	if errors.As(err, &notFound) {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"ok":    false,
+			"error": "team_not_found",
+		})
+	}
+	return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+		"ok":    false,
+		"error": errorCode,
+	})
+}
+
 func (h *BillingHandler) deleteRazorpayWebhookClaim(ctx context.Context, eventID string, claimedHere bool) {
 	if !claimedHere || eventID == "" || h.db == nil {
 		return
@@ -1718,9 +1758,61 @@ func (h *BillingHandler) handlePaymentFailed(ctx context.Context, c *fiber.Ctx, 
 		"error_desc", pay.ErrorDescription,
 	)
 
-	if pay.Email == "" {
-		slog.Warn("billing.payment.failed.no_email", "payment_id", pay.ID)
+	// B11-P1 (2026-05-20): resolve the dunning recipient server-side from
+	// the team_id (via notes/subscription_id), NOT from pay.Email.
+	//
+	// Previous behaviour trusted `payload.payment.entity.email` verbatim
+	// — meaning anyone with the Razorpay webhook secret (a leaked CI
+	// var, a malicious vendor, an over-shared HMAC key) could synthesize
+	// a payment.failed event with `email: <victim>` and fanout dunning
+	// notifications to arbitrary recipients. The Brevo provider treats
+	// a payment-failed email as transactional and bypasses unsubscribe
+	// preferences, so the impact was "spam any address you can
+	// enumerate, with our SendGrid reputation behind it."
+	//
+	// Fix: derive the team from `notes.team_id` / `subscription_id` /
+	// `order_id`, look up its primary user, and send to THAT address.
+	// If we can't resolve a team or its primary user, drop the email
+	// (loud WARN log so ops can see it; no email is strictly better
+	// than the wrong email).
+	teamID, resolvedVia := resolveTeamFromPayment(ctx, h, pay, event)
+	if teamID == uuid.Nil {
+		slog.Warn("billing.payment.failed.team_unresolvable",
+			"payment_id", pay.ID,
+			"subscription_id", pay.SubscriptionID,
+			"order_id", pay.OrderID,
+			"note", "no team resolvable from payload — dunning email DROPPED (B11-P1 takes precedence over delivery)")
 		return nil
+	}
+	primary, lookupErr := models.GetPrimaryUserByTeamID(ctx, h.db, teamID)
+	if lookupErr != nil {
+		slog.Warn("billing.payment.failed.primary_user_lookup_failed",
+			"error", lookupErr,
+			"payment_id", pay.ID,
+			"team_id", teamID,
+			"resolved_via", resolvedVia,
+			"note", "team resolved but no primary user — dunning email DROPPED")
+		return nil
+	}
+	recipient := models.NormalizeEmail(primary.Email)
+	if recipient == "" {
+		slog.Warn("billing.payment.failed.primary_email_empty",
+			"payment_id", pay.ID, "team_id", teamID)
+		return nil
+	}
+
+	// Defensive log: surface the case where the payload-supplied email
+	// differed from the resolved one. This is the per-event signal that
+	// the previous-trust path WOULD have sent to the wrong recipient,
+	// useful for both alerting and forensic incident review.
+	if payloadEmail := strings.ToLower(strings.TrimSpace(pay.Email)); payloadEmail != "" && payloadEmail != recipient {
+		slog.Warn("billing.payment.failed.payload_email_mismatch",
+			"payment_id", pay.ID,
+			"team_id", teamID,
+			"resolved_via", resolvedVia,
+			"payload_email_masked", models.MaskEmail(pay.Email),
+			"resolved_email_masked", models.MaskEmail(recipient),
+			"note", "payload email differs from team primary — using resolved (B11-P1)")
 	}
 
 	// C5 per-cycle dedup. payment.failed and subscription.pending are two
@@ -1729,7 +1821,7 @@ func (h *BillingHandler) handlePaymentFailed(ctx context.Context, c *fiber.Ctx, 
 	// dunning emails. dunningDedupKey collapses one recipient's failed cycle
 	// to a single send. A (false, nil) claim means the sibling event already
 	// sent the dunning notice. Fail-open: a dedup DB error sends anyway.
-	if key := dunningDedupKey(pay.Email); key != "" {
+	if key := dunningDedupKey(recipient); key != "" {
 		claimed, claimErr := models.ClaimEmailSend(ctx, h.db, key, models.EmailSendKindDunning)
 		if claimErr != nil {
 			slog.Warn("billing.payment.failed.dunning_dedup_failed",
@@ -1746,15 +1838,72 @@ func (h *BillingHandler) handlePaymentFailed(ctx context.Context, c *fiber.Ctx, 
 	// ledger + provider Idempotency-Key header so a network-glitch retry
 	// (caller perceives the send failed, retries with the same key)
 	// collapses at both layers.
-	if err := h.email.SendPaymentFailedWithKey(ctx, pay.Email, dunningDedupKey(pay.Email), pay.AttemptCount, nil); err != nil {
+	if err := h.email.SendPaymentFailedWithKey(ctx, recipient, dunningDedupKey(recipient), pay.AttemptCount, nil); err != nil {
 		slog.Error("billing.payment.failed.email_failed",
-			"error", err, "to", models.MaskEmail(pay.Email), "payment_id", pay.ID)
+			"error", err, "to", models.MaskEmail(recipient), "payment_id", pay.ID)
 		return fmt.Errorf("payment.failed email send: %w", err)
 	}
 
 	slog.Info("billing.payment.failed.email_sent",
-		"to", models.MaskEmail(pay.Email), "payment_id", pay.ID)
+		"to", models.MaskEmail(recipient),
+		"payment_id", pay.ID,
+		"team_id", teamID,
+		"resolved_via", resolvedVia)
 	return nil
+}
+
+// resolveTeamFromPayment derives the team UUID for a payment.failed /
+// subscription-tied payment event by inspecting the Razorpay payload server-
+// side. Priority order (most-specific → least-specific):
+//
+//  1. payment.notes.team_id        — caller-supplied (we set this on the
+//     subscription, which Razorpay copies onto the payment)
+//  2. payment.subscription_id      — DB lookup against teams.stripe_customer_id
+//     (column name is legacy; stores Razorpay subscription IDs now)
+//  3. event.Payload.Subscription   — webhook may include the sibling entity;
+//     parse it and recurse via subscription notes / id
+//  4. payment.order_id             — not yet wired; future hook for one-shot
+//     orders if we add them
+//
+// Returns (uuid.Nil, "") when no path resolves, signalling "drop the email"
+// to the caller. The string is a slug naming the resolution path, used for
+// observability logging.
+//
+// NEVER consults payment.Email — the whole point of this helper (B11-P1) is
+// to remove the payload-email trust path from the dunning flow.
+func resolveTeamFromPayment(ctx context.Context, h *BillingHandler, pay rzpPaymentEntity, event rzpWebhookEvent) (uuid.UUID, string) {
+	// 1. payment.notes.team_id
+	if pay.Notes != nil {
+		if raw := strings.TrimSpace(pay.Notes["team_id"]); raw != "" {
+			if id, err := uuid.Parse(raw); err == nil {
+				return id, "payment.notes.team_id"
+			}
+		}
+	}
+	// 2. payment.subscription_id → DB lookup
+	if sid := strings.TrimSpace(pay.SubscriptionID); sid != "" {
+		if team, err := models.GetTeamByRazorpaySubscriptionID(ctx, h.db, sid); err == nil && team != nil {
+			return team.ID, "payment.subscription_id"
+		}
+	}
+	// 3. event.Payload.Subscription sibling — same entity unmarshal +
+	//    notes/id read as resolveTeamFromNotes
+	if event.Payload.Subscription != nil && len(event.Payload.Subscription.Entity) > 0 {
+		var sub rzpSubscriptionEntity
+		if err := json.Unmarshal(event.Payload.Subscription.Entity, &sub); err == nil {
+			if raw := strings.TrimSpace(sub.Notes["team_id"]); raw != "" {
+				if id, err := uuid.Parse(raw); err == nil {
+					return id, "subscription.notes.team_id"
+				}
+			}
+			if sub.ID != "" {
+				if team, err := models.GetTeamByRazorpaySubscriptionID(ctx, h.db, sub.ID); err == nil && team != nil {
+					return team.ID, "subscription.id"
+				}
+			}
+		}
+	}
+	return uuid.Nil, ""
 }
 
 // dunningDedupKey builds the per-billing-cycle dedup key for the payment-
