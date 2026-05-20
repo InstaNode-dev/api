@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -332,12 +333,24 @@ func generateSessionID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// frontendURL returns the base URL for the frontend.
-// In production this is https://instant.dev; in local dev it falls back to localhost.
+// frontendURL returns the base URL for the dashboard the user must visit to
+// complete CLI login. Reads cfg.DashboardBaseURL (DASHBOARD_BASE_URL env var,
+// default http://localhost:5173) so a single env-var flip moves /auth/cli's
+// auth_url for every environment.
+//
+// B13-P0-F1 (2026-05-20): previously hardcoded "https://instant.dev" in
+// production. instant.dev is the legacy marketing host (returns 404); the
+// brand moved to instanode.dev. An agent following the auth_url landed on a
+// dead-brand parking page and gave up. The fallback below is instanode.dev
+// (not instant.dev) so a deployment that forgets DASHBOARD_BASE_URL still
+// points at the real product domain rather than a known-bad host.
 func frontendURL(cfg *config.Config) string {
-	if cfg.Environment == "production" {
-		return "https://instant.dev"
+	if cfg != nil && cfg.DashboardBaseURL != "" {
+		return strings.TrimRight(cfg.DashboardBaseURL, "/")
 	}
-	return "http://localhost:3000"
+	if cfg != nil && cfg.Environment == "production" {
+		return "https://instanode.dev"
+	}
+	return "http://localhost:5173"
 }
 

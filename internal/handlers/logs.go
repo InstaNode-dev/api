@@ -133,7 +133,7 @@ func (h *LogsHandler) ResourceLogs(c *fiber.Ctx) error {
 			"Log streaming is only available for growth-tier (isolated) resources. "+
 				"Shared-tier resources run on platform pods shared across customers. "+
 				"For shared-tier log access, connect your app to a log aggregation service "+
-				"(e.g. Splunk, Datadog, Grafana Loki). See https://instant.dev/docs/logging")
+				"(e.g. Splunk, Datadog, Grafana Loki). See https://instanode.dev/docs/logging")
 	}
 
 	namespace := resource.ProviderResourceID.String

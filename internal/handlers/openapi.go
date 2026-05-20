@@ -1537,16 +1537,18 @@ const openAPISpec = `{
     },
     "/stacks/{slug}/env": {
       "patch": {
-        "summary": "Note env var overrides for a stack (applied on next redeploy)",
-        "description": "Accepts a map of env vars to be applied on the next call to POST /stacks/{slug}/redeploy. MVP: env vars are NOT persisted to the stacks table — the message in the response reminds the caller to issue a redeploy. Auth required: anonymous stacks cannot be mutated after creation.",
+        "summary": "Update env vars on a stack (persisted; applied on next redeploy)",
+        "description": "PATCH semantics — incoming env map is merged into the stack's existing env_vars (B7-P0-1, migration 062). Setting a key to the empty string deletes it. Keys must match POSIX [A-Z_][A-Z0-9_]* — the same shape /deploy/new and /stacks/new enforce. Total payload after merge is capped at 64KiB. Persisted to stacks.env_vars JSONB; the next POST /stacks/{slug}/redeploy applies them. Auth required: anonymous stacks cannot be mutated after creation.",
         "security": [{ "bearerAuth": [] }],
         "parameters": [{ "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["env"], "properties": { "env": { "type": "object", "additionalProperties": { "type": "string" } } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["env"], "properties": { "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Env vars to upsert. Empty-string value deletes a key." } } } } } },
         "responses": {
-          "200": { "description": "Env vars noted" },
-          "400": { "description": "Body missing or env is empty" },
+          "200": { "description": "Env vars persisted; response includes the full merged env map.", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Full env set on the stack AFTER the merge — caller does not need to re-GET." }, "message": { "type": "string" } } } } } },
+          "400": { "description": "Body missing, env is empty, or an env-var key fails the POSIX [A-Z_][A-Z0-9_]* shape (error=invalid_env_key)." },
           "401": { "description": "Unauthorized" },
-          "404": { "description": "Stack not found or not owned by this team" }
+          "404": { "description": "Stack not found or not owned by this team" },
+          "409": { "description": "Stack is mid-teardown and cannot be modified (error=stack_deleting)." },
+          "413": { "description": "Merged env_vars payload exceeds 64KiB (error=env_too_large)." }
         }
       }
     },
@@ -2781,7 +2783,7 @@ const openAPISpec = `{
           "token": { "type": "string", "format": "uuid" },
           "name": { "type": "string" },
           "connection_url": { "type": "string", "description": "Public bucket URL scoped to the per-token prefix" },
-          "endpoint": { "type": "string", "description": "S3-compatible endpoint host (e.g. minio.instant-data.svc.cluster.local:9000 / r2.instant.dev)" },
+          "endpoint": { "type": "string", "description": "S3-compatible endpoint host (e.g. minio.instant-data.svc.cluster.local:9000 / r2.instanode.dev)" },
           "access_key_id": { "type": "string", "description": "Present in credential modes only (shared-master-key / prefix-scoped / prefix-scoped-temporary). Omitted in broker mode." },
           "secret_access_key": { "type": "string", "description": "Shown ONCE — store now; rotation requires re-provisioning. Omitted in broker mode." },
           "session_token": { "type": "string", "description": "Present only when mode=prefix-scoped-temporary (R2 temp-creds / S3 STS). Pass this to your S3 SDK as the session token to complete the credential triple." },
