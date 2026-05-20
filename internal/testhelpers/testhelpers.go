@@ -792,6 +792,11 @@ func testConfig() *config.Config {
 		Environment:              "test",
 		PostgresProvisionBackend: "local",
 		PostgresCustomersURL:     customersURL,
+		// Wave 3 P2 (BugHunt 2026-05-20): the Razorpay webhook signature
+		// verification path is exercised by TestWave3P2_RazorpaySignature_*.
+		// The secret must match the test's calculator, which uses the
+		// same local-dev value the k8s secret seeds in prod.
+		RazorpayWebhookSecret: "razorpay_instant_dev_local_test_secret_for_ci",
 		// Slice 4 of env-aware deployments: production default is `true`, so
 		// tests should mirror that. Tests that need the flag off override it
 		// after the testConfig call.
@@ -932,6 +937,13 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 			return nil
 		},
 		ProxyHeader: "X-Forwarded-For",
+		// Wave 3 P2 (BugHunt 2026-05-20): mirror the production global
+		// BodyLimit (50 MiB). Without this the Fiber default (4 MiB)
+		// triggers `body size exceeds the given limit` BEFORE the
+		// ErrorHandler runs — which is the regression
+		// TestWave3P2_GlobalBodyLimit guards against. Production sets the
+		// same value in internal/router/router.go (see T13 P2-T13-05 note).
+		BodyLimit: 50 * 1024 * 1024,
 	})
 
 	app.Use(middleware.RequestID())
@@ -961,6 +973,18 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	app.Get("/start", onboardH.StartLanding)
 	app.Post("/claim", onboardH.Claim)
 	app.Get("/auth/me", middleware.RequireAuth(cfg), cliAuthH.GetCurrentUser)
+
+	// Wave 3 P2 (BugHunt 2026-05-20): mirror production routes that the
+	// wave3_p2_test.go regression suite hits directly.
+	//
+	// - /openapi.json — public OpenAPI 3.1 spec endpoint
+	//   (TestWave3P2_OpenAPI_Documents429And413).
+	// - /razorpay/webhook — Razorpay webhook receiver; signature is
+	//   verified against cfg.RazorpayWebhookSecret seeded in testConfig
+	//   (TestWave3P2_RazorpaySignature_RejectsWhitespace).
+	app.Get("/openapi.json", handlers.ServeOpenAPI)
+	billingH := handlers.NewBillingHandler(db, cfg, email.NewNoop())
+	app.Post("/razorpay/webhook", billingH.RazorpayWebhook)
 
 	// Provisioning routes for Phase 2/3/4 services.
 	// Idempotency middleware mirrors the production wiring in
