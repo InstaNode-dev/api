@@ -1395,6 +1395,31 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 		return upgradeErr
 	}
 
+	// Enqueue an explicit propagation row for the worker's propagation_runner.
+	// This is the durable "user upgraded, infra not yet regraded" signal —
+	// the entitlement_reconciler is still the eventually-consistent backstop,
+	// but the runner reacts within ~30s + tracks per-team retries with
+	// exponential backoff and a dead-letter audit row after maxAttempts. See
+	// migration 058 and worker/internal/jobs/propagation_runner.go.
+	//
+	// FAIL-OPEN: this runs AFTER the atomic upgrade tx has committed. An
+	// INSERT failure here MUST NOT 500 the webhook (Razorpay redelivery
+	// cannot help, the tier flip already landed, and the entitlement
+	// reconciler will eventually correct any infra drift on its 5-min sweep).
+	// A loud slog.Error is the operator-visible signal that the eager retry
+	// path is not running for this charge — NR can alert on it.
+	if _, enqErr := models.EnqueuePendingPropagation(
+		ctx, h.db, models.PropagationKindTierElevation, teamID, tier, nil,
+	); enqErr != nil {
+		slog.Error("billing.subscription.charged.propagation_enqueue_failed",
+			"error", enqErr,
+			"team_id", teamID,
+			"tier", tier,
+			"subscription_id", sub.ID,
+			"note", "fail-open — tier upgrade committed; entitlement_reconciler 5m sweep is the backstop",
+		)
+	}
+
 	// Checkout completed — clear the pending_checkouts row so the worker's
 	// checkout reconciler does not later notify this subscription as a
 	// payment failure. Reached from BOTH subscription.activated and

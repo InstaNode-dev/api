@@ -612,6 +612,35 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			audit_id TEXT PRIMARY KEY,
 			sent_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		// 058_pending_propagations — durable retry queue for "tier elevated
+		// in DB but infra regrade not yet applied" scenarios. The api
+		// enqueues a row inside handleSubscriptionCharged AFTER the atomic
+		// upgrade tx; the worker's propagation_runner job pulls eligible
+		// rows (next_attempt_at <= now() AND no terminal timestamp) and
+		// invokes the provisioner. Mirrored so handler tests can assert
+		// the api's INSERT and the worker's dispatch read the same schema.
+		`CREATE TABLE IF NOT EXISTS pending_propagations (
+			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			kind            TEXT NOT NULL,
+			team_id         UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			target_tier     TEXT,
+			payload         JSONB NOT NULL DEFAULT '{}'::jsonb,
+			attempts        INT NOT NULL DEFAULT 0,
+			last_attempt_at TIMESTAMPTZ,
+			last_error      TEXT,
+			next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			applied_at      TIMESTAMPTZ,
+			failed_at       TIMESTAMPTZ,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_propagations_due
+			ON pending_propagations (next_attempt_at)
+			WHERE applied_at IS NULL AND failed_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_propagations_failed
+			ON pending_propagations (failed_at)
+			WHERE failed_at IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_propagations_team
+			ON pending_propagations (team_id, kind)`,
 		// 050_deployment_events — failure-autopsy records read by
 		// GET /deploy/:id as the top-level "failure" object.
 		`CREATE TABLE IF NOT EXISTS deployment_events (
