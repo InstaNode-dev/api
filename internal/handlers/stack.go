@@ -68,12 +68,15 @@ type StackHandler struct {
 	// emailClient is wired by SetEmailClient. Left nil = email-confirmed
 	// deletion falls back to immediate destruction (same pattern as
 	// DeployHandler; see deletion_confirm.go).
-	emailClient *email.Client
+	//
+	// email.Mailer (not *email.Client) so the router wires the
+	// circuit-broken BreakingClient — P0-1 CIRCUIT-RETRY-AUDIT-2026-05-20.
+	emailClient email.Mailer
 }
 
 // SetEmailClient wires the email client used by the two-step deletion
 // flow on /stacks/:slug. See DeployHandler.SetEmailClient.
-func (h *StackHandler) SetEmailClient(c *email.Client) {
+func (h *StackHandler) SetEmailClient(c email.Mailer) {
 	h.emailClient = c
 }
 

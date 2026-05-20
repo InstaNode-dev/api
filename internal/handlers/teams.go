@@ -27,13 +27,17 @@ import (
 // this handler implements the new admin/developer/viewer RBAC tiers + token
 // acceptance.
 type TeamsHandler struct {
-	db   *sql.DB
-	cfg  *config.Config
-	mail *email.Client
+	db  *sql.DB
+	cfg *config.Config
+	// mail is the Mailer used for team-invite emails. P0-1
+	// (CIRCUIT-RETRY-AUDIT-2026-05-20): main.go can pass a
+	// *email.BreakingClient that fast-fails after N consecutive Brevo
+	// errors. *email.Client also satisfies Mailer for tests.
+	mail email.Mailer
 }
 
 // NewTeamsHandler constructs a TeamsHandler.
-func NewTeamsHandler(db *sql.DB, cfg *config.Config, mail *email.Client) *TeamsHandler {
+func NewTeamsHandler(db *sql.DB, cfg *config.Config, mail email.Mailer) *TeamsHandler {
 	return &TeamsHandler{db: db, cfg: cfg, mail: mail}
 }
 
@@ -85,7 +89,10 @@ func (h *TeamsHandler) CreateInvitation(c *fiber.Ctx) error {
 		if t, terr := models.GetTeamByID(c.Context(), h.db, teamID); terr == nil && t.Name.Valid {
 			teamName = t.Name.String
 		}
-		if mailErr := h.mail.SendTeamInvite(c.Context(), inv.Email, teamName, acceptURL); mailErr != nil {
+		// P0-1: thread the invitation token as the idempotency key so a
+		// resend of the SAME invitation through a retry path collapses
+		// at the email-layer ledger + the provider's Idempotency-Key.
+		if mailErr := h.mail.SendTeamInviteWithKey(c.Context(), inv.Email, inv.Token, teamName, acceptURL); mailErr != nil {
 			slog.Warn("teams.invite_email_failed", "error", mailErr, "invitation_id", inv.ID)
 		}
 	} else {

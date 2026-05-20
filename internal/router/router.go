@@ -176,6 +176,15 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	}))
 
 	// ── Handlers ─────────────────────────────────────────────────────────────
+	// P0-1 (CIRCUIT-RETRY-AUDIT-2026-05-20): wrap the base email client in
+	// a process-wide consecutive-failure circuit breaker. Every keyed
+	// transactional send (payment receipt, dunning, team-invite,
+	// deletion-confirm) is gated by the breaker so a Brevo brownout
+	// fast-fails after N consecutive errors instead of stalling every
+	// request handler on the SDK timeout. The breaker is shared across
+	// all handlers via the Mailer interface (*Client and *BreakingClient
+	// both satisfy it).
+	breakingMailer := email.NewBreakingClient(emailClient)
 	onboardH := handlers.NewOnboardingHandler(db, cfg, emailClient)
 	authH := handlers.NewAuthHandler(db, cfg)
 	authH.SetRedis(rdb) // P1-K: single-use OAuth state consume
@@ -223,7 +232,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	}
 
 	resourceH := handlers.NewResourceHandler(db, rdb, cfg, planRegistry, provClient, storageProv)
-	teamMembersH := handlers.NewTeamMembersHandler(db, cfg, planRegistry, emailClient, rdb)
+	teamMembersH := handlers.NewTeamMembersHandler(db, cfg, planRegistry, breakingMailer, rdb)
 	envPolicyH := handlers.NewEnvPolicyHandler(db)
 	dbH := handlers.NewDBHandler(db, rdb, cfg, provClient, planRegistry)
 	vectorH := handlers.NewVectorHandler(db, rdb, cfg, provClient, planRegistry)
@@ -249,8 +258,8 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// without touching the constructor signature. emailClient may be
 	// nil on a misconfigured boot — the handlers detect that and fall
 	// back to immediate destruction.
-	deployH.SetEmailClient(emailClient)
-	stackH.SetEmailClient(emailClient)
+	deployH.SetEmailClient(breakingMailer)
+	stackH.SetEmailClient(breakingMailer)
 
 	// P3: start the background teardown reconciler. The worker's
 	// DeploymentExpirer only flips expired deploys to status='expired' —
@@ -541,7 +550,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Post("/auth/logout", middleware.RequireAuth(cfg), logoutH.Logout)
 
 	// Billing
-	billing := handlers.NewBillingHandler(db, cfg, emailClient)
+	billing := handlers.NewBillingHandler(db, cfg, breakingMailer)
 	// Legacy alias kept for backward compatibility; canonical path is
 	// /api/v1/billing/checkout (registered under the /api/v1 group below).
 	// RequireWritable rejects impersonated sessions — an admin viewing-as-
@@ -607,7 +616,7 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	// Public token-based invitation accept — must be registered BEFORE the
 	// /api/v1 auth group so the group middleware doesn't catch it.
 	// (Token IS the auth here — no Bearer required.)
-	teamsHPublic := handlers.NewTeamsHandler(db, cfg, emailClient)
+	teamsHPublic := handlers.NewTeamsHandler(db, cfg, breakingMailer)
 	app.Post("/api/v1/invitations/:token/accept", teamsHPublic.AcceptInvitation)
 
 	// Email-provider feedback webhooks — bounces, unsubscribes, spam

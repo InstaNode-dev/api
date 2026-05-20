@@ -7,6 +7,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/oschwald/maxminddb-golang"
+	"instant.dev/internal/metrics"
 )
 
 // cloudASNs maps well-known ASNs to their cloud vendor slug.
@@ -53,6 +54,14 @@ var warnOnce sync.Once
 
 // GeoEnrich returns a middleware that performs MaxMind lookups and stores results in Fiber locals.
 // If dbs is nil (MaxMind files not present), defaults are used and a warning is logged once.
+//
+// P2 (CIRCUIT-RETRY-AUDIT-2026-05-20): the silent-fail-open path
+// (country=XX, vendor=unknown when MMDB missing) now also bumps the
+// `instant_fail_open_events_total{subsystem="geoip"}` counter so the
+// "MMDB pod is missing its DB" condition becomes observable. The
+// behaviour is unchanged — every request still gets safe defaults — but
+// operators no longer learn about the failure mode only when a customer
+// reports wrong-currency pricing.
 func GeoEnrich(dbs *GeoDBs) fiber.Handler {
 	if dbs == nil {
 		warnOnce.Do(func() {
@@ -74,6 +83,12 @@ func GeoEnrich(dbs *GeoDBs) fiber.Handler {
 			if ip != nil {
 				enrichFromIP(ip, dbs, result)
 			}
+		} else {
+			// P2: emit a fail-open metric so the "missing MMDB" condition
+			// is alertable instead of silent. Bounded label cardinality:
+			// the counter is incremented per-request when the DB is
+			// absent, which is exactly the signal we want.
+			metrics.FailOpenEvents.WithLabelValues("geoip", "mmdb_missing").Inc()
 		}
 
 		c.Locals("country", result.CountryCode)

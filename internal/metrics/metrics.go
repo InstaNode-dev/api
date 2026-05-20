@@ -79,6 +79,29 @@ var (
 		Help: "Redis operation errors",
 	}, []string{"operation"})
 
+	// FailOpenEvents counts every time a documented fail-open path
+	// actually trips (P2 CIRCUIT-RETRY-AUDIT-2026-05-20). The api's
+	// rate-limit, fingerprint, JWT-revocation, GeoIP, and email
+	// suppression paths all degrade open on a downstream error — which
+	// is the right call (better than silently blocking legitimate
+	// requests during a Redis/Postgres blip), but ALSO a silent
+	// reliability tell: a steady non-zero rate() means a downstream is
+	// flapping and the rate-limit/abuse signal is effectively off.
+	//
+	// One counter, two labels:
+	//   subsystem  — "redis_rate_limit" | "redis_fingerprint" |
+	//                "redis_revocation" | "redis_quota" |
+	//                "geoip" | "email_suppression" | "email_ledger_probe"
+	//   reason     — short failure class label ("redis_unavailable",
+	//                "db_error", "mmdb_missing", ...) — bounded
+	//                cardinality, suitable for prometheus labels.
+	//
+	// Drives the "fail-open rate" NR alert.
+	FailOpenEvents = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_fail_open_events_total",
+		Help: "Documented fail-open paths that actually tripped during a downstream error",
+	}, []string{"subsystem", "reason"})
+
 	// GeoIPDBAge reports the age of the MaxMind GeoLite2 database in hours.
 	GeoIPDBAge = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "instant_geoip_db_age_hours",

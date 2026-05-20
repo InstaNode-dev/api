@@ -71,8 +71,15 @@ type Config struct {
 
 // provider is the internal seam: one method, no provider-specific types leak
 // out. All public Send* helpers on Client funnel through provider.Send.
+//
+// idempotencyKey, when non-empty, is forwarded to the upstream provider so a
+// network-glitch retry collapses to one delivered email (P0-1
+// CIRCUIT-RETRY-AUDIT-2026-05-20). Brevo: `X-Mailin-Custom` header. Resend:
+// `idempotency_key` field on SendWithOptions. The empty-string default
+// preserves the historical no-key behaviour for backwards-compatible call
+// sites that don't yet pass a key.
 type provider interface {
-	Send(ctx context.Context, to, subject, plainText, htmlBody string) error
+	Send(ctx context.Context, to, subject, plainText, htmlBody, idempotencyKey string) error
 	Name() ProviderName
 }
 
@@ -92,6 +99,36 @@ type SuppressionChecker interface {
 	IsSuppressed(ctx context.Context, emailAddr string) (bool, error)
 }
 
+// SendLedger is the idempotency ledger consulted by every keyed
+// transactional send (P0-1 CIRCUIT-RETRY-AUDIT-2026-05-20). For an
+// idempotency-keyed send, the email Client probes Sent BEFORE invoking the
+// upstream provider; if Sent returns true, the call is skipped (treated as a
+// success — the previous attempt got through). After a successful provider
+// 2xx, MarkSent records the key so a subsequent retry with the SAME key is
+// a no-op.
+//
+// The shape is intentionally narrow — just probe + mark — so the only
+// production implementation (models.EmailDedupLedger, backed by the
+// `email_send_dedup` table from migration 056) is a thin SQL wrapper. The
+// ledger is OPTIONAL; a Client without one falls back to the historical
+// always-send behaviour, which is the right default for callers that
+// haven't yet adopted idempotency keys.
+//
+// Implementations MUST fail open on DB errors: (false, err) from Sent means
+// "could not determine, send anyway" and a MarkSent error is logged-and-
+// swallowed by the caller. Better one rare duplicate during a Postgres blip
+// than a missed receipt or deletion-confirm.
+type SendLedger interface {
+	// Sent reports whether key has already been recorded as sent. fail-open
+	// contract: (false, err) on DB trouble.
+	Sent(ctx context.Context, key string) (bool, error)
+	// MarkSent records key as sent for emailKind. Returning a non-nil err
+	// is allowed; the caller logs and swallows it — the upstream provider
+	// already 2xx'd, the email is in the customer's inbox, a missing
+	// ledger row is at most one duplicate on the next retry.
+	MarkSent(ctx context.Context, key, emailKind string) error
+}
+
 // Client is the public façade. Handlers depend on *Client; they never see the
 // provider type, so swapping backends does not ripple into call sites.
 type Client struct {
@@ -99,6 +136,7 @@ type Client struct {
 	fromName    string
 	fromAddr    string
 	suppression SuppressionChecker
+	ledger      SendLedger // P0-1 idempotency ledger; nil = no ledger.
 }
 
 // New constructs an email Client. Provider selection precedence:
@@ -169,6 +207,17 @@ func (c *Client) WithSuppressionChecker(s SuppressionChecker) *Client {
 	return c
 }
 
+// WithSendLedger attaches a SendLedger so any keyed Send* call (the
+// *WithKey variants) is gated by a ledger probe and recorded after a
+// successful provider 2xx (P0-1 CIRCUIT-RETRY-AUDIT-2026-05-20). nil
+// clears the ledger (the historical always-send default). Calls that
+// pass an empty idempotency key bypass the ledger entirely — only keyed
+// calls are gated, so the change is backwards-compatible.
+func (c *Client) WithSendLedger(l SendLedger) *Client {
+	c.ledger = l
+	return c
+}
+
 // resolveProvider implements the precedence rules documented on New.
 func resolveProvider(cfg Config) ProviderName {
 	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
@@ -199,6 +248,27 @@ func resolveProvider(cfg Config) ProviderName {
 // fail-open: a DB error during the lookup logs and proceeds with the send,
 // because a Postgres blip must never swallow a transactional email.
 func (c *Client) send(ctx context.Context, to, subject, plainText, htmlBody string) error {
+	return c.sendWithKey(ctx, to, subject, plainText, htmlBody, "", "")
+}
+
+// sendWithKey is the keyed variant of send. When idempotencyKey is non-empty
+// the call is gated by the SendLedger (P0-1 CIRCUIT-RETRY-AUDIT-2026-05-20):
+//
+//  1. Probe ledger.Sent(idempotencyKey) — if true, skip (return nil).
+//  2. Forward idempotencyKey to the upstream provider (Brevo
+//     `X-Mailin-Custom`, Resend `idempotency_key`) so the provider's own
+//     dedup can collapse the request.
+//  3. On a successful provider call, ledger.MarkSent(idempotencyKey, kind).
+//
+// An empty idempotencyKey OR a nil ledger preserves the historical
+// always-send behaviour — callers that don't pass a key are unaffected by
+// this code path.
+//
+// Fail-open contract: ledger.Sent errors are logged and the send proceeds
+// (better one rare duplicate than a missed deletion-confirm during a
+// Postgres blip). MarkSent errors are logged and swallowed (the provider
+// already 2xx'd, the email is in the inbox).
+func (c *Client) sendWithKey(ctx context.Context, to, subject, plainText, htmlBody, idempotencyKey, emailKind string) error {
 	if c.provider == nil {
 		// Defensive: a zero-value Client (never returned by New) would
 		// otherwise panic. Treat it as noop.
@@ -211,6 +281,12 @@ func (c *Client) send(ctx context.Context, to, subject, plainText, htmlBody stri
 		if err != nil {
 			// Fail open — log and send anyway. A suppression-lookup failure
 			// must never block a sign-in link or a payment receipt.
+			//
+			// P2 (CIRCUIT-RETRY-AUDIT-2026-05-20): emit the fail-open
+			// metric so a DB outage that disables suppression for the
+			// duration of the brownout is alertable. Sender-reputation
+			// cost is uncapped without this signal.
+			recordSuppressionFailOpen()
 			slog.Warn("email.suppression.check_failed",
 				"to", maskEmail(to), "subject", subject, "error", err)
 		} else if suppressed {
@@ -221,7 +297,43 @@ func (c *Client) send(ctx context.Context, to, subject, plainText, htmlBody stri
 		}
 	}
 
-	return c.provider.Send(ctx, to, subject, plainText, htmlBody)
+	// P0-1 idempotency-ledger probe. Only consulted when a key is present
+	// AND a ledger was configured — keyless calls preserve historical
+	// always-send behaviour.
+	if idempotencyKey != "" && c.ledger != nil {
+		sent, err := c.ledger.Sent(ctx, idempotencyKey)
+		if err != nil {
+			// P2: ledger-probe fail-open metric (same observability
+			// rationale as suppression — make a Postgres brownout
+			// alertable instead of silent).
+			recordLedgerProbeFailOpen()
+			slog.Warn("email.ledger.probe_failed_open",
+				"to", maskEmail(to), "subject", subject,
+				"key", idempotencyKey, "error", err)
+		} else if sent {
+			slog.Info("email.ledger.deduped",
+				"to", maskEmail(to), "subject", subject,
+				"key", idempotencyKey,
+				"reason", "previous send already 2xx'd and recorded in email_send_dedup")
+			return nil
+		}
+	}
+
+	if err := c.provider.Send(ctx, to, subject, plainText, htmlBody, idempotencyKey); err != nil {
+		return err
+	}
+
+	// P0-1 post-send mark. Best-effort: a MarkSent error here is logged
+	// and swallowed (the email already delivered; a missing ledger row
+	// is at most one duplicate on the next retry).
+	if idempotencyKey != "" && c.ledger != nil {
+		if err := c.ledger.MarkSent(ctx, idempotencyKey, emailKind); err != nil {
+			slog.Warn("email.ledger.mark_sent_failed",
+				"to", maskEmail(to), "subject", subject,
+				"key", idempotencyKey, "kind", emailKind, "error", err)
+		}
+	}
+	return nil
 }
 
 // ProviderName returns the active backend identifier. Useful for /healthz
@@ -245,7 +357,7 @@ type resendProvider struct {
 
 func (p *resendProvider) Name() ProviderName { return ProviderResend }
 
-func (p *resendProvider) Send(ctx context.Context, to, subject, plainText, htmlBody string) error {
+func (p *resendProvider) Send(ctx context.Context, to, subject, plainText, htmlBody, idempotencyKey string) error {
 	params := &resend.SendEmailRequest{
 		From:    p.from,
 		To:      []string{to},
@@ -253,11 +365,24 @@ func (p *resendProvider) Send(ctx context.Context, to, subject, plainText, htmlB
 		Text:    plainText,
 		Html:    htmlBody,
 	}
-	if _, err := p.client.Emails.SendWithContext(ctx, params); err != nil {
+	// P0-1: Resend SDK exposes idempotency on SendWithOptions; route
+	// keyed sends there so a network-glitch retry collapses to one
+	// delivered email. Keyless sends keep the existing SendWithContext
+	// path — no behaviour change for callers that don't pass a key.
+	var err error
+	if idempotencyKey != "" {
+		_, err = p.client.Emails.SendWithOptions(ctx, params, &resend.SendEmailOptions{
+			IdempotencyKey: idempotencyKey,
+		})
+	} else {
+		_, err = p.client.Emails.SendWithContext(ctx, params)
+	}
+	if err != nil {
 		slog.Error("email.send_failed",
 			"provider", string(ProviderResend),
 			"to", maskEmail(to),
 			"subject", subject,
+			"idempotency_key_present", idempotencyKey != "",
 			"error", err,
 		)
 		return fmt.Errorf("email.send: %w", err)
@@ -299,7 +424,7 @@ type brevoSendRequest struct {
 	HTMLContent string           `json:"htmlContent,omitempty"`
 }
 
-func (p *brevoProvider) Send(ctx context.Context, to, subject, plainText, htmlBody string) error {
+func (p *brevoProvider) Send(ctx context.Context, to, subject, plainText, htmlBody, idempotencyKey string) error {
 	if strings.TrimSpace(to) == "" {
 		return fmt.Errorf("email.brevo: empty recipient")
 	}
@@ -323,6 +448,18 @@ func (p *brevoProvider) Send(ctx context.Context, to, subject, plainText, htmlBo
 	req.Header.Set("api-key", p.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	// P0-1: Brevo supports `X-Mailin-Custom` as an arbitrary per-send tag
+	// surfaced on every webhook event for that send. Used by the worker
+	// forwarder for dedup; the api uses it here so a network-glitch
+	// retry (caller perceives 5xx, retries with the same key) reaches
+	// Brevo's own dedup. Keyless sends omit the header.
+	if idempotencyKey != "" {
+		req.Header.Set("X-Mailin-Custom", idempotencyKey)
+		// Brevo also accepts a stricter `Idempotency-Key` header on some
+		// preview endpoints — we set both so a future Brevo policy change
+		// that prefers the stricter header is still honoured.
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
 
 	resp, err := p.http.Do(req)
 	if err != nil {
@@ -362,7 +499,7 @@ type noopProvider struct{}
 
 func (p *noopProvider) Name() ProviderName { return ProviderNoop }
 
-func (p *noopProvider) Send(_ context.Context, to, subject, _, _ string) error {
+func (p *noopProvider) Send(_ context.Context, to, subject, _, _, idempotencyKey string) error {
 	// EMAIL-BUGBASH L1: DEBUG, not INFO — the noop provider runs on every
 	// non-prod env and a per-send INFO line is log spam. The recipient is
 	// masked regardless of level so a plaintext address never reaches logs.
@@ -370,6 +507,7 @@ func (p *noopProvider) Send(_ context.Context, to, subject, _, _ string) error {
 		"provider", string(ProviderNoop),
 		"to", maskEmail(to),
 		"subject", subject,
+		"idempotency_key_present", idempotencyKey != "",
 	)
 	return nil
 }
@@ -406,11 +544,47 @@ func clampAttemptCount(n int) int {
 	return n
 }
 
+// EmailSendKindPaymentFailed / Receipt / TeamInvite / DeletionConfirm / MagicLink
+// are the kind labels stamped into email_send_dedup.email_kind for every
+// keyed send through *WithKey variants (P0-1
+// CIRCUIT-RETRY-AUDIT-2026-05-20). The labels match models.EmailSendKind*
+// where a sibling already existed; the new labels (TeamInvite,
+// DeletionConfirm, MagicLink) are introduced here. Stored as a free-form
+// TEXT column on the table, so adding a new kind never needs a migration —
+// the only invariant is "operators can filter by kind in the dashboard".
+const (
+	EmailSendKindPaymentFailed    = "payment_failed"
+	EmailSendKindPaymentReceipt   = "receipt"
+	EmailSendKindTeamInvite       = "team_invite"
+	EmailSendKindDeletionConfirm  = "deletion_confirm"
+	EmailSendKindMagicLink        = "magic_link"
+)
+
 // SendPaymentFailed sends a payment failure notification email.
 // attemptCount is the number of attempts Razorpay has made (1–3); values
 // outside that range are clamped (EMAIL-BUGBASH C6).
 // nextAttemptDate is when Razorpay will retry; nil means no further retry is scheduled.
+//
+// This is the keyless variant — preserved verbatim for backwards
+// compatibility. New call sites that have a stable per-cycle key should
+// use SendPaymentFailedWithKey instead so the inner ledger (P0-1) can
+// collapse network-glitch retries.
 func (c *Client) SendPaymentFailed(ctx context.Context, to string, attemptCount int, nextAttemptDate *time.Time) error {
+	return c.SendPaymentFailedWithKey(ctx, to, "", attemptCount, nextAttemptDate)
+}
+
+// SendPaymentFailedWithKey is the P0-1 idempotent variant. idempotencyKey
+// (typically the dunning cycle key built by dunningDedupKey in
+// handlers/billing.go) is plumbed through to:
+//
+//  1. The ledger probe — if a previous attempt already 2xx'd with this
+//     key the call is a no-op.
+//  2. The upstream provider — `X-Mailin-Custom` (Brevo) /
+//     `idempotency_key` (Resend) so the provider's own dedup catches a
+//     truly-in-flight retry the local ledger hasn't yet recorded.
+//
+// An empty key falls back to the historical always-send path.
+func (c *Client) SendPaymentFailedWithKey(ctx context.Context, to, idempotencyKey string, attemptCount int, nextAttemptDate *time.Time) error {
 	subject := "Payment failed for your instanode.dev subscription"
 
 	attemptCount = clampAttemptCount(attemptCount)
@@ -471,7 +645,7 @@ func (c *Client) SendPaymentFailed(ctx context.Context, to string, attemptCount 
 </body>
 </html>`, attemptCount, maxPaymentAttempts, retryHTML, urgencyHTML)
 
-	return c.send(ctx, to, subject, plain, html)
+	return c.sendWithKey(ctx, to, subject, plain, html, idempotencyKey, EmailSendKindPaymentFailed)
 }
 
 // PaymentReceipt carries the fields rendered into the payment-success
@@ -509,7 +683,19 @@ type PaymentReceipt struct {
 // Go-rendered in full (CLAUDE.md rule 70 — all email kinds Go-rendered, no
 // Brevo template dependency) so the receipt copy can never silently break
 // on a template-id drift.
+//
+// This is the keyless variant — preserved for backwards compatibility.
+// New call sites that have a stable per-cycle key (the existing
+// receiptDedupKey in handlers/billing.go is the canonical example) should
+// use SendPaymentSucceededWithKey instead so the inner ledger (P0-1) can
+// collapse network-glitch retries.
 func (c *Client) SendPaymentSucceeded(ctx context.Context, to string, receipt PaymentReceipt) error {
+	return c.SendPaymentSucceededWithKey(ctx, to, "", receipt)
+}
+
+// SendPaymentSucceededWithKey is the P0-1 idempotent variant. See
+// SendPaymentFailedWithKey for the ledger + provider-header semantics.
+func (c *Client) SendPaymentSucceededWithKey(ctx context.Context, to, idempotencyKey string, receipt PaymentReceipt) error {
 	headline := "Payment received — your instanode.dev plan is active"
 	leadPlain := fmt.Sprintf("Thank you for upgrading to %s. Your payment was successful and your plan is now active.", receipt.Plan)
 	leadHTML := fmt.Sprintf("Thank you for upgrading to <strong>%s</strong>. Your payment was successful and your plan is now active.", htmlEscape(receipt.Plan))
@@ -572,7 +758,7 @@ Need help? Reply to this email or contact support@instanode.dev.
 </body>
 </html>`, headline, leadHTML, htmlEscape(receipt.Plan), amountHTMLValue, htmlEscape(receipt.Period))
 
-	return c.send(ctx, to, subject, plain, htmlBody)
+	return c.sendWithKey(ctx, to, subject, plain, htmlBody, idempotencyKey, EmailSendKindPaymentReceipt)
 }
 
 // SendMagicLink emails a one-click sign-in link to the user. The link MUST
@@ -622,7 +808,17 @@ request this email, you can safely ignore it.
 }
 
 // SendTeamInvite emails an invitation to join a team on instanode.dev.
+// Keyless variant — preserved for backwards compatibility. New call sites
+// should pass the invite id (or token) via SendTeamInviteWithKey so a
+// network-glitch retry doesn't double-send the invitation.
 func (c *Client) SendTeamInvite(ctx context.Context, toEmail, teamName, acceptURL string) error {
+	return c.SendTeamInviteWithKey(ctx, toEmail, "", teamName, acceptURL)
+}
+
+// SendTeamInviteWithKey is the P0-1 idempotent variant. Pass the stable
+// invitation id (or accept-URL token) as idempotencyKey so a webhook
+// redelivery or in-process retry collapses to one delivered email.
+func (c *Client) SendTeamInviteWithKey(ctx context.Context, toEmail, idempotencyKey, teamName, acceptURL string) error {
 	subject := "You've been invited to an instanode.dev team"
 	plain := fmt.Sprintf(`Hi,
 
@@ -648,7 +844,7 @@ Open this link while signed in with %s to accept:
 </body>
 </html>`, safeTeam, htmlEscape(toEmail), safeURL)
 
-	return c.send(ctx, toEmail, subject, plain, htmlBody)
+	return c.sendWithKey(ctx, toEmail, subject, plain, htmlBody, idempotencyKey, EmailSendKindTeamInvite)
 }
 
 // SendDeletionConfirmation emails the user a one-click link to confirm
@@ -667,9 +863,28 @@ Open this link while signed in with %s to accept:
 //
 // Wave FIX-I — two-step deletion. The flow is intentionally human-only:
 // the agent can request deletion but cannot confirm it.
+//
+// Keyless variant — preserved for backwards compatibility. New call sites
+// should pass the pending-deletion id or token via
+// SendDeletionConfirmationWithKey: the deletion confirm has NO redelivery
+// safety net (no webhook redelivery, no worker retry), so a network glitch
+// double-sending the email is the worst-case audit finding the P0-1 fix
+// closes.
 func (c *Client) SendDeletionConfirmation(
 	ctx context.Context,
 	toEmail, resourceLabel, link string,
+	ttlMinutes int,
+) error {
+	return c.SendDeletionConfirmationWithKey(ctx, toEmail, "", resourceLabel, link, ttlMinutes)
+}
+
+// SendDeletionConfirmationWithKey is the P0-1 idempotent variant. Pass the
+// pending-deletion row id as idempotencyKey so a retry triggered by a
+// network glitch between provider 2xx and our handler reading the
+// response is a no-op.
+func (c *Client) SendDeletionConfirmationWithKey(
+	ctx context.Context,
+	toEmail, idempotencyKey, resourceLabel, link string,
 	ttlMinutes int,
 ) error {
 	subject := fmt.Sprintf("Confirm deletion of %s on instanode.dev (expires in %d min)", resourceLabel, ttlMinutes)
@@ -719,7 +934,7 @@ it from your dashboard at https://instanode.dev/app.
 </body>
 </html>`, safeLabel, ttlMinutes, safeLink, safeLink)
 
-	return c.send(ctx, toEmail, subject, plain, htmlBody)
+	return c.sendWithKey(ctx, toEmail, subject, plain, htmlBody, idempotencyKey, EmailSendKindDeletionConfirm)
 }
 
 // htmlEscape replaces HTML-unsafe characters with their entity equivalents.

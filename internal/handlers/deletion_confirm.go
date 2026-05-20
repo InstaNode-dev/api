@@ -114,8 +114,14 @@ func buildConfirmationLink(apiPublicURL, dashboardBaseURL, plaintextToken string
 // because the deploy and stack handlers carry different concrete types
 // but share this dependency shape.
 type requestDeletionDeps struct {
-	DB               *sql.DB
-	Email            *email.Client
+	DB *sql.DB
+	// Email accepts any email.Mailer (P0-1
+	// CIRCUIT-RETRY-AUDIT-2026-05-20): the production wiring passes a
+	// *email.BreakingClient wrapped around the *email.Client so a Brevo
+	// brownout fast-fails the deletion-confirm send after N consecutive
+	// errors instead of stalling every customer's deletion request on
+	// the SDK timeout. Tests pass the bare *email.Client.
+	Email            email.Mailer
 	APIPublicURL     string
 	DashboardBaseURL string
 	TTLMinutes       int
@@ -198,8 +204,18 @@ func requestEmailConfirmedDeletion(
 	// "deletion queued" message they never see in their inbox. The
 	// 10s default timeout on the Brevo client keeps the request handler
 	// well under load-balancer limits.
-	if err := deps.Email.SendDeletionConfirmation(
-		c.Context(), owner.Email, resourceLabel, link, deps.TTLMinutes,
+	//
+	// P0-1 (CIRCUIT-RETRY-AUDIT-2026-05-20): pending.ID is the natural
+	// idempotency key — it is unique per pending deletion row and stable
+	// across retries (a duplicate POST to the same deletion endpoint
+	// hits ErrPendingDeletionAlreadyExists and never reaches this path,
+	// so the only way the same key reappears is on an in-flight retry
+	// of THIS Send call). Threading it through means a network glitch
+	// between provider 2xx and our handler reading the response no
+	// longer double-sends the confirmation — the worst-case audit
+	// finding the P0-1 fix exists to close.
+	if err := deps.Email.SendDeletionConfirmationWithKey(
+		c.Context(), owner.Email, pending.ID.String(), resourceLabel, link, deps.TTLMinutes,
 	); err != nil {
 		// Roll back the pending row so a retry doesn't hit the
 		// "already pending" wall. Best-effort: the worker's expirer

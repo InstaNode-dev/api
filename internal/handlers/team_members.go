@@ -25,8 +25,11 @@ type TeamMembersHandler struct {
 	db    *sql.DB
 	cfg   *config.Config
 	plans *plans.Registry
-	mail  *email.Client
-	rdb   *redis.Client
+	// P0-1 (CIRCUIT-RETRY-AUDIT-2026-05-20): Mailer interface accepts
+	// the circuit-broken *email.BreakingClient so a Brevo brownout
+	// fast-fails team-invite sends after N consecutive failures.
+	mail email.Mailer
+	rdb  *redis.Client
 }
 
 // NewTeamMembersHandler constructs a TeamMembersHandler.
@@ -35,7 +38,7 @@ type TeamMembersHandler struct {
 // /team/members/invite) degrades to "no limit" rather than failing the
 // request. Production callers always pass a real client; tests that don't
 // need rate-limit assertions can pass nil to keep their setup tiny.
-func NewTeamMembersHandler(db *sql.DB, cfg *config.Config, reg *plans.Registry, mail *email.Client, rdb *redis.Client) *TeamMembersHandler {
+func NewTeamMembersHandler(db *sql.DB, cfg *config.Config, reg *plans.Registry, mail email.Mailer, rdb *redis.Client) *TeamMembersHandler {
 	return &TeamMembersHandler{db: db, cfg: cfg, plans: reg, mail: mail, rdb: rdb}
 }
 
@@ -206,7 +209,10 @@ func (h *TeamMembersHandler) InviteMember(c *fiber.Ctx) error {
 		}
 		if h.mail != nil {
 			acceptURL := base + "/settings?section=team&invite=" + inv.ID.String()
-			if mailErr := h.mail.SendTeamInvite(c.Context(), inv.Email, teamName, acceptURL); mailErr != nil {
+			// P0-1: invitation id is the natural idempotency key —
+			// stable, unique, and threaded through to the email ledger
+			// + provider Idempotency-Key.
+			if mailErr := h.mail.SendTeamInviteWithKey(c.Context(), inv.Email, inv.ID.String(), teamName, acceptURL); mailErr != nil {
 				slog.Warn("team_members.invite_email_failed", "error", mailErr)
 			}
 		}
@@ -248,7 +254,8 @@ func (h *TeamMembersHandler) InviteMember(c *fiber.Ctx) error {
 	}
 	if h.mail != nil {
 		acceptURL := base + "/invitations/" + inv.Token + "/accept"
-		if mailErr := h.mail.SendTeamInvite(c.Context(), inv.Email, teamName, acceptURL); mailErr != nil {
+		// P0-1: invitation token is the natural idempotency key.
+		if mailErr := h.mail.SendTeamInviteWithKey(c.Context(), inv.Email, inv.Token, teamName, acceptURL); mailErr != nil {
 			slog.Warn("team_members.invite_email_failed", "error", mailErr)
 		}
 	}
