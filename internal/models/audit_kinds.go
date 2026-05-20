@@ -433,6 +433,23 @@ const (
 	// not an automated template. Metadata: {propagation_id, kind,
 	// team_id, target_tier, attempts, last_error, age_seconds}.
 	AuditKindPropagationDeadLettered = "propagation.dead_lettered"
+
+	// AuditKindProvisionPersistenceFailed fires from finalizeProvision when the
+	// backend provision RPC succeeded but a post-RPC persistence step
+	// (connection-URL encrypt/store, provider_resource_id store, pending→active
+	// flip) failed. This is the MR-P0-3 orphan-prevention signal: at the
+	// moment we know "the customer got real credentials downstream but our
+	// platform DB cannot address the row", we tear down the backend object
+	// (best-effort), soft-delete the row, return 503 to the caller, AND emit
+	// this audit kind so operators can reconstruct exactly when the platform
+	// produced an unreachable resource. NOT wired into the Loops/Brevo email
+	// forwarder — this is an internal operator alert, not a customer event
+	// (mirrors AuditKindBillingChargeUndeliverable and
+	// AuditKindPropagationDeadLettered). Metadata: {resource_id, resource_type,
+	// log_prefix, provider_resource_id, request_id, tier, env}. INFO-level
+	// audit row + ERROR-level slog line (already emitted at the per-step
+	// failure) for NR alerting.
+	AuditKindProvisionPersistenceFailed = "provision.persistence_failed"
 )
 
 // PropagationKind* are the discriminator values for pending_propagations.kind.

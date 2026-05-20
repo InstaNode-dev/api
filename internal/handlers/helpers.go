@@ -223,6 +223,20 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the provisioner is temporarily unavailable. Retry in 30 seconds — see live status at https://instanode.dev/status.",
 		UpgradeURL:  "https://instanode.dev/status",
 	},
+
+	// MR-P0-3 (BugBash 2026-05-20): explicit agent_action for the catch-all
+	// `provision_failed` 503 — historically omitted here so the response fell
+	// back to AgentActionContactSupport ("email support"). For an atomic-
+	// persistence-failure landing this code, that fallback is wrong: the
+	// backend object was just torn down (best-effort) and the row soft-
+	// deleted, so the right action is "retry the provision with backoff,"
+	// NOT "email support." Sentence keeps the U3 contract (opens with
+	// "Tell the user", names the reason, names the action, full
+	// https://instanode.dev URL, < 280 chars). The retry_after_seconds
+	// header on a 503 also signals the backoff window.
+	"provision_failed": {
+		AgentAction: "Tell the user provisioning hit a transient platform-persistence error and no charge or resource was created. Retry the same request with exponential backoff (start at 5s, cap at 60s) — see https://instanode.dev/status if it persists.",
+	},
 	"billing_provider_unavailable": {
 		AgentAction: "Tell the user the billing provider is temporarily unavailable. Retry the upgrade in 60 seconds — see status at https://instanode.dev/status.",
 		UpgradeURL:  "https://instanode.dev/status",
