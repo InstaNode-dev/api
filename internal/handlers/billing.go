@@ -939,9 +939,18 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 
 	if !verifyRazorpaySignature(payload, sig, h.cfg.RazorpayWebhookSecret) {
 		slog.Error("billing.webhook.signature_failed")
+		// B10 P2-3 (BugBash 2026-05-20): hydrate canonical ErrorResponse
+		// envelope on signature rejection. Razorpay support always asks for
+		// the request_id when a webhook fails; pre-fix the body was bare
+		// `{ok:false,error:"invalid_signature"}` with no correlator,
+		// message, or operator guidance.
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"ok":    false,
-			"error": "invalid_signature",
+			"ok":                  false,
+			"error":               "invalid_signature",
+			"message":             "X-Razorpay-Signature did not match HMAC-SHA256 of the raw request body.",
+			"request_id":          middleware.GetRequestID(c),
+			"retry_after_seconds": nil,
+			"agent_action":        "The Razorpay webhook signature did not verify. Confirm RAZORPAY_WEBHOOK_SECRET matches the value in the Razorpay dashboard and that the raw request body is being HMAC'd (not the parsed JSON). Razorpay will retry automatically.",
 		})
 	}
 
@@ -949,8 +958,12 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 	if err := json.Unmarshal(payload, &event); err != nil {
 		slog.Error("billing.webhook.parse_failed", "error", err)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"ok":    false,
-			"error": "invalid_payload",
+			"ok":                  false,
+			"error":               "invalid_payload",
+			"message":             "Razorpay webhook body is not valid JSON.",
+			"request_id":          middleware.GetRequestID(c),
+			"retry_after_seconds": nil,
+			"agent_action":        "Razorpay sent a body that is not valid JSON. Check the Razorpay dashboard webhook configuration and recent delivery attempts.",
 		})
 	}
 

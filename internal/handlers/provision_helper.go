@@ -717,9 +717,15 @@ func sanitizeName(name string) (string, error) {
 		"'", "",
 	)
 	name = stripper.Replace(name)
-	if len(name) > 120 {
-		name = name[:120]
-	}
+	// B18 M2 (BugBash 2026-05-20): the 120-BYTE silent truncation that lived
+	// here was a footgun. requireName already enforces the 64-RUNE limit via
+	// utf8.RuneCountInString below — having a second, looser, silent cap at
+	// 120 bytes meant a multi-byte name landing between 65 and 120 runes
+	// after the strip would be silently truncated instead of cleanly
+	// rejected with `invalid_name`. The regex (`^[A-Za-z0-9][A-Za-z0-9 _-]*$`)
+	// rejects all non-ASCII today, so the silent path was unreachable — but
+	// any future relaxation of the regex would reopen the gap. The single
+	// 64-rune gate in requireName is now the authoritative length contract.
 	return name, nil
 }
 
@@ -827,6 +833,22 @@ func requireName(c *fiber.Ctx, raw string) (string, error) {
 			invalidNameAgentAction, "")
 	}
 
+	// B18 L1 (BugBash 2026-05-20): if sanitizeName mutated the input (CRLF /
+	// tab / NUL / HTML-special chars stripped), surface an X-Instant-Notice
+	// response header so the calling agent can detect "the persisted name
+	// is not what I sent" without parsing prose. Previously the strip was
+	// silent — an agent looking up `db_for_user\n` later by exact name
+	// would never find the persisted `db_for_user`. We deliberately do not
+	// fail the request; the strip is a deliberate hardening on top of the
+	// regex, and a 400 here would break legitimate-but-sloppy callers.
+	if trimmedRaw := strings.TrimSpace(raw); trimmedRaw != trimmed && trimmedRaw != "" {
+		// Only emit when the change is structural — not when only outer
+		// whitespace was trimmed (which is documented in the agent_action).
+		if c != nil {
+			c.Set("X-Instant-Notice", "name_normalized: control/HTML-special characters were stripped from your name input")
+		}
+	}
+
 	return trimmed, nil
 }
 
@@ -880,6 +902,26 @@ func parseProvisionBody(c *fiber.Ctx, v any) error {
 	raw := c.Body()
 	if len(raw) == 0 {
 		return nil
+	}
+	// B18 L2 (BugBash 2026-05-20): when a non-empty body arrives with an
+	// explicit non-JSON Content-Type (application/xml, text/xml,
+	// application/x-www-form-urlencoded, etc.), return 415
+	// `unsupported_media_type` BEFORE attempting UTF-8 / JSON validation.
+	// Pre-fix, sending `<x>hello</x>` with `Content-Type: application/xml`
+	// returned `400 name_required` — a misleading code that cost the
+	// caller one extra debugging cycle to discover the real issue is the
+	// Content-Type. The OpenAPI spec declares `application/json` only;
+	// 415 is the RFC-correct status. application/json, no Content-Type,
+	// and text/plain (legacy "raw POST" senders) all continue through
+	// the JSON path; only declared non-JSON types are rejected.
+	ct := strings.ToLower(strings.TrimSpace(c.Get("Content-Type")))
+	// Strip any "; charset=..." suffix.
+	if idx := strings.Index(ct, ";"); idx >= 0 {
+		ct = strings.TrimSpace(ct[:idx])
+	}
+	if ct != "" && ct != "application/json" && ct != "text/plain" && ct != "text/json" {
+		return respondError(c, fiber.StatusUnsupportedMediaType, "unsupported_media_type",
+			"Request body Content-Type "+ct+" is not supported. Use application/json.")
 	}
 	if !utf8.Valid(raw) {
 		return respondError(c, fiber.StatusBadRequest, "invalid_body",

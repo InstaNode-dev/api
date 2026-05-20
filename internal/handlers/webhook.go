@@ -782,6 +782,15 @@ func (h *WebhookHandler) storeIdempotentReceive(ctx context.Context, token, key 
 // Auth: the resource token in the URL is itself the credential — no session required.
 // This makes the endpoint agent-friendly: whoever holds the token can read their payloads.
 // Authenticated users additionally get access to team-owned webhooks by session.
+//
+// B18 M3 (BugBash 2026-05-20): the UUID-shape check at the top runs BEFORE
+// any auth/lookup — intentionally. The webhook token is a public-by-design
+// capability (it lands in HTTP headers, server logs, and outbound URLs of the
+// upstream sender), so a "this UUID is well-formed but unknown" response is
+// not an oracle leak — it conveys nothing the token holder couldn't already
+// determine by sending a real receive request to /webhook/receive/:token.
+// The ordering matches /webhook/receive/:token + /webhook/idempotency
+// surfaces — keep them aligned if either changes.
 func (h *WebhookHandler) ListRequests(c *fiber.Ctx) error {
 	ctx := c.UserContext()
 	requestID := middleware.GetRequestID(c)

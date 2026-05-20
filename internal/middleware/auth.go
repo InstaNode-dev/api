@@ -96,6 +96,15 @@ const unauthorizedMessage = "Authentication required: missing, malformed, or exp
 // claims, invalid PAT). Kept as a single helper so adding RFC 6750
 // WWW-Authenticate headers in a future PR happens in one place.
 func respondUnauthorized(c *fiber.Ctx) error {
+	// B10 P2-4 (BugBash 2026-05-20): RFC 6750 §3 requires `WWW-Authenticate:
+	// Bearer realm=...` on every 401 from a Bearer-protected resource.
+	// Pre-fix only the audience-mismatch path set the header — every other
+	// 401 (missing header, malformed JWT, expired JWT, wrong secret) was
+	// RFC-non-compliant. OAuth-aware clients and HTTP debugging tools look
+	// for this header. Audience mismatch + DPoP still emit their own
+	// header with the appropriate `error="..."` keyword — this default
+	// covers the generic auth-required path.
+	c.Set("WWW-Authenticate", `Bearer realm="instanode"`)
 	return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 		"ok":                  false,
 		"error":               "unauthorized",
