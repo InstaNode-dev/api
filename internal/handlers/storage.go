@@ -73,9 +73,63 @@ func NewStorageHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, storag
 	return h
 }
 
-// provisionStorage provisions R2 credentials using the local provider.
+// provisionStorage provisions storage credentials via the configured backend.
+// The capability-aware mode decision (broker vs credential) is made by
+// decideStorageMode below; this just calls the underlying provider.
 func (h *StorageHandler) provisionStorage(ctx context.Context, token, tier string) (*storageprovider.Credentials, error) {
 	return h.storageProvider.Provision(ctx, token, tier)
+}
+
+// decideStorageMode is the capability-aware switch from STORAGE-ABSTRACTION-
+// DESIGN. Given the live backend's Capabilities() and the tenant's tier, it
+// picks ONE of:
+//
+//   - "credential"       — issue a long-lived (or temp) tenant credential
+//                          (PrefixScopedKeys=true backends: R2, S3, MinIO)
+//   - "broker"           — no long-lived credential; tenant calls
+//                          /storage/:token/presign for short-lived URLs
+//                          (PrefixScopedKeys=false backends: DO Spaces, when
+//                          tenant tier doesn't qualify for a dedicated bucket)
+//   - "dedicated-bucket" — paid-tier on a backend without prefix-scoping but
+//                          with BucketPerTenant=true. Reserved; not yet
+//                          auto-provisioned (the API skeleton routes these to
+//                          broker mode for now).
+//
+// The DO Spaces master-key behaviour is still reachable as a fallback so
+// existing tenants don't break, but it's not selectable by this switch.
+func (h *StorageHandler) decideStorageMode(tier string) storageProvisionStrategy {
+	if h.storageProvider == nil {
+		return storageProvisionStrategy{kind: "unavailable"}
+	}
+	caps := h.storageProvider.Capabilities()
+	switch {
+	case caps.PrefixScopedKeys:
+		return storageProvisionStrategy{kind: "credential"}
+	case caps.BucketPerTenant && isPaidTier(tier):
+		// Reserved for the dedicated-bucket-per-paying-tenant flow. For now,
+		// fall through to broker mode rather than mint a bucket we don't yet
+		// know how to lifecycle. Tracked as a follow-up in CLAUDE.md.
+		return storageProvisionStrategy{kind: "broker", reason: "dedicated-bucket-not-yet-wired"}
+	default:
+		return storageProvisionStrategy{kind: "broker", reason: "backend-has-no-prefix-scoping"}
+	}
+}
+
+// storageProvisionStrategy carries the decision made by decideStorageMode.
+type storageProvisionStrategy struct {
+	kind   string // "credential" | "broker" | "unavailable"
+	reason string // human-readable note for logs / response when applicable
+}
+
+// isPaidTier reports whether a tier qualifies for the dedicated-bucket path.
+// Kept narrow on purpose — anonymous/free never qualify; hobby+ do.
+func isPaidTier(tier string) bool {
+	switch tier {
+	case "hobby", "hobby_plus", "pro", "growth", "team",
+		"hobby_yearly", "hobby_plus_yearly", "pro_yearly", "team_yearly":
+		return true
+	}
+	return false
 }
 
 // NewStorage handles POST /storage/new.
@@ -184,6 +238,19 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 				if existing.ProviderResourceID.String != "" {
 					dedupResp["prefix"] = existing.ProviderResourceID.String + "/"
 				}
+				// Surface the storage_mode the dedup-hit row is on so the
+				// dashboard / caller knows whether to expect a credential or
+				// use the presign endpoint. Mode is derived from the live
+				// backend's Capabilities() (legacy DO Spaces rows surface as
+				// shared-master-key; an R2-backed deployment shows
+				// prefix-scoped).
+				if h.storageProvider != nil {
+					caps := h.storageProvider.Capabilities()
+					dedupResp["mode"] = string(storageprovider.DeriveStorageMode(caps, false))
+					if !caps.PrefixScopedKeys {
+						dedupResp["presign_url"] = "/storage/" + existing.Token.String() + "/presign"
+					}
+				}
 				dedupResp["credentials_note"] = "access_key_id/secret_access_key are issued once at provision time and not re-emitted on a dedup hit — sign up to provision a fresh bucket with credentials"
 				// P2-06: use respondOK so the dedup response carries
 				// decorateEnvOverride's env_override_reason like every other
@@ -243,7 +310,11 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 
 	tokenStr := resource.Token.String()
 
-	// Provision R2 credentials.
+	// Capability-aware fallback — see STORAGE-ABSTRACTION-DESIGN-2026-05-20.md.
+	// DO Spaces today: anon lands in broker mode (no long-lived credential).
+	// R2 / S3 / MinIO: anon gets a real prefix-scoped credential.
+	strategy := h.decideStorageMode("anonymous")
+
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, "storage", "anonymous", "", fp, tokenStr)
 	creds, err := h.provisionStorage(provCtx, tokenStr, "anonymous")
@@ -254,18 +325,13 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 		middleware.RecordProvisionFail("storage", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("storage.new.provision_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
-		// Soft-delete the resource record so limits aren't falsely consumed.
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("storage.new.soft_delete_failed", "error", delErr, "resource_id", resource.ID)
 		}
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision R2 storage credentials")
+		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision storage credentials")
 	}
 
-	// MR-P0-2 / MR-P0-3: persist the connection URL (BucketURL) + the canonical
-	// object prefix (provider_resource_id) and flip the row pending→active. Any
-	// persistence failure tears down the backend bucket prefix and returns 503,
-	// never a 201 — a stored PRID also closes the token-truncation cross-tenant
-	// class for storage.
+	// MR-P0-2 / MR-P0-3: persist + flip pending→active.
 	if finErr := h.finalizeProvision(ctx, resource, creds.BucketURL, "", creds.ProviderResourceID, requestID, "storage.new",
 		func() {
 			if h.storageProvider != nil {
@@ -302,6 +368,8 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 		"fingerprint", fp,
 		"cloud_vendor", vendor,
 		"tier", "anonymous",
+		"mode", string(creds.StorageMode),
+		"strategy", strategy.kind,
 		"duration_ms", time.Since(start).Milliseconds(),
 		"request_id", requestID,
 	)
@@ -315,24 +383,59 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 		metrics.RedisErrors.WithLabelValues("recycle_mark").Inc()
 	}
 
-	return respondCreated(c, fiber.Map{
-		"ok":                true,
-		"id":                resource.ID.String(),
-		"token":             tokenStr,
-		"name":              resource.Name.String,
-		"connection_url":    creds.BucketURL,
-		"endpoint":          creds.Endpoint,
-		"access_key_id":     creds.AccessKeyID,
-		"secret_access_key": creds.SecretAccessKey,
-		"prefix":            creds.Prefix,
-		"tier":              "anonymous",
-		"env":               resource.Env,
-		"limits":            h.storageAnonymousLimits(),
-		"note":              upgradeNote(upgradeURL),
-		"upgrade":           upgradeURL,
-		"upgrade_jwt":       jwtToken,
-		"expires_at":        expiresAt.Format(time.RFC3339),
-	})
+	resp := h.buildStorageResponse(strategy, creds, tokenStr, resource, "anonymous")
+	resp["note"] = upgradeNote(upgradeURL)
+	resp["upgrade"] = upgradeURL
+	resp["upgrade_jwt"] = jwtToken
+	resp["expires_at"] = expiresAt.Format(time.RFC3339)
+	resp["limits"] = h.storageAnonymousLimits()
+	return respondCreated(c, resp)
+}
+
+// buildStorageResponse composes the /storage/new response body. Centralised
+// so the broker vs credential branching is in one place; both the anonymous
+// and authenticated paths use it.
+//
+// In broker mode, access_key_id / secret_access_key are OMITTED — the tenant
+// uses POST /storage/:token/presign to mint short-lived presigned URLs. The
+// agent_action field tells an automated caller how to fetch them.
+func (h *StorageHandler) buildStorageResponse(
+	strategy storageProvisionStrategy,
+	creds *storageprovider.Credentials,
+	tokenStr string,
+	resource *models.Resource,
+	tier string,
+) fiber.Map {
+	resp := fiber.Map{
+		"ok":             true,
+		"id":             resource.ID.String(),
+		"token":          tokenStr,
+		"name":           resource.Name.String,
+		"connection_url": creds.BucketURL,
+		"endpoint":       creds.Endpoint,
+		"prefix":         creds.Prefix,
+		"tier":           tier,
+		"env":            resource.Env,
+		"mode":           string(creds.StorageMode),
+	}
+	switch strategy.kind {
+	case "broker":
+		// Override the mode to broker (overrides any derived mode), and omit
+		// long-lived credentials. The agent uses /storage/:token/presign to
+		// get short-lived URLs.
+		resp["mode"] = string(storageprovider.ModeBroker)
+		resp["agent_action"] = "use_presign_endpoint"
+		resp["presign_url"] = "/storage/" + tokenStr + "/presign"
+		resp["broker_reason"] = strategy.reason
+		resp["note_isolation"] = "Backend does not enforce s3:prefix at the IAM layer; long-lived keys would let any tenant read others' objects. Use the presign endpoint for short-lived signed URLs instead."
+	case "credential":
+		resp["access_key_id"] = creds.AccessKeyID
+		resp["secret_access_key"] = creds.SecretAccessKey
+		if creds.SessionToken != "" {
+			resp["session_token"] = creds.SessionToken
+		}
+	}
+	return resp
 }
 
 func (h *StorageHandler) newStorageAuthenticated(
@@ -398,7 +501,9 @@ func (h *StorageHandler) newStorageAuthenticated(
 
 	tokenStr := resource.Token.String()
 
-	// Provision R2 credentials.
+	// Capability-aware fallback (see STORAGE-ABSTRACTION-DESIGN-2026-05-20.md).
+	strategy := h.decideStorageMode(team.PlanTier)
+
 	provStart := time.Now()
 	provCtx, span := h.startProvisionSpan(ctx, "storage", team.PlanTier, teamIDStr, fp, tokenStr)
 	creds, err := h.provisionStorage(provCtx, tokenStr, team.PlanTier)
@@ -412,7 +517,7 @@ func (h *StorageHandler) newStorageAuthenticated(
 		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("storage.new.soft_delete_failed_auth", "error", delErr, "resource_id", resource.ID)
 		}
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision R2 storage credentials")
+		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision storage credentials")
 	}
 
 	// MR-P0-2 / MR-P0-3: persist + flip pending→active; a persistence failure
@@ -449,7 +554,10 @@ func (h *StorageHandler) newStorageAuthenticated(
 	// the provision. Only emitted when the provider is actually issuing
 	// per-tenant keys; shared-key mode reuses the master across all
 	// customers and the kind would be misleading.
-	if h.storageProvider != nil && h.storageProvider.Backend() == storageprovider.BackendMinIOAdmin {
+	// Emit a per-tenant-key audit row only when a credential was actually
+	// minted (prefix-scoped backends), so the audit log doesn't lie in
+	// broker / shared-master-key mode where no new identity was created.
+	if h.storageProvider != nil && creds.StorageMode == storageprovider.ModePrefixScoped {
 		safego.Go("storage.iam_audit", func() {
 			(func(rid uuid.UUID, accessKey string) {
 				_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
@@ -465,22 +573,11 @@ func (h *StorageHandler) newStorageAuthenticated(
 		})
 	}
 
-	return respondCreated(c, fiber.Map{
-		"ok":                true,
-		"id":                resource.ID.String(),
-		"token":             resource.Token.String(),
-		"name":              resource.Name.String,
-		"connection_url":    creds.BucketURL,
-		"endpoint":          creds.Endpoint,
-		"access_key_id":     creds.AccessKeyID,
-		"secret_access_key": creds.SecretAccessKey,
-		"prefix":            creds.Prefix,
-		"tier":              team.PlanTier,
-		"env":               resource.Env,
-		"limits": fiber.Map{
-			"storage_mb": h.plans.StorageLimitMB(team.PlanTier, "storage"),
-		},
-	})
+	resp := h.buildStorageResponse(strategy, creds, resource.Token.String(), resource, team.PlanTier)
+	resp["limits"] = fiber.Map{
+		"storage_mb": h.plans.StorageLimitMB(team.PlanTier, "storage"),
+	}
+	return respondCreated(c, resp)
 }
 
 // decryptStorageURL decrypts an AES-encrypted connection URL stored

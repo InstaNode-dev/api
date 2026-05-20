@@ -49,23 +49,39 @@ func TestNew_PublicEndpointAccepted(t *testing.T) {
 // TestResolveBackend exercises the operator-facing alias table. The router
 // uses this to translate OBJECT_STORE_MODE / OBJECT_STORE_BACKEND into the
 // internal Backend constant.
+//
+// After the 2026-05-20 abstraction refactor: "minio" is its own canonical
+// tag (BackendMinIO) distinct from the legacy "minio-admin" alias
+// (BackendMinIOAdmin). Both route to the same MinIO IAM-user provider via
+// Factory; the test verifies the alias table preserves operator-facing
+// behaviour for every historical input.
 func TestResolveBackend(t *testing.T) {
 	cases := []struct {
 		in   string
 		want storageprovider.Backend
 	}{
-		// Admin aliases — all collapse to the secure default.
+		// Legacy admin aliases — collapse to the secure default
+		// (BackendMinIOAdmin → minio impl under the hood).
 		{"", storageprovider.BackendMinIOAdmin},
 		{"admin", storageprovider.BackendMinIOAdmin},
-		{"minio", storageprovider.BackendMinIOAdmin},
 		{"minio-admin", storageprovider.BackendMinIOAdmin},
 		{"iam", storageprovider.BackendMinIOAdmin},
 		{"  ADMIN  ", storageprovider.BackendMinIOAdmin},
-		// Shared-key aliases — opt-in only.
+		// Shared-key aliases — historical name for the DO-Spaces master-key
+		// pattern; routes to the do-spaces impl.
 		{"shared", storageprovider.BackendSharedKey},
 		{"shared-key", storageprovider.BackendSharedKey},
 		{"shared_key", storageprovider.BackendSharedKey},
 		{"master", storageprovider.BackendSharedKey},
+		// New canonical names (added 2026-05-20 with the abstraction).
+		{"minio", storageprovider.BackendMinIO},
+		{"do-spaces", storageprovider.BackendDOSpaces},
+		{"digitalocean", storageprovider.BackendDOSpaces},
+		{"spaces", storageprovider.BackendDOSpaces},
+		{"r2", storageprovider.BackendR2},
+		{"cloudflare", storageprovider.BackendR2},
+		{"s3", storageprovider.BackendS3},
+		{"aws", storageprovider.BackendS3},
 		// Unknown values fall through to the secure default.
 		{"garbage", storageprovider.BackendMinIOAdmin},
 	}
