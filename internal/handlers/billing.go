@@ -28,6 +28,7 @@ import (
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
 	"instant.dev/internal/razorpaybilling"
+	"instant.dev/internal/safego"
 )
 
 // checkoutNoteAdminPromoCodeID is the Razorpay subscription `notes` key we
@@ -939,32 +940,55 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 
 	if !verifyRazorpaySignature(payload, sig, h.cfg.RazorpayWebhookSecret) {
 		slog.Error("billing.webhook.signature_failed")
-		// B10 P2-3 (BugBash 2026-05-20): hydrate canonical ErrorResponse
-		// envelope on signature rejection. Razorpay support always asks for
-		// the request_id when a webhook fails; pre-fix the body was bare
-		// `{ok:false,error:"invalid_signature"}` with no correlator,
-		// message, or operator guidance.
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"ok":                  false,
-			"error":               "invalid_signature",
-			"message":             "X-Razorpay-Signature did not match HMAC-SHA256 of the raw request body.",
-			"request_id":          middleware.GetRequestID(c),
-			"retry_after_seconds": nil,
-			"agent_action":        "The Razorpay webhook signature did not verify. Confirm RAZORPAY_WEBHOOK_SECRET matches the value in the Razorpay dashboard and that the raw request body is being HMAC'd (not the parsed JSON). Razorpay will retry automatically.",
-		})
+		// B18 wave-3 hardening (2026-05-21): emit an audit_log row on every
+		// signature-mismatch attempt so an operator dashboard can chart
+		// "N auth failures / hour" without grepping NR logs. Best-effort
+		// via safego.Go so a DB outage cannot block the 400 we owe
+		// Razorpay's retry loop. Metadata carries presence booleans + the
+		// masked source-IP subnet ONLY: never the raw signature, never
+		// the webhook secret, never the unmasked source IP.
+		if h.db != nil {
+			haveSig := sig != ""
+			haveSecret := h.cfg.RazorpayWebhookSecret != ""
+			subnet := maskSourceIP(c.IP())
+			safego.Go("razorpay.webhook.unauthorized.audit", func() {
+				meta, _ := json.Marshal(map[string]any{
+					"have_signature_header":  haveSig,
+					"have_configured_secret": haveSecret,
+					"source_ip_subnet":       subnet,
+				})
+				_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
+					Actor:    "system",
+					Kind:     models.AuditKindRazorpayWebhookUnauthorized,
+					Summary:  "Razorpay webhook signature verification failed",
+					Metadata: meta,
+				})
+			})
+		}
+		// B13-F8 / B10 P2-3: hydrate the canonical ErrorResponse envelope
+		// via the standard respondErrorWithAgentAction so every webhook 4xx
+		// matches the documented shape (ok/error/message/request_id/
+		// retry_after_seconds/agent_action). Razorpay support always asks
+		// for the request_id when a webhook fails; the pre-fix body
+		// hand-built the envelope inline. Now goes through the canonical
+		// helper so a future field added to ErrorResponse propagates here
+		// without a re-edit.
+		return respondErrorWithAgentAction(c, fiber.StatusBadRequest,
+			"invalid_signature",
+			"X-Razorpay-Signature did not match HMAC-SHA256 of the raw request body.",
+			"The Razorpay webhook signature did not verify. Confirm RAZORPAY_WEBHOOK_SECRET matches the value in the Razorpay dashboard and that the raw request body is being HMAC'd (not the parsed JSON). Razorpay will retry automatically.",
+			"")
 	}
 
 	var event rzpWebhookEvent
 	if err := json.Unmarshal(payload, &event); err != nil {
 		slog.Error("billing.webhook.parse_failed", "error", err)
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"ok":                  false,
-			"error":               "invalid_payload",
-			"message":             "Razorpay webhook body is not valid JSON.",
-			"request_id":          middleware.GetRequestID(c),
-			"retry_after_seconds": nil,
-			"agent_action":        "Razorpay sent a body that is not valid JSON. Check the Razorpay dashboard webhook configuration and recent delivery attempts.",
-		})
+		// B13-F8: canonical 4xx envelope via respondErrorWithAgentAction.
+		return respondErrorWithAgentAction(c, fiber.StatusBadRequest,
+			"invalid_payload",
+			"Razorpay webhook body is not valid JSON.",
+			"Razorpay sent a body that is not valid JSON. Check the Razorpay dashboard webhook configuration and recent delivery attempts.",
+			"")
 	}
 
 	ctx, span := otel.Tracer("instant.dev/handlers").Start(c.UserContext(), "billing.razorpay_webhook",

@@ -149,6 +149,13 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	})
 
 	// ── Middleware chain (order matters) ─────────────────────────────────────
+	// SecurityHeaders runs BEFORE RequestID so the static defense-in-depth
+	// response headers (Permissions-Policy, Referrer-Policy,
+	// X-Content-Type-Options, and — in prod only — Strict-Transport-Security)
+	// land on every response including the cheap-path 404/405/livez surfaces
+	// that the request-id middleware also covers. The middleware is allocation-
+	// free per request; all values are static strings.
+	app.Use(middleware.SecurityHeaders(cfg.Environment == "production"))
 	app.Use(middleware.RequestID())
 	// LoggerContext copies request_id (and team_id once auth has run)
 	// from Fiber locals onto the Go ctx so every slog call downstream

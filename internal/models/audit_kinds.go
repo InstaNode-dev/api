@@ -450,6 +450,24 @@ const (
 	// audit row + ERROR-level slog line (already emitted at the per-step
 	// failure) for NR alerting.
 	AuditKindProvisionPersistenceFailed = "provision.persistence_failed"
+
+	// AuditKindBrevoWebhookUnauthorized fires from POST /webhooks/brevo/:secret
+	// when the URL-token compare fails (B18 hardening, 2026-05-21). Persisted
+	// best-effort via safego.Go so a DB outage NEVER blocks the 401 owed to
+	// the caller; the audit row carries presence booleans + a masked source-IP
+	// subnet (never the secret value itself) so an operator can see "X auth
+	// failures over Y minutes" without grepping NR logs. Useful as the signal
+	// for a sustained burst from a non-Brevo IP (the URL-token-auth surface
+	// is a known soft target relative to HMAC-signed webhooks).
+	AuditKindBrevoWebhookUnauthorized = "webhook.brevo.unauthorized"
+
+	// AuditKindRazorpayWebhookUnauthorized fires from POST /razorpay/webhook
+	// when verifyRazorpaySignature returns false (B18 hardening, 2026-05-21).
+	// Same shape as the Brevo unauthorized kind: persisted best-effort via
+	// safego.Go, metadata carries presence booleans + masked source-IP subnet
+	// only (never the raw signature or webhook secret). Detects probing
+	// attempts against the billing-webhook path with crafted payloads.
+	AuditKindRazorpayWebhookUnauthorized = "webhook.razorpay.unauthorized"
 )
 
 // PropagationKind* are the discriminator values for pending_propagations.kind.
