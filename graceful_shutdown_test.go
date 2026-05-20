@@ -26,6 +26,9 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"instant.dev/internal/handlers"
+	"instant.dev/internal/router"
 )
 
 // pickFreePort returns a TCP port number currently free on localhost. Lets
@@ -66,7 +69,7 @@ func TestRunServerWithGracefulShutdown_DrainsInflight(t *testing.T) {
 	// Run the helper in a goroutine — same shape main() uses.
 	srvErr := make(chan error, 1)
 	go func() {
-		srvErr <- runServerWithGracefulShutdown(app, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+		srvErr <- runServerWithGracefulShutdown(app, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second, router.ShutdownHooks{})
 	}()
 
 	// Wait for the listener to bind. Tight retry loop with a generous cap so
@@ -138,10 +141,130 @@ func TestRunServerWithGracefulShutdown_DrainsInflight(t *testing.T) {
 	}
 }
 
+
+// TestRunServerWithGracefulShutdown_MarksReadinessDraining — the
+// MR-P0-7 readiness contract: on SIGTERM the helper MUST flip
+// hooks.Readyz.MarkDraining BEFORE Fiber's ShutdownWithTimeout closes
+// the listener. Without this, the kubelet's readinessProbe keeps
+// returning 200 right up to SIGKILL and the Service keeps routing new
+// traffic to a pod that is about to stop accepting connections.
+func TestRunServerWithGracefulShutdown_MarksReadinessDraining(t *testing.T) {
+	port := pickFreePort(t)
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app.Get("/ping", func(c *fiber.Ctx) error { return c.SendString("ok") })
+
+	readyzH := &handlers.ReadyzHandler{}
+	require.False(t, readyzH.IsDraining(), "fresh ReadyzHandler must not start in draining state")
+
+	srvErr := make(chan error, 1)
+	go func() {
+		srvErr <- runServerWithGracefulShutdown(
+			app,
+			fmt.Sprintf("127.0.0.1:%d", port),
+			3*time.Second,
+			router.ShutdownHooks{Readyz: readyzH},
+		)
+	}()
+
+	require.Eventually(t, func() bool {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
+	}, 3*time.Second, 25*time.Millisecond, "server never bound to :%d", port)
+
+	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
+
+	require.Eventually(t, readyzH.IsDraining,
+		2*time.Second, 10*time.Millisecond,
+		"hooks.Readyz.MarkDraining was never called — readinessProbe will keep returning 200 (MR-P0-7 regression)")
+
+	select {
+	case sErr := <-srvErr:
+		assert.NoError(t, sErr, "clean SIGTERM drain must return nil")
+	case <-time.After(8 * time.Second):
+		t.Fatal("runServerWithGracefulShutdown never returned after the drain")
+	}
+	assert.True(t, readyzH.IsDraining(), "drain flag is single-shot, never un-flipped")
+}
+
+// TestRunServerWithGracefulShutdown_TimeoutKillsStuckRequest — the
+// MR-P0-7 timeout contract: a request that never returns MUST NOT
+// block the helper past shutdownTimeout. ShutdownWithTimeout returns a
+// non-nil error which the helper surfaces, so the process exits in
+// bounded time instead of being SIGKILLed by the kubelet.
+func TestRunServerWithGracefulShutdown_TimeoutKillsStuckRequest(t *testing.T) {
+	port := pickFreePort(t)
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+
+	stuck := make(chan struct{})
+	defer close(stuck)
+	requestStarted := make(chan struct{}, 1)
+	app.Get("/stuck", func(c *fiber.Ctx) error {
+		select {
+		case requestStarted <- struct{}{}:
+		default:
+		}
+		<-stuck
+		return nil
+	})
+
+	const tinyTimeout = 500 * time.Millisecond
+	srvErr := make(chan error, 1)
+	go func() {
+		srvErr <- runServerWithGracefulShutdown(
+			app,
+			fmt.Sprintf("127.0.0.1:%d", port),
+			tinyTimeout,
+			router.ShutdownHooks{},
+		)
+	}()
+
+	require.Eventually(t, func() bool {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
+	}, 3*time.Second, 25*time.Millisecond, "server never bound to :%d", port)
+
+	clientCtx, cancelClient := context.WithCancel(context.Background())
+	defer cancelClient()
+	go func() {
+		req, _ := http.NewRequestWithContext(clientCtx, http.MethodGet,
+			fmt.Sprintf("http://127.0.0.1:%d/stuck", port), nil)
+		_, _ = http.DefaultClient.Do(req)
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stuck handler never started — setup is broken, not the SUT")
+	}
+
+	start := time.Now()
+	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
+
+	select {
+	case sErr := <-srvErr:
+		elapsed := time.Since(start)
+		assert.Error(t, sErr,
+			"stuck request must surface ShutdownWithTimeout's non-nil return so operators can grep server.graceful_shutdown_failed")
+		// readinessDrainGrace (3s) + tinyTimeout (0.5s) + slack ≤ ~6s.
+		assert.Less(t, elapsed, 6*time.Second,
+			"helper took %s — timeout path is broken; a real pod would be SIGKILLed", elapsed)
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServerWithGracefulShutdown blocked past shutdownTimeout — the kubelet would SIGKILL this pod")
+	}
+}
+
 // Compile-time guard against a regression that removes the helper or changes
 // its signature in a way that would silently bypass the MR-P0-7 fix.
 var _ = func(app *fiber.App) error {
-	return runServerWithGracefulShutdown(app, ":0", time.Second)
+	return runServerWithGracefulShutdown(app, ":0", time.Second, router.ShutdownHooks{})
 }
 
 // sync.WaitGroup import-guard so a future test that adds goroutines can rely
