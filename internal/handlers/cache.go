@@ -147,8 +147,12 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
 			// Decrypt the stored connection_url to return it in plaintext.
-			connectionURL := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
-			if connectionURL != "" {
+			// T1 P1-5 (BugHunt 2026-05-20): fail-closed — see db.go.
+			connectionURL, ok := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
+			if !ok {
+				slog.Warn("cache.new.dedup_decrypt_failed — provisioning fresh",
+					"token", existing.Token, "request_id", requestID)
+			} else if connectionURL != "" {
 				metrics.FingerprintAbuseBlocked.Inc()
 				// internal_url omitted via setInternalURL on the anon dedup
 				// path — see internal_url.go for the W11 scrub rationale.
@@ -427,23 +431,26 @@ func (h *CacheHandler) newCacheAuthenticated(
 	return respondCreated(c, authResp)
 }
 
-// decryptConnectionURL decrypts an AES-encrypted connection URL stored in the DB.
-// Returns the ciphertext unchanged if decryption fails (fails open — caller must handle).
-func (h *CacheHandler) decryptConnectionURL(encrypted, requestID string) string {
+// decryptConnectionURL decrypts an AES-encrypted connection URL stored
+// in the DB. T1 P1-5 (BugHunt 2026-05-20): fail-CLOSED — see db.go for
+// rationale. Returns (plain, true) on success, ("", true) for empty
+// input, ("", false) on decrypt error. Callers MUST NOT treat a
+// (_, false) return as a valid URL — fall through to fresh-provision.
+func (h *CacheHandler) decryptConnectionURL(encrypted, requestID string) (string, bool) {
 	if encrypted == "" {
-		return ""
+		return "", true
 	}
 	aesKey, err := crypto.ParseAESKey(h.cfg.AESKey)
 	if err != nil {
 		slog.Error("cache.decrypt_url.aes_key_parse_failed", "error", err, "request_id", requestID)
-		return encrypted
+		return "", false
 	}
 	plain, err := crypto.Decrypt(aesKey, encrypted)
 	if err != nil {
 		slog.Error("cache.decrypt_url.decrypt_failed", "error", err, "request_id", requestID)
-		return encrypted
+		return "", false
 	}
-	return plain
+	return plain, true
 }
 
 // cacheAnonymousLimits returns the limits map for anonymous Redis resources.

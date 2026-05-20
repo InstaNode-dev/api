@@ -157,8 +157,12 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
 			// Decrypt the stored connection_url to return it in plaintext.
-			connectionURL := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
-			if connectionURL != "" {
+			// T1 P1-5 (BugHunt 2026-05-20): fail-closed — see db.go.
+			connectionURL, ok := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
+			if !ok {
+				slog.Warn("queue.new.dedup_decrypt_failed — provisioning fresh",
+					"token", existing.Token, "request_id", requestID)
+			} else if connectionURL != "" {
 				metrics.FingerprintAbuseBlocked.Inc()
 				// internal_url omitted on the anonymous dedup path — see
 				// internal_url.go (W11 scrub).
@@ -432,23 +436,25 @@ func (h *QueueHandler) newQueueAuthenticated(
 	return respondCreated(c, resp)
 }
 
-// decryptConnectionURL decrypts an AES-encrypted connection URL stored in the DB.
-// Returns the ciphertext unchanged if decryption fails (fails open — caller must handle).
-func (h *QueueHandler) decryptConnectionURL(encrypted, requestID string) string {
+// decryptConnectionURL decrypts an AES-encrypted connection URL stored
+// in the DB. T1 P1-5 (BugHunt 2026-05-20): fail-CLOSED. See db.go for
+// rationale. (plain, true) success / ("", true) empty / ("", false)
+// decrypt error — never returns ciphertext as a "connection_url".
+func (h *QueueHandler) decryptConnectionURL(encrypted, requestID string) (string, bool) {
 	if encrypted == "" {
-		return ""
+		return "", true
 	}
 	aesKey, err := crypto.ParseAESKey(h.cfg.AESKey)
 	if err != nil {
 		slog.Error("queue.decrypt_url.aes_key_parse_failed", "error", err, "request_id", requestID)
-		return encrypted
+		return "", false
 	}
 	plain, err := crypto.Decrypt(aesKey, encrypted)
 	if err != nil {
 		slog.Error("queue.decrypt_url.decrypt_failed", "error", err, "request_id", requestID)
-		return encrypted
+		return "", false
 	}
-	return plain
+	return plain, true
 }
 
 // queueAnonymousLimits returns the limits map for anonymous queue resources.

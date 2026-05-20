@@ -146,8 +146,12 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
 			// Decrypt the stored connection_url to return it in plaintext.
-			connectionURL := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
-			if connectionURL != "" {
+			// T1 P1-5 (BugHunt 2026-05-20): fail-closed — see db.go.
+			connectionURL, ok := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
+			if !ok {
+				slog.Warn("nosql.new.dedup_decrypt_failed — provisioning fresh",
+					"token", existing.Token, "request_id", requestID)
+			} else if connectionURL != "" {
 				metrics.FingerprintAbuseBlocked.Inc()
 				// internal_url omitted on the anonymous dedup path — see
 				// internal_url.go (W11 scrub).
@@ -424,23 +428,24 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 	return respondCreated(c, nosqlAuthResp)
 }
 
-// decryptConnectionURL decrypts an AES-encrypted connection URL stored in the DB.
-// Returns the ciphertext unchanged if decryption fails (fails open — caller must handle).
-func (h *NoSQLHandler) decryptConnectionURL(encrypted, requestID string) string {
+// decryptConnectionURL decrypts an AES-encrypted connection URL stored
+// in the DB. T1 P1-5 (BugHunt 2026-05-20): fail-CLOSED — see db.go.
+// (plain, true) / ("", true on empty) / ("", false on decrypt error).
+func (h *NoSQLHandler) decryptConnectionURL(encrypted, requestID string) (string, bool) {
 	if encrypted == "" {
-		return ""
+		return "", true
 	}
 	aesKey, err := crypto.ParseAESKey(h.cfg.AESKey)
 	if err != nil {
 		slog.Error("nosql.decrypt_url.aes_key_parse_failed", "error", err, "request_id", requestID)
-		return encrypted
+		return "", false
 	}
 	plain, err := crypto.Decrypt(aesKey, encrypted)
 	if err != nil {
 		slog.Error("nosql.decrypt_url.decrypt_failed", "error", err, "request_id", requestID)
-		return encrypted
+		return "", false
 	}
-	return plain
+	return plain, true
 }
 
 // nosqlAnonymousLimits returns the limits map for anonymous MongoDB resources.

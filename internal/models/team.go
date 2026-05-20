@@ -328,17 +328,46 @@ func UpdatePlanTier(ctx context.Context, db *sql.DB, teamID uuid.UUID, tier stri
 // ElevateDeploymentTiersByTeam and ElevateStackTiersByTeam carry analogous
 // terminal-status filters.
 func UpgradeTeamAllTiers(ctx context.Context, db *sql.DB, teamID uuid.UUID, newTier string) error {
+	return UpgradeTeamAllTiersWithSubscription(ctx, db, teamID, newTier, "")
+}
+
+// UpgradeTeamAllTiersWithSubscription is UpgradeTeamAllTiers + an
+// atomic SET of teams.stripe_customer_id (the legacy column name for
+// razorpay_subscription_id) inside the same transaction.
+//
+// T4 P2-4 (BugHunt 2026-05-20): the previous flow was
+// UpgradeTeamAllTiers → UpdateRazorpaySubscriptionID as two separate
+// statements. A crash between them left the team on the paid tier
+// with stripe_customer_id still NULL — a later subscription.cancelled
+// could not match the team by sub_id and the team stayed paid forever.
+// Folding the sub_id write into the upgrade tx closes that window:
+// either the team upgrades AND has the sub_id, or nothing changes.
+//
+// Pass subscriptionID = "" to skip the column update (admin/dev paths
+// that have no Razorpay subscription).
+func UpgradeTeamAllTiersWithSubscription(ctx context.Context, db *sql.DB, teamID uuid.UUID, newTier, subscriptionID string) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("models.UpgradeTeamAllTiers: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// 1. Update the team's plan tier.
+	// 1a. Update the team's plan tier.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE teams SET plan_tier = $1 WHERE id = $2
 	`, newTier, teamID); err != nil {
 		return fmt.Errorf("models.UpgradeTeamAllTiers: update_plan_tier: %w", err)
+	}
+
+	// 1b. Same row — atomic stripe_customer_id (= razorpay_subscription_id)
+	//     write iff a non-empty id was supplied. Inside the same tx so a
+	//     crash between the two SETs can't leave NULL sub_id on a paid team.
+	if subscriptionID != "" {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE teams SET stripe_customer_id = $1 WHERE id = $2
+		`, subscriptionID, teamID); err != nil {
+			return fmt.Errorf("models.UpgradeTeamAllTiers: set_sub_id: %w", err)
+		}
 	}
 
 	// 2. Resources — reaper-race guard: only lift non-expired rows.

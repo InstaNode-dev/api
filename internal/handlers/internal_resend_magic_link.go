@@ -296,12 +296,13 @@ func verifyInternalResendMagicLinkJWT(c *fiber.Ctx, secret string, linkID uuid.U
 	}
 
 	claims := &internalResendMagicLinkClaims{}
+	// T10 P2-1 (BugHunt 2026-05-20): pin HS256 only via WithValidMethods.
 	tok, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return []byte(secret), nil
-	})
+	}, jwt.WithValidMethods([]string{"HS256"}))
 	if err != nil {
 		slog.Warn("internal.resend_magic_link.auth.parse_failed", "error", err, "link_id", linkID.String())
 		return err

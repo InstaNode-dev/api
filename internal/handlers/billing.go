@@ -1196,14 +1196,33 @@ func (h *BillingHandler) deleteRazorpayWebhookClaim(ctx context.Context, eventID
 }
 
 // verifyRazorpaySignature checks HMAC-SHA256(key=secret, msg=rawBody) == signature.
+//
+// T7 P3-F (BugHunt 2026-05-20): a probe with `signature = " <hex> "`
+// (leading/trailing whitespace) was accepted because some upstream
+// header-reader stripped the surrounding whitespace before the
+// constant-time compare ran. Razorpay's real signatures are exactly
+// 64 hex characters with no padding; tighten the contract by trimming
+// surrounding whitespace ONCE at the top and then rejecting any
+// signature whose length is not 64 hex chars before the
+// constant-time compare. Both the trim and the length check run in
+// data-independent time (no early-exit on content) so they do not
+// re-introduce a side-channel.
 func verifyRazorpaySignature(body []byte, signature, secret string) bool {
 	if secret == "" || signature == "" {
+		return false
+	}
+	// Trim once at top — strict compare below.
+	sig := strings.TrimSpace(signature)
+	// Razorpay HMAC-SHA256 hex = exactly 64 chars. Anything else is
+	// rejected before the constant-time compare; the length check is
+	// content-independent.
+	if len(sig) != 64 {
 		return false
 	}
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
 	expected := hex.EncodeToString(mac.Sum(nil))
-	return subtle.ConstantTimeCompare([]byte(expected), []byte(signature)) == 1
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(sig)) == 1
 }
 
 // handleSubscriptionCharged processes subscription.charged events (payment confirmed → upgrade).
@@ -1346,20 +1365,20 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 		return nil
 	}
 
-	// Atomically upgrade the team tier + all resources, deployments, and stacks.
-	// Returns an error on failure — caller will return HTTP 500 so Razorpay retries.
-	if upgradeErr := models.UpgradeTeamAllTiers(ctx, h.db, teamID, tier); upgradeErr != nil {
+	// T4 P2-4 (BugHunt 2026-05-20): fold the subscription_id write into
+	// UpgradeTeamAllTiers' transaction so a crash between the tier flip
+	// and the sub_id write can't leave a paid team with NULL sub_id
+	// (which would render any later subscription.cancelled un-matchable
+	// and the team paid forever).
+	//
+	// Atomically upgrade the team tier + all resources, deployments,
+	// stacks, AND set stripe_customer_id (== razorpay_subscription_id).
+	// Returns an error on failure — caller will return HTTP 500 so
+	// Razorpay retries.
+	if upgradeErr := models.UpgradeTeamAllTiersWithSubscription(ctx, h.db, teamID, tier, sub.ID); upgradeErr != nil {
 		slog.Error("billing.subscription.charged.upgrade_all_tiers_failed",
 			"error", upgradeErr, "team_id", teamID, "tier", tier)
 		return upgradeErr
-	}
-
-	// Store subscription ID for future lookups.
-	if sub.ID != "" {
-		if updateErr := models.UpdateRazorpaySubscriptionID(ctx, h.db, teamID, sub.ID); updateErr != nil {
-			slog.Error("billing.subscription.charged.update_sub_id_failed",
-				"error", updateErr, "team_id", teamID)
-		}
 	}
 
 	// Checkout completed — clear the pending_checkouts row so the worker's

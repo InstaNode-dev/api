@@ -169,8 +169,19 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
 			// Decrypt the stored connection_url to return it in plaintext.
-			connectionURL := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
-			if connectionURL != "" {
+			// T1 P1-5 (BugHunt 2026-05-20): decryptConnectionURL is now
+			// fail-closed — ok=false on decrypt error returns
+			// (""=, false) so we fall through to fresh-provision rather
+			// than emitting ciphertext-as-connection_url to the agent.
+			connectionURL, ok := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
+			if !ok {
+				// Decrypt error on a non-empty stored URL — log was
+				// already emitted at ERROR. Treat as "no usable URL"
+				// and fall through to fresh provision; better than
+				// returning unusable ciphertext to the caller.
+				slog.Warn("db.new.dedup_decrypt_failed — provisioning fresh",
+					"token", existing.Token, "request_id", requestID)
+			} else if connectionURL != "" {
 				metrics.FingerprintAbuseBlocked.Inc()
 				// internal_url omitted via setInternalURL: existing.Tier is
 				// "anonymous" on the fingerprint-dedup path (never crosses into
@@ -463,23 +474,41 @@ func (h *DBHandler) newDBAuthenticated(
 	return respondCreated(c, authResp)
 }
 
-// decryptConnectionURL decrypts an AES-encrypted connection URL stored in the DB.
-// Returns the ciphertext unchanged if decryption fails (fails open).
-func (h *DBHandler) decryptConnectionURL(encrypted, requestID string) string {
+// decryptConnectionURL decrypts an AES-encrypted connection URL stored
+// in the DB.
+//
+// T1 P1-5 (BugHunt 2026-05-20): previously this fail-OPEN'd on a
+// decrypt error and returned the ciphertext to the caller — non-empty,
+// so the rate-limit dedup branch in newDB / newCache / etc. wrote it
+// straight into the 201/200 response's `connection_url` field. The
+// customer's agent then dialed garbage. Fail-CLOSED instead: a
+// non-empty `encrypted` that fails decrypt returns ("", false) so the
+// caller skips the dedup branch and either returns 500 or falls
+// through to a fresh provision.
+//
+// Semantics:
+//   - ("", true)         → input was empty; nothing to decrypt.
+//   - (plain, true)      → successful decrypt.
+//   - ("", false)        → decrypt error; caller MUST treat as
+//                          "no usable URL" (NOT as ciphertext).
+//
+// Logging stays as ERROR — a decrypt failure on a non-empty stored
+// value is always alarming (key rotation gone wrong, DB tamper, etc.).
+func (h *DBHandler) decryptConnectionURL(encrypted, requestID string) (string, bool) {
 	if encrypted == "" {
-		return ""
+		return "", true
 	}
 	aesKey, err := crypto.ParseAESKey(h.cfg.AESKey)
 	if err != nil {
 		slog.Error("db.decrypt_url.aes_key_parse_failed", "error", err, "request_id", requestID)
-		return encrypted
+		return "", false
 	}
 	plain, err := crypto.Decrypt(aesKey, encrypted)
 	if err != nil {
 		slog.Error("db.decrypt_url.decrypt_failed", "error", err, "request_id", requestID)
-		return encrypted
+		return "", false
 	}
-	return plain
+	return plain, true
 }
 
 // dbAnonymousLimits returns the limits map for anonymous Postgres resources.

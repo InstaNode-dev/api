@@ -290,8 +290,12 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 				upgradeURL = urls.UpgradeStartURL(jwtToken)
 				c.Set("X-Instant-Upgrade", upgradeURL)
 			}
-			connectionURL := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
-			if connectionURL != "" {
+			// T1 P1-5 (BugHunt 2026-05-20): fail-closed — see db.go.
+			connectionURL, ok := h.decryptConnectionURL(existing.ConnectionURL.String, requestID)
+			if !ok {
+				slog.Warn("vector.new.dedup_decrypt_failed — provisioning fresh",
+					"token", existing.Token, "request_id", requestID)
+			} else if connectionURL != "" {
 				metrics.FingerprintAbuseBlocked.Inc()
 				// internal_url omitted on the anonymous dedup path — see
 				// internal_url.go (W11 scrub).
@@ -561,22 +565,22 @@ func (h *VectorHandler) newVectorAuthenticated(
 	return respondCreated(c, authResp)
 }
 
-// decryptConnectionURL is shared with DBHandler but kept separately on the
-// VectorHandler so the two handlers stay independently testable. The body
-// is identical — fail-open AES decryption.
-func (h *VectorHandler) decryptConnectionURL(encrypted, requestID string) string {
+// decryptConnectionURL is shared with DBHandler but kept separately on
+// the VectorHandler so the two handlers stay independently testable.
+// T1 P1-5 (BugHunt 2026-05-20): fail-CLOSED — see db.go.
+func (h *VectorHandler) decryptConnectionURL(encrypted, requestID string) (string, bool) {
 	if encrypted == "" {
-		return ""
+		return "", true
 	}
 	aesKey, err := crypto.ParseAESKey(h.cfg.AESKey)
 	if err != nil {
 		slog.Error("vector.decrypt_url.aes_key_parse_failed", "error", err, "request_id", requestID)
-		return encrypted
+		return "", false
 	}
 	plain, err := crypto.Decrypt(aesKey, encrypted)
 	if err != nil {
 		slog.Error("vector.decrypt_url.decrypt_failed", "error", err, "request_id", requestID)
-		return encrypted
+		return "", false
 	}
-	return plain
+	return plain, true
 }

@@ -264,12 +264,19 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 		}
 
 		claims := &sessionClaims{}
+		// T10 P2-1 (BugHunt 2026-05-20): pin to HS256 only via
+		// jwt.WithValidMethods. The Method-type-assert below catches
+		// SigningMethodHMAC family but accepts HS384/HS512 — an
+		// attacker-selectable alg the crypto package (crypto/jwt.go)
+		// explicitly forbids elsewhere. Keep both gates: WithValidMethods
+		// enforces the alg-string allowlist, the type-assert is a belt
+		// against custom SigningMethod implementations.
 		parsed, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
 			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 				return nil, errors.New("unexpected signing method")
 			}
 			return []byte(cfg.JWTSecret), nil
-		})
+		}, jwt.WithValidMethods([]string{"HS256"}))
 		if err != nil || !parsed.Valid {
 			return respondUnauthorized(c)
 		}
@@ -431,12 +438,15 @@ func optionalAuthImpl(cfg *config.Config, strict bool) fiber.Handler {
 		}
 
 		claims := &sessionClaims{}
+		// T10 P2-1 (BugHunt 2026-05-20): pin to HS256 only — see comment
+		// in RequireAuth above. Drop-in WithValidMethods option blocks
+		// HS384/HS512 downgrade even on the OptionalAuth path.
 		parsed, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
 			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 				return nil, errors.New("unexpected signing method")
 			}
 			return []byte(cfg.JWTSecret), nil
-		})
+		}, jwt.WithValidMethods([]string{"HS256"}))
 		if err != nil || !parsed.Valid || claims.UserID == "" || claims.TeamID == "" {
 			if strict {
 				// Header present but JWT is bad — reject so the caller
