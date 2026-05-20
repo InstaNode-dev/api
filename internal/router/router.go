@@ -323,6 +323,16 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 		})
 	})
 
+	// /readyz — deep, component-by-component readiness probe wired to
+	// the k8s readinessProbe (NOT livenessProbe — see /healthz above
+	// which stays the shallow liveness check). The handler runs all
+	// component checks in parallel with a 10s per-check cache so probe
+	// traffic doesn't hammer upstreams. See handlers/readyz.go for the
+	// check registry, criticality rules, and the Brevo silent-rejection
+	// motivation (RETRO 2026-05-20).
+	readyzH := handlers.NewReadyzHandler(cfg, db, rdb, provClient)
+	app.Get("/readyz", readyzH.Get)
+
 	// OpenAPI spec — machine-readable description of the agent-facing API.
 	// T19 P0-1 (BugHunt 2026-05-20): pass ENVIRONMENT so the served spec
 	// strips /internal/set-tier in production (where the route is not
@@ -634,6 +644,26 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	emailWebhookH := handlers.NewEmailWebhookHandler(db, cfg)
 	app.Post("/api/v1/email/webhook/brevo", emailWebhookH.Brevo)
 	app.Post("/api/v1/email/webhook/ses", emailWebhookH.SES)
+
+	// Brevo transactional-delivery receiver — closes the "201 ≠ delivered"
+	// gap. Brevo's transactional API returns 201 on accept but actual
+	// SMTP-relay happens async. This endpoint receives per-event callbacks
+	// (delivered/soft_bounce/hard_bounce/blocked/complaint/deferred/
+	// unsubscribed/error) and updates forwarder_sent.classification +
+	// delivered_at to reflect the ACTUAL outcome, not the API-acceptance
+	// state.
+	//
+	// Auth shape: URL-token (BREVO_WEBHOOK_SECRET in the :secret path
+	// segment), NOT HMAC. Brevo's transactional webhooks don't carry
+	// HMAC signatures by default; the URL-token approach works without
+	// requiring per-callback signing toggles in the dashboard. See
+	// brevo_webhook.go for the full rationale.
+	//
+	// Registered BEFORE the /api/v1 auth group (same reason as the
+	// HMAC-signed /api/v1/email/webhook/brevo above): Brevo's servers
+	// present no Authorization header.
+	brevoTxH := handlers.NewBrevoTransactionalWebhookHandler(db, cfg)
+	app.Post("/webhooks/brevo/:secret", brevoTxH.Receive)
 
 	// Authenticated resource management
 	middleware.SetRoleLookupDB(db) // populate auth_team_role on every RequireAuth
