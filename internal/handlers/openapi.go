@@ -180,9 +180,20 @@ const openAPISpec = `{
     },
     "/healthz": {
       "get": {
-        "summary": "Health check",
+        "summary": "Health check (shallow liveness)",
+        "description": "Process-level liveness — returns 200 if the api binary is up and can ping its primary platform DB. Wired to Kubernetes livenessProbe. Use /readyz for deep upstream-reachability checks.",
         "responses": {
           "200": { "description": "Service is healthy", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HealthResponse" } } } }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "summary": "Deep readiness check (multi-component)",
+        "description": "Runs component-by-component readiness checks against every critical upstream the api depends on (platform_db, customer_db, provisioner_grpc, brevo, razorpay, redis, do_spaces). Each check has a 10-15s cache to avoid upstream spam. Wired to Kubernetes readinessProbe — a degraded pod is removed from the Service endpoint list (but not restarted). Critical-failed components (platform_db, provisioner_grpc) → 503; everything else → 200 with overall=degraded.",
+        "responses": {
+          "200": { "description": "Service is ready (overall=ok) or degraded but still serving (overall=degraded). The body's checks[] enumerates per-component status.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReadinessResponse" } } } },
+          "503": { "description": "Critical component failed — pod removed from Service rotation by kubelet. The body's checks[] still enumerates per-component status so an operator can diagnose.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReadinessResponse" } } } }
         }
       }
     },
@@ -2580,6 +2591,28 @@ const openAPISpec = `{
           "migration_version": { "type": "string", "description": "Filename of the highest-applied embedded migration recorded in the platform DB's schema_migrations table (e.g. '022_schema_migrations.sql'). Empty when migration_status='unknown'." },
           "migration_count": { "type": "integer", "description": "Total number of migrations recorded as applied in schema_migrations. 0 when migration_status='unknown'." },
           "migration_status": { "type": "string", "enum": ["ok", "unknown"], "description": "'ok' when the read against schema_migrations succeeded; 'unknown' when the DB was unreachable or the table is absent. The service still returns 200 OK in either case — this field surfaces tracking-read health independently of overall service health." }
+        }
+      },
+      "ReadinessResponse": {
+        "type": "object",
+        "description": "Multi-component readiness envelope returned by GET /readyz. Each check runs in parallel behind a 10-15s cache; overall summarises the worst-status across checks, applying the per-service criticality matrix (platform_db + provisioner_grpc are critical → failed → 503; everything else degrades to 200 + overall=degraded).",
+        "properties": {
+          "overall": { "type": "string", "enum": ["ok", "degraded", "failed"], "description": "Aggregated status across all checks. 'ok' = every check ok; 'degraded' = at least one non-critical check failed/degraded; 'failed' = at least one critical check failed (response code is 503 only in this case)." },
+          "service": { "type": "string", "description": "Identifier for the service answering the probe (e.g. 'instant-api', 'instant-worker', 'instant-provisioner')." },
+          "commit_id": { "type": "string", "description": "Short git SHA of the running binary (same value as /healthz.commit_id)." },
+          "checks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string", "description": "Stable component identifier (e.g. 'platform_db', 'provisioner_grpc', 'brevo', 'razorpay', 'redis', 'do_spaces', 'river')." },
+                "status": { "type": "string", "enum": ["ok", "degraded", "failed"], "description": "Per-component status. Critical components only impact overall=failed; non-critical only impact overall=degraded." },
+                "latency_ms": { "type": "integer", "description": "Wall-clock duration of the last probe in milliseconds." },
+                "last_error": { "type": "string", "description": "Last observed error message (only present when status != 'ok'). Scrubbed of credentials." },
+                "last_check_at": { "type": "string", "format": "date-time", "description": "RFC3339 UTC timestamp of the last probe (may be older than the request if the cache served this response)." }
+              }
+            }
+          }
         }
       },
       "ProvisionRequest": {
