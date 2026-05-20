@@ -185,6 +185,14 @@ var auditConsumerSpec = map[string]auditConsumerExpectation{
 	"backup.requested":         {IntentionallyNoConsumer: true},
 	"restore.requested":        {IntentionallyNoConsumer: true},
 	"connection_url.decrypted": {IntentionallyNoConsumer: true},
+
+	// B18 wave-3 hardening (2026-05-21) — webhook unauthorized-attempt audit
+	// rows. Internal operator-alert kinds (sustained-burst signal), NOT wired
+	// into the customer-email forwarder. Counterparts to billing.charge_undeliverable
+	// and propagation.dead_lettered — the audit row is a dashboard signal, not
+	// a customer notification.
+	"webhook.brevo.unauthorized":    {IntentionallyNoConsumer: true},
+	"webhook.razorpay.unauthorized": {IntentionallyNoConsumer: true},
 }
 
 // ─── Test 1: every constant has a spec entry ──────────────────────────────────
