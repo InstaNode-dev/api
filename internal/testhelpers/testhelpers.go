@@ -617,10 +617,26 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		// 055_forwarder_sent — worker-side send ledger for the event-email
 		// forwarder. Mirrored so a bare-Postgres CI run has the table the
 		// forwarder INSERTs into (ON CONFLICT DO NOTHING) for idempotency.
+		// 059 enriches with audit columns (provider, provider_id, recipient,
+		// template_kind, classification) so support can grep the ledger
+		// for "what happened to email X" without log-spelunking, AND so the
+		// F4 missing-renderer path has a place to write permanent_drop rows.
 		`CREATE TABLE IF NOT EXISTS forwarder_sent (
-			audit_id TEXT PRIMARY KEY,
-			sent_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+			audit_id       TEXT PRIMARY KEY,
+			sent_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+			provider       TEXT NOT NULL DEFAULT 'legacy',
+			provider_id    TEXT NOT NULL DEFAULT '',
+			recipient      TEXT NOT NULL DEFAULT '',
+			template_kind  TEXT NOT NULL DEFAULT '',
+			classification TEXT NOT NULL DEFAULT 'success'
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_forwarder_sent_sent_at
+			ON forwarder_sent (sent_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_forwarder_sent_template_kind_sent_at
+			ON forwarder_sent (template_kind, sent_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_forwarder_sent_perm_drop
+			ON forwarder_sent (sent_at DESC)
+			WHERE classification = 'permanent_drop'`,
 		// 058_pending_propagations — durable retry queue for "tier elevated
 		// in DB but infra regrade not yet applied" scenarios. The api
 		// enqueues a row inside handleSubscriptionCharged AFTER the atomic
