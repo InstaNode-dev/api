@@ -33,6 +33,52 @@ const (
 	razorpayCircuitCooldown  = 60 * time.Second
 )
 
+// RazorpayHTTPTimeoutSeconds is the per-HTTP-call deadline imposed on every
+// outbound Razorpay request by api-side code (P0-2 in
+// CIRCUIT-RETRY-AUDIT-2026-05-20). 30 seconds matches the worker's billing
+// reconciler and is the documented ceiling we treat a hung Razorpay
+// endpoint as "definitely a fault" — past this we record the failure
+// against the breaker and 503 the caller instead of holding a request
+// handler open for minutes.
+//
+// Why explicit and not "rely on the SDK default": the SDK default is 10s,
+// which is BELOW Razorpay's documented p99 for subscription create. A
+// brownout that pushes p99 to 12-25s would silently 10s-fail every
+// checkout without ever flipping the breaker, because the SDK
+// converted the slow response into a generic "context deadline" error
+// every time. 30s lets normal slow-but-healthy responses through,
+// while still bounding the worst-case handler stall.
+//
+// int16 because the SDK's SetTimeout signature uses int16; values >32767
+// seconds would overflow but we're well clear at 30.
+const RazorpayHTTPTimeoutSeconds int16 = 30
+
+// ApplyHTTPTimeout installs the audit-mandated 30-second HTTP timeout on a
+// freshly-constructed razorpay.Client. Every razorpay.NewClient call in
+// the api MUST be funneled through this helper so a future refactor
+// cannot silently regress to the 10s SDK default (or worse, no timeout).
+//
+// Returns the same *razorpay.Client for fluent construction.
+//
+// The SDK's SetTimeout replaces the underlying *http.Client with a fresh
+// one carrying the requested timeout — that's how we override the 10s
+// default. We rely on the SDK guarantee that this is safe to call
+// immediately after NewClient and before any RPC.
+func ApplyHTTPTimeout(c *razorpay.Client) *razorpay.Client {
+	if c == nil {
+		return nil
+	}
+	c.Request.SetTimeout(RazorpayHTTPTimeoutSeconds)
+	return c
+}
+
+// NewTimeoutClient constructs a razorpay.Client with the audit-mandated
+// HTTP timeout already applied. Use this everywhere instead of
+// razorpay.NewClient — it is a one-line drop-in.
+func NewTimeoutClient(keyID, keySecret string) *razorpay.Client {
+	return ApplyHTTPTimeout(razorpay.NewClient(keyID, keySecret))
+}
+
 // sharedBreaker is the package-level Razorpay breaker. Lazy-init so
 // the package can be imported without registering Prometheus metrics
 // in tests that never reach a Razorpay call.
@@ -94,7 +140,10 @@ func (p *Portal) client() (*razorpay.Client, error) {
 	if p.Cfg.RazorpayKeyID == "" || p.Cfg.RazorpayKeySecret == "" {
 		return nil, fmt.Errorf("billing not configured")
 	}
-	return razorpay.NewClient(p.Cfg.RazorpayKeyID, p.Cfg.RazorpayKeySecret), nil
+	// P0-2: 30s HTTP timeout via ApplyHTTPTimeout — never the bare SDK
+	// default (10s) which is below Razorpay's documented p99 for
+	// subscription create.
+	return NewTimeoutClient(p.Cfg.RazorpayKeyID, p.Cfg.RazorpayKeySecret), nil
 }
 
 // SubscriptionID returns the Razorpay subscription id stored on the team (stripe_customer_id column).

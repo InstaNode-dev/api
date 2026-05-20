@@ -2,15 +2,18 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"instant.dev/internal/circuit"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
@@ -90,6 +93,15 @@ func NewClient(addr, secret string) (*Client, *grpc.ClientConn, error) {
 // circuit.ErrOpen WITHOUT issuing the RPC when the breaker is open.
 // A nil breaker is treated as closed (test paths that build the Client
 // as a struct literal don't need the breaker wired).
+//
+// P1-1 (CIRCUIT-RETRY-AUDIT 2026-05-20): not every non-nil error indicates
+// a *server* fault. Caller-side cancellations and bad-input gRPC codes are
+// scrubbed via shouldRecordBreakerErr before reaching Record, so a flood of
+// abandoned clients or malformed requests can no longer trip the breaker
+// for EVERYONE — preventing a self-inflicted /db/new outage caused by one
+// misbehaving caller. nil and "real" upstream errors still flow through
+// Record unchanged, so a genuine provisioner outage still trips the breaker
+// at the documented threshold.
 func callWithBreaker[T any](b *circuit.Breaker, fn func() (T, error)) (T, error) {
 	if b == nil {
 		return fn()
@@ -99,8 +111,66 @@ func callWithBreaker[T any](b *circuit.Breaker, fn func() (T, error)) (T, error)
 		return zero, circuit.ErrOpen
 	}
 	out, err := fn()
-	b.Record(err)
+	if shouldRecordBreakerErr(err) {
+		b.Record(err)
+	} else {
+		// We consumed an Allow() slot — for half-open trial fairness we
+		// must still tell the breaker "this call did not fail" so a
+		// successful trial closes and the half-open slot is released.
+		// Recording a nil here is the documented success path.
+		b.Record(nil)
+	}
 	return out, err
+}
+
+// shouldRecordBreakerErr reports whether err represents a real provisioner
+// fault (Unavailable, ResourceExhausted, server-side DeadlineExceeded,
+// Internal, Unknown, etc.) and should therefore advance the consecutive-
+// failure counter, OR a caller/argument problem (context.Canceled,
+// context.DeadlineExceeded from the *caller's* abandoned ctx, gRPC
+// InvalidArgument / FailedPrecondition / PermissionDenied / Unauthenticated
+// / NotFound) that must NOT count toward tripping.
+//
+// Two reference points for the policy:
+//
+//   - https://grpc.io/docs/guides/error/ — only "service is unavailable"
+//     class errors should drive caller-side circuit logic.
+//   - gRPC's own Wait-For-Ready semantics treat Unavailable distinctly.
+//
+// Returns true for "record as failure", false for "scrub" (treated as a
+// successful trial by the caller, since the inner fn returned but the
+// failure is the *caller's* fault not the server's).
+//
+// nil errs are NEVER passed here — they are recorded as success by Record
+// in the regular path. shouldRecordBreakerErr is only consulted for non-nil.
+func shouldRecordBreakerErr(err error) bool {
+	if err == nil {
+		// Defensive — Record(nil) is success; callers don't need to ask.
+		return true
+	}
+	// Caller-cancelled context. The user closed the browser tab, the
+	// upstream HTTP request timed out, etc. — provisioner side never
+	// saw a problem, so don't punish it.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// gRPC status codes that signal "the request is bad", not "the server
+	// is sick". A flood of these from one misbehaving caller MUST NOT trip
+	// the breaker for everyone else.
+	if st, ok := status.FromError(err); ok {
+		switch st.Code() {
+		case codes.Canceled,
+			codes.InvalidArgument,
+			codes.FailedPrecondition,
+			codes.PermissionDenied,
+			codes.Unauthenticated,
+			codes.NotFound,
+			codes.AlreadyExists,
+			codes.OutOfRange:
+			return false
+		}
+	}
+	return true
 }
 
 // Breaker exposes the underlying breaker for tests and /healthz.

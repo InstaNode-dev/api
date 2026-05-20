@@ -79,12 +79,29 @@ var (
 		Help: "Circuit breaker open transitions (closed→open or half_open→open)",
 	}, []string{"name"})
 
-	// breakerAttempts counts every Allow() call regardless of outcome.
-	// (Allow() = true + Allow() = false combined.) Useful as the
-	// denominator for "what fraction of attempts were short-circuited?".
+	// breakerAttempts counts every Allow() call that admitted the
+	// request (Allow() returned true). NOT the historical "every Allow()
+	// invocation" — P3 hygiene fix per CIRCUIT-RETRY-AUDIT-2026-05-20:
+	// the old semantics inflated the denominator with rejected-while-open
+	// calls, so `attempts - failures` did not equal "successes" and
+	// operators miscomputed success rate.
+	//
+	// New semantics: attempts == calls that actually reached the inner
+	// (sum of successes + failures recorded via Record). Rejected
+	// calls are counted in breakerRejected.
 	breakerAttempts = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "instant_circuit_breaker_attempts_total",
-		Help: "Calls that hit the circuit breaker (Allow() invocations)",
+		Help: "Calls that the breaker admitted to the inner (Allow=true). attempts - failures == successes.",
+	}, []string{"name"})
+
+	// breakerRejected counts every Allow() call that the breaker rejected
+	// (Allow returned false). Added in P3 (CIRCUIT-RETRY-AUDIT-2026-05-20)
+	// so the previously-conflated "rejected while open" signal is its
+	// own metric — used as the numerator in the "what fraction of calls
+	// were short-circuited?" widget.
+	breakerRejected = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_circuit_breaker_rejected_total",
+		Help: "Calls short-circuited by the breaker (Allow=false during open / lost half-open trial CAS)",
 	}, []string{"name"})
 
 	// breakerFailures counts Record(err) calls where err != nil.
@@ -92,7 +109,7 @@ var (
 	// before flipping open.
 	breakerFailures = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "instant_circuit_breaker_failures_total",
-		Help: "Failures recorded against the circuit breaker",
+		Help: "Failures recorded against the breaker. attempts - failures == successes.",
 	}, []string{"name"})
 
 	// breakerState is sampled on every state transition so an NR widget
@@ -188,16 +205,23 @@ func (b *Breaker) WithOnOpen(fn func()) *Breaker {
 // Callers that get `false` MUST NOT call Record() — they didn't make
 // the request, so they can't fail it. Returning ErrOpen from the
 // caller wrapper is the canonical pattern.
+//
+// P3 hygiene (CIRCUIT-RETRY-AUDIT-2026-05-20): attempts is incremented
+// ONLY on the admit path so attempts - failures == successes (the
+// previous semantics counted rejected-while-open calls in attempts and
+// confused operator dashboards). Rejected calls are counted in
+// `instant_circuit_breaker_rejected_total`.
 func (b *Breaker) Allow() bool {
-	breakerAttempts.WithLabelValues(b.name).Inc()
 	openUntilNs := b.openUntil.Load()
 	if openUntilNs == 0 {
-		// Closed — fast path.
+		// Closed — fast path. Admit.
+		breakerAttempts.WithLabelValues(b.name).Inc()
 		return true
 	}
 	now := time.Now().UnixNano()
 	if now < openUntilNs {
 		// Still open; reject.
+		breakerRejected.WithLabelValues(b.name).Inc()
 		return false
 	}
 	// Cooldown elapsed → try to grab the half-open trial slot.
@@ -206,9 +230,11 @@ func (b *Breaker) Allow() bool {
 	if b.halfOpen.CompareAndSwap(false, true) {
 		// Win — transition the gauge so dashboards reflect the trial.
 		breakerState.WithLabelValues(b.name).Set(float64(StateHalfOpen))
+		breakerAttempts.WithLabelValues(b.name).Inc()
 		return true
 	}
 	// Lost the CAS — another goroutine owns the trial. Reject.
+	breakerRejected.WithLabelValues(b.name).Inc()
 	return false
 }
 

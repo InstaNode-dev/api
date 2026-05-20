@@ -90,7 +90,11 @@ type DeployHandler struct {
 	// share the singleton with auth / billing / onboarding handlers.
 	// Left nil = email-confirmed deletion falls back to immediate
 	// destruction (back-compat for pre-FIX-I deploys + local dev).
-	emailClient *email.Client
+	//
+	// email.Mailer (not *email.Client) so the router can wire the
+	// circuit-broken *email.BreakingClient (P0-1
+	// CIRCUIT-RETRY-AUDIT-2026-05-20).
+	emailClient email.Mailer
 }
 
 // NewDeployHandler initialises the handler and selects the compute backend based on
@@ -120,7 +124,7 @@ func NewDeployHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, planReg
 // NewDeployHandler signature stable — every existing test would have
 // otherwise needed updating with a noop email client. Router calls this
 // after construction with the shared singleton.
-func (h *DeployHandler) SetEmailClient(c *email.Client) {
+func (h *DeployHandler) SetEmailClient(c email.Mailer) {
 	h.emailClient = c
 }
 

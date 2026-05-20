@@ -124,6 +124,13 @@ func main() {
 	// deletion confirm) so api-originated mail never reaches a hard-bounced,
 	// unsubscribed, or spam-complaining address. Fail-open on a DB error.
 	emailClient = emailClient.WithSuppressionChecker(models.NewSuppressionChecker(database))
+	// P0-1 (CIRCUIT-RETRY-AUDIT-2026-05-20): wire the email_send_dedup
+	// ledger so every keyed Send* call (the *WithKey variants used by
+	// payment receipts, dunning, team-invite, deletion-confirm) probes
+	// the ledger before sending and records the key after the upstream
+	// provider 2xx'd. A network-glitch retry between provider 2xx and
+	// our handler reading the response collapses to one delivered email.
+	emailClient = emailClient.WithSendLedger(models.NewEmailDedupLedger(database))
 
 	plansPath := os.Getenv("PLANS_PATH")
 	if plansPath == "" {

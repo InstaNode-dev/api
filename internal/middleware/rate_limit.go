@@ -65,6 +65,12 @@ func RateLimit(rdb *redis.Client, cfg RateLimitConfig) fiber.Handler {
 				"request_id", GetRequestID(c),
 			)
 			metrics.RedisErrors.WithLabelValues("rate_limit").Inc()
+			// P2 (CIRCUIT-RETRY-AUDIT-2026-05-20): record the fail-open
+			// trip so the "fail-open rate" alert fires when Redis is
+			// flapping. Semantics are unchanged — we still let the
+			// request through — but the metric makes the loss-of-rate-
+			// limit visible.
+			metrics.FailOpenEvents.WithLabelValues("redis_rate_limit", "redis_unavailable").Inc()
 			// Fail open — do not block the request. We still set the
 			// X-RateLimit-Limit header so the client sees the policy;
 			// "remaining" is unknown so we omit it on the failure path.

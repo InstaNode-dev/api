@@ -298,3 +298,74 @@ func (s *SuppressionChecker) IsSuppressed(ctx context.Context, emailAddr string)
 	}
 	return HasSuppressionFor(ctx, s.db, emailAddr)
 }
+
+// EmailDedupLedger is a DB-backed implementation of the structural
+// email.SendLedger interface — the P0-1
+// (CIRCUIT-RETRY-AUDIT-2026-05-20) idempotency ledger consulted by every
+// keyed transactional send. Backed by the existing email_send_dedup table
+// (migration 056). Two operations:
+//
+//   - Sent(key)            — SELECT 1 WHERE dedup_key = $1; (false, err)
+//                            on DB error per fail-open contract.
+//   - MarkSent(key, kind)  — INSERT ... ON CONFLICT DO NOTHING; a conflict
+//                            is silently ignored (the key was already
+//                            claimed by another caller, which is exactly
+//                            the dedup outcome we want).
+//
+// This is intentionally a thin wrapper around the table. The webhook-dedup
+// caller (sendPaymentReceipt / sendPaymentFailed in handlers/billing.go)
+// still uses ClaimEmailSend for its own pre-send claim semantics — the
+// ledger here is a DEFENSE-IN-DEPTH layer that catches network-glitch
+// retries that occur between the upstream provider's 2xx and our handler
+// reading the response.
+type EmailDedupLedger struct {
+	db *sql.DB
+}
+
+// NewEmailDedupLedger returns a ledger bound to db. A nil db yields a
+// ledger whose Sent always returns (false, nil) and MarkSent is a no-op —
+// the "no-ledger" degrade path, matching the test/bootstrap convention.
+func NewEmailDedupLedger(db *sql.DB) *EmailDedupLedger {
+	return &EmailDedupLedger{db: db}
+}
+
+// Sent reports whether dedupKey has a row in email_send_dedup. Returns
+// (false, err) on DB error so the email Client fails open (sends anyway).
+func (l *EmailDedupLedger) Sent(ctx context.Context, dedupKey string) (bool, error) {
+	if l == nil || l.db == nil {
+		return false, nil
+	}
+	if strings.TrimSpace(dedupKey) == "" {
+		return false, nil
+	}
+	var exists bool
+	err := l.db.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM email_send_dedup WHERE dedup_key = $1)
+	`, dedupKey).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("models.EmailDedupLedger.Sent: %w", err)
+	}
+	return exists, nil
+}
+
+// MarkSent records dedupKey as sent for emailKind. INSERT ... ON CONFLICT
+// DO NOTHING — a duplicate key is silently ignored (that IS the dedup
+// outcome). Returning nil on conflict keeps the caller's success path
+// trivial.
+func (l *EmailDedupLedger) MarkSent(ctx context.Context, dedupKey, emailKind string) error {
+	if l == nil || l.db == nil {
+		return nil
+	}
+	if strings.TrimSpace(dedupKey) == "" {
+		return nil
+	}
+	_, err := l.db.ExecContext(ctx, `
+		INSERT INTO email_send_dedup (dedup_key, email_kind)
+		VALUES ($1, $2)
+		ON CONFLICT (dedup_key) DO NOTHING
+	`, dedupKey, emailKind)
+	if err != nil {
+		return fmt.Errorf("models.EmailDedupLedger.MarkSent: %w", err)
+	}
+	return nil
+}

@@ -16,7 +16,6 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
-	razorpay "github.com/razorpay/razorpay-go"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -102,7 +101,16 @@ const errCheckoutAlreadyOnTier = "already_on_plan"
 type BillingHandler struct {
 	db    *sql.DB
 	cfg   *config.Config
-	email *email.Client
+	// email is the Mailer used for all webhook-triggered sends (payment
+	// receipts, payment-failed dunning, etc.). The interface lets main.go
+	// wrap the underlying *email.Client in a *email.BreakingClient — a
+	// process-wide consecutive-failure circuit breaker — so a Brevo
+	// brownout fast-fails after N consecutive errors instead of freezing
+	// every webhook handler on the SDK timeout (P0-1
+	// CIRCUIT-RETRY-AUDIT-2026-05-20). Tests pass either the bare
+	// *email.Client (via NewBillingHandler) or a fake that satisfies
+	// the interface.
+	email email.Mailer
 
 	// rdb is the Redis client used by the BB2-D5 server-side dedup guard
 	// on CreateCheckoutAPI (the SETNX `team_checkout_inflight:<team_id>`
@@ -160,7 +168,7 @@ type BillingHandler struct {
 // then assign the field directly (e.g. `bh.CreateSubscription = ...`) BEFORE
 // the handler is exercised; that single-goroutine setup overwrites the default
 // with no race.
-func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient *email.Client) *BillingHandler {
+func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient email.Mailer) *BillingHandler {
 	h := &BillingHandler{db: db, cfg: cfg, email: emailClient}
 	// Default to the real Razorpay portal; tests override this field directly.
 	h.FetchSubscriptionDetails = func(subID string) (*razorpaybilling.SubscriptionDetails, error) {
@@ -170,7 +178,12 @@ func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient *email.Client
 	// CreateSubscription mints a new Razorpay subscription. Wired once here so
 	// CreateCheckoutAPI never mutates the field per-request (see the doc above).
 	h.CreateSubscription = func(subBody map[string]any) (map[string]any, error) {
-		client := razorpay.NewClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
+		// P0-2 (CIRCUIT-RETRY-AUDIT-2026-05-20): NewTimeoutClient applies the
+		// audit-mandated 30s HTTP timeout. Never razorpay.NewClient directly —
+		// the SDK default is 10s, below Razorpay's documented p99 for
+		// subscription create, so a brownout would 10s-fail every checkout
+		// without ever flipping the breaker.
+		client := razorpaybilling.NewTimeoutClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
 		return razorpaybilling.CallWithBreaker(func() (map[string]any, error) {
 			return client.Subscription.Create(subBody, nil)
 		})
@@ -178,7 +191,8 @@ func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient *email.Client
 	// FetchCheckoutSubscription GETs a subscription's status + short_url for the
 	// F7 reuse probe. Wired once here for the same reason as CreateSubscription.
 	h.FetchCheckoutSubscription = func(subscriptionID string) (string, string, error) {
-		client := razorpay.NewClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
+		// P0-2: 30s HTTP timeout via NewTimeoutClient (see CreateSubscription).
+		client := razorpaybilling.NewTimeoutClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
 		sub, err := razorpaybilling.CallWithBreaker(func() (map[string]any, error) {
 			return client.Subscription.Fetch(subscriptionID, nil, nil)
 		})
@@ -1703,7 +1717,11 @@ func (h *BillingHandler) handlePaymentFailed(ctx context.Context, c *fiber.Ctx, 
 		}
 	}
 
-	if err := h.email.SendPaymentFailed(ctx, pay.Email, pay.AttemptCount, nil); err != nil {
+	// P0-1: thread the per-cycle dedup key through to the email-layer
+	// ledger + provider Idempotency-Key header so a network-glitch retry
+	// (caller perceives the send failed, retries with the same key)
+	// collapses at both layers.
+	if err := h.email.SendPaymentFailedWithKey(ctx, pay.Email, dunningDedupKey(pay.Email), pay.AttemptCount, nil); err != nil {
 		slog.Error("billing.payment.failed.email_failed",
 			"error", err, "to", models.MaskEmail(pay.Email), "payment_id", pay.ID)
 		return fmt.Errorf("payment.failed email send: %w", err)
@@ -1807,7 +1825,9 @@ func (h *BillingHandler) handleSubscriptionPending(ctx context.Context, c *fiber
 		}
 	}
 
-	if err := h.email.SendPaymentFailed(ctx, owner.Email, subscriptionPendingAttemptCount, nil); err != nil {
+	// P0-1: keyed variant so a network-glitch retry collapses at the
+	// email-layer ledger + the upstream provider's Idempotency-Key.
+	if err := h.email.SendPaymentFailedWithKey(ctx, owner.Email, dunningDedupKey(owner.Email), subscriptionPendingAttemptCount, nil); err != nil {
 		slog.Error("billing.subscription.pending.email_failed",
 			"error", err, "to", models.MaskEmail(owner.Email), "team_id", teamID, "sub_id", sub.ID)
 		return fmt.Errorf("subscription.pending email send: %w", err)
@@ -2671,8 +2691,14 @@ func (h *BillingHandler) sendPaymentReceipt(ctx context.Context, teamID uuid.UUI
 
 	// C4 per-cycle dedup. A (false, nil) claim means another event of this
 	// same billing cycle already sent the receipt — skip silently.
+	//
+	// receiptKey is also threaded down to SendPaymentSucceededWithKey
+	// (P0-1) so the email-layer ledger + upstream provider header collapse
+	// a network-glitch retry independently of this pre-send claim.
+	var receiptKey string
 	if sub, ok := parseSubscriptionEntity(event); ok {
 		if key := receiptDedupKey(sub, event); key != "" {
+			receiptKey = key
 			claimed, claimErr := models.ClaimEmailSend(ctx, h.db, key, models.EmailSendKindReceipt)
 			if claimErr != nil {
 				slog.Warn("billing.subscription.charged.receipt_dedup_failed",
@@ -2710,7 +2736,7 @@ func (h *BillingHandler) sendPaymentReceipt(ctx context.Context, teamID uuid.UUI
 		// definite figure.
 		AmountKnown: paymentID != "" && amountMinor > 0,
 	}
-	if err := h.email.SendPaymentSucceeded(ctx, owner.Email, receipt); err != nil {
+	if err := h.email.SendPaymentSucceededWithKey(ctx, owner.Email, receiptKey, receipt); err != nil {
 		slog.Warn("billing.subscription.charged.receipt_send_failed",
 			"error", err, "team_id", teamID, "to", models.MaskEmail(owner.Email))
 		return
