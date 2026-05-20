@@ -452,7 +452,32 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// POST /storage/:token/presign — broker-mode access path. Authentication is
 	// the token in the URL (the same token returned by /storage/new). Used by
 	// agents on DO Spaces today where no long-lived credential is issued.
-	app.Post("/storage/:token/presign", storageH.PresignStorage)
+	// Middleware chain (B17-P0, 2026-05-20):
+	//   - OptionalAuth — non-strict: a session JWT is OPTIONAL. When
+	//     present, the handler cross-checks the JWT's team_id against
+	//     the resource's team_id (a leaked token + a legit but
+	//     different-team session must not be able to impersonate the
+	//     resource owner). Bad/expired JWTs silently drop to anonymous
+	//     here — strict mode would 401 every anonymous broker access
+	//     loop, which is the common case.
+	//   - PresignTokenRateLimit — per-:token sliding window
+	//     (10/min/token). Complements the global per-IP RateLimit at
+	//     app.Use scope: a leaked token used from a botnet of distinct
+	//     IPs is throttled by THIS counter even when the per-IP limiter
+	//     sees only one hit per source. See
+	//     internal/middleware/presign_token_rate_limit.go for the
+	//     algorithm.
+	//   - Idempotency — Stripe-shape Idempotency-Key + body-fingerprint
+	//     fallback, matching every other mutating endpoint. Without
+	//     this, an agent's retry of a transient 5xx mints two presigned
+	//     URLs from the same logical request, each consuming a slot in
+	//     the per-token rate limit.
+	app.Post("/storage/:token/presign",
+		middleware.OptionalAuth(cfg),
+		middleware.PresignTokenRateLimit(rdb),
+		middleware.Idempotency(rdb, "storage.presign"),
+		storageH.PresignStorage,
+	)
 	app.Post("/webhook/new", middleware.OptionalAuthStrict(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "webhook.new"), webhookH.NewWebhook)
 	// /webhook/receive/:token is registered with app.All so any HTTP method
 	// (GET for Slack URL verification, POST for the bulk of webhook senders,

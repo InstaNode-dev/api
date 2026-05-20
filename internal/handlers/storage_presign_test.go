@@ -13,6 +13,38 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TestIsSafePresignKey covers the B17-P0 hard-reject contract. Pre-B17
+// the handler silently stripped "../" segments — the new contract is to
+// 400 path_unsafe on any traversal token, so the sanitiser becomes pure
+// defense-in-depth. isSafePresignKey is the boolean gate that drives the
+// rejection.
+func TestIsSafePresignKey(t *testing.T) {
+	cases := map[string]bool{
+		"":                false, // empty key is invalid (separate invalid_key gate, but isSafe is also false)
+		"file.txt":        true,
+		"a/b/c":           true,
+		"a/b/c.bin":       true,
+		"valid-key.bin":   true,
+		"path/with-dash":  true,
+		"path with space": true, // spaces are fine in S3 keys
+		"deep/nested/path/with/many/segments/file.txt": true,
+
+		"/file.txt":    false, // leading slash is rejected
+		"//file.txt":   false,
+		"../etc":       false, // ".." segment
+		"../../escape": false,
+		"a/../b":       false, // ".." anywhere
+		"./file.txt":   false, // "." segment
+		"a/./b":        false,
+		"a//b":         false, // empty segment (double slash)
+		"trailing/":    false, // trailing slash = empty trailing segment
+	}
+	for in, want := range cases {
+		got := isSafePresignKey(in)
+		assert.Equalf(t, want, got, "isSafePresignKey(%q)", in)
+	}
+}
+
 // TestSanitisePresignKey verifies the path-traversal trim used by the
 // presign handler. Any tenant-supplied "../" component would let a leaked
 // URL escape the resource's prefix; the sanitiser must drop those.
