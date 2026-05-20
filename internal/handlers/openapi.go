@@ -2216,6 +2216,41 @@ const openAPISpec = `{
         }
       }
     },
+    "/webhooks/brevo/{secret}": {
+      "post": {
+        "summary": "Receive a Brevo transactional-email delivery event (PUBLIC, URL-token auth)",
+        "description": "Brevo POSTs here for every transactional event (delivered, soft_bounce, hard_bounce, blocked, complaint, deferred, unsubscribed, error). Authentication is by URL token: the {secret} path segment is constant-time-compared against the BREVO_WEBHOOK_SECRET env var (Brevo's transactional webhooks don't carry HMAC signatures by default — the URL-token approach works even when per-callback signing is disabled in their dashboard). Behaviour: matched events update the forwarder_sent ledger row keyed by (provider='brevo', provider_id=message-id), setting classification to the event outcome and (for 'delivered' only) stamping delivered_at = now(). Unknown messageIds return 200 with matched=false (Brevo retries on 5xx — orphan events MUST NOT amplify retry traffic). Unhandled event types (request/click/open/etc.) return 200 with skipped=true. Single-event payloads only — Brevo's optional batched-array endpoint must be disabled in the dashboard. Operator setup: paste https://api.instanode.dev/webhooks/brevo/<SECRET> into Brevo dashboard → Transactional → Settings → Webhook URL, ensure single-event-per-call is selected, and toggle on every event we care about. Closes the '201 ≠ delivered' gap: the worker still stamps classification='success' on Brevo's 201 (API acceptance), but the receiver overwrites that with the real outcome the moment Brevo's relay decides. CLAUDE.md rule 12 verification surface: ledger classification, NOT 201.",
+        "parameters": [
+          { "name": "secret", "in": "path", "required": true, "schema": { "type": "string", "minLength": 32 }, "description": "Shared secret matching BREVO_WEBHOOK_SECRET. Mismatch returns 401. Never log or echo this value." }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "Brevo transactional webhook event (single-event payload). See https://developers.brevo.com/docs/transactional-webhooks. Only the fields below are consumed; additional fields (tags, link, ts_epoch, ts_event, sending_ip, message_id_v3, ...) are accepted and ignored.",
+                "properties": {
+                  "event":      { "type": "string", "enum": ["delivered","soft_bounce","hard_bounce","blocked","complaint","spam","deferred","unsubscribed","error"], "description": "Brevo event name. 'spam' is an alias for 'complaint' (older integrations)." },
+                  "email":      { "type": "string", "description": "Recipient address. Logged masked-only." },
+                  "message-id": { "type": "string", "description": "Brevo's opaque messageId — the lookup key against forwarder_sent.provider_id." },
+                  "subject":    { "type": "string", "description": "Subject line at send time. Optional; not persisted." },
+                  "reason":     { "type": "string", "description": "Free-text reason for failure events (bounces, blocked, error). Logged but not persisted; raw payload is never stored." },
+                  "date":       { "type": "string", "description": "Brevo-side event timestamp. We stamp delivered_at = NOW() server-side instead of trusting upstream clock." }
+                },
+                "required": ["event"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Event accepted. Body: { ok:true, matched:<bool>, event:<string> } when a ledger row was located; { ok:true, skipped:true } when the event type isn't tracked; { ok:true, matched:false, event:<string> } when no row matched the messageId (logged WARN — Brevo dashboard test / cross-cluster traffic / legacy row)." },
+          "400": { "description": "invalid_payload (malformed JSON) OR payload_too_large (> 16 KiB)" },
+          "401": { "description": "unauthorized — URL :secret did not match BREVO_WEBHOOK_SECRET" },
+          "500": { "description": "internal_error — DB unreachable. Brevo retries with exponential backoff, which is the right behaviour." }
+        }
+      }
+    },
     "/api/v1/stacks": {
       "get": {
         "summary": "List all stacks owned by the caller's team",

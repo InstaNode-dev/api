@@ -621,6 +621,13 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		// template_kind, classification) so support can grep the ledger
 		// for "what happened to email X" without log-spelunking, AND so the
 		// F4 missing-renderer path has a place to write permanent_drop rows.
+		// 061_forwarder_sent_delivery — extends the ledger with delivered_at
+		// so the Brevo transactional-webhook receiver can stamp the actual
+		// SMTP-relay outcome (vs the API-acceptance the worker stamps at send
+		// time). Closes the "201 ≠ delivered" gap. The classification column
+		// stays free-form TEXT; the receiver writes additional values
+		// ('delivered','bounced_hard','bounced_soft','rejected','complaint',
+		// 'deferred','unsubscribed') on top of the worker's 'success'/'permanent_drop'.
 		`CREATE TABLE IF NOT EXISTS forwarder_sent (
 			audit_id       TEXT PRIMARY KEY,
 			sent_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -628,8 +635,14 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			provider_id    TEXT NOT NULL DEFAULT '',
 			recipient      TEXT NOT NULL DEFAULT '',
 			template_kind  TEXT NOT NULL DEFAULT '',
-			classification TEXT NOT NULL DEFAULT 'success'
+			classification TEXT NOT NULL DEFAULT 'success',
+			delivered_at   TIMESTAMPTZ NULL
 		)`,
+		// 061_forwarder_sent_delivery — ALTER for already-populated test
+		// DBs created before migration 061 landed. The CREATE TABLE IF
+		// NOT EXISTS above carries the column for fresh DBs; this ALTER
+		// keeps reused test DBs in sync.
+		`ALTER TABLE forwarder_sent ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_forwarder_sent_sent_at
 			ON forwarder_sent (sent_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_forwarder_sent_template_kind_sent_at
@@ -637,6 +650,11 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`CREATE INDEX IF NOT EXISTS idx_forwarder_sent_perm_drop
 			ON forwarder_sent (sent_at DESC)
 			WHERE classification = 'permanent_drop'`,
+		`CREATE INDEX IF NOT EXISTS idx_forwarder_sent_delivered_at
+			ON forwarder_sent (delivered_at DESC)
+			WHERE delivered_at IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_forwarder_sent_provider_provider_id
+			ON forwarder_sent (provider, provider_id)`,
 		// 058_pending_propagations — durable retry queue for "tier elevated
 		// in DB but infra regrade not yet applied" scenarios. The api
 		// enqueues a row inside handleSubscriptionCharged AFTER the atomic
