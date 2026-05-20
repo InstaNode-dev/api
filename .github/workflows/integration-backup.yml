@@ -1,0 +1,106 @@
+# instant.dev/api — Weekly backup/restore integration test
+#
+# What this runs:
+#   The `integration_backup`-tagged Go tests in api/e2e/
+#   (backup_restore_integration_test.go). Tests invoke
+#   ../../infra/scripts/restore-drill.sh against the cluster pointed to
+#   by KUBECONFIG_TEST_CLUSTER and assert RTO/RPO + cleanup + alert YAML.
+#
+# Cluster safety:
+#   This workflow MUST NEVER run against the prod cluster. The drill
+#   script itself enforces this on its end (refuses to run outside the
+#   `do-nyc3-instant-prod` context name). The workflow uses a SEPARATE
+#   secret KUBECONFIG_TEST_CLUSTER which the operator points at a
+#   non-prod context.
+#
+# Why weekly:
+#   The drill creates a throwaway namespace + pod, which holds slots
+#   for ~2 minutes. Running on every PR would burn cluster capacity for
+#   marginal extra signal. Weekly catches:
+#     - the alert YAML / Prom rule has drifted from the published
+#       36h+60h thresholds
+#     - the script's cleanup path is broken
+#     - the actual RTO/RPO crosses the SLA
+#   Manual trigger via workflow_dispatch for ad-hoc operator validation.
+#
+# Companion runbook: infra/BACKUP-RESTORE-RUNBOOK.md
+
+name: Integration · Backup Restore
+
+on:
+  schedule:
+    # 04:00 UTC Sunday — 1h after the nightly backup CronJob windows
+    # so the most-recent artifact is fresh and the RPO assertion is
+    # exercised against a real new backup.
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-backup
+  cancel-in-progress: false
+
+jobs:
+  backup-restore-drill:
+    name: Restore drill (test cluster)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ vars.INTEGRATION_BACKUP_ENABLED == 'true' }}
+    steps:
+      - name: Check out api
+        uses: actions/checkout@v4
+        with:
+          path: api
+      - name: Check out infra (sibling repo with restore-drill.sh)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/infra
+          path: infra
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+      - name: Materialise drill kubeconfig
+        env:
+          KUBECONFIG_TEST_CLUSTER: ${{ secrets.KUBECONFIG_TEST_CLUSTER }}
+        run: |
+          if [ -z "$KUBECONFIG_TEST_CLUSTER" ]; then
+            echo "::error::KUBECONFIG_TEST_CLUSTER secret is empty — refusing to run drill against unknown cluster"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/kube"
+          printf '%s' "$KUBECONFIG_TEST_CLUSTER" | base64 -d > "$RUNNER_TEMP/kube/config"
+          chmod 0600 "$RUNNER_TEMP/kube/config"
+          # Defensive: refuse to proceed if the kubeconfig context name
+          # contains 'prod' — second backstop beyond the drill script's
+          # own gate.
+          ctx=$(KUBECONFIG="$RUNNER_TEMP/kube/config" kubectl config current-context)
+          case "$ctx" in
+            *prod*|*production*)
+              echo "::error::KUBECONFIG_TEST_CLUSTER context name is '$ctx' — looks like prod, refusing to run drill"
+              exit 1
+              ;;
+          esac
+          echo "Drill context: $ctx"
+      - name: Run integration_backup tests
+        env:
+          KUBECONFIG_DRILL: ${{ runner.temp }}/kube/config
+          DRILL_SCRIPT_PATH: ${{ github.workspace }}/infra/scripts/restore-drill.sh
+        working-directory: api
+        run: |
+          go test -tags integration_backup -v -timeout 25m ./e2e/...
+      - name: Surface alert-config drift (non-cluster tests)
+        if: always()
+        env:
+          DRILL_SCRIPT_PATH: ${{ github.workspace }}/infra/scripts/restore-drill.sh
+        working-directory: api
+        run: |
+          # Re-run only the static-asset tests with no KUBECONFIG_DRILL —
+          # these are pure-parse tests and run even when the cluster
+          # arm above SKIPPed.
+          go test -tags integration_backup -run 'TestBackupRestore_NRAlert|TestBackupRestore_PromRule' -v ./e2e/...
