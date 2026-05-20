@@ -114,7 +114,16 @@ type Resource struct {
 	// to prevent tight-loop re-sweeping of the same pending row. Added by
 	// migration 030_resource_heartbeat.
 	LastReconciledAt sql.NullTime
-	CreatedAt        time.Time
+	// AuthMode is the credential isolation mode for the resource.
+	//   "isolated"     — per-tenant credential (the default for new provisions
+	//                    after the operator-mode cutover; default for every
+	//                    resource type other than queue)
+	//   "legacy_open"  — grandfathered pre-cutover queue row with no auth;
+	//                    kept working until it recycles. New provisions never
+	//                    use this mode.
+	// Added by migration 060_resources_auth_mode.sql (MR-P0-5, 2026-05-20).
+	AuthMode  string
+	CreatedAt time.Time
 }
 
 // ErrResourceNotFound is returned when a resource lookup yields no rows.
@@ -151,7 +160,7 @@ type CreateResourceParams struct {
 const resourceColumns = `id, team_id, token, resource_type, name, connection_url, key_prefix, tier,
        env, fingerprint, cloud_vendor, country_code, status, migration_status,
        expires_at, storage_bytes, provider_resource_id, created_request_id, parent_resource_id, paused_at,
-       last_seen_at, degraded, degraded_reason, last_reconciled_at, created_at`
+       last_seen_at, degraded, degraded_reason, last_reconciled_at, auth_mode, created_at`
 
 // scanResource reads a single resources row in the order defined by resourceColumns.
 func scanResource(row interface {
@@ -165,7 +174,7 @@ func scanResource(row interface {
 		&r.MigrationStatus, &r.ExpiresAt, &r.StorageBytes, &r.ProviderResourceID, &r.CreatedRequestID,
 		&parentID, &r.PausedAt,
 		&r.LastSeenAt, &r.Degraded, &r.DegradedReason, &r.LastReconciledAt,
-		&r.CreatedAt,
+		&r.AuthMode, &r.CreatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -594,6 +603,25 @@ func UpdateConnectionURL(ctx context.Context, db *sql.DB, resourceID uuid.UUID, 
 	`, encryptedURL, resourceID)
 	if err != nil {
 		return fmt.Errorf("models.UpdateConnectionURL: %w", err)
+	}
+	return nil
+}
+
+// SetResourceAuthMode updates a resource's auth_mode. Used by the queue
+// handler to mark a row 'legacy_open' when the staged-cutover queueprovider
+// returned unisolated credentials (operator seed not configured yet). New
+// rows default to 'isolated' via the column default — callers only need to
+// call this when they need to flip to 'legacy_open'.
+// MR-P0-5 (NATS per-tenant isolation, 2026-05-20).
+func SetResourceAuthMode(ctx context.Context, db *sql.DB, resourceID uuid.UUID, authMode string) error {
+	if authMode != "isolated" && authMode != "legacy_open" {
+		return fmt.Errorf("models.SetResourceAuthMode: invalid auth_mode %q", authMode)
+	}
+	_, err := db.ExecContext(ctx, `
+		UPDATE resources SET auth_mode = $1 WHERE id = $2
+	`, authMode, resourceID)
+	if err != nil {
+		return fmt.Errorf("models.SetResourceAuthMode: %w", err)
 	}
 	return nil
 }

@@ -168,6 +168,22 @@ var (
 		Help: "Teardown sweeps where compute was destroyed but the row could not be marked 'deleted'",
 	})
 
+	// NatsAuthFailures counts NATS credential-issuance failures from the
+	// common/queueprovider abstraction. MR-P0-5 (NATS per-tenant isolation,
+	// 2026-05-20). A non-zero rate is almost always one of:
+	//   - the operator seed in the nats-operator Secret is out of sync with
+	//     the running nats-server's operator JWT (rotate one without the
+	//     other and you get this);
+	//   - the resolver push subject is unreachable from the api pod (network
+	//     policy / SYS account creds wrong);
+	//   - the embedded jwt/v2 lib failed to sign for an unexpected reason.
+	// Alert at rate > 0 for 5 min — every failure means a tenant landed on
+	// the legacy_open path instead of getting real isolation.
+	NatsAuthFailures = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "nats_auth_failures_total",
+		Help: "NATS credential issuance failures (operator seed mismatch, resolver unreachable, signing error)",
+	})
+
 	// GoroutinePanics counts panics recovered inside fire-and-forget
 	// goroutines by the safego helper. Any non-zero value means a background
 	// task crashed but the pod survived — alert on rate() > 0. The `task`

@@ -30,6 +30,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	commonqp "instant.dev/common/queueprovider"
 	"instant.dev/internal/config"
 	"instant.dev/internal/crypto"
 	"instant.dev/internal/metrics"
@@ -47,6 +48,11 @@ type QueueHandler struct {
 	provisionHelper
 	queueProvider *queueprovider.Provider // non-nil when PROVISIONER_ADDR is unset
 	provClient    *provisioner.Client     // non-nil when PROVISIONER_ADDR is set (future)
+	// credProvider issues per-tenant credentials via the common/queueprovider
+	// abstraction (MR-P0-5 — NATS per-tenant isolation). Returned creds may
+	// be AuthMode=isolated (real per-tenant account JWT) or
+	// AuthMode=legacy_open (no auth — staged-cutover fallback).
+	credProvider commonqp.QueueCredentialProvider
 }
 
 // NewQueueHandler constructs a QueueHandler.
@@ -59,6 +65,25 @@ func NewQueueHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, provClie
 	// does not yet have a ProvisionQueue RPC. When it does, wire it here like
 	// CacheHandler.provisionCache does.
 	h.queueProvider = queueprovider.New(cfg.NATSHost)
+	// Build the credential issuer. Falls back to legacy_open when no operator
+	// seed is configured so api can deploy before the operator-key generation.
+	if cp, err := buildQueueProvider(cfg); err == nil {
+		h.credProvider = cp
+	} else {
+		slog.Error("queue.cred_provider_init_failed_fallback_legacy_open",
+			"error", err,
+			"backend", cfg.QueueBackend)
+		// Defensive: never leave h.credProvider nil. The legacyopen provider
+		// is always registered so this fallback always succeeds.
+		fallback, _ := commonqp.Factory(commonqp.Config{
+			Backend:    "legacy_open",
+			Host:       cfg.NATSHost,
+			PublicHost: cfg.NATSPublicHost,
+			Port:       4222,
+			UseTLS:     cfg.NATSUseTLS,
+		})
+		h.credProvider = fallback
+	}
 	return h
 }
 
@@ -80,6 +105,39 @@ func (h *QueueHandler) provisionQueue(ctx context.Context, token, tier, teamID s
 		}, nil
 	}
 	return h.queueProvider.Provision(ctx, token, tier)
+}
+
+// issueTenantCreds asks the common/queueprovider abstraction for a per-tenant
+// credential. Returns (nil, nil) when the resolved credential is legacy_open
+// (no creds to embed) so the caller can keep the existing response shape;
+// returns a populated TenantCreds when isolation is in effect.
+//
+// MR-P0-5 (2026-05-20): this is the single point where /queue/new transitions
+// from "shared unauthenticated NATS" to "per-tenant accounts + signed user
+// JWTs". Other backends (rabbitmq, kafka, future) plug in here without
+// touching the handler.
+func (h *QueueHandler) issueTenantCreds(ctx context.Context, token, subjectPrefix string) (*commonqp.TenantCreds, error) {
+	if h.credProvider == nil {
+		return nil, nil
+	}
+	creds, err := h.credProvider.IssueTenantCredentials(ctx, commonqp.IssueRequest{
+		ResourceToken: token,
+		Subject:       subjectPrefix,
+		TTL:           0, // long-lived; the resource row lifetime controls expiry
+	})
+	if err != nil {
+		// Don't fail the provision over creds-issuance — log + return nil and
+		// the handler will fall back to the legacy_open response shape. The
+		// row will get auth_mode='legacy_open' and the worker reaper will
+		// recycle it next sweep.
+		metrics.NatsAuthFailures.Inc()
+		slog.Error("queue.cred_issue_failed_fallback_legacy_open",
+			"error", err,
+			"token", token,
+			"backend", h.credProvider.Name())
+		return nil, err
+	}
+	return creds, nil
 }
 
 // NewQueue handles POST /queue/new.
@@ -233,6 +291,15 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		return respondProvisionFailed(c, err, "Failed to provision NATS credentials")
 	}
 
+	// MR-P0-5: issue per-tenant credentials via the queueprovider abstraction.
+	// May return AuthMode=isolated (real per-tenant account JWT) or
+	// AuthMode=legacy_open (no auth — staged-cutover fallback).
+	tenantCreds, _ := h.issueTenantCreds(ctx, tokenStr, creds.SubjectPrefix)
+	authMode := commonqp.AuthModeLegacyOpen
+	if tenantCreds != nil && tenantCreds.AuthMode != "" {
+		authMode = tenantCreds.AuthMode
+	}
+
 	// MR-P0-2 / MR-P0-3: persist connection URL + PRID and flip the row
 	// pending→active. Any persistence failure tears down the backend NATS
 	// resource and returns 503, never a 201.
@@ -241,6 +308,15 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 	); finErr != nil {
 		metrics.ProvisionFailures.WithLabelValues("queue", "persist_error").Inc()
 		return respondProvisionFailed(c, finErr, "Failed to persist queue resource")
+	}
+	// Persist the auth_mode on the row. Best-effort — a failure here is
+	// non-fatal (the row already lives with the column default 'isolated';
+	// only legacy_open needs an explicit UPDATE).
+	if authMode == commonqp.AuthModeLegacyOpen {
+		if err := models.SetResourceAuthMode(ctx, h.db, resource.ID, authMode); err != nil {
+			slog.Warn("queue.new.set_auth_mode_failed_non_fatal",
+				"error", err, "resource_id", resource.ID, "auth_mode", authMode, "request_id", requestID)
+		}
 	}
 
 	jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "queue", []string{tokenStr})
@@ -287,6 +363,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
 		"subject_prefix": creds.SubjectPrefix,
+		"auth_mode":      authMode,
 		"tier":           "anonymous",
 		"env":            resource.Env,
 		"limits":         h.queueAnonymousLimits(),
@@ -294,12 +371,52 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		"upgrade":        upgradeURL,
 		"upgrade_jwt":    jwtToken,
 	}
+	// MR-P0-5: when isolated creds are minted, surface them. Tenant clients
+	// pass nats_jwt + nats_nkey to nats.UserJWTAndSeed(), or write the
+	// creds_file blob to disk and pass it to nats.UserCredentials(path).
+	addQueueCredentials(queueResp, tenantCreds)
 	// T19 P0-2 (BugHunt 2026-05-20): emit top-level expires_at for
 	// shape parity with storage/webhook responses; see db.go for rationale.
 	if resource.ExpiresAt.Valid {
 		queueResp["expires_at"] = resource.ExpiresAt.Time.Format(time.RFC3339)
 	}
 	return respondCreated(c, queueResp)
+}
+
+// addQueueCredentials embeds the per-tenant credentials into the /queue/new
+// response when the queueprovider returned isolated creds. Legacy-open creds
+// (no JWT, no NKey) leave the response shape untouched — the caller still
+// gets the unauthenticated connection_url for now and the row carries
+// auth_mode=legacy_open so the worker reaper can recycle it on schedule.
+func addQueueCredentials(resp fiber.Map, creds *commonqp.TenantCreds) {
+	if creds == nil || creds.AuthMode != commonqp.AuthModeIsolated {
+		return
+	}
+	credMap := fiber.Map{
+		"auth_mode": creds.AuthMode,
+	}
+	if creds.JWT != "" {
+		credMap["nats_jwt"] = creds.JWT
+	}
+	if creds.NKey != "" {
+		credMap["nats_nkey"] = creds.NKey
+	}
+	if creds.CredsFile != "" {
+		credMap["creds_file"] = creds.CredsFile
+	}
+	if creds.Username != "" {
+		credMap["username"] = creds.Username
+	}
+	if creds.Password != "" {
+		credMap["password"] = creds.Password
+	}
+	if creds.KeyID != "" {
+		credMap["key_id"] = creds.KeyID
+	}
+	if creds.ExpiresAt != nil {
+		credMap["expires_at"] = creds.ExpiresAt.Format(time.RFC3339)
+	}
+	resp["credentials"] = credMap
 }
 
 func (h *QueueHandler) newQueueAuthenticated(
@@ -396,6 +513,13 @@ func (h *QueueHandler) newQueueAuthenticated(
 		return respondProvisionFailed(c, err, "Failed to provision NATS credentials")
 	}
 
+	// MR-P0-5: issue per-tenant credentials via the queueprovider abstraction.
+	tenantCreds, _ := h.issueTenantCreds(ctx, tokenStr, creds.SubjectPrefix)
+	authMode := commonqp.AuthModeLegacyOpen
+	if tenantCreds != nil && tenantCreds.AuthMode != "" {
+		authMode = tenantCreds.AuthMode
+	}
+
 	// MR-P0-2 / MR-P0-3: persist + flip pending→active; a persistence failure
 	// tears down the backend NATS resource and returns 503, never a 201.
 	if finErr := h.finalizeProvision(ctx, resource, creds.URL, "", creds.ProviderResourceID, requestID, "queue.new.auth",
@@ -403,6 +527,12 @@ func (h *QueueHandler) newQueueAuthenticated(
 	); finErr != nil {
 		metrics.ProvisionFailures.WithLabelValues("queue", "persist_error").Inc()
 		return respondProvisionFailed(c, finErr, "Failed to persist queue resource")
+	}
+	if authMode == commonqp.AuthModeLegacyOpen {
+		if err := models.SetResourceAuthMode(ctx, h.db, resource.ID, authMode); err != nil {
+			slog.Warn("queue.new.set_auth_mode_failed_non_fatal_auth",
+				"error", err, "resource_id", resource.ID, "auth_mode", authMode, "request_id", requestID)
+		}
 	}
 
 	slog.Info("provision.success",
@@ -425,6 +555,7 @@ func (h *QueueHandler) newQueueAuthenticated(
 		"name":           resource.Name.String,
 		"connection_url": creds.URL,
 		"subject_prefix": creds.SubjectPrefix,
+		"auth_mode":      authMode,
 		"tier":           tier,
 		"env":            resource.Env,
 		"dedicated":      dedicated,
@@ -432,6 +563,7 @@ func (h *QueueHandler) newQueueAuthenticated(
 			"storage_mb": h.plans.StorageLimitMB(tier, "queue"),
 		},
 	}
+	addQueueCredentials(resp, tenantCreds)
 	setInternalURL(resp, tier, creds.URL, "queue")
 	return respondCreated(c, resp)
 }

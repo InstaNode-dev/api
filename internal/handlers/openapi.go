@@ -2660,8 +2660,22 @@ const openAPISpec = `{
           "id": { "type": "string", "format": "uuid", "description": "Resource row id." },
           "token": { "type": "string", "format": "uuid" },
           "name": { "type": "string", "description": "Human-readable label supplied on the request (or the generated default)." },
-          "connection_url": { "type": "string", "description": "nats:// connection string with per-account subject isolation. Use this from external callers." },
+          "connection_url": { "type": "string", "description": "nats:// connection string. After the operator-mode cutover (MR-P0-5, 2026-05-20) this URL is unauthenticated by itself — pair it with the embedded JWT + NKey in the credentials field below." },
           "internal_url": { "type": "string", "description": "Cluster-internal nats:// URL routed via instant-nats-proxy. Use this when calling from a workload deployed inside the instanode cluster." },
+          "auth_mode": { "type": "string", "enum": ["isolated", "legacy_open"], "description": "Credential isolation mode. 'isolated' = per-tenant NATS account JWT in credentials below; 'legacy_open' = grandfathered pre-cutover queue with no auth (will be recycled). MR-P0-5 (NATS per-tenant isolation, 2026-05-20)." },
+          "subject_prefix": { "type": "string", "description": "The subject namespace this resource is scoped to (e.g. 'tenant_<token>.'). Publish/subscribe under {subject_prefix}* only." },
+          "credentials": {
+            "type": "object",
+            "description": "Per-tenant NATS credentials. Present only when auth_mode='isolated'. Use either (nats_jwt + nats_nkey) via nats.UserJWTAndSeed() or write creds_file to disk and pass to nats.UserCredentials(path).",
+            "properties": {
+              "auth_mode": { "type": "string" },
+              "nats_jwt": { "type": "string", "description": "Signed user JWT scoped to this resource's subject prefix." },
+              "nats_nkey": { "type": "string", "description": "User NKey seed (SU... format). SECRET — treat like a password." },
+              "creds_file": { "type": "string", "description": "Pre-rendered .creds blob (combines JWT + NKey). Write to disk and pass path to nats.UserCredentials()." },
+              "key_id": { "type": "string", "description": "Account public key (A... format). Used by the platform for credential revocation." },
+              "expires_at": { "type": "string", "format": "date-time", "description": "Credential expiry. Omitted = long-lived." }
+            }
+          },
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },

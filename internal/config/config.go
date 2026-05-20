@@ -78,6 +78,23 @@ type Config struct {
 	ProvisionerAddr          string // PROVISIONER_ADDR — if set, use gRPC provisioner; if empty, use local providers
 	ProvisionerSecret        string // PROVISIONER_SECRET — metadata token sent to provisioner
 	NATSHost                 string // NATS_HOST — host for building nats:// connection strings
+
+	// Queue backend (MR-P0-5 — NATS per-tenant isolation, 2026-05-20).
+	// QueueBackend selects the queueprovider implementation:
+	//   "nats"        — operator-mode NATS with per-tenant accounts (the
+	//                   target after cutover)
+	//   "legacy_open" — pre-cutover unauthenticated NATS (default during
+	//                   the staged-cutover window when NATS_OPERATOR_SEED
+	//                   is unset)
+	// New rows always default to auth_mode='isolated' on the row, but the
+	// CREDENTIALS returned to the caller depend on the backend selection
+	// here. Falls back to "legacy_open" when NATS_OPERATOR_SEED is empty so
+	// the api can deploy before the operator runs `nsc generate`.
+	QueueBackend         string // QUEUE_BACKEND — "nats" | "legacy_open" | "rabbitmq" | "kafka"
+	NATSPublicHost       string // NATS_PUBLIC_HOST — hostname embedded in customer URLs (default nats.instanode.dev)
+	NATSOperatorSeed     string // NATS_OPERATOR_SEED — operator NKey seed; empty = legacy_open fallback
+	NATSSystemAccountKey string // NATS_SYSTEM_ACCOUNT_PUBLIC_KEY — system account public key
+	NATSUseTLS           bool   // NATS_USE_TLS — true → tls:// URLs
 	R2Endpoint               string // R2_ENDPOINT — R2 endpoint hostname (default: r2.instant.dev)
 	R2BucketName             string // R2_BUCKET_NAME — shared R2 bucket name (default: instant-shared)
 	R2APIToken               string // R2_API_TOKEN — Cloudflare API token; if empty, R2 is not used
@@ -284,6 +301,16 @@ func Load() *Config {
 	cfg.ProvisionerAddr = os.Getenv("PROVISIONER_ADDR") // intentionally empty = use local providers
 	cfg.ProvisionerSecret = os.Getenv("PROVISIONER_SECRET")
 	cfg.NATSHost = getenv("NATS_HOST", "nats.instant-data.svc.cluster.local")
+
+	// Queue backend selection (MR-P0-5 — NATS per-tenant isolation).
+	// Defaults to "nats" — but the `nats` provider itself transparently
+	// degrades to legacy_open creds when NATSOperatorSeed is unset, so
+	// deploys before the operator key generation still work.
+	cfg.QueueBackend = getenv("QUEUE_BACKEND", "nats")
+	cfg.NATSPublicHost = getenv("NATS_PUBLIC_HOST", "nats.instanode.dev")
+	cfg.NATSOperatorSeed = os.Getenv("NATS_OPERATOR_SEED")
+	cfg.NATSSystemAccountKey = os.Getenv("NATS_SYSTEM_ACCOUNT_PUBLIC_KEY")
+	cfg.NATSUseTLS = os.Getenv("NATS_USE_TLS") == "true"
 	cfg.R2Endpoint = getenv("R2_ENDPOINT", "r2.instant.dev")
 	cfg.R2BucketName = getenv("R2_BUCKET_NAME", "instant-shared")
 	cfg.R2APIToken = os.Getenv("R2_API_TOKEN")
