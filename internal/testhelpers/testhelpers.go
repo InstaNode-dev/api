@@ -451,6 +451,15 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		// /webhook/receive/:token. Mirrored here so a fresh SetupTestDB has
 		// the column the receive handler reads at request time.
 		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS hmac_secret TEXT`,
+		// 060_resources_auth_mode — credential isolation mode column for
+		// the NATS per-tenant isolation cutover (MR-P0-5, 2026-05-20).
+		// Mirrored here so a fresh SetupTestDB has the columns the
+		// queue handler reads. New rows default to 'isolated'; pre-cutover
+		// queue rows are backfilled to 'legacy_open' in prod by the
+		// migration. Tests start with a clean schema so the backfill
+		// matches the column default — no UPDATE needed here.
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS auth_mode TEXT NOT NULL DEFAULT 'isolated'`,
+		`ALTER TABLE resources ADD COLUMN IF NOT EXISTS queue_account_seed_encrypted TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_degraded ON resources(degraded) WHERE degraded`,
 		`CREATE INDEX IF NOT EXISTS idx_resources_pending_sweep ON resources(status, created_at) WHERE status = 'pending'`,
 		// 031_backups — customer-facing Postgres backup + restore tables.
