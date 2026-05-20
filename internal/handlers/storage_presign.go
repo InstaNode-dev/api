@@ -66,29 +66,21 @@ func (h *StorageHandler) PresignStorage(c *fiber.Ctx) error {
 
 	requestID := middleware.GetRequestID(c)
 
+	// B18 M4 (BugBash 2026-05-20): verify token existence BEFORE body validation.
+	// Previously, /storage/<random-uuid>/presign with an invalid body would
+	// surface `invalid_operation` (400) before checking whether the token
+	// matched a real resource. That ordering is information-flow risk if the
+	// validators ever loosen — a path-traversal `key` could be inspected for
+	// shape before the existence check. New order: parse token → fetch
+	// resource → validate body shape (operation, key, expires_in). The body
+	// parse itself stays early because `c.BodyParser` errors are not
+	// resource-conditional.
 	var req presignRequest
 	if err := c.BodyParser(&req); err != nil {
 		return respondError(c, fiber.StatusBadRequest, "invalid_body", "could not parse JSON body")
 	}
-	op := strings.ToUpper(strings.TrimSpace(req.Operation))
-	if op != "GET" && op != "PUT" {
-		return respondError(c, fiber.StatusBadRequest, "invalid_operation",
-			"operation must be GET or PUT")
-	}
-	if strings.TrimSpace(req.Key) == "" {
-		return respondError(c, fiber.StatusBadRequest, "invalid_key", "key is required")
-	}
-	if req.ExpiresIn <= 0 {
-		req.ExpiresIn = 600
-	}
-	if req.ExpiresIn > 3600 {
-		// Hard cap. A 1-hour presigned URL is already a lot of attack surface
-		// for a leaked URL; longer would push us toward "they may as well
-		// have the long-lived key."
-		req.ExpiresIn = 3600
-	}
 
-	// Verify the token maps to an active storage resource.
+	// Verify the token maps to an active storage resource FIRST.
 	resource, err := models.GetResourceByToken(c.UserContext(), h.db, tokenUUID)
 	if err != nil {
 		var notFound *models.ErrResourceNotFound
@@ -106,6 +98,25 @@ func (h *StorageHandler) PresignStorage(c *fiber.Ctx) error {
 	if resource.Status != "active" {
 		return respondError(c, fiber.StatusGone, "resource_inactive",
 			"storage resource is not active")
+	}
+
+	// Body-shape validation runs AFTER existence — see B18 M4 note above.
+	op := strings.ToUpper(strings.TrimSpace(req.Operation))
+	if op != "GET" && op != "PUT" {
+		return respondError(c, fiber.StatusBadRequest, "invalid_operation",
+			"operation must be GET or PUT")
+	}
+	if strings.TrimSpace(req.Key) == "" {
+		return respondError(c, fiber.StatusBadRequest, "invalid_key", "key is required")
+	}
+	if req.ExpiresIn <= 0 {
+		req.ExpiresIn = 600
+	}
+	if req.ExpiresIn > 3600 {
+		// Hard cap. A 1-hour presigned URL is already a lot of attack surface
+		// for a leaked URL; longer would push us toward "they may as well
+		// have the long-lived key."
+		req.ExpiresIn = 3600
 	}
 
 	// Resolve the canonical object prefix from the stored provider_resource_id,
