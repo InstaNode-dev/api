@@ -192,7 +192,57 @@ var (
 		Name: "instant_goroutine_panics_total",
 		Help: "Panics recovered in fire-and-forget goroutines by the safego helper",
 	}, []string{"task"})
+
+	// BrevoWebhookEventsTotal counts inbound Brevo transactional-webhook
+	// events at /webhooks/brevo/:secret, labelled by the normalized event
+	// type written to forwarder_sent.classification. The brief's
+	// "201 ≠ delivered" gap closes once this counter sees real traffic:
+	//   - rate(brevo_webhook_events_total{event="delivered"}[5m]) /
+	//     rate(brevo_webhook_events_total[5m]) gives the live
+	//     delivery ratio. Alert on < 95% over 1h.
+	//   - sum by (event) gives the per-class breakdown (bounced_hard,
+	//     bounced_soft, rejected, complaint, deferred, unsubscribed,
+	//     error, unhandled, missing_message_id, unauthorized,
+	//     invalid_payload, oversized).
+	//
+	// Cardinality is bounded: the labels are a closed set defined in
+	// brevo_webhook.go (the LedgerClass* constants + the admin labels
+	// "unauthorized" / "invalid_payload" / "oversized" / "unhandled" /
+	// "missing_message_id" / "error"). No user-controlled values land
+	// here.
+	BrevoWebhookEventsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "brevo_webhook_events_total",
+		Help: "Inbound Brevo transactional-webhook events by normalized class (delivered/bounced_hard/bounced_soft/rejected/complaint/deferred/unsubscribed/error/unhandled/missing_message_id/unauthorized/invalid_payload/oversized)",
+	}, []string{"event"})
+
+	// readyzCheckStatusGauge is the per-component readiness status for
+	// /readyz. Value: 1 = ok, 0.5 = degraded, 0 = failed. Labels:
+	//   - service:  "instant-api", "instant-worker", "instant-provisioner"
+	//   - check:    "platform_db", "brevo", "razorpay", "do_spaces",
+	//               "provisioner_grpc", "redis", "customer_db", etc.
+	// The NR alert reads `readyz_check_status{service=~".+"} == 0` over
+	// the last 5 minutes — a sustained failed state pages the operator.
+	// Brevo silent-rejection (2026-05-20) would have surfaced here as
+	// `readyz_check_status{service="instant-api",check="brevo"}` flipping
+	// from 1 → 0.5 the moment the api-key went bad.
+	readyzCheckStatusGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "readyz_check_status",
+		Help: "Per-component readiness status (1=ok, 0.5=degraded, 0=failed). Set by /readyz on every probe.",
+	}, []string{"service", "check"})
 )
+
+// ReadyzCheckStatus updates the gauge for one check in this service.
+// Wired from the readyzMetrics adapter in handlers/readyz.go. The
+// service label is omitted from the caller's signature and stamped by
+// this helper so a future refactor that adds a new service can't
+// accidentally publish under the wrong label.
+//
+// service is "instant-api" because this is the api repo; sibling repos
+// have their own metrics.ReadyzCheckStatus with their own service label
+// (or call the gauge directly via WithLabelValues).
+func ReadyzCheckStatus(check string, value float64) {
+	readyzCheckStatusGauge.WithLabelValues("instant-api", check).Set(value)
+}
 
 // StatusClass converts an HTTP status code to a label-safe class string.
 // Returns "2xx", "4xx", "5xx", or "other".

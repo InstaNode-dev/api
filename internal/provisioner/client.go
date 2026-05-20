@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -43,8 +44,14 @@ type Credentials struct {
 
 // Client wraps the gRPC ProvisionerServiceClient with convenience methods
 // and a process-shared circuit breaker.
+//
+// conn is retained (in addition to the typed grpc client) so /readyz can
+// issue grpc.health.v1.Health/Check probes via NewHealthClient(conn). It
+// is set when constructed via NewClient and may be nil for tests that
+// build a struct literal — HealthCheck handles that fail-closed.
 type Client struct {
 	grpc    provisionerv1.ProvisionerServiceClient
+	conn    *grpc.ClientConn
 	secret  string
 	breaker *circuit.Breaker // nil-safe; tests that construct {grpc, secret} still work
 }
@@ -84,6 +91,7 @@ func NewClient(addr, secret string) (*Client, *grpc.ClientConn, error) {
 	})
 	return &Client{
 		grpc:    provisionerv1.NewProvisionerServiceClient(conn),
+		conn:    conn,
 		secret:  secret,
 		breaker: br,
 	}, conn, nil
@@ -175,6 +183,43 @@ func shouldRecordBreakerErr(err error) bool {
 
 // Breaker exposes the underlying breaker for tests and /healthz.
 func (c *Client) Breaker() *circuit.Breaker { return c.breaker }
+
+// HealthCheck issues a grpc.health.v1.Health/Check RPC against the
+// provisioner and returns nil iff the response status is SERVING.
+//
+// Used by /readyz (api/internal/handlers/readyz.go) to surface
+// "provisioner gRPC is reachable AND serving" as a critical readiness
+// check. Marked critical: a provisioner outage means /db/new etc. all
+// 503, so the api pod should be pulled from the Service endpoints
+// until the provisioner recovers.
+//
+// IMPORTANT: this method DOES NOT go through the circuit breaker. The
+// circuit is meant to short-circuit *provisioning* calls when the
+// provisioner is sick; a /readyz probe needs to actually attempt the
+// upstream call so the pod can come back into rotation once the
+// provisioner recovers. If we routed through the breaker, an open
+// breaker would self-perpetuate "/readyz says failed" → "pod stays
+// out of rotation" → "no requests open the breaker via half-open
+// trials" → ∞.
+//
+// The standard "" service name is the package-level health (per the
+// gRPC Health Checking protocol spec). The provisioner registers its
+// health service at boot — see provisioner/main.go.
+func (c *Client) HealthCheck(ctx context.Context) error {
+	if c == nil || c.conn == nil {
+		return errors.New("provisioner_conn_not_configured")
+	}
+	hc := healthpb.NewHealthClient(c.conn)
+	// Auth header is required by the provisioner's auth interceptor.
+	resp, err := hc.Check(c.ctxWithAuth(ctx), &healthpb.HealthCheckRequest{Service: ""})
+	if err != nil {
+		return err
+	}
+	if resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+		return fmt.Errorf("provisioner_status_%s", resp.GetStatus().String())
+	}
+	return nil
+}
 
 // ctxWithAuth attaches the provisioner auth token and, if present, the
 // X-Request-ID from the calling HTTP request so the provisioner's logs
