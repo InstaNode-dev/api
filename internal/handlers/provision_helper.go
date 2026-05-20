@@ -453,7 +453,69 @@ func (h *provisionHelper) finalizeProvision(
 		slog.Error(logPrefix+".cleanup_soft_delete_failed", "error", delErr,
 			"resource_id", resource.ID, "request_id", requestID)
 	}
+
+	// MR-P0-3: emit the operator-alert audit row. This is the moment the
+	// platform produced an unreachable resource — the backend object existed
+	// (briefly), the platform DB could not address it, and the deprovision +
+	// soft-delete is the compensation. Operators key on this kind to
+	// reconstruct the exact request, find the upstream failure cause
+	// (DB unreachable / encrypt failure / etc.), and audit-trace any backend
+	// objects that escaped the best-effort cleanup. Best-effort emit: audit-
+	// log errors must never block the 503 — the customer needs a clean answer.
+	emitProvisionPersistenceFailedAudit(ctx, h.db, resource, providerResourceID, requestID, logPrefix)
+
 	return errProvisionPersistFailed
+}
+
+// emitProvisionPersistenceFailedAudit emits the
+// AuditKindProvisionPersistenceFailed row. Best-effort: any audit-write error
+// is logged at WARN and swallowed — the caller already runs the cleanup +
+// soft-delete and returns 503 to the customer. We never want an audit-store
+// blip to wedge the response. Synchronous (not goroutine'd) so the row lands
+// before the request goroutine returns; the row is small (< 1 KB), the DB hit
+// is sub-millisecond on a healthy platform, and the bound on request latency
+// is already dominated by the backend RPC that just succeeded.
+func emitProvisionPersistenceFailedAudit(
+	ctx context.Context,
+	db *sql.DB,
+	res *models.Resource,
+	providerResourceID, requestID, logPrefix string,
+) {
+	var teamID uuid.UUID
+	if res.TeamID.Valid {
+		teamID = res.TeamID.UUID
+	}
+
+	// JSONB metadata so operator queries can pivot by resource_type / log_prefix
+	// / provider_resource_id. Hand-constructed via fmt.Sprintf with %q
+	// formatting so each field is JSON-string-escaped — avoids a json package
+	// import here. Keys are stable contract: the NR Log dashboard queries them
+	// by literal name.
+	meta := fmt.Sprintf(
+		`{"resource_id":%q,"resource_type":%q,"log_prefix":%q,"provider_resource_id":%q,"request_id":%q,"tier":%q,"env":%q}`,
+		res.ID.String(),
+		res.ResourceType,
+		logPrefix,
+		providerResourceID,
+		requestID,
+		res.Tier,
+		res.Env,
+	)
+
+	if auditErr := models.InsertAuditEvent(ctx, db, models.AuditEvent{
+		TeamID:       teamID,
+		Actor:        "system",
+		Kind:         models.AuditKindProvisionPersistenceFailed,
+		ResourceType: res.ResourceType,
+		ResourceID:   uuid.NullUUID{UUID: res.ID, Valid: true},
+		Summary: "provision succeeded downstream but platform persistence failed; " +
+			"backend object torn down (best-effort), resource soft-deleted, " +
+			"503 returned to caller",
+		Metadata: []byte(meta),
+	}); auditErr != nil {
+		slog.Warn(logPrefix+".persistence_failed_audit_emit_failed",
+			"error", auditErr, "resource_id", res.ID, "request_id", requestID)
+	}
 }
 
 // issueOnboardingJWT signs a short-lived JWT for the upgrade CTA.

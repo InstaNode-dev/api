@@ -183,12 +183,20 @@ func TestRespondError_KnownCode_PopulatesAgentAction(t *testing.T) {
 // request_id"). upgrade_url stays absent because the remedy is not an
 // upgrade.
 func TestRespondError_UnknownCode_5xx_FallsBackToContactSupport(t *testing.T) {
+	// Pick a 5xx code that is deliberately NOT in codeToAgentAction so the
+	// W7G fallback branch fires. Previously this test used `provision_failed`,
+	// but MR-P0-3 (BugBash 2026-05-20) added an explicit retry-with-backoff
+	// entry for that code — its 503 must instruct the agent to retry, not
+	// contact support, because the backend object was atomically rolled back.
+	// `db_error` is documented in helpers.go's curation principles as one of
+	// the "pure plumbing errors deliberately omitted" — exactly the shape this
+	// test is meant to exercise.
 	status, body := doErrorRequest(t, func(c *fiber.Ctx) error {
-		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "transient failure")
+		return respondError(c, fiber.StatusServiceUnavailable, "db_error", "transient failure")
 	})
 	assert.Equal(t, fiber.StatusServiceUnavailable, status)
 	assert.Equal(t, false, body["ok"])
-	assert.Equal(t, "provision_failed", body["error"])
+	assert.Equal(t, "db_error", body["error"])
 	assert.Equal(t, "transient failure", body["message"])
 
 	action, _ := body["agent_action"].(string)
