@@ -285,6 +285,690 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"deletion_email_disabled": {
 		AgentAction: AgentActionDeletionEmailDisabled,
 	},
+
+	// ── Wave 3 consolidated (2026-05-21): exhaustive agent_action coverage ──
+	//
+	// Pre-wave3 the registry covered ~38 codes. An AST walk of every
+	// respondError* call site (rg -oE 'respondError[a-zA-Z]*\([^,]+,...,
+	// "<code>"' internal/handlers/) surfaced 227 unique emitted codes;
+	// the registry-iterating coverage test
+	// (TestErrorCode_HasAgentAction) walks the same set and asserts every
+	// emitted code has either an entry here OR is in an explicit
+	// allowlist of pure plumbing codes that legitimately fall back to
+	// AgentActionContactSupport on 5xx (no domain-specific guidance
+	// would be more useful than "email support").
+	//
+	// Each entry below names the concrete failure, names the agent's next
+	// action, includes a full https://instanode.dev/ URL, and stays under
+	// 280 chars per the U3 contract (see agent_action.go).
+
+	// ── Validation 4xx: missing required fields ────────────────────────────
+	"missing_name": {
+		AgentAction: "Tell the user a 'name' field is required for this operation. Add a short human label (1-64 chars; letters, numbers, spaces, dashes) and retry — see https://instanode.dev/docs.",
+	},
+	"missing_email": {
+		AgentAction: "Tell the user an email address is required. Have them re-submit with a valid email — see https://instanode.dev/docs/auth.",
+	},
+	"missing_code": {
+		AgentAction: "Tell the user the verification code is missing. Have them paste the code from their email and retry at https://instanode.dev/login.",
+	},
+	// (missing_token already in registry above — auth section)
+	"missing_id": {
+		AgentAction: "Tell the user the resource id is missing from the path. Re-issue the request with a valid UUID id — see https://instanode.dev/docs.",
+	},
+	"missing_team_id": {
+		AgentAction: "Tell the user no team is associated with this session. Have them log in at https://instanode.dev/login and select a team.",
+	},
+	"missing_session_id": {
+		AgentAction: "Tell the user the session id is missing. Have them re-run the CLI login flow — see https://instanode.dev/docs/cli.",
+	},
+	"missing_redirect_uri": {
+		AgentAction: "Tell the user the redirect_uri is missing. Have them register an OAuth client at https://instanode.dev/app/team and include the URI in the request.",
+	},
+	"missing_id_token": {
+		AgentAction: "Tell the user the OAuth id_token was missing in the callback. Restart the flow at https://instanode.dev/login.",
+	},
+	"missing_env": {
+		AgentAction: "Tell the user this endpoint requires an 'env' field (development | staging | production). Add it and retry — see https://instanode.dev/docs/env.",
+	},
+	"missing_target_env": {
+		AgentAction: "Tell the user the target_env field is required. Specify the destination env (development | staging | production) and retry — see https://instanode.dev/docs/env.",
+	},
+	"missing_source_env": {
+		AgentAction: "Tell the user the source_env field is required. Specify the source env and retry — see https://instanode.dev/docs/env.",
+	},
+	"missing_target_plan": {
+		AgentAction: "Tell the user the target_plan field is required for this billing action. Specify the destination plan (hobby | hobby_plus | pro | growth | team) and retry — see https://instanode.dev/pricing.",
+	},
+	"missing_reason": {
+		AgentAction: "Tell the user a reason is required for this admin action. Add a short reason string and retry — see https://instanode.dev/docs/admin.",
+	},
+	"missing_tarball": {
+		AgentAction: "Tell the user the deployment tarball is missing. POST a multipart form with 'tarball' (.tar.gz, <=50 MiB) — see https://instanode.dev/docs/deploy.",
+	},
+	"missing_manifest": {
+		AgentAction: "Tell the user the stack manifest is missing. POST a multipart form with 'manifest' (YAML) — see https://instanode.dev/docs/stacks.",
+	},
+	"missing_body": {
+		AgentAction: "Tell the user the request body is missing. POST with a JSON body matching the documented schema — see https://instanode.dev/docs.",
+	},
+	"missing_fields": {
+		AgentAction: "Tell the user one or more required fields are missing. Check the response message for the field list and retry — see https://instanode.dev/docs.",
+	},
+	"missing_backup_id": {
+		AgentAction: "Tell the user the backup_id path parameter is missing. Use GET https://instanode.dev/api/v1/backups to find an id and retry.",
+	},
+	"missing_confirm_slug": {
+		AgentAction: "Tell the user the confirm_slug field is required to confirm this destructive action — supply the slug exactly as shown in the prompt and retry.",
+	},
+	"name_too_long": {
+		AgentAction: "Tell the user the 'name' field exceeds 64 characters. Shorten it to a short human label (1-64 chars) and retry — see https://instanode.dev/docs.",
+	},
+	"body_too_long": {
+		AgentAction: "Tell the user the request body exceeded the per-endpoint cap. Shrink the payload — see https://instanode.dev/docs for per-endpoint limits.",
+	},
+	"env_too_large": {
+		AgentAction: "Tell the user the env_vars block is too large. Trim to <=128 keys totalling <=64 KiB and retry — see https://instanode.dev/docs/env.",
+	},
+
+	// ── Validation 4xx: invalid format / value ─────────────────────────────
+	"invalid_name": {
+		AgentAction: "Tell the user the 'name' field is invalid. Use a short human label of 1-64 chars that starts with a letter or digit and contains only letters, numbers, spaces, underscores or dashes — see https://instanode.dev/docs.",
+	},
+	"invalid_id": {
+		AgentAction: "Tell the user the id in the URL path is not a valid UUID. Check the value against the resource list at https://instanode.dev/app and retry.",
+	},
+	"invalid_payload": {
+		AgentAction: "Tell the user the request body could not be parsed. Verify it is valid JSON matching the documented schema — see https://instanode.dev/docs.",
+	},
+	"invalid_form": {
+		AgentAction: "Tell the user the multipart form is malformed. Check the Content-Type boundary and form-field names — see https://instanode.dev/docs.",
+	},
+	"invalid_env": {
+		AgentAction: "Tell the user the env value is invalid. Use lowercase letters, digits, or dashes only (max 32 chars; e.g. development, staging, production) — see https://instanode.dev/docs/env.",
+	},
+	"invalid_source_env": {
+		AgentAction: "Tell the user the source_env value is invalid. Use lowercase letters, digits, or dashes only (max 32 chars) — see https://instanode.dev/docs/env.",
+	},
+	"invalid_target_env": {
+		AgentAction: "Tell the user the target_env value is invalid. Use lowercase letters, digits, or dashes only (max 32 chars) — see https://instanode.dev/docs/env.",
+	},
+	"invalid_env_key": {
+		AgentAction: "Tell the user the env_var key is invalid. Use uppercase letters, digits, and underscores only, starting with a letter — see https://instanode.dev/docs/env.",
+	},
+	"invalid_env_vars": {
+		AgentAction: "Tell the user the env_vars block failed validation. Check key naming + value sizes against the docs at https://instanode.dev/docs/env.",
+	},
+	"invalid_env_policy": {
+		AgentAction: "Tell the user the env_policy JSON is invalid. Confirm the per-env action allowlists at https://instanode.dev/docs/env-policy and retry.",
+	},
+	"invalid_state": {
+		AgentAction: "Tell the user the OAuth state parameter is invalid or expired. Restart the login flow at https://instanode.dev/login.",
+	},
+	"invalid_signature": {
+		AgentAction: "Tell the user the webhook signature did not verify. Confirm the webhook secret in your dashboard and retry — see https://instanode.dev/docs/webhooks.",
+	},
+	"signature_invalid": {
+		AgentAction: "Tell the user the request signature failed verification. Confirm the signing key and the canonical request body and retry — see https://instanode.dev/docs.",
+	},
+	"invalid_tier": {
+		AgentAction: "Tell the user the tier value is invalid. Use one of: anonymous, free, hobby, hobby_plus, pro, growth, team — see https://instanode.dev/pricing.",
+	},
+	"invalid_plan": {
+		AgentAction: "Tell the user the plan value is invalid. Use one of the published plans at https://instanode.dev/pricing and retry.",
+	},
+	"invalid_role": {
+		AgentAction: "Tell the user the role value is invalid. Use one of: owner, admin, member, viewer — see https://instanode.dev/docs/team-roles.",
+	},
+	"invalid_scope": {
+		AgentAction: "Tell the user the OAuth scope is invalid. Check the requested scopes against the docs at https://instanode.dev/docs/auth.",
+	},
+	"invalid_kind": {
+		AgentAction: "Tell the user the kind/discriminator value is invalid. Check the docs at https://instanode.dev/docs for the allowed values and retry.",
+	},
+	"invalid_event_type": {
+		AgentAction: "Tell the user the event_type value is unknown. Check the audit-log docs at https://instanode.dev/docs/audit for the allowed kinds.",
+	},
+	"invalid_window": {
+		AgentAction: "Tell the user the time window value is invalid. Use one of the documented windows (1h, 24h, 7d, 30d) — see https://instanode.dev/docs.",
+	},
+	"invalid_since": {
+		AgentAction: "Tell the user the 'since' timestamp is invalid. Use RFC 3339 (e.g. 2026-05-21T00:00:00Z) — see https://instanode.dev/docs.",
+	},
+	"invalid_limit": {
+		AgentAction: "Tell the user the limit value is out of range. Use a positive integer within the documented cap — see https://instanode.dev/docs.",
+	},
+	"invalid_cursor": {
+		AgentAction: "Tell the user the pagination cursor is invalid or expired. Restart the listing without a cursor — see https://instanode.dev/docs.",
+	},
+	"invalid_sort_by": {
+		AgentAction: "Tell the user the sort_by value is invalid. Check the documented sort keys at https://instanode.dev/docs.",
+	},
+	"invalid_dimensions": {
+		AgentAction: "Tell the user the vector dimensions value is invalid. Use a positive integer within the supported range (see https://instanode.dev/docs/vector).",
+	},
+	"invalid_key": {
+		AgentAction: "Tell the user the object key is invalid. Use a non-empty UTF-8 path without traversal (../) — see https://instanode.dev/docs/storage.",
+	},
+	"invalid_operation": {
+		AgentAction: "Tell the user the operation value is invalid. Use GET or PUT for /storage/:token/presign — see https://instanode.dev/docs/storage.",
+	},
+	"invalid_service": {
+		AgentAction: "Tell the user the service value is unknown. Use one of: postgres, redis, mongodb, queue, storage, webhook, vector — see https://instanode.dev/docs.",
+	},
+	"invalid_port": {
+		AgentAction: "Tell the user the port value is out of range. Use an integer between 1 and 65535 — see https://instanode.dev/docs/deploy.",
+	},
+	"invalid_branch": {
+		AgentAction: "Tell the user the branch name is invalid. Use a valid git ref (letters, digits, /._-) — see https://instanode.dev/docs/deploy.",
+	},
+	"invalid_repo": {
+		AgentAction: "Tell the user the GitHub repo identifier is invalid. Use the `owner/name` form — see https://instanode.dev/docs/deploy.",
+	},
+	"invalid_hostname": {
+		AgentAction: "Tell the user the hostname is invalid. Use lowercase letters, digits, and dashes only (RFC 1035) — see https://instanode.dev/docs/custom-domains.",
+	},
+	"invalid_promo": {
+		AgentAction: "Tell the user the promo code is invalid or expired. Check the dashboard at https://instanode.dev/app/billing for active codes.",
+	},
+	"invalid_team": {
+		AgentAction: "Tell the user the team identifier is invalid. Use the team's UUID from https://instanode.dev/app/team and retry.",
+	},
+	"invalid_team_id": {
+		AgentAction: "Tell the user the team_id path/body parameter is not a valid UUID. Check the team list at https://instanode.dev/app/team and retry.",
+	},
+	"invalid_user_id": {
+		AgentAction: "Tell the user the user_id parameter is not a valid UUID. Check the team-member list at https://instanode.dev/app/team and retry.",
+	},
+	"invalid_note_id": {
+		AgentAction: "Tell the user the note_id is not a valid UUID. Check the notes list and retry — see https://instanode.dev/docs/admin.",
+	},
+	"invalid_link_id": {
+		AgentAction: "Tell the user the magic-link id is invalid or expired. Restart the login flow at https://instanode.dev/login.",
+	},
+	"invalid_approval_id": {
+		AgentAction: "Tell the user the approval_id is not a valid UUID. Check the approval link in your email and retry.",
+	},
+	"invalid_backup_id": {
+		AgentAction: "Tell the user the backup_id is not a valid UUID. List backups at GET https://instanode.dev/api/v1/backups and retry.",
+	},
+	"invalid_target": {
+		AgentAction: "Tell the user the target value is invalid. Check the docs at https://instanode.dev/docs for the allowed targets.",
+	},
+	"invalid_target_resource_id": {
+		AgentAction: "Tell the user the target_resource_id is not a valid UUID. List resources at GET https://instanode.dev/api/v1/resources and retry.",
+	},
+	"invalid_parent_resource_id": {
+		AgentAction: "Tell the user the parent_resource_id is not a valid UUID. Check the resource list at https://instanode.dev/app/resources and retry.",
+	},
+	"invalid_resource_bindings": {
+		AgentAction: "Tell the user the resource_bindings array is malformed. Each binding needs a token + alias — see https://instanode.dev/docs/stacks.",
+	},
+	"invalid_frequency": {
+		AgentAction: "Tell the user the frequency value is invalid. Use one of: hourly, daily, weekly, monthly — see https://instanode.dev/docs.",
+	},
+	"invalid_variant": {
+		AgentAction: "Tell the user the experiment variant value is unknown. Use a variant id from the experiment definition — see https://instanode.dev/docs/experiments.",
+	},
+	"invalid_ttl_policy": {
+		AgentAction: "Tell the user the deploy TTL policy JSON is invalid. Check the docs at https://instanode.dev/docs/deploy-ttl and retry.",
+	},
+	"invalid_value": {
+		AgentAction: "Tell the user the supplied value failed validation. Check the response message for the specific constraint and retry — see https://instanode.dev/docs.",
+	},
+	"invalid_valid_for_days": {
+		AgentAction: "Tell the user the valid_for_days value is out of range. Use a positive integer within the documented cap — see https://instanode.dev/docs.",
+	},
+	"invalid_manifest": {
+		AgentAction: "Tell the user the stack manifest YAML is invalid. Check syntax + required fields — see https://instanode.dev/docs/stacks.",
+	},
+
+	// ── Not-found / gone ───────────────────────────────────────────────────
+	"webhook_expired": {
+		AgentAction: "Tell the user this webhook token has expired. Have them claim their resources at https://instanode.dev/claim before the 24h TTL, or provision a fresh webhook with POST https://instanode.dev/webhook/new.",
+	},
+	"session_not_found": {
+		AgentAction: "Tell the user this CLI login session was not found or has expired. Restart with `instanode auth login` — see https://instanode.dev/docs/cli.",
+	},
+	"magic_link_not_found": {
+		AgentAction: "Tell the user this magic-link is invalid, used, or expired. Request a new one at https://instanode.dev/login.",
+	},
+	"team_not_found": {
+		AgentAction: "Tell the user the team does not exist or they are not a member. Check the team list at https://instanode.dev/app/team.",
+	},
+	"user_not_found": {
+		AgentAction: "Tell the user no account matched. Verify the email at https://instanode.dev/login or sign up there.",
+	},
+	"note_not_found": {
+		AgentAction: "Tell the user this admin note is gone. Refresh the customer view at https://instanode.dev/app/admin and retry.",
+	},
+	"pod_not_found": {
+		AgentAction: "Tell the user the pod is no longer scheduled. Re-deploy from https://instanode.dev/app/deployments or use POST /deploy/:id/redeploy.",
+	},
+	"target_not_found": {
+		AgentAction: "Tell the user the target resource is gone. List resources at https://instanode.dev/app/resources and retry with a valid token.",
+	},
+	"parent_not_found": {
+		AgentAction: "Tell the user the parent resource referenced by this request no longer exists. Re-provision the parent or retarget — see https://instanode.dev/docs.",
+	},
+	"backup_not_found": {
+		AgentAction: "Tell the user the backup id is unknown. List available backups at GET https://instanode.dev/api/v1/backups and retry.",
+	},
+	"approval_not_found": {
+		AgentAction: "Tell the user the approval link is invalid or expired. The team owner can re-issue the approval — see https://instanode.dev/docs/promote.",
+	},
+	"no_subscription": {
+		AgentAction: "Tell the user no active subscription exists for this team. Start one at https://instanode.dev/pricing.",
+	},
+
+	// ── Conflict / state errors ────────────────────────────────────────────
+	"already_paused": {
+		AgentAction: "Tell the user this resource is already paused. No action needed; resume it from https://instanode.dev/app/resources when ready.",
+	},
+	"already_pending": {
+		AgentAction: "Tell the user a matching pending operation is already in flight. Wait for it to settle, or check status at https://instanode.dev/app.",
+	},
+	"not_active": {
+		AgentAction: "Tell the user this resource is not active (paused, suspended, or expired). Resume or re-provision it from https://instanode.dev/app/resources.",
+	},
+	"not_paused": {
+		AgentAction: "Tell the user this resource is not currently paused — the resume action does not apply. Check status at https://instanode.dev/app/resources.",
+	},
+	"not_pending": {
+		AgentAction: "Tell the user this operation is not in the pending state required for this action. Refresh state from https://instanode.dev/app and retry.",
+	},
+	"not_ready": {
+		AgentAction: "Tell the user this resource is not ready yet. Wait for the status to transition to 'active' (poll every 5 s) — see https://instanode.dev/docs.",
+	},
+	"not_growth": {
+		AgentAction: "Tell the user this action requires the Growth plan or higher. Upgrade at https://instanode.dev/pricing.",
+		UpgradeURL:  "https://instanode.dev/pricing",
+	},
+	"tier_unchanged": {
+		AgentAction: "Tell the user the team is already on the target tier. No action needed — see https://instanode.dev/app/billing.",
+	},
+	"same_plan": {
+		AgentAction: "Tell the user the requested plan equals the current plan. No action needed — see https://instanode.dev/app/billing.",
+	},
+	"same_env": {
+		AgentAction: "Tell the user the source_env and target_env are identical. Pick different envs and retry — see https://instanode.dev/docs/env.",
+	},
+	"twin_exists": {
+		AgentAction: "Tell the user a twin deployment for this env already exists. Use PATCH or DELETE on it first — see https://instanode.dev/docs/deploy-twins.",
+	},
+	"duplicate": {
+		AgentAction: "Tell the user a duplicate request was detected. Check the existing resource at https://instanode.dev/app and retry only if intentional.",
+	},
+	"hostname_taken": {
+		AgentAction: "Tell the user this hostname is already claimed by another deployment. Pick a different hostname — see https://instanode.dev/docs/custom-domains.",
+	},
+	"stack_deleting": {
+		AgentAction: "Tell the user this stack is currently being deleted and is not available. Wait for the delete to complete — see https://instanode.dev/app/stacks.",
+	},
+	"approval_already_executed": {
+		AgentAction: "Tell the user this promote approval has already been used. No action needed — see https://instanode.dev/docs/promote.",
+	},
+	"approval_expired": {
+		AgentAction: "Tell the user this approval link has expired. Re-request the promote from https://instanode.dev/app and an owner will receive a fresh link.",
+	},
+	"approval_mismatch": {
+		AgentAction: "Tell the user this approval link does not match the in-flight promote. Re-request approval from https://instanode.dev/app.",
+	},
+	"approval_not_approved": {
+		AgentAction: "Tell the user this promote has not been approved yet. Ask the team owner to confirm the email link — see https://instanode.dev/docs/promote.",
+	},
+
+	// ── Permission / authn errors ──────────────────────────────────────────
+	"email_not_verified": {
+		AgentAction: "Tell the user this action requires a verified email. Open the verification link in their inbox or resend it from https://instanode.dev/app/settings.",
+	},
+	"forbidden_parent_resource": {
+		AgentAction: "Tell the user the parent resource belongs to a different team. Have them switch teams at https://instanode.dev/app/team or use a parent they own.",
+	},
+	"target_cross_team": {
+		AgentAction: "Tell the user the target resource belongs to a different team. Have them switch teams at https://instanode.dev/app/team or pick a target they own.",
+	},
+	"target_type_mismatch": {
+		AgentAction: "Tell the user the target resource type does not match the requested operation. Check the resource list at https://instanode.dev/app/resources.",
+	},
+	"type_mismatch": {
+		AgentAction: "Tell the user the resource type does not match the endpoint. Use the correct endpoint for this resource type — see https://instanode.dev/docs.",
+	},
+	"resource_inactive": {
+		AgentAction: "Tell the user this resource is suspended or expired. Resume from https://instanode.dev/app/resources, or provision a fresh one.",
+	},
+	"not_a_storage_resource": {
+		AgentAction: "Tell the user this token is not a /storage/ resource — the presign endpoint only accepts storage tokens. Provision storage at POST https://instanode.dev/storage/new.",
+	},
+	"unsupported_for_twin": {
+		AgentAction: "Tell the user this operation is not supported on twin deployments. Apply it to the parent deployment instead — see https://instanode.dev/docs/deploy-twins.",
+	},
+	"unsupported_resource_type": {
+		AgentAction: "Tell the user this resource type is not supported for this operation. Check the docs at https://instanode.dev/docs for the supported types.",
+	},
+	"unsupported_type": {
+		AgentAction: "Tell the user this type value is not supported for this operation. See https://instanode.dev/docs for the supported types.",
+	},
+	"service_disabled": {
+		AgentAction: "Tell the user this service is disabled on the platform. Check the live status at https://instanode.dev/status; enable it via INSTANT_ENABLED_SERVICES if self-hosting.",
+	},
+	"variant_mismatch": {
+		AgentAction: "Tell the user the experiment variant in the request no longer matches the assigned variant. Refresh the page and retry — see https://instanode.dev/docs/experiments.",
+	},
+	"unknown_experiment": {
+		AgentAction: "Tell the user this experiment id is unknown or has been retired. Check active experiments at https://instanode.dev/app/admin.",
+	},
+
+	// ── Billing-specific failures ──────────────────────────────────────────
+	"billing_not_configured": {
+		AgentAction: "Tell the user billing is not configured on this deployment. Operators must set RAZORPAY_KEY_ID / SECRET — see https://instanode.dev/docs/billing.",
+	},
+	"downgrade_not_self_serve": {
+		AgentAction: "Tell the user downgrades and cancellations are not self-serve. Email support@instanode.dev — see https://instanode.dev/support.",
+	},
+	"yearly_change_plan_unsupported": {
+		AgentAction: "Tell the user yearly subscriptions can't switch plans inline. Cancel the current subscription, then start the new plan at https://instanode.dev/pricing.",
+	},
+	"grace_expired": {
+		AgentAction: "Tell the user the payment grace window has expired and the team has been downgraded. Re-subscribe at https://instanode.dev/pricing to restore access.",
+		UpgradeURL:  "https://instanode.dev/pricing",
+	},
+
+	// ── Razorpay codes (kept as raw passthrough) ───────────────────────────
+	"razorpay_error": {
+		AgentAction: "Tell the user Razorpay returned an error completing the payment. Check the error message and retry, or contact support@instanode.dev — see https://instanode.dev/support.",
+	},
+
+	// ── Validation 4xx: signature / state ──────────────────────────────────
+	"failed_precondition": {
+		AgentAction: "Tell the user a precondition for this action failed. Check the response message for the specific state mismatch — see https://instanode.dev/docs.",
+	},
+	"destructive_ack_required": {
+		AgentAction: "Tell the user this destructive action requires an explicit acknowledgement. Re-issue with `ack: true` after confirming — see https://instanode.dev/docs.",
+	},
+	"slug_mismatch": {
+		AgentAction: "Tell the user the slug in the URL does not match the resource. Refresh from https://instanode.dev/app and retry with the correct slug.",
+	},
+	"env_mismatch": {
+		AgentAction: "Tell the user the env in the request does not match the resource's env. Re-issue with the resource's env value — see https://instanode.dev/docs/env.",
+	},
+	"oauth_failed": {
+		AgentAction: "Tell the user the OAuth handshake failed. Restart the login at https://instanode.dev/login and check that the OAuth client is correctly configured.",
+	},
+	"oauth_not_configured": {
+		AgentAction: "Tell the user OAuth is not configured on this deployment. Operators must set GITHUB_CLIENT_ID / GOOGLE_CLIENT_ID — see https://instanode.dev/docs/auth.",
+	},
+	// (invitation_invalid covered in the auth/token section above)
+	"backup_resource_mismatch": {
+		AgentAction: "Tell the user this backup belongs to a different resource. List the resource's backups at GET https://instanode.dev/api/v1/resources/<id>/backups and retry.",
+	},
+	"restore_in_progress": {
+		AgentAction: "Tell the user a restore is already in progress on this resource. Wait for it to complete — see https://instanode.dev/app/resources.",
+	},
+	"backup_not_ready": {
+		AgentAction: "Tell the user this backup is still being created. Wait for status='ready' — see https://instanode.dev/app/resources.",
+	},
+	"family_validate_failed": {
+		AgentAction: "Tell the user a tier-family validation failed. Check the docs at https://instanode.dev/pricing for the allowed transitions and retry.",
+	},
+	"since_too_old": {
+		AgentAction: "Tell the user the 'since' value is older than the retention window. Use a more recent timestamp — see https://instanode.dev/docs/audit.",
+	},
+
+	// ── 5xx plumbing — domain-specific so the agent doesn't always email support ──
+	// Each of these returns 5xx; without an entry here respondError falls
+	// back to AgentActionContactSupport ("email support"). For codes whose
+	// transient nature suggests "retry with backoff", we surface a sentence
+	// that says so explicitly.
+	"db_error": {
+		AgentAction: "Tell the user the platform database hit a transient error. Retry in 30 seconds with exponential backoff — see https://instanode.dev/status if it persists.",
+	},
+	"db_failed": {
+		AgentAction: "Tell the user the platform database hit a transient error. Retry in 30 seconds with exponential backoff — see https://instanode.dev/status if it persists.",
+	},
+	"internal_error": {
+		AgentAction: "Tell the user something on our side went wrong. Email support@instanode.dev with this request_id, or check https://instanode.dev/status.",
+	},
+	"lookup_failed": {
+		AgentAction: "Tell the user a lookup on the platform backend timed out. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"list_failed": {
+		AgentAction: "Tell the user the list operation hit a transient backend error. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"count_failed": {
+		AgentAction: "Tell the user the count operation hit a transient backend error. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"fetch_failed": {
+		AgentAction: "Tell the user the fetch hit a transient backend error. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"create_failed": {
+		AgentAction: "Tell the user the resource could not be created right now. Retry in 30 seconds; if it persists check https://instanode.dev/status.",
+	},
+	"update_failed": {
+		AgentAction: "Tell the user the update could not be persisted right now. Retry in 30 seconds; if it persists check https://instanode.dev/status.",
+	},
+	"delete_failed": {
+		AgentAction: "Tell the user the delete could not be applied right now. Retry in 30 seconds; if it persists check https://instanode.dev/status.",
+	},
+	"persist_failed": {
+		AgentAction: "Tell the user the persistence step failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"compute_update_failed": {
+		AgentAction: "Tell the user the deployment update on the compute backend failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"backup_create_failed": {
+		AgentAction: "Tell the user creating the backup failed. Retry in 60 seconds — see https://instanode.dev/status.",
+	},
+	"backup_lookup_failed": {
+		AgentAction: "Tell the user looking up the backup failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"restore_create_failed": {
+		AgentAction: "Tell the user creating the restore failed. Retry in 60 seconds — see https://instanode.dev/status.",
+	},
+	"restore_failed": {
+		AgentAction: "Tell the user the restore did not complete. Retry in 60 seconds; if it persists email support@instanode.dev — see https://instanode.dev/status.",
+	},
+	"deletion_request_failed": {
+		AgentAction: "Tell the user the team-deletion request failed to persist. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"approval_failed": {
+		AgentAction: "Tell the user recording the promote approval failed. Retry the approval link in 30 seconds.",
+	},
+	"reject_failed": {
+		AgentAction: "Tell the user recording the promote rejection failed. Retry the rejection in 30 seconds.",
+	},
+	"execute_failed": {
+		AgentAction: "Tell the user executing the action failed. Retry in 30 seconds; if it persists email support@instanode.dev.",
+	},
+	"summary_failed": {
+		AgentAction: "Tell the user computing the summary failed. Retry in 30 seconds; if it persists email support@instanode.dev.",
+	},
+	"status_failed": {
+		AgentAction: "Tell the user reading the status failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"status_lookup_failed": {
+		AgentAction: "Tell the user reading the resource status failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"tier_failed": {
+		AgentAction: "Tell the user updating the tier failed. Retry in 30 seconds; if it persists email support@instanode.dev.",
+	},
+	"upgrade_failed": {
+		AgentAction: "Tell the user the tier upgrade could not be applied right now. Retry in 30 seconds; if it persists email support@instanode.dev.",
+	},
+	"revocation_failed": {
+		AgentAction: "Tell the user revoking the session failed. Retry in 30 seconds; if it persists email support@instanode.dev.",
+	},
+	"role_lookup_failed": {
+		AgentAction: "Tell the user a team-role lookup failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"team_lookup_failed": {
+		AgentAction: "Tell the user a team lookup failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"team_creation_failed": {
+		AgentAction: "Tell the user creating the team failed. Retry in 30 seconds; if it persists email support@instanode.dev.",
+	},
+	"team_has_no_users": {
+		AgentAction: "Tell the user this team has no users yet — add an owner before issuing operations against it. See https://instanode.dev/docs/team.",
+	},
+	"user_creation_failed": {
+		AgentAction: "Tell the user creating the user account failed. Retry in 30 seconds; if it persists email support@instanode.dev.",
+	},
+	"user_upsert_failed": {
+		AgentAction: "Tell the user upserting the user record failed. Retry in 30 seconds.",
+	},
+	"session_failed": {
+		AgentAction: "Tell the user the session could not be issued. Retry the login at https://instanode.dev/login.",
+	},
+	"token_failed": {
+		AgentAction: "Tell the user the token could not be minted. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"token_issue_failed": {
+		AgentAction: "Tell the user issuing the API token failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"verify_failed": {
+		AgentAction: "Tell the user verification failed on the backend. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"sign_failed": {
+		AgentAction: "Tell the user signing the response failed on the backend. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"generate_failed": {
+		AgentAction: "Tell the user generating the value failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"mark_converted_failed": {
+		AgentAction: "Tell the user marking the JWT as converted failed. Retry the claim in 30 seconds — see https://instanode.dev/status.",
+	},
+	// (deletion_token_invalid covered in the deletion-confirmed section above)
+	"encryption_failed": {
+		AgentAction: "Tell the user the encryption step failed. Retry in 30 seconds; if it persists email support@instanode.dev with this request_id.",
+	},
+	"decrypt_failed": {
+		AgentAction: "Tell the user decrypting the stored credential failed. Retry in 30 seconds; if it persists email support@instanode.dev with this request_id.",
+	},
+	"encryption_unavailable": {
+		AgentAction: "Tell the user the encryption backend is temporarily unavailable. Retry in 60 seconds — see https://instanode.dev/status.",
+	},
+	"enqueue_failed": {
+		AgentAction: "Tell the user enqueueing the background job failed. Retry the action in 30 seconds — see https://instanode.dev/status.",
+	},
+	"plans_unavailable": {
+		AgentAction: "Tell the user the plans registry is temporarily unavailable. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"pods_unavailable": {
+		AgentAction: "Tell the user the deployment pods are unreachable right now. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"provider_failed": {
+		AgentAction: "Tell the user the upstream provider hit a transient error. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"upstream_failed": {
+		AgentAction: "Tell the user the upstream dependency failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"vault_ref_failed": {
+		AgentAction: "Tell the user resolving the vault reference failed. Confirm the env+key exist at https://instanode.dev/app/vault and retry.",
+	},
+	"usage_failed": {
+		AgentAction: "Tell the user computing usage failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"logs_failed": {
+		AgentAction: "Tell the user fetching logs failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"logs_unavailable": {
+		AgentAction: "Tell the user logs are temporarily unavailable for this deployment. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"stream_failed": {
+		AgentAction: "Tell the user the streaming connection dropped. Re-open the SSE / WebSocket — see https://instanode.dev/docs.",
+	},
+	"tarball_open_failed": {
+		AgentAction: "Tell the user the deployment tarball could not be opened. Verify it is a valid .tar.gz (<=50 MiB) and retry — see https://instanode.dev/docs/deploy.",
+	},
+	"tarball_read_failed": {
+		AgentAction: "Tell the user reading the deployment tarball failed mid-upload. Retry the upload with a clean tarball — see https://instanode.dev/docs/deploy.",
+	},
+	"tarball_too_large": {
+		AgentAction: "Tell the user the deployment tarball exceeded the 50 MiB cap. Trim node_modules / build artefacts and retry — see https://instanode.dev/docs/deploy.",
+	},
+	"no_services": {
+		AgentAction: "Tell the user the stack manifest declared no services. Add at least one service block — see https://instanode.dev/docs/stacks.",
+	},
+	"no_connection_url": {
+		AgentAction: "Tell the user no connection URL is recorded for this resource. Re-provision the resource — see https://instanode.dev/docs.",
+	},
+	"no_update_url": {
+		AgentAction: "Tell the user no update URL is recorded for this checkout. Refresh the billing page at https://instanode.dev/app/billing and restart the upgrade.",
+	},
+	"pause_failed": {
+		AgentAction: "Tell the user the pause action failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"resume_failed": {
+		AgentAction: "Tell the user the resume action failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"inflight_check_failed": {
+		AgentAction: "Tell the user the in-flight dedup check failed. Retry the action in 30 seconds.",
+	},
+	"quota_check_failed": {
+		AgentAction: "Tell the user the quota check failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"billing_persistence_failed": {
+		AgentAction: "Tell the user persisting the billing change failed. Retry the action in 30 seconds; if it persists email support@instanode.dev with this request_id.",
+	},
+
+	// ── 429 rate-limited (canonical) ───────────────────────────────────────
+	// helpers.go already maps "rate_limit_exceeded"; map "rate_limited"
+	// (used by the rate-limit middleware itself).
+	"rate_limited": {
+		AgentAction: "Tell the user they've been rate-limited. Wait 60 seconds and retry — see https://instanode.dev/docs/rate-limits, or upgrade at https://instanode.dev/pricing for higher limits.",
+		UpgradeURL:  "https://instanode.dev/pricing",
+	},
+
+	// ── Coverage-test patches (codes discovered by TestErrorCode_HasAgentAction) ──
+	"already_connected": {
+		AgentAction: "Tell the user a GitHub deployment is already connected to this resource. Disconnect at https://instanode.dev/app/deployments first, then retry.",
+	},
+	"deployment_limit_reached": {
+		AgentAction: "Tell the user they've hit their plan's deployment-app limit. Upgrade at https://instanode.dev/pricing to provision more deploys.",
+		UpgradeURL:  "https://instanode.dev/pricing",
+	},
+	"queue_limit_reached": {
+		AgentAction: "Tell the user they've hit their plan's queue-resource limit. Upgrade at https://instanode.dev/pricing to provision more queues.",
+		UpgradeURL:  "https://instanode.dev/pricing",
+	},
+	"github_requires_paid_tier": {
+		AgentAction: "Tell the user GitHub auto-deploys require a paid plan (Hobby+). Upgrade at https://instanode.dev/pricing — takes 30 seconds.",
+		UpgradeURL:  "https://instanode.dev/pricing",
+	},
+	"private_deploy_requires_pro": {
+		AgentAction: "Tell the user private deployments require the Pro plan or higher. Upgrade at https://instanode.dev/pricing — takes 30 seconds.",
+		UpgradeURL:  "https://instanode.dev/pricing",
+	},
+	"private_deploy_requires_allowed_ips": {
+		AgentAction: "Tell the user `private: true` requires an `allowed_ips` array. Add at least one IP/CIDR and retry — see https://instanode.dev/docs/private-deploys.",
+	},
+	"too_many_allowed_ips": {
+		AgentAction: "Tell the user allowed_ips exceeded the documented cap. Trim the list (see the docs at https://instanode.dev/docs/private-deploys for the limit) and retry.",
+	},
+	"invalid_allowed_ip": {
+		AgentAction: "Tell the user an allowed_ips entry is not a valid IP/CIDR. Use IPv4 or IPv6 address-or-CIDR notation — see https://instanode.dev/docs/private-deploys.",
+	},
+	"invalid_hours": {
+		AgentAction: "Tell the user the hours value is invalid. Use a positive integer within the documented cap — see https://instanode.dev/docs/deploy-ttl.",
+	},
+	"invalid_notify_webhook": {
+		AgentAction: "Tell the user the notify_webhook URL is malformed. Use a fully-qualified https URL — see https://instanode.dev/docs/deploy-ttl.",
+	},
+	"email_send_failed": {
+		AgentAction: "Tell the user delivering the email failed. Retry in 60 seconds — see https://instanode.dev/status if it persists.",
+	},
+	"deletion_create_failed": {
+		AgentAction: "Tell the user persisting the deletion request failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"deletion_lookup_failed": {
+		AgentAction: "Tell the user looking up the deletion request failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"deletion_mark_failed": {
+		AgentAction: "Tell the user marking the deletion as confirmed failed. Retry in 30 seconds — see https://instanode.dev/status.",
+	},
+	"subscription_cancel_failed": {
+		AgentAction: "Tell the user cancelling the Razorpay subscription failed. The team-delete is paused; email support@instanode.dev so an operator can reconcile in the Razorpay dashboard.",
+	},
 }
 
 // ErrorResponse is the canonical JSON shape for every 4xx/5xx response.
@@ -413,8 +1097,38 @@ func respondError(c *fiber.Ctx, status int, code, message string) error {
 	if resp.RetryAfterSeconds != nil && shouldSetRetryAfterHeader(status) {
 		c.Set(fiber.HeaderRetryAfter, strconv.Itoa(*resp.RetryAfterSeconds))
 	}
+	setSecurityHeadersFor401(c, status)
 	_ = c.Status(status).JSON(resp)
 	return ErrResponseWritten
+}
+
+// setSecurityHeadersFor401 emits the canonical WWW-Authenticate response
+// header on every 401 envelope so HTTP-spec-compliant clients (RFC 7235
+// §4.1) know which authentication scheme + realm the API expects. Without
+// this header, the JSON envelope said "unauthorized" but the wire-level
+// HTTP contract was incomplete — an MCP / SDK / browser fetch checking
+// HEAD on a protected route had no machine-readable handshake to follow.
+//
+// realm="instanode" is the canonical realm; agents that recognise the
+// realm can offer to re-authenticate without prompting the user
+// repeatedly. The scheme is `Bearer` because every authenticated path
+// expects `Authorization: Bearer <jwt|pat>` — DPoP-required routes still
+// carry the Bearer challenge here because the DPoP scheme is opaque to
+// most HTTP libraries; the DPoP middleware sets its own per-route header
+// only when DPoP is the only acceptable proof.
+//
+// No-op for non-401 statuses. Lives next to respondError* so every 401
+// path goes through it without scattering c.Set("WWW-Authenticate", ...)
+// calls across 20+ handler files.
+func setSecurityHeadersFor401(c *fiber.Ctx, status int) {
+	if status != fiber.StatusUnauthorized {
+		return
+	}
+	// Only set if not already set by the DPoP middleware (which uses
+	// a richer "DPoP algs=..." challenge on routes that require DPoP).
+	if existing := c.Get(fiber.HeaderWWWAuthenticate); existing == "" {
+		c.Set(fiber.HeaderWWWAuthenticate, `Bearer realm="instanode"`)
+	}
 }
 
 // respondErrorWithAgentAction writes a structured JSON error with an
@@ -441,6 +1155,7 @@ func respondErrorWithAgentAction(c *fiber.Ctx, status int, code, message, agentA
 	if resp.RetryAfterSeconds != nil && shouldSetRetryAfterHeader(status) {
 		c.Set(fiber.HeaderRetryAfter, strconv.Itoa(*resp.RetryAfterSeconds))
 	}
+	setSecurityHeadersFor401(c, status)
 	_ = c.Status(status).JSON(resp)
 	return ErrResponseWritten
 }
@@ -463,6 +1178,7 @@ func respondRecycleGate(c *fiber.Ctx, code, message, agentAction, claimURL strin
 		UpgradeURL:        claimURL,
 		ClaimURL:          claimURL,
 	}
+	setSecurityHeadersFor401(c, status)
 	_ = c.Status(status).JSON(resp)
 	return ErrResponseWritten
 }
@@ -536,6 +1252,7 @@ func respondErrorWithRetry(c *fiber.Ctx, status int, code, message string, retry
 	if ra != nil && shouldSetRetryAfterHeader(status) {
 		c.Set(fiber.HeaderRetryAfter, strconv.Itoa(*ra))
 	}
+	setSecurityHeadersFor401(c, status)
 	_ = c.Status(status).JSON(resp)
 	return ErrResponseWritten
 }
