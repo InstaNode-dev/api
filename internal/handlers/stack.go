@@ -1096,8 +1096,25 @@ type updateStackEnvBody struct {
 }
 
 // UpdateEnv handles PATCH /stacks/:slug/env.
-// For MVP: accepts env var overrides and returns a note that they take effect on the
-// next redeploy. Env vars are NOT persisted to the DB (no env_vars column on stacks).
+//
+// B7-P0-1 (2026-05-20): previously logged stack.env.noted, returned 200, but
+// NEVER persisted — the silent-data-loss failure mode. Now backed by
+// migration 062's stacks.env_vars JSONB column. The handler:
+//
+//  1. Loads existing env_vars from the row.
+//  2. Merges the incoming body's `env` map into the existing set (PATCH
+//     semantics — each call is incremental, not replace-all). Setting a
+//     key to the empty string deletes it (matches the dashboard contract
+//     and the env-var convention for "absent" elsewhere on the platform).
+//  3. Validates every key against isValidEnvKey (POSIX [A-Z_][A-Z0-9_]*),
+//     mirroring deploy.go and /stacks/new so PATCH cannot smuggle in a
+//     key shape the create/redeploy paths would reject async.
+//  4. Persists via UpdateStackEnvVars.
+//  5. Emits a best-effort audit_log row (kind=stack.env.updated) for the
+//     dashboard activity feed and the support panel.
+//  6. Returns the FULL merged env in the response so the caller doesn't
+//     have to re-GET to see the new state.
+//
 // Auth required — anonymous stacks cannot be mutated after creation.
 func (h *StackHandler) UpdateEnv(c *fiber.Ctx) error {
 	team, err := h.requireStackTeam(c)
@@ -1138,12 +1155,92 @@ func (h *StackHandler) UpdateEnv(c *fiber.Ctx) error {
 			"Field 'env' must be a non-empty object")
 	}
 
-	slog.Info("stack.env.noted",
-		"slug", slug, "team_id", team.ID, "keys_noted", len(body.Env))
+	// Validate every incoming key against the same POSIX shape /deploy/new
+	// and /stacks/new enforce. Rejecting at PATCH time keeps the next
+	// redeploy from failing async in the build pipeline with an opaque
+	// k8s C_IDENTIFIER error.
+	if ok, badKey := validateEnvVarKeys(body.Env); !ok {
+		return respondError(c, fiber.StatusBadRequest, "invalid_env_key",
+			"Env-var key "+quoteForError(badKey)+" must match POSIX shape [A-Z_][A-Z0-9_]*")
+	}
+
+	// Load existing env, merge, save. Empty-string value deletes the key —
+	// matches the dashboard's PATCH-with-delete affordance.
+	existing, err := models.GetStackEnvVars(c.Context(), h.db, stack.ID)
+	if err != nil {
+		var notFound *models.ErrStackNotFound
+		if errors.As(err, &notFound) {
+			// Row vanished between GetStackBySlug and here. Treat as 404.
+			return respondError(c, fiber.StatusNotFound, "not_found", "Stack not found")
+		}
+		slog.Error("stack.env.fetch_failed",
+			"slug", slug, "team_id", team.ID, "stack_id", stack.ID, "error", err)
+		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed",
+			"Failed to fetch existing env vars")
+	}
+	if existing == nil {
+		existing = map[string]string{}
+	}
+	merged := make(map[string]string, len(existing)+len(body.Env))
+	for k, v := range existing {
+		merged[k] = v
+	}
+	deletes := 0
+	for k, v := range body.Env {
+		if v == "" {
+			delete(merged, k)
+			deletes++
+			continue
+		}
+		merged[k] = v
+	}
+
+	if err := models.UpdateStackEnvVars(c.Context(), h.db, stack.ID, merged); err != nil {
+		if errors.Is(err, models.ErrStackEnvVarsTooLarge) {
+			return respondError(c, fiber.StatusRequestEntityTooLarge, "env_too_large",
+				"Total env_vars payload exceeds 64KiB. Trim values or split across services.")
+		}
+		var notFound *models.ErrStackNotFound
+		if errors.As(err, &notFound) {
+			return respondError(c, fiber.StatusNotFound, "not_found", "Stack not found")
+		}
+		slog.Error("stack.env.persist_failed",
+			"slug", slug, "team_id", team.ID, "stack_id", stack.ID, "error", err)
+		return respondError(c, fiber.StatusServiceUnavailable, "persist_failed",
+			"Failed to persist env vars")
+	}
+
+	// Best-effort audit emit — never block the response on this.
+	auditMeta, _ := json.Marshal(map[string]any{
+		"keys_set":     len(body.Env) - deletes,
+		"keys_deleted": deletes,
+		"total_after":  len(merged),
+	})
+	go func(teamID uuid.UUID, stackID uuid.UUID, slug string, meta []byte) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if aErr := models.InsertAuditEvent(ctx, h.db, models.AuditEvent{
+			TeamID:       teamID,
+			Actor:        auditActorSystem,
+			Kind:         "stack.env.updated",
+			ResourceType: "stack",
+			ResourceID:   uuid.NullUUID{UUID: stackID, Valid: true},
+			Summary:      "updated env vars on stack <code>" + slug + "</code>",
+			Metadata:     meta,
+		}); aErr != nil {
+			slog.Warn("stack.env.audit_failed",
+				"error", aErr, "team_id", teamID, "stack_id", stackID, "slug", slug)
+		}
+	}(team.ID, stack.ID, slug, auditMeta)
+
+	slog.Info("stack.env.updated",
+		"slug", slug, "team_id", team.ID, "stack_id", stack.ID,
+		"keys_set", len(body.Env)-deletes, "keys_deleted", deletes, "total_after", len(merged))
 
 	return c.JSON(fiber.Map{
 		"ok":      true,
-		"message": "Env vars noted. Call POST /stacks/" + slug + "/redeploy with updated tarballs to apply.",
+		"env":     merged,
+		"message": "Env vars persisted. Call POST /stacks/" + slug + "/redeploy to apply.",
 	})
 }
 

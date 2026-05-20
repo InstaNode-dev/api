@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -581,4 +583,88 @@ func CountActiveStacksByTeam(ctx context.Context, db dbExecutor, teamID uuid.UUI
 		return 0, fmt.Errorf("models.CountActiveStacksByTeam: %w", err)
 	}
 	return n, nil
+}
+
+// ── env_vars persistence (migration 062, B7-P0-1 2026-05-20) ────────────────
+//
+// env_vars lives in its own dedicated read/write pair rather than being
+// threaded through scanStack. Three call sites (custom_domain, promote, log
+// streaming) already pin scanStack's 13-column shape via sqlmock fixtures,
+// and broadening that shape would touch every fixture for a single
+// optional field. The dedicated accessors below match what PATCH
+// /stacks/:slug/env actually does: load env, merge, save.
+
+// GetStackEnvVars returns the env_vars JSONB blob for a stack as a flat
+// map. An empty/NULL column reads back as an empty map (never nil) so
+// callers don't have to nil-guard before iterating.
+//
+// The query is a separate roundtrip rather than a column on scanStack so
+// the dozen-plus call sites that load a Stack don't pay the JSON
+// unmarshal cost when they never read env_vars (the common case).
+func GetStackEnvVars(ctx context.Context, db *sql.DB, stackID uuid.UUID) (map[string]string, error) {
+	var raw []byte
+	err := db.QueryRowContext(ctx, `
+		SELECT COALESCE(env_vars, '{}'::jsonb) FROM stacks WHERE id = $1
+	`, stackID).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return nil, &ErrStackNotFound{Slug: stackID.String()}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("models.GetStackEnvVars: %w", err)
+	}
+	out := map[string]string{}
+	if len(raw) == 0 {
+		return out, nil
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("models.GetStackEnvVars: unmarshal: %w", err)
+	}
+	return out, nil
+}
+
+// ErrStackEnvVarsTooLarge is returned by UpdateStackEnvVars when the
+// serialized JSONB payload exceeds maxStackEnvVarsBytes. The cap exists
+// because env_vars lives in a single Postgres column on every stack
+// row — an unbounded payload would let a single tenant inflate the
+// stacks-table row size and slow every scan, including the no-env-vars
+// reads. 64KiB matches the practical k8s ConfigMap upper bound (1MiB
+// hard cap, but kubectl warns at 1MiB and 64KiB is roomy for ~1000 env
+// pairs at ~64 bytes each).
+var ErrStackEnvVarsTooLarge = errors.New("stack env_vars payload exceeds 64KiB")
+
+// maxStackEnvVarsBytes is the serialized-JSON byte cap on env_vars.
+// 64*1024 = 65536. See ErrStackEnvVarsTooLarge for rationale.
+const maxStackEnvVarsBytes = 64 * 1024
+
+// UpdateStackEnvVars replaces the env_vars JSONB blob for a stack. The
+// passed map is the FULL replacement set — partial updates are the
+// caller's responsibility (PATCH semantics live in the handler, which
+// loads-merges-saves).
+//
+// Nil and empty maps both persist as '{}'::jsonb so the column is never
+// SQL NULL (the runtime always reads a usable map).
+//
+// Bounded at maxStackEnvVarsBytes after marshaling to keep a single
+// tenant from inflating stacks-row sizes.
+func UpdateStackEnvVars(ctx context.Context, db *sql.DB, stackID uuid.UUID, envVars map[string]string) error {
+	if envVars == nil {
+		envVars = map[string]string{}
+	}
+	envVarsJSON, err := json.Marshal(envVars)
+	if err != nil {
+		return fmt.Errorf("models.UpdateStackEnvVars: marshal: %w", err)
+	}
+	if len(envVarsJSON) > maxStackEnvVarsBytes {
+		return ErrStackEnvVarsTooLarge
+	}
+	res, err := db.ExecContext(ctx, `
+		UPDATE stacks SET env_vars = $1, updated_at = now() WHERE id = $2
+	`, envVarsJSON, stackID)
+	if err != nil {
+		return fmt.Errorf("models.UpdateStackEnvVars: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return &ErrStackNotFound{Slug: stackID.String()}
+	}
+	return nil
 }

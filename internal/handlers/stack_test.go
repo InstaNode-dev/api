@@ -73,6 +73,9 @@ func ensureStackTables(t *testing.T, db *sql.DB) {
 		// before this migration (matches the production migration sequence).
 		`ALTER TABLE stacks ADD COLUMN IF NOT EXISTS env TEXT NOT NULL DEFAULT 'production'`,
 		`ALTER TABLE stacks ADD COLUMN IF NOT EXISTS parent_stack_id UUID`,
+		// Migration 062 — B7-P0-1 (2026-05-20): PATCH /stacks/:slug/env now persists
+		// to this JSONB column. Default '{}'::jsonb so existing rows read as empty.
+		`ALTER TABLE stacks ADD COLUMN IF NOT EXISTS env_vars JSONB NOT NULL DEFAULT '{}'::jsonb`,
 		`CREATE TABLE IF NOT EXISTS stack_services (
 			id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			stack_id    UUID NOT NULL REFERENCES stacks(id) ON DELETE CASCADE,

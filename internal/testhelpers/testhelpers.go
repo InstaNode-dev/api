@@ -546,10 +546,14 @@ func runMigrations(t *testing.T, db *sql.DB) {
 			status      TEXT NOT NULL DEFAULT 'pending',
 			tier        TEXT NOT NULL DEFAULT 'anonymous',
 			env         TEXT NOT NULL DEFAULT 'development',
+			env_vars    JSONB NOT NULL DEFAULT '{}'::jsonb,
 			expires_at  TIMESTAMPTZ,
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		// Migration 062 — B7-P0-1 (2026-05-20). Idempotent ALTER for environments
+		// where the slim stacks shape above was created before this column existed.
+		`ALTER TABLE stacks ADD COLUMN IF NOT EXISTS env_vars JSONB NOT NULL DEFAULT '{}'::jsonb`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS uq_stacks_team_slug ON stacks(team_id, slug)`,
 		`CREATE INDEX IF NOT EXISTS idx_stacks_team ON stacks(team_id)`,
 		`CREATE TABLE IF NOT EXISTS stack_services (
