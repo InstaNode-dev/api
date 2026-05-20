@@ -92,8 +92,13 @@ func TestSanitizeName_StripsXSSVectors(t *testing.T) {
 		{"strips single quote", "it's mine", "its mine"},
 		{"strips mixed", "<img src=\"x\" onerror='alert(1)'>", "img src=x onerror=alert(1)"},
 		{"preserves ampersand", "Smith & Co", "Smith & Co"},
-		{"caps at 120 chars", strings.Repeat("a", 200), strings.Repeat("a", 120)},
-		{"strip before truncate", "<" + strings.Repeat("a", 200) + ">", strings.Repeat("a", 120)},
+		// B18 M2 (BugBash 2026-05-20): sanitizeName no longer truncates at
+		// 120 bytes — requireName's 64-rune gate is the single source of
+		// truth on length. sanitizeName is now responsible only for
+		// stripping control + HTML-special chars; length enforcement
+		// (and the 400 invalid_name response) belongs to requireName.
+		{"passes 200-char input through unchanged", strings.Repeat("a", 200), strings.Repeat("a", 200)},
+		{"strips angle brackets, length preserved", "<" + strings.Repeat("a", 200) + ">", strings.Repeat("a", 200)},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
