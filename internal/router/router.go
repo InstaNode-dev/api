@@ -421,6 +421,10 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	app.Post("/nosql/new", middleware.OptionalAuthStrict(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "nosql.new"), nosqlH.NewNoSQL)
 	app.Post("/queue/new", middleware.OptionalAuthStrict(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "queue.new"), queueH.NewQueue)
 	app.Post("/storage/new", middleware.OptionalAuthStrict(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "storage.new"), storageH.NewStorage)
+	// POST /storage/:token/presign — broker-mode access path. Authentication is
+	// the token in the URL (the same token returned by /storage/new). Used by
+	// agents on DO Spaces today where no long-lived credential is issued.
+	app.Post("/storage/:token/presign", storageH.PresignStorage)
 	app.Post("/webhook/new", middleware.OptionalAuthStrict(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "webhook.new"), webhookH.NewWebhook)
 	// /webhook/receive/:token is registered with app.All so any HTTP method
 	// (GET for Slack URL verification, POST for the bulk of webhook senders,

@@ -1447,16 +1447,48 @@ const openAPISpec = `{
     "/storage/new": {
       "post": {
         "summary": "Provision S3-compatible object storage",
-        "description": "Returns S3-compatible credentials (access_key_id + secret_access_key) scoped to a per-token prefix inside a shared MinIO/R2 bucket. Anonymous tier: 10MB, 24h TTL (plans.yaml storage_storage_mb=10; was incorrectly documented as 1024MB — FIX-K 2026-05-16). Returns 503 service_disabled when MINIO_ENDPOINT / R2_API_TOKEN are not configured on the server.\n\nSupports Stripe/AWS-style idempotency via the optional Idempotency-Key request header.",
+        "description": "Provisions an object-storage prefix for the caller. The response shape depends on what isolation the configured backend can ENFORCE (PrefixScopedKeys capability — see STORAGE-ABSTRACTION-DESIGN-2026-05-20.md):\n\n- 'prefix-scoped' / 'prefix-scoped-temporary' (R2, S3, MinIO): returns access_key_id + secret_access_key (and session_token for STS-backed flows) that the backend IAM enforces against <prefix>/*. Use directly with any S3 SDK.\n\n- 'shared-master-key' (legacy DO Spaces rows): returns the platform master key + prefix. Isolation is by convention only; new tenants do NOT land here.\n\n- 'broker' (DO Spaces today for new tenants): NO long-lived credential is returned. Instead the response carries agent_action='use_presign_endpoint' + presign_url pointing to POST /storage/{token}/presign for short-lived signed URLs.\n\nAlways inspect the 'mode' field in the response to pick the right access pattern. Anonymous tier: 10MB, 24h TTL (plans.yaml storage_storage_mb=10). Supports Stripe/AWS-style idempotency via the optional Idempotency-Key request header.",
         "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars). First response cached for 24h; replays return the cached body with X-Idempotent-Replay: true. Reusing the key with a different body returns 409." }],
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
-          "201": { "description": "Storage provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StorageProvisionResponse" } } } },
+          "201": { "description": "Storage provisioned. Response carries a 'mode' field — one of shared-master-key | prefix-scoped | prefix-scoped-temporary | broker — describing the isolation the tenant has.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StorageProvisionResponse" } } } },
           "400": { "description": "Bad request — one of: name_required (name field missing/empty), invalid_name (name fails the 1-64-char start-alnum pattern or contains invalid UTF-8), invalid_body (request body is not valid JSON), invalid_env, or an invalid Idempotency-Key (empty, >255 chars, or non-ASCII-printable).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Storage limit reached. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "429": { "description": "Anonymous fingerprint limit exceeded. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Object storage is not configured on this environment", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      }
+    },
+    "/storage/{token}/presign": {
+      "post": {
+        "summary": "Mint a short-lived presigned S3 URL (broker-mode access)",
+        "description": "Returns a signed URL the caller can use directly with HTTP GET/PUT against the configured object-storage endpoint. Used in BROKER MODE — when the backend (DO Spaces today) cannot enforce per-tenant prefix-scoping at the IAM layer, /storage/new returns no long-lived credential and the caller fetches one signed URL per object operation via this endpoint instead. The token in the URL IS the credential (same token returned by /storage/new); no Authorization header required. expires_in is clamped to a maximum of 3600 seconds. The 'key' field is rooted at the resource's prefix — path-traversal segments ('../', '.') are dropped.",
+        "parameters": [
+          { "name": "token", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" }, "description": "The storage resource's token (returned by /storage/new)." }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["operation", "key"],
+                "properties": {
+                  "operation": { "type": "string", "enum": ["GET", "PUT"], "description": "S3 verb to sign for." },
+                  "key": { "type": "string", "description": "Object key, relative to the resource's prefix. Leading slashes + '../' components are stripped." },
+                  "expires_in": { "type": "integer", "description": "Lifetime of the signed URL in seconds. Default 600, max 3600.", "default": 600, "maximum": 3600 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Signed URL minted.", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "url": { "type": "string" }, "method": { "type": "string" }, "key": { "type": "string" }, "object_key": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" } } } } } },
+          "400": { "description": "invalid_token, invalid_operation, or invalid_key.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "404": { "description": "resource_not_found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "410": { "description": "resource_inactive — paused, expired, or deleted.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "503": { "description": "service_disabled or sign_failed (object storage not configured).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
@@ -2668,8 +2700,14 @@ const openAPISpec = `{
           "name": { "type": "string" },
           "connection_url": { "type": "string", "description": "Public bucket URL scoped to the per-token prefix" },
           "endpoint": { "type": "string", "description": "S3-compatible endpoint host (e.g. minio.instant-data.svc.cluster.local:9000 / r2.instant.dev)" },
-          "access_key_id": { "type": "string" },
-          "secret_access_key": { "type": "string", "description": "Shown ONCE — store now; rotation requires re-provisioning" },
+          "access_key_id": { "type": "string", "description": "Present in credential modes only (shared-master-key / prefix-scoped / prefix-scoped-temporary). Omitted in broker mode." },
+          "secret_access_key": { "type": "string", "description": "Shown ONCE — store now; rotation requires re-provisioning. Omitted in broker mode." },
+          "session_token": { "type": "string", "description": "Present only when mode=prefix-scoped-temporary (R2 temp-creds / S3 STS). Pass this to your S3 SDK as the session token to complete the credential triple." },
+          "mode": { "type": "string", "enum": ["shared-master-key", "prefix-scoped", "prefix-scoped-temporary", "broker", "dedicated-bucket"], "description": "Isolation mode the tenant is on. 'shared-master-key' = DO Spaces legacy (every tenant holds the master key, prefix-by-convention). 'prefix-scoped' = backend IAM enforces s3:prefix against <prefix>/* (R2, S3, MinIO). 'prefix-scoped-temporary' = same but credentials expire (STS). 'broker' = NO long-lived credential issued; use POST /storage/{token}/presign for short-lived signed URLs. 'dedicated-bucket' = reserved for the paid-tier-on-DO-Spaces flow (not yet auto-issued)." },
+          "presign_url": { "type": "string", "description": "Path to the broker-mode access endpoint. Present only when mode=broker. POST to this URL with { operation, key, expires_in } to mint a short-lived signed URL." },
+          "broker_reason": { "type": "string", "description": "Human-readable note explaining why broker mode was selected (e.g. 'backend-has-no-prefix-scoping'). Present only when mode=broker." },
+          "note_isolation": { "type": "string", "description": "Human-readable explanation of the isolation tradeoff. Present only when mode=broker." },
+          "agent_action": { "type": "string", "description": "Machine-readable hint for an automated caller. Present only when mode=broker; value is 'use_presign_endpoint'." },
           "prefix": { "type": "string", "description": "Object-key prefix all writes must use for isolation" },
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
