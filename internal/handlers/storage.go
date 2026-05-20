@@ -255,7 +255,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 				// P2-06: use respondOK so the dedup response carries
 				// decorateEnvOverride's env_override_reason like every other
 				// provision response.
-				return respondOK(c, dedupResp)
+				return respondDedupReplay(c, dedupResp)
 			}
 			// Empty connection_url — provisioning failed mid-flight on the
 			// existing resource. Fall through to provision a fresh one.

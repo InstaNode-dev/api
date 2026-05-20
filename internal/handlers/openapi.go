@@ -204,10 +204,12 @@ const openAPISpec = `{
         "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars) that makes this POST safe to retry. The first response is cached for 24h; subsequent calls carrying the same key return the cached response verbatim with X-Idempotent-Replay: true. Reusing a key with a different body returns 409. Replays still consume rate-limit budget (anti-abuse) but do NOT consume quota budget (the original call already did)." }],
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
-          "201": { "description": "Database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DBProvisionResponse" } } } },
+          "200": { "description": "Dedup replay (B13-F2/F4 2026-05-20). Sets X-Idempotent-Replay: true.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DBProvisionResponse" } } } },
+          "201": { "description": "Database provisioned (fresh)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DBProvisionResponse" } } } },
           "400": { "description": "Bad request — one of: name_required (name field missing/empty), invalid_name (name fails the 1-64-char start-alnum pattern or contains invalid UTF-8), invalid_body (request body is not valid JSON), invalid_env, or an invalid Idempotency-Key (empty, >255 chars, or non-ASCII-printable).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim — anonymous fingerprint that previously provisioned must claim with email before re-provisioning). Includes agent_action with copy the calling agent can show the user, plus upgrade_url and (for the recycle gate) claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
-          "409": { "description": "Idempotency-Key already used with a different request body (error=idempotency_key_conflict). The agent reused a key for a logically different call — generate a new key.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "409": { "description": "Idempotency-Key conflict.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "429": { "description": "Anonymous daily cap reached (error=provision_limit_reached). B13-F5/F6.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -218,9 +220,12 @@ const openAPISpec = `{
         "description": "Returns a real postgres:// connection string with the pgvector extension pre-installed. Use for embedding stores (OpenAI ada-002 = 1536 dims, text-embedding-3-small = 1536, text-embedding-3-large = 3072). The optional dimensions field is a documentation hint — pgvector lets you pick per-column dimensions at table-create time, so the server stores the declared default but does not enforce it. Tier limits mirror Postgres exactly because the underlying storage IS Postgres. Anonymous tier: 10MB, 2 connections, 24h TTL.",
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VectorProvisionRequest" } } } },
         "responses": {
-          "201": { "description": "Vector database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VectorProvisionResponse" } } } },
+          "200": { "description": "Dedup replay (B13-F2/F4). Sets X-Idempotent-Replay: true.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VectorProvisionResponse" } } } },
+          "201": { "description": "Vector database provisioned (fresh)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VectorProvisionResponse" } } } },
           "400": { "description": "Bad request — one of: invalid dimensions (must be 1..16000), invalid env, invalid_name (name contains invalid UTF-8), or invalid_body (request body is not valid JSON).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
-          "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "402": { "description": "Quota exceeded OR recycle.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "409": { "description": "Idempotency conflict. B13-F21.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "429": { "description": "Anonymous daily cap reached (error=provision_limit_reached). B13-F5.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -232,10 +237,12 @@ const openAPISpec = `{
         "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars). First response cached for 24h; replays return the cached body with X-Idempotent-Replay: true. Reusing the key with a different body returns 409." }],
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
-          "201": { "description": "Cache provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CacheProvisionResponse" } } } },
+          "200": { "description": "Dedup replay (B13-F2/F4). Sets X-Idempotent-Replay: true.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CacheProvisionResponse" } } } },
+          "201": { "description": "Cache provisioned (fresh)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CacheProvisionResponse" } } } },
           "400": { "description": "Bad request — one of: name_required (name field missing/empty), invalid_name (name fails the 1-64-char start-alnum pattern or contains invalid UTF-8), invalid_body (request body is not valid JSON), invalid_env, or an invalid Idempotency-Key (empty, >255 chars, or non-ASCII-printable).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
-          "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "409": { "description": "Idempotency conflict.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "429": { "description": "Anonymous daily cap reached (error=provision_limit_reached). B13-F5.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -247,10 +254,12 @@ const openAPISpec = `{
         "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars). First response cached for 24h; replays return the cached body with X-Idempotent-Replay: true. Reusing the key with a different body returns 409." }],
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
-          "201": { "description": "MongoDB database provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NoSQLProvisionResponse" } } } },
+          "200": { "description": "Dedup replay (B13-F2/F4). Sets X-Idempotent-Replay: true.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NoSQLProvisionResponse" } } } },
+          "201": { "description": "MongoDB database provisioned (fresh)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NoSQLProvisionResponse" } } } },
           "400": { "description": "Bad request — one of: name_required (name field missing/empty), invalid_name (name fails the 1-64-char start-alnum pattern or contains invalid UTF-8), invalid_body (request body is not valid JSON), invalid_env, or an invalid Idempotency-Key (empty, >255 chars, or non-ASCII-printable).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
-          "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "409": { "description": "Idempotency conflict.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "429": { "description": "Anonymous daily cap reached (error=provision_limit_reached). B13-F5.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -262,10 +271,12 @@ const openAPISpec = `{
         "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars). First response cached for 24h; replays return the cached body with X-Idempotent-Replay: true. Reusing the key with a different body returns 409." }],
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
-          "201": { "description": "Queue provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueProvisionResponse" } } } },
+          "200": { "description": "Dedup replay (B13-F2/F4). Sets X-Idempotent-Replay: true.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueProvisionResponse" } } } },
+          "201": { "description": "Queue provisioned (fresh)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueProvisionResponse" } } } },
           "400": { "description": "Bad request — one of: name_required (name field missing/empty), invalid_name (name fails the 1-64-char start-alnum pattern or contains invalid UTF-8), invalid_body (request body is not valid JSON), invalid_env, or an invalid Idempotency-Key (empty, >255 chars, or non-ASCII-printable).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded, feature requires upgrade, OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
-          "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "409": { "description": "Idempotency conflict.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "429": { "description": "Anonymous daily cap reached (error=provision_limit_reached). B13-F5.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -277,10 +288,12 @@ const openAPISpec = `{
         "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars). First response cached for 24h; replays return the cached body with X-Idempotent-Replay: true. Reusing the key with a different body returns 409." }],
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
-          "201": { "description": "Webhook receiver provisioned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WebhookProvisionResponse" } } } },
+          "200": { "description": "Dedup replay (B13-F2/F4). Sets X-Idempotent-Replay: true.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WebhookProvisionResponse" } } } },
+          "201": { "description": "Webhook receiver provisioned (fresh)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WebhookProvisionResponse" } } } },
           "400": { "description": "Bad request — one of: name_required (name field missing/empty), invalid_name (name fails the 1-64-char start-alnum pattern or contains invalid UTF-8), invalid_body (request body is not valid JSON), invalid_env, or an invalid Idempotency-Key (empty, >255 chars, or non-ASCII-printable).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Quota exceeded OR free-tier recycle requires claim (error=free_tier_recycle_requires_claim). Includes agent_action and upgrade_url; recycle gate also returns claim_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
-          "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "409": { "description": "Idempotency conflict.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "429": { "description": "Anonymous daily cap reached (error=provision_limit_reached). B13-F5.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "503": { "description": "Provisioning failed (transient). Retry with backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
@@ -297,6 +310,7 @@ const openAPISpec = `{
         "requestBody": { "description": "Raw body of any content type — the handler stores the bytes verbatim and does not parse by Content-Type. The listed types are the common cases; the wildcard entry documents that any media type is accepted.", "content": { "application/json": {}, "application/x-www-form-urlencoded": {}, "text/plain": {}, "application/octet-stream": {}, "*/*": {} } },
         "responses": {
           "200": { "description": "Payload stored", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string" } } } } } },
+          "400": { "description": "Token not a UUID (error=invalid_token). B13-F13.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "401": { "description": "HMAC signature missing or invalid (when hmac_secret is set on the resource).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "404": { "description": "Token not found.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "410": { "description": "Token exists but resource status != 'active'.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
@@ -1463,7 +1477,8 @@ const openAPISpec = `{
         "parameters": [{ "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string", "maxLength": 255 }, "description": "Opaque client-supplied key (1-255 ASCII printable chars). First response cached for 24h; replays return the cached body with X-Idempotent-Replay: true. Reusing the key with a different body returns 409." }],
         "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } } },
         "responses": {
-          "201": { "description": "Storage provisioned. Response carries a 'mode' field — one of shared-master-key | prefix-scoped | prefix-scoped-temporary | broker — describing the isolation the tenant has.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StorageProvisionResponse" } } } },
+          "200": { "description": "Dedup replay (B13-F2/F4); access_key_id/secret_access_key NOT re-emitted. Sets X-Idempotent-Replay: true.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StorageProvisionResponse" } } } },
+          "201": { "description": "Storage provisioned (fresh). Response carries mode field.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StorageProvisionResponse" } } } },
           "400": { "description": "Bad request — one of: name_required (name field missing/empty), invalid_name (name fails the 1-64-char start-alnum pattern or contains invalid UTF-8), invalid_body (request body is not valid JSON), invalid_env, or an invalid Idempotency-Key (empty, >255 chars, or non-ASCII-printable).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "402": { "description": "Storage limit reached. Includes agent_action and upgrade_url.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
           "409": { "description": "Idempotency-Key already used with a different body (error=idempotency_key_conflict).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
@@ -1635,8 +1650,8 @@ const openAPISpec = `{
         "responses": {
           "200": { "description": "Login complete", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "api_key": { "type": "string" }, "email": { "type": "string", "format": "email" }, "tier": { "type": "string" }, "team_name": { "type": "string" }, "claimed_tokens": { "type": "array", "items": { "type": "string", "format": "uuid" } } } } } } },
           "202": { "description": "Still pending" },
-          "400": { "description": "Missing session id" },
-          "404": { "description": "Session not found or expired" }
+          "400": { "description": "Missing session id. B13-F12.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "404": { "description": "Session not found or expired (error=session_not_found). B13-F12.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
@@ -2585,6 +2600,8 @@ const openAPISpec = `{
     "schemas": {
       "HealthResponse": {
         "type": "object",
+        "description": "Liveness response. B13-F17: all fields always present on 2xx.",
+        "required": ["ok", "service", "commit_id", "build_time", "version", "migration_version", "migration_count", "migration_status"],
         "properties": {
           "ok": { "type": "boolean" },
           "service": { "type": "string" },
@@ -2608,7 +2625,7 @@ const openAPISpec = `{
             "items": {
               "type": "object",
               "properties": {
-                "name": { "type": "string", "description": "Stable component identifier (e.g. 'platform_db', 'provisioner_grpc', 'brevo', 'razorpay', 'redis', 'do_spaces', 'river')." },
+                "name": { "type": "string", "description": "Stable component. api emits: customer_db, do_spaces, platform_db, provisioner_grpc, razorpay, redis. B13-F16: api does NOT emit brevo." },
                 "status": { "type": "string", "enum": ["ok", "degraded", "failed"], "description": "Per-component status. Critical components only impact overall=failed; non-critical only impact overall=degraded." },
                 "latency_ms": { "type": "integer", "description": "Wall-clock duration of the last probe in milliseconds." },
                 "last_error": { "type": "string", "description": "Last observed error message (only present when status != 'ok'). Scrubbed of credentials." },

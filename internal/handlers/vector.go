@@ -315,7 +315,7 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 					"upgrade_jwt":    jwtToken,
 				}
 				setInternalURL(dedupResp, existing.Tier, connectionURL, "postgres")
-				return respondOK(c, dedupResp)
+				return respondDedupReplay(c, dedupResp)
 			}
 			slog.Warn("vector.new.dedup_empty_url — provisioning fresh",
 				"token", existing.Token, "request_id", requestID)

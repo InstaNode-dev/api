@@ -285,7 +285,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 				// provisioning endpoint — matches storage.go.
 				resp["expires_at"] = existing.ExpiresAt.Time.Format(time.RFC3339)
 			}
-			return respondOK(c, resp)
+			return respondDedupReplay(c, resp)
 		}
 	}
 

@@ -238,7 +238,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 					"upgrade_jwt":    jwtToken,
 				}
 				setInternalURL(dedupResp, existing.Tier, connectionURL, "queue")
-				return respondOK(c, dedupResp)
+				return respondDedupReplay(c, dedupResp)
 			}
 			// Empty connection_url means provisioning failed mid-flight on the existing
 			// resource. Fall through to provision a fresh one rather than returning
