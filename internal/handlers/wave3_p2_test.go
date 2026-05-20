@@ -342,6 +342,22 @@ func TestWave3P2_JWTAlgPin_RejectsHS384AndHS512(t *testing.T) {
 // T12-4 — AES key-version envelope (round-trip)
 // ──────────────────────────────────────────────────────────────────────
 
+// isVersionMarker reports whether s carries the structural "vN."
+// version-marker prefix written by crypto.EncryptVersioned (lowercase
+// 'v', ASCII digit '1'..'9', literal '.'). Mirrors the splitter in
+// internal/crypto/aes.go::splitVersionedEnvelope so this test stays
+// independent of unexported helpers.
+//
+// IMPORTANT: don't replace this with strings.HasPrefix(s, "v") — base64-url's
+// alphabet includes 'v', so a non-trivial fraction of plain crypto.Encrypt
+// outputs begin with 'v' purely from a random nonce byte.
+func isVersionMarker(s string) bool {
+	if len(s) < 3 || s[0] != 'v' || s[2] != '.' {
+		return false
+	}
+	return s[1] >= '1' && s[1] <= '9'
+}
+
 // TestWave3P2_AESKeyring_RoundTripsAcrossVersions guards the keyring
 // rotation primitive: a v2-tagged envelope produced by EncryptVersioned
 // is decryptable by the keyring; a legacy un-prefixed envelope is also
@@ -380,7 +396,16 @@ func TestWave3P2_AESKeyring_RoundTripsAcrossVersions(t *testing.T) {
 	// (this is what every existing row in prod looks like today).
 	legacy, err := crypto.Encrypt(keyV2, "legacy")
 	require.NoError(t, err)
-	require.False(t, strings.HasPrefix(legacy, "v"), "legacy envelope must not carry a version prefix")
+	// The check is structural: a legacy envelope MUST NOT match the
+	// "vN." marker pattern produced by EncryptVersioned (v = lowercase
+	// 'v', N = ASCII digit '1'..'9', '.' at position 2). A plain
+	// crypto.Encrypt output is base64(nonce||ct||tag) — base64-url's
+	// alphabet legitimately includes the byte 'v', so ~1.6% of legacy
+	// ciphertexts start with 'v' purely by chance from the random
+	// nonce. Asserting "no leading v" makes the test flake on those
+	// runs (CI seen 2026-05-20). The correct invariant is the full
+	// 3-byte marker shape.
+	require.False(t, isVersionMarker(legacy), "legacy envelope must not carry a vN. version marker")
 	outLegacy, err := kr2.Decrypt(legacy)
 	require.NoError(t, err)
 	assert.Equal(t, "legacy", outLegacy)
