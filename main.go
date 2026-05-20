@@ -162,7 +162,7 @@ func main() {
 		slog.Info("main.provisioner_local", "note", "PROVISIONER_ADDR not set, using local providers")
 	}
 
-	app := router.New(cfg, database, rdb, geoDbs, emailClient, planRegistry, provClient, nrApp)
+	app, hooks := router.NewWithHooks(cfg, database, rdb, geoDbs, emailClient, planRegistry, provClient, nrApp)
 
 	slog.Info("server.starting",
 		"port", cfg.Port,
@@ -171,7 +171,7 @@ func main() {
 		"build_time", buildinfo.BuildTime,
 		"version", buildinfo.Version,
 	)
-	if err := runServerWithGracefulShutdown(app, ":"+cfg.Port, gracefulShutdownTimeout); err != nil {
+	if err := runServerWithGracefulShutdown(app, ":"+cfg.Port, gracefulShutdownTimeout, hooks); err != nil {
 		slog.Error("server.fatal", "error", err)
 		os.Exit(1)
 	}
@@ -179,11 +179,23 @@ func main() {
 
 // gracefulShutdownTimeout is the budget Fiber gets to drain in-flight requests
 // after SIGTERM. The Kubernetes Deployment sets terminationGracePeriodSeconds
-// to 30s; we leave a 5s margin so a stuck shutdown does not collide with
+// to 35s; we leave a 5s margin so a stuck shutdown does not collide with
 // SIGKILL. Mirror of the provisioner's 5s healthz drain + grpc.GracefulStop —
 // the api needs more because its longest in-flight request is a multi-minute
 // provision.
 const gracefulShutdownTimeout = 25 * time.Second
+
+// readinessDrainGrace is the window held open AFTER MarkDraining flips
+// /readyz to 503 and BEFORE we stop accepting new connections. Lets the
+// kubelet's readinessProbe tick observe the 503 and pull the pod from
+// the Service endpoint list. Pairs with the container preStop hook
+// (`sleep 5`) in infra/k8s/app.yaml — two belt-and-braces buffers for
+// the same LB-staleness race.
+//
+// Budget: readinessDrainGrace (3s) + gracefulShutdownTimeout (25s) +
+// slack (~2s) ≈ 30s; manifest terminationGracePeriodSeconds=35 leaves a
+// 5s safety margin before SIGKILL.
+const readinessDrainGrace = 3 * time.Second
 
 // runServerWithGracefulShutdown is the MR-P0-7 fix (BugBash 2026-05-20):
 // before this, `app.Listen(":"+cfg.Port)` blocked with no signal handler,
@@ -192,15 +204,22 @@ const gracefulShutdownTimeout = 25 * time.Second
 // multi-minute provisions. Now we:
 //
 //  1. Serve in a goroutine so main() can also wait on SIGINT/SIGTERM.
-//  2. Trap SIGTERM (kubelet sends it before SIGKILL); on receipt
-//     call app.ShutdownWithTimeout to drain in-flight handlers within the
+//  2. Trap SIGTERM (kubelet sends it before SIGKILL).
+//  3. Flip /readyz to 503 via hooks.Readyz.MarkDraining so the kubelet's
+//     readinessProbe pulls the pod from the Service endpoint list.
+//  4. Sleep readinessDrainGrace (~3s) so the readinessProbe has a chance
+//     to tick before we stop accepting new connections.
+//  5. Call app.ShutdownWithTimeout to drain in-flight handlers within the
 //     pod's terminationGracePeriodSeconds.
 //
 // Returns a non-nil error only when the serve goroutine reports a fatal
-// listener error (port bind failure etc.); a clean shutdown via SIGTERM
-// returns nil. Extracted as a free function so unit tests can verify the
-// drain contract (TestRunServerWithGracefulShutdown_DrainsInflight).
-func runServerWithGracefulShutdown(app *fiber.App, addr string, shutdownTimeout time.Duration) error {
+// listener error (port bind failure etc.) or ShutdownWithTimeout's drain
+// budget expires on a stuck request; a clean shutdown via SIGTERM returns
+// nil. Extracted as a free function so unit tests can verify the
+// drain contract (TestRunServerWithGracefulShutdown_DrainsInflight,
+// TestRunServerWithGracefulShutdown_MarksReadinessDraining,
+// TestRunServerWithGracefulShutdown_TimeoutKillsStuckRequest).
+func runServerWithGracefulShutdown(app *fiber.App, addr string, shutdownTimeout time.Duration, hooks router.ShutdownHooks) error {
 	serveErr := make(chan error, 1)
 	go func() {
 		// Listener errors include ErrServerClosed when ShutdownWithTimeout
@@ -223,12 +242,31 @@ func runServerWithGracefulShutdown(app *fiber.App, addr string, shutdownTimeout 
 		return sErr
 	case <-ctx.Done():
 		slog.Info("server.shutdown_signal_received",
-			"timeout_seconds", int(shutdownTimeout.Seconds()))
+			"timeout_seconds", int(shutdownTimeout.Seconds()),
+			"readiness_drain_grace_seconds", int(readinessDrainGrace.Seconds()),
+		)
 	}
 
-	// Drain in-flight requests within shutdownTimeout. Fiber's
+	// Phase A: flip /readyz → 503. The kubelet's readinessProbe will
+	// observe the 503 on its next tick and pull the pod from the
+	// Service endpoint list. The preStop `sleep 5` in infra/k8s/app.yaml
+	// already guarantees an LB-update window before SIGTERM is delivered;
+	// this is the in-process belt to that hook's braces.
+	if hooks.Readyz != nil {
+		hooks.Readyz.MarkDraining()
+		slog.Info("server.readiness_marked_draining")
+	}
+
+	// Phase B: sleep readinessDrainGrace so a probe tick (and an LB
+	// endpoint refresh) can land before we stop accepting connections.
+	time.Sleep(readinessDrainGrace)
+
+	// Phase C: drain in-flight requests within shutdownTimeout. Fiber's
 	// ShutdownWithTimeout stops accepting new connections and waits for
 	// existing handlers to finish (up to the timeout) before returning.
+	// A timeout returns a non-nil error which we surface to main() — the
+	// process still exits cleanly, but the operator can grep
+	// server.graceful_shutdown_failed for stuck-request audits.
 	if err := app.ShutdownWithTimeout(shutdownTimeout); err != nil {
 		slog.Error("server.graceful_shutdown_failed", "error", err)
 		return err
