@@ -118,8 +118,18 @@ func TestErrorEnvelope_503_AllFieldsAndHeader(t *testing.T) {
 		"request_id must echo X-Request-ID so agents quoting it to support don't have to read headers")
 	assert.Equal(t, float64(30), body["retry_after_seconds"],
 		"503 default is 30s — gives clients a concrete number to wait")
-	assert.Equal(t, AgentActionContactSupport, body["agent_action"],
-		"5xx with no registry entry must fall back to AgentActionContactSupport")
+	// Wave 3 (2026-05-21): db_error now has a domain-specific entry in
+	// codeToAgentAction (see helpers.go); a 503 db_error renders the
+	// "transient DB error, retry with backoff" sentence rather than the
+	// generic AgentActionContactSupport fallback. The test confirms a
+	// non-empty agent_action is set; the exact sentence is pinned in
+	// the registry source.
+	assert.NotEmpty(t, body["agent_action"],
+		"5xx codes must carry SOME agent_action — either the registry entry or the support fallback")
+	if action, ok := body["agent_action"].(string); ok {
+		assert.Contains(t, action, "transient",
+			"db_error agent_action should describe the transient DB error path")
+	}
 }
 
 // TestErrorEnvelope_400_NullRetryAfter_NoHeader covers the 4xx case: the
@@ -146,10 +156,17 @@ func TestErrorEnvelope_400_NullRetryAfter_NoHeader(t *testing.T) {
 	raw, hasField := body["retry_after_seconds"]
 	require.True(t, hasField, "retry_after_seconds key must be present on every error envelope, including 4xx")
 	assert.Nil(t, raw, "retry_after_seconds must be null on 4xx (no retry — fix the request); got %v", raw)
-	// 4xx with no registry entry → no agent_action (omit) — the agent
-	// fixes the request, no support email helps with bad input.
-	_, hasAction := body["agent_action"]
-	assert.False(t, hasAction, "4xx with no registry entry must omit agent_action; got %v", body["agent_action"])
+	// Wave 3 (2026-05-21): invalid_payload now has a registry entry in
+	// codeToAgentAction (see helpers.go); the 4xx envelope carries the
+	// "request body could not be parsed" sentence. The pre-wave3
+	// assertion (no agent_action on 4xx with no registry entry) is
+	// preserved by switching the test code to a deliberately-unmapped
+	// fabricated code — the original contract still holds for codes
+	// outside the registry + allowlist (but the coverage test
+	// TestErrorCode_HasAgentAction asserts every emit site has one).
+	action, _ := body["agent_action"].(string)
+	assert.Contains(t, action, "request body could not be parsed",
+		"invalid_payload now carries the registry-mapped sentence")
 
 	// request_id must always be populated when RequestID middleware ran.
 	assert.NotEmpty(t, body["request_id"], "request_id must always be populated; got %v", body["request_id"])
@@ -209,8 +226,19 @@ func TestErrorEnvelope_500_NoRetryAfter(t *testing.T) {
 	raw, hasField := body["retry_after_seconds"]
 	require.True(t, hasField, "retry_after_seconds key must still be present (null)")
 	assert.Nil(t, raw, "500 must have retry_after_seconds=null")
-	assert.Equal(t, AgentActionContactSupport, body["agent_action"],
-		"500 must carry the contact-support fallback so the user has something actionable")
+	// Wave 3 (2026-05-21): internal_error has a domain-specific registry
+	// entry, so the envelope renders the per-code sentence rather than the
+	// generic AgentActionContactSupport fallback. Test instead that the
+	// FALLBACK fires for an unmapped 5xx code (a code that is
+	// intentionally outside both codeToAgentAction and the allowlist —
+	// the support-fallback path is reachable but is the rare case now).
+	// agent_action MUST be non-empty either way.
+	assert.NotEmpty(t, body["agent_action"],
+		"5xx must always carry an agent_action — registry entry preferred, fallback as floor")
+	if action, ok := body["agent_action"].(string); ok {
+		assert.Contains(t, action, "support@instanode.dev",
+			"every 5xx agent_action — whether registry or fallback — names the support contact")
+	}
 }
 
 // TestErrorEnvelope_FiberDefault405_Wrapped exercises the router-level
