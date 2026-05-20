@@ -115,6 +115,48 @@ func TestLogMagicLinkSendResult_FailureEmitsWarnNotSent(t *testing.T) {
 	}
 }
 
+// TestEmailRateLimitKey_FullHashFingerprint pins B4-F2 (BugBash 2026-05-20):
+// the per-email rate-limit key must use the FULL sha256 digest (64 hex
+// chars), not the truncated h[:8] (16 hex chars). The truncated form had a
+// 2^32-effort birthday-collision space; the full digest is 2^128. A green
+// `go test` after a regression to h[:8] would re-introduce the bypass.
+func TestEmailRateLimitKey_FullHashFingerprint(t *testing.T) {
+	got := emailRateLimitKey("alice@example.com")
+	// "ml:email:rl:" prefix + ":" + 64 hex chars.
+	const wantPrefix = "ml:email:rl:"
+	if !strings.HasPrefix(got, wantPrefix) {
+		t.Fatalf("emailRateLimitKey: missing %q prefix, got %q", wantPrefix, got)
+	}
+	suffix := strings.TrimPrefix(got, wantPrefix)
+	if len(suffix) != 64 {
+		t.Errorf("emailRateLimitKey suffix has wrong length: got %d (%q), want 64 (full sha256 hex). Did somebody re-introduce the h[:8] truncation? See B4-F2.", len(suffix), suffix)
+	}
+}
+
+// TestLooksLikeEmail_LocalPartCap pins B4-F4 (BugBash 2026-05-20): RFC 5321
+// §4.5.3.1.1 caps the local-part at 64 octets. A green test after a
+// regression would re-admit guaranteed-undeliverable addresses to the
+// magic-link send pipeline.
+func TestLooksLikeEmail_LocalPartCap(t *testing.T) {
+	cases := []struct {
+		name string
+		s    string
+		want bool
+	}{
+		{"local_part_under_cap", strings.Repeat("a", 60) + "@example.com", true},
+		{"local_part_at_cap", strings.Repeat("a", 64) + "@example.com", true},
+		{"local_part_over_cap", strings.Repeat("a", 65) + "@example.com", false},
+		{"local_part_way_over_cap", strings.Repeat("a", 100) + "@example.com", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := looksLikeEmail(tc.s); got != tc.want {
+				t.Errorf("looksLikeEmail(%q) = %v, want %v", tc.s, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestLogMagicLinkSendResult_FailureIncludesRequestID asserts the warn-line
 // payload carries the request_id field so an operator can correlate the
 // failure with the request in NR (or trace it through downstream logs).

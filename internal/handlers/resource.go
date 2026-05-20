@@ -136,6 +136,17 @@ func (h *ResourceHandler) Get(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
 	}
 
+	// B20-P2-1 (BugBash 2026-05-20): GetResourceByToken has no status filter,
+	// so a soft-deleted resource (status='deleted', set by DELETE
+	// /api/v1/resources/:id → SoftDeleteResource) used to surface here as if
+	// active. The 404 below treats deleted rows the same as missing rows —
+	// the customer-visible contract is "the resource is gone after DELETE."
+	// The row stays around for audit + tombstone purposes; only the public
+	// read surface should hide it.
+	if resource.Status == "deleted" {
+		return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
+	}
+
 	storageLimitMB := h.plans.StorageLimitMB(resource.Tier, resource.ResourceType)
 	_, storageExceeded, _ := quota.CheckStorageQuota(c.Context(), h.db, resource.ID, storageLimitMB)
 

@@ -15,6 +15,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"instant.dev/internal/config"
 	"instant.dev/internal/email"
+	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
 )
@@ -36,6 +37,13 @@ const magicLinkEmailRateLimitWindow = time.Hour
 // Kept as a named constant so tests and monitoring can grep for it without
 // coupling to a string literal buried in a format string.
 const magicLinkEmailRLKeyPrefix = "ml:email:rl"
+
+// magicLinkStartMaxBodyBytes caps the inbound POST /auth/email/start JSON
+// body. Real bodies are ~80 bytes (email + return_to); 1 KiB is comfortable
+// for a future field without inviting megabyte-sized abuse payloads. The
+// global Fiber BodyLimit is 50 MiB for /deploy/new tarballs — far too
+// generous for a 2-field JSON envelope (B4-F5, BugBash 2026-05-20).
+const magicLinkStartMaxBodyBytes = 1024
 
 // MagicLinkHandler implements the passwordless email login flow:
 //   POST /auth/email/start    — generates a token, emails the link, returns 202
@@ -84,9 +92,17 @@ func NewMagicLinkHandlerWithMailerAndRedis(db *sql.DB, cfg *config.Config, mail 
 // emailRateLimitKey returns the Redis key for a given normalised email address.
 // Uses a SHA-256 hash of the email so PII (email addresses) never appear as
 // Redis key names in logs, Redis MONITOR output, or memory dumps.
+//
+// B4-F2 (BugBash 2026-05-20): previously truncated to h[:8] (8 bytes / 64
+// bits) which has a birthday-collision space of only ~2^32 attempts. An
+// attacker could plausibly grind ~4B email candidates to find two that
+// share a fingerprint and use the false-collision to bypass the per-email
+// limit on a victim's address. Use the full 32-byte digest — 256-bit
+// collision space is the same defence the canonical Redis cache keys
+// elsewhere in the codebase use.
 func emailRateLimitKey(emailAddr string) string {
 	h := sha256.Sum256([]byte(emailAddr))
-	return fmt.Sprintf("%s:%x", magicLinkEmailRLKeyPrefix, h[:8])
+	return fmt.Sprintf("%s:%x", magicLinkEmailRLKeyPrefix, h[:])
 }
 
 // checkEmailRateLimit increments the per-email Redis counter and returns
@@ -139,6 +155,19 @@ type magicLinkStartRequest struct {
 func (h *MagicLinkHandler) Start(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
+	// B4-F5 (BugBash 2026-05-20): the global Fiber BodyLimit is 50MiB to
+	// accommodate /deploy/new tarballs — that's far too generous for a
+	// 2-field JSON envelope. A 10MB JSON body on /auth/email/start passed
+	// silently before this fix: the parser would chew on megabytes of
+	// garbage attached to {"email":"a@b.c"}, holding a goroutine + buffer
+	// per request. Cap inbound bodies at 1KiB here (a real magic-link
+	// request body is ~80 bytes including the longest plausible email +
+	// return_to). Anything larger is malformed or hostile.
+	if len(c.Body()) > magicLinkStartMaxBodyBytes {
+		return respondError(c, fiber.StatusRequestEntityTooLarge, "payload_too_large",
+			"Request body exceeds the 1KiB cap for POST /auth/email/start")
+	}
+
 	var body magicLinkStartRequest
 	if err := c.BodyParser(&body); err != nil {
 		return respondError(c, fiber.StatusBadRequest, "invalid_body", "Request body must be valid JSON")
@@ -160,6 +189,13 @@ func (h *MagicLinkHandler) Start(c *fiber.Ctx) error {
 		)
 		// fail-open: continue as if not limited
 	} else if limited {
+		// B4-F1 (BugBash 2026-05-20): bump the operator-side metric BEFORE
+		// returning 202. The user-visible response stays identical to the
+		// success path (no attacker-side enumeration signal), but a
+		// monotonically-rising counter surfaces the abuse pattern in NR.
+		// Pair with the structured WARN below — the log carries the
+		// request_id correlator, the metric carries the rate.
+		metrics.MagicLinkEmailRateLimited.Inc()
 		slog.Warn("magic_link.start.email_rate_limited",
 			"request_id", requestID,
 		)
@@ -329,6 +365,11 @@ func (h *MagicLinkHandler) Callback(c *fiber.Ctx) error {
 // '@' with non-empty local-part and a host that contains a '.'. RFC 5321 has
 // edge cases (quoted local-parts, IP-literal hosts) we deliberately reject —
 // instanode.dev users never have those addresses.
+//
+// B4-F4 (BugBash 2026-05-20): RFC 5321 §4.5.3.1.1 caps the local-part at
+// 64 octets — addresses with a longer local-part are guaranteed-undeliverable
+// even when syntactically well-formed. Reject up-front so the magic-link
+// pipeline doesn't waste a Brevo send + ledger row on a doomed address.
 func looksLikeEmail(s string) bool {
 	if len(s) < 3 || len(s) > 254 {
 		return false
@@ -338,6 +379,13 @@ func looksLikeEmail(s string) bool {
 		return false
 	}
 	if strings.Count(s, "@") != 1 {
+		return false
+	}
+	// RFC 5321 §4.5.3.1.1: local-part max 64 octets. `at` is the index of
+	// the '@', which is also the byte-length of the local-part (s is ASCII-
+	// only here after the upstream trim/lowercase, so byte-length == octet-
+	// length for any address that reaches this gate).
+	if at > 64 {
 		return false
 	}
 	host := s[at+1:]

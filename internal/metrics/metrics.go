@@ -215,6 +215,19 @@ var (
 		Help: "Inbound Brevo transactional-webhook events by normalized class (delivered/bounced_hard/bounced_soft/rejected/complaint/deferred/unsubscribed/error/unhandled/missing_message_id/unauthorized/invalid_payload/oversized)",
 	}, []string{"event"})
 
+	// MagicLinkEmailRateLimited counts POST /auth/email/start requests
+	// silently absorbed by the per-email rate limiter. B4-F1 (BugBash
+	// 2026-05-20): the per-email limit responds 202 (identical to the
+	// success path) to deny attackers an enumeration signal — but that
+	// also denied OPERATORS any signal a real abuser was hammering one
+	// address. This counter is the operator-side telemetry: a rising
+	// rate should fire an NR alert ("someone is flood-testing magic-link
+	// requests for a single mailbox").
+	MagicLinkEmailRateLimited = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_magic_link_email_rate_limited_total",
+		Help: "POST /auth/email/start requests silently absorbed by the per-email rate limit (B4-F1, BugBash 2026-05-20).",
+	})
+
 	// readyzCheckStatusGauge is the per-component readiness status for
 	// /readyz. Value: 1 = ok, 0.5 = degraded, 0 = failed. Labels:
 	//   - service:  "instant-api", "instant-worker", "instant-provisioner"

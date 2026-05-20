@@ -187,6 +187,30 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"invalid_body": {
 		AgentAction: "Tell the user the request body is not valid JSON. Have them check for trailing commas, unquoted keys, and the matching Content-Type header — see https://instanode.dev/docs.",
 	},
+	// B4-F7 (BugBash 2026-05-20): invalid_email landed in respondError
+	// without an agent_action — the W7G "every 4xx carries the LLM-ready
+	// next sentence" contract was silently violated on the magic-link
+	// start path. Sentence names the reason (bad-syntax email) and the
+	// concrete remedy (have the user re-enter a valid address); full URL.
+	"invalid_email": {
+		AgentAction: "Tell the user the email address looks malformed. Have them re-enter a syntactically valid address (e.g. you@example.com) and retry the magic-link sign-in at https://instanode.dev/login.",
+	},
+	"invalid_email_format": {
+		AgentAction: "Tell the user the email address fails RFC 5322 validation. Have them re-enter a syntactically valid address (e.g. you@example.com) and retry — see https://instanode.dev/docs.",
+	},
+
+	// ── Provisioning 429 quota walls ───────────────────────────────────────
+	// B10-P1-3 / B13-F6 (BugBash 2026-05-20): the 429
+	// `provision_limit_reached` envelope was missing agent_action +
+	// upgrade_url despite being the most-hit programmatic wall. Agents
+	// branching on `error` saw the code but had no LLM-ready sentence to
+	// relay; CLAUDE.md convention #6 + the W7G contract both promise one.
+	// The sentence names the daily-cap reason and the exact next action
+	// (claim to keep using the same resources, or sign in).
+	"provision_limit_reached": {
+		AgentAction: "Tell the user they've hit the anonymous daily provisioning cap for this network. Have them claim their existing resources at https://instanode.dev/claim — takes 30 seconds, lifts the cap, and keeps every existing token usable.",
+		UpgradeURL:  "https://instanode.dev/claim",
+	},
 
 	// ── Fiber-default 4xx routing errors ───────────────────────────────────
 	// The default Fiber 404/405/413/415 paths flow through the ErrorHandler

@@ -1168,6 +1168,51 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 				"ok": false, "error": "payment_failed_handler_failed",
 			})
 		}
+	case "subscription.deauthenticated":
+		// B11-F1 (BugBash 2026-05-20): subscription.deauthenticated fires
+		// when the customer's mandate is revoked (UPI/NACH/eMandate
+		// withdrawn). The subscription cannot charge again until the user
+		// re-authenticates — for our purposes this is functionally
+		// identical to a cancel: the team must move off the paid tier so
+		// the next provision-time check sees the correct quota. Without
+		// this branch the event silently fell to `default` 200 and the
+		// team kept paid-tier limits forever despite Razorpay being unable
+		// to bill them.
+		if hErr := h.handleSubscriptionCancelled(ctx, c, event); hErr != nil {
+			slog.Error("billing.webhook.subscription_deauthenticated.failed",
+				"error", hErr, "event_id", eventID)
+			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"ok": false, "error": "subscription_deauthenticated_failed",
+			})
+		}
+	case "subscription.updated":
+		// B11-F1 (BugBash 2026-05-20): subscription.updated fires when a
+		// plan change is committed (typically initiated by us via the
+		// Razorpay API, or by a support-side dashboard edit). The right
+		// next action is "re-resolve the team's tier from the subscription
+		// state" — exactly what handleSubscriptionCharged does
+		// (idempotent, naming-pinned). Without this branch a mid-cycle
+		// plan upgrade left the team on the old tier until the next
+		// charge fired (potentially a month later).
+		if hErr := h.handleSubscriptionCharged(ctx, c, event); hErr != nil {
+			slog.Error("billing.webhook.subscription_updated.failed",
+				"error", hErr, "event_id", eventID)
+			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
+			return webhookErrorStatus(c, hErr, "subscription_updated_failed")
+		}
+	case "refund.processed":
+		// B11-F1 (BugBash 2026-05-20): refund.processed is a record-keeping
+		// event from a successful refund. No tier change is implied — the
+		// refund handler in the dunning pipeline already updated the
+		// subscription state; this event is the after-the-fact confirmation
+		// Razorpay sends once their payment processor settles. Acknowledge
+		// at INFO level so it shows up in operator log search but doesn't
+		// fire the WARN-tier "unhandled_event" alert. Audit-row emit so
+		// finance can correlate against `audit_log` rows for the refund.
+		slog.Info("billing.webhook.refund_processed",
+			"event_id", eventID, "event_type", event.Event)
+		span.SetAttributes(attribute.Bool("rzp.refund_processed", true))
 	default:
 		// Log unhandled events at WARN so they surface in New Relic — a span
 		// attribute alone is invisible to log-based alerting. A new Razorpay
