@@ -307,3 +307,38 @@ chaostest:
 	@: $${E2E_BASE_URL:?set E2E_BASE_URL to the live API root, e.g. https://api.instanode.dev}
 	go test ./e2e/... -tags 'e2e loadtest' -v -count=1 -timeout 600s \
 	  -run 'TestChaos_'
+
+# ── chaostest-propagation (CHAOS-DRILL-2026-05-20 Test 1) ──
+# Exercises the propagation_runner retry + dead-letter path end-to-end against
+# the LIVE worker. Seeds a synthetic team + bogus postgres resource + a
+# pending_propagations row pre-attempted to (maxAttempts-1) so the next worker
+# tick dead-letters. Asserts:
+#   - Worker picks up the row within the tick budget.
+#   - Backoff schedule advances per propagationBackoffSchedule[0]=1m.
+#   - Row transitions to failed_at, propagation.dead_lettered audit row emitted.
+#
+# Required: E2E_PLATFORM_DB_URL (= kubectl get secret instant-secrets -n instant \
+#                                     -o jsonpath='{.data.DATABASE_URL}' | base64 -d)
+# Optional: CHAOS_TICK_BUDGET (default 90s),
+#           CHAOS_BACKOFF_PHASE=skip to skip Phase B.
+chaostest-propagation:
+	@: $${E2E_PLATFORM_DB_URL:?set E2E_PLATFORM_DB_URL — see CHAOS-DRILL-2026-05-20.md}
+	go test ./e2e/... -tags chaos -v -count=1 -timeout 600s \
+	  -run 'TestChaos_PropagationRunner_DeadLetterPath'
+
+# ── chaostest-lease-recovery (CHAOS-DRILL-2026-05-20 Test 2) ──
+# Worker pod-kill / lease-takeover drill. Enqueues a stub chaos_lease_recovery
+# job, waits for the start marker, then PAUSES for the operator to run
+#   kubectl delete pod -n instant-infra <pod-id> --grace-period=0 --force
+# and polls for the end marker emitted by a sibling worker after River's
+# rescuer re-leases the orphaned job. Reports the observed lease-recovery
+# RTO. River default = JobTimeout (20m) + RescueAfter (1h) ≈ 1h20m worst case.
+#
+# Required: E2E_PLATFORM_DB_URL (same as chaostest-propagation).
+# Optional: CHAOS_LEASE_SLEEP_SECONDS (default 180),
+#           CHAOS_LEASE_RTO_BUDGET (default 90m),
+#           CHAOS_LEASE_MODE=observe to skip the operator prompt.
+chaostest-lease-recovery:
+	@: $${E2E_PLATFORM_DB_URL:?set E2E_PLATFORM_DB_URL — see CHAOS-DRILL-2026-05-20.md}
+	go test ./e2e/... -tags chaos -v -count=1 -timeout 7200s \
+	  -run 'TestChaos_WorkerLeaseRecovery'
