@@ -511,7 +511,15 @@ plans:
       team_members: 10
       vault_max_entries: 200
       vault_envs_allowed: []
-      deployments_apps: 5
+      # B6-P3 (BugBash 2026-05-20, wave-3 consolidated): bumped from 5 → 50.
+      # Pro's deployments_apps = 10; the previous value of 5 placed Growth
+      # ($99/mo) BELOW Pro ($49/mo) on this dimension — a tier-ladder
+      # inversion that violated the published "Growth = more of everything
+      # Pro has, on shared infra" promise. 50 keeps a clear gap above Pro
+      # without leaping to Team's unlimited (-1); a Growth customer
+      # provisioning 50 distinct deploys is the realistic ceiling under
+      # shared k8s before per-namespace overhead matters.
+      deployments_apps: 50
       # Growth: matches Pro's backup posture (30-day retention, restore).
       # Growth sits between Pro and Team — the differentiator is dedicated
       # infra, not backup retention.
