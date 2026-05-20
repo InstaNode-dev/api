@@ -1063,6 +1063,16 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	storageH := handlers.NewStorageHandler(db, rdb, cfg, nil, planReg)
 	webhookH := handlers.NewWebhookHandler(db, rdb, cfg, planReg)
 	app.Post("/storage/new", middleware.OptionalAuth(cfg), middleware.Idempotency(rdb, "storage.new"), storageH.NewStorage)
+	// B17-P0 (BugBash 2026-05-20): broker-mode presign with the production
+	// middleware chain so handler-level tests see the same guarantees as
+	// production callers. See internal/router/router.go for the wiring
+	// rationale (OptionalAuth → PresignTokenRateLimit → Idempotency).
+	app.Post("/storage/:token/presign",
+		middleware.OptionalAuth(cfg),
+		middleware.PresignTokenRateLimit(rdb),
+		middleware.Idempotency(rdb, "storage.presign"),
+		storageH.PresignStorage,
+	)
 	app.Post("/webhook/new", middleware.OptionalAuth(cfg), middleware.Idempotency(rdb, "webhook.new"), webhookH.NewWebhook)
 	// Mirror the production router: app.All so GET/PUT/DELETE verification
 	// flows reach the handler instead of 405-ing. See router.go for the
