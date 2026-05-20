@@ -359,7 +359,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the backup_id path parameter is missing. Use GET https://instanode.dev/api/v1/backups to find an id and retry.",
 	},
 	"missing_confirm_slug": {
-		AgentAction: "Tell the user the confirm_slug field is required to confirm this destructive action — supply the slug exactly as shown in the prompt and retry.",
+		AgentAction: "Tell the user the confirm_slug field is required to confirm this destructive action — supply the slug exactly as shown in the prompt and retry — see https://instanode.dev/docs.",
 	},
 	"name_too_long": {
 		AgentAction: "Tell the user the 'name' field exceeds 64 characters. Shorten it to a short human label (1-64 chars) and retry — see https://instanode.dev/docs.",
@@ -487,7 +487,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the magic-link id is invalid or expired. Restart the login flow at https://instanode.dev/login.",
 	},
 	"invalid_approval_id": {
-		AgentAction: "Tell the user the approval_id is not a valid UUID. Check the approval link in your email and retry.",
+		AgentAction: "Tell the user the approval_id is not a valid UUID. Check the approval link in your email and retry — see https://instanode.dev/docs/promote.",
 	},
 	"invalid_backup_id": {
 		AgentAction: "Tell the user the backup_id is not a valid UUID. List backups at GET https://instanode.dev/api/v1/backups and retry.",
@@ -772,16 +772,16 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the team-deletion request failed to persist. Retry in 30 seconds — see https://instanode.dev/status.",
 	},
 	"approval_failed": {
-		AgentAction: "Tell the user recording the promote approval failed. Retry the approval link in 30 seconds.",
+		AgentAction: "Tell the user recording the promote approval failed. Retry the approval link in 30 seconds — see https://instanode.dev/status.",
 	},
 	"reject_failed": {
-		AgentAction: "Tell the user recording the promote rejection failed. Retry the rejection in 30 seconds.",
+		AgentAction: "Tell the user recording the promote rejection failed. Retry the rejection in 30 seconds — see https://instanode.dev/status.",
 	},
 	"execute_failed": {
-		AgentAction: "Tell the user executing the action failed. Retry in 30 seconds; if it persists email support@instanode.dev.",
+		AgentAction: "Tell the user executing the action failed. Retry in 30 seconds; if it persists email support@instanode.dev — see https://instanode.dev/support.",
 	},
 	"summary_failed": {
-		AgentAction: "Tell the user computing the summary failed. Retry in 30 seconds; if it persists email support@instanode.dev.",
+		AgentAction: "Tell the user computing the summary failed. Retry in 30 seconds; if it persists email support@instanode.dev — see https://instanode.dev/support.",
 	},
 	"status_failed": {
 		AgentAction: "Tell the user reading the status failed. Retry in 30 seconds — see https://instanode.dev/status.",
@@ -790,13 +790,13 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user reading the resource status failed. Retry in 30 seconds — see https://instanode.dev/status.",
 	},
 	"tier_failed": {
-		AgentAction: "Tell the user updating the tier failed. Retry in 30 seconds; if it persists email support@instanode.dev.",
+		AgentAction: "Tell the user updating the tier failed. Retry in 30 seconds; if it persists email support@instanode.dev — see https://instanode.dev/support.",
 	},
 	"upgrade_failed": {
-		AgentAction: "Tell the user the tier upgrade could not be applied right now. Retry in 30 seconds; if it persists email support@instanode.dev.",
+		AgentAction: "Tell the user the tier upgrade could not be applied right now. Retry in 30 seconds; if it persists email support@instanode.dev — see https://instanode.dev/support.",
 	},
 	"revocation_failed": {
-		AgentAction: "Tell the user revoking the session failed. Retry in 30 seconds; if it persists email support@instanode.dev.",
+		AgentAction: "Tell the user revoking the session failed. Retry in 30 seconds; if it persists email support@instanode.dev — see https://instanode.dev/support.",
 	},
 	"role_lookup_failed": {
 		AgentAction: "Tell the user a team-role lookup failed. Retry in 30 seconds — see https://instanode.dev/status.",
@@ -805,16 +805,16 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user a team lookup failed. Retry in 30 seconds — see https://instanode.dev/status.",
 	},
 	"team_creation_failed": {
-		AgentAction: "Tell the user creating the team failed. Retry in 30 seconds; if it persists email support@instanode.dev.",
+		AgentAction: "Tell the user creating the team failed. Retry in 30 seconds; if it persists email support@instanode.dev — see https://instanode.dev/support.",
 	},
 	"team_has_no_users": {
 		AgentAction: "Tell the user this team has no users yet — add an owner before issuing operations against it. See https://instanode.dev/docs/team.",
 	},
 	"user_creation_failed": {
-		AgentAction: "Tell the user creating the user account failed. Retry in 30 seconds; if it persists email support@instanode.dev.",
+		AgentAction: "Tell the user creating the user account failed. Retry in 30 seconds; if it persists email support@instanode.dev — see https://instanode.dev/support.",
 	},
 	"user_upsert_failed": {
-		AgentAction: "Tell the user upserting the user record failed. Retry in 30 seconds.",
+		AgentAction: "Tell the user upserting the user record failed. Retry in 30 seconds — see https://instanode.dev/status.",
 	},
 	"session_failed": {
 		AgentAction: "Tell the user the session could not be issued. Retry the login at https://instanode.dev/login.",
@@ -839,10 +839,10 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	},
 	// (deletion_token_invalid covered in the deletion-confirmed section above)
 	"encryption_failed": {
-		AgentAction: "Tell the user the encryption step failed. Retry in 30 seconds; if it persists email support@instanode.dev with this request_id.",
+		AgentAction: "Tell the user the encryption step failed. Retry in 30 seconds; if it persists email support@instanode.dev with this request_id — see https://instanode.dev/support.",
 	},
 	"decrypt_failed": {
-		AgentAction: "Tell the user decrypting the stored credential failed. Retry in 30 seconds; if it persists email support@instanode.dev with this request_id.",
+		AgentAction: "Tell the user decrypting the stored credential failed. Retry in 30 seconds; if it persists email support@instanode.dev with this request_id — see https://instanode.dev/support.",
 	},
 	"encryption_unavailable": {
 		AgentAction: "Tell the user the encryption backend is temporarily unavailable. Retry in 60 seconds — see https://instanode.dev/status.",
@@ -902,13 +902,13 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the resume action failed. Retry in 30 seconds — see https://instanode.dev/status.",
 	},
 	"inflight_check_failed": {
-		AgentAction: "Tell the user the in-flight dedup check failed. Retry the action in 30 seconds.",
+		AgentAction: "Tell the user the in-flight dedup check failed. Retry the action in 30 seconds — see https://instanode.dev/status.",
 	},
 	"quota_check_failed": {
 		AgentAction: "Tell the user the quota check failed. Retry in 30 seconds — see https://instanode.dev/status.",
 	},
 	"billing_persistence_failed": {
-		AgentAction: "Tell the user persisting the billing change failed. Retry the action in 30 seconds; if it persists email support@instanode.dev with this request_id.",
+		AgentAction: "Tell the user persisting the billing change failed. Retry the action in 30 seconds; if it persists email support@instanode.dev with this request_id — see https://instanode.dev/support.",
 	},
 
 	// ── 429 rate-limited (canonical) ───────────────────────────────────────
@@ -967,7 +967,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user marking the deletion as confirmed failed. Retry in 30 seconds — see https://instanode.dev/status.",
 	},
 	"subscription_cancel_failed": {
-		AgentAction: "Tell the user cancelling the Razorpay subscription failed. The team-delete is paused; email support@instanode.dev so an operator can reconcile in the Razorpay dashboard.",
+		AgentAction: "Tell the user cancelling the Razorpay subscription failed. The team-delete is paused; email support@instanode.dev so an operator can reconcile — see https://instanode.dev/support.",
 	},
 }
 

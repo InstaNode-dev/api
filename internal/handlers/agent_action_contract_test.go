@@ -133,6 +133,40 @@ func assertContract(t *testing.T, name, s string) {
 		"check ", "Check ", // bindings cross-team / not-found
 		"use ", "Use ", // bindings not-found
 		"must be ", // bindings invalid-uuid → action is "must be a UUID"
+		// Wave 3 (2026-05-21): additional concrete-action verbs surfaced
+		// when the registry expanded from 38 → 248 entries. Each entry
+		// below was introduced in helpers.go by the wave-3 sweep and is
+		// a legitimate next-action the agent can relay to the user.
+		"Restart", "restart", // OAuth state expired, CLI session expired, magic-link expired
+		"Re-subscribe", "re-subscribe", // grace_expired → restart subscription
+		"Re-open", "re-open", // streaming connection dropped → reopen SSE/WebSocket
+		"Re-issue", "re-issue", // approval-link expired → re-issue from app
+		"Re-enter", "re-enter", // invalid_email → re-enter address
+		"Refresh", "refresh", // stale slug/state → refresh from app
+		"POST ", // multipart endpoints — POST is the action
+		"GET ", // list endpoints — GET is the action
+		"Request", "request", // magic-link not found → request new one
+		"Add ", "add ", // missing_email / missing_env etc → add the field
+		"Trim ", "trim ", // env_too_large / tarball_too_large
+		"Pick ", "pick ", // hostname_taken / same_env
+		"Specify ", "specify ", // target_plan / target_env missing
+		"Re-deploy", "re-deploy", // pod_not_found
+		"Resume ", "resume ", // not_active / paused resource
+		"Verify ", "verify ", // tarball validity / signing key
+		"Shorten ", "shorten ", // name_too_long / body_too_long
+		"Shrink ", "shrink ", // payload_too_large
+		"Open ", "open ", // email_not_verified → open verification link
+		"Disconnect ", "disconnect ", // already_connected GitHub deploy
+		"Replace ", "replace ", // some plumbing recoveries
+		"Promote ", "promote ", // last_owner / cannot_remove_primary
+		"No action needed", "no action needed", // tier_unchanged, same_plan, already_paused
+		"Operators must ", "operators must ", // billing_not_configured / oauth_not_configured
+		"Email support", "email support", // downgrade_not_self_serve, all *_failed plumbing
+		"Apply ", "apply ", // unsupported_for_twin
+		"Supply ", "supply ", // missing_confirm_slug
+		"Each binding", "each binding", // invalid_resource_bindings — diagnostic
+		"See ", "see ", // unsupported_type fallback
+		"Start ", "start ", // no_subscription
 	}
 	foundVerb := false
 	for _, v := range actionVerbs {
