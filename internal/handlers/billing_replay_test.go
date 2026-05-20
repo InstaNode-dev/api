@@ -45,22 +45,38 @@ func billingTestAppWithRealDB(t *testing.T) (*fiber.App, func()) {
 // makePaymentFailedPayloadWithEventID is a variant of the existing helper
 // that lets the test pin a specific event id so we can assert dedup
 // behaviour by replaying the exact same payload.
+//
+// B11-P1 (2026-05-20): handlePaymentFailed no longer trusts payload.email —
+// it resolves the dunning recipient via notes.team_id. The 3-arg overload
+// (eventID, customerEmail) is kept for back-compat (subscription-less
+// fixtures testing the dedup / no-team-resolvable path), and a 4-arg
+// overload `WithTeam` lets the C5 dedup test wire a notes.team_id so the
+// resolver lands on the seeded owner row. Callers that want a recipient
+// to actually be looked up must use the WithTeam variant.
 func makePaymentFailedPayloadWithEventID(t *testing.T, eventID string, customerEmail string) []byte {
+	return makePaymentFailedPayloadWithEventIDAndTeam(t, eventID, customerEmail, "")
+}
+
+func makePaymentFailedPayloadWithEventIDAndTeam(t *testing.T, eventID, customerEmail, teamID string) []byte {
 	t.Helper()
+	entity := map[string]any{
+		"id":            "pay_test123",
+		"status":        "failed",
+		"email":         customerEmail,
+		"description":   "Test failed payment",
+		"attempt_count": 1,
+		"contact":       "+15551234567",
+	}
+	if teamID != "" {
+		entity["notes"] = map[string]string{"team_id": teamID}
+	}
 	body := map[string]any{
 		"id":     eventID,
 		"entity": "event",
 		"event":  "payment.failed",
 		"payload": map[string]any{
 			"payment": map[string]any{
-				"entity": map[string]any{
-					"id":            "pay_test123",
-					"status":        "failed",
-					"email":         customerEmail,
-					"description":   "Test failed payment",
-					"attempt_count": 1,
-					"contact":       "+15551234567",
-				},
+				"entity": entity,
 			},
 		},
 	}

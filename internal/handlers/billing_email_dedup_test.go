@@ -179,13 +179,21 @@ func TestBillingWebhook_DunningDedup_OneCycleOneEmail(t *testing.T) {
 	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
 	defer db.Exec(`DELETE FROM teams WHERE id = $1::uuid`, teamID)
 	owner := "dunning-" + uuid.NewString()[:8] + "@example.com"
+	// B11-P1: dunning recipient is now resolved via the team's primary
+	// user, not the payload email — owner row MUST be is_primary=true so
+	// GetPrimaryUserByTeamID finds it.
 	_, err := db.Exec(
-		`INSERT INTO users (team_id, email, role) VALUES ($1::uuid, $2, 'owner')`,
+		`INSERT INTO users (team_id, email, role, is_primary) VALUES ($1::uuid, $2, 'owner', true)`,
 		teamID, owner)
 	require.NoError(t, err)
 
-	// Event 1: payment.failed carrying the owner's address.
-	pf := makePaymentFailedPayloadWithEventID(t, "evt_pf_"+uuid.NewString(), owner)
+	// Event 1: payment.failed carrying the owner's address + notes.team_id.
+	// B11-P1: payload.email is no longer trusted; the resolver uses
+	// notes.team_id → team primary user. Without the WithTeam variant
+	// (which threads notes.team_id), the dunning email would be DROPPED
+	// rather than mis-delivered — also a valid B11-P1 outcome, but the
+	// dedup contract this test pins requires a successful send.
+	pf := makePaymentFailedPayloadWithEventIDAndTeam(t, "evt_pf_"+uuid.NewString(), owner, teamID)
 	resp1, err := app.Test(signedWebhookRequest(t, pf), 5000)
 	require.NoError(t, err)
 	resp1.Body.Close()

@@ -211,6 +211,37 @@ func SetEmailVerified(ctx context.Context, db *sql.DB, userID uuid.UUID) error {
 	return nil
 }
 
+// GetPrimaryUserByTeamID returns the team's primary user (is_primary=true).
+//
+// Used by the billing webhook handlers (B11-P1, 2026-05-20) to resolve the
+// authoritative recipient for dunning / payment-failure emails — instead of
+// trusting the `email` field on a Razorpay payload (which any holder of the
+// webhook secret can spoof to fanout dunning emails to arbitrary recipients).
+//
+// Returns ErrUserNotFound when no primary user exists for the team
+// (shouldn't happen in well-formed data — every team has a primary on
+// CreateTeam, and team_members.PromoteMemberToPrimary maintains the
+// invariant — but a defensive return so callers can fall back to "no
+// email sent" rather than panicking).
+func GetPrimaryUserByTeamID(ctx context.Context, db *sql.DB, teamID uuid.UUID) (*User, error) {
+	u := &User{}
+	err := db.QueryRowContext(ctx, `
+		SELECT id, team_id, email, COALESCE(role, 'member'), github_id, google_id, email_verified, created_at
+		FROM users
+		WHERE team_id = $1 AND is_primary = true
+		LIMIT 1
+	`, teamID).Scan(
+		&u.ID, &u.TeamID, &u.Email, &u.Role, &u.GitHubID, &u.GoogleID, &u.EmailVerified, &u.CreatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, &ErrUserNotFound{Email: fmt.Sprintf("team:%s/primary", teamID)}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("models.GetPrimaryUserByTeamID: %w", err)
+	}
+	return u, nil
+}
+
 // GetUserByID fetches a user by primary key UUID.
 func GetUserByID(ctx context.Context, db *sql.DB, id uuid.UUID) (*User, error) {
 	u := &User{}
@@ -353,10 +384,36 @@ func UpgradeTeamAllTiersWithSubscription(ctx context.Context, db *sql.DB, teamID
 	defer func() { _ = tx.Rollback() }()
 
 	// 1a. Update the team's plan tier.
-	if _, err := tx.ExecContext(ctx, `
+	//
+	// B11-P1 (2026-05-20): the UPDATE used to be silent on 0 rows
+	// affected. A Razorpay webhook carrying notes.team_id pointing at a
+	// non-existent team (typo, deleted-team race, forged synthetic event
+	// from anyone with the webhook secret) would land here, the UPDATE
+	// would no-op, the function returned nil, and the webhook handler
+	// happily 200'd the event — burning the dedup claim and silently
+	// "applying" an upgrade to nothing. The downstream
+	// EnqueuePendingPropagation then queued a propagation row for a
+	// dangling team_id, the entitlement_reconciler logged WARNs forever,
+	// and ops had no signal anything was wrong.
+	//
+	// Fix: check RowsAffected on the team UPDATE. 0 rows → ErrTeamNotFound
+	// (returned unwrapped so callers can errors.As). The billing webhook
+	// handler maps this to HTTP 404 — Razorpay treats 4xx as non-retryable
+	// (won't replay) AND our deleteRazorpayWebhookClaim path releases the
+	// dedup claim row so a future event with the correct team_id can be
+	// re-processed.
+	res, err := tx.ExecContext(ctx, `
 		UPDATE teams SET plan_tier = $1 WHERE id = $2
-	`, newTier, teamID); err != nil {
+	`, newTier, teamID)
+	if err != nil {
 		return fmt.Errorf("models.UpgradeTeamAllTiers: update_plan_tier: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("models.UpgradeTeamAllTiers: rows_affected: %w", err)
+	}
+	if rows == 0 {
+		return &ErrTeamNotFound{ID: teamID}
 	}
 
 	// 1b. Same row — atomic stripe_customer_id (= razorpay_subscription_id)

@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/mail"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -183,10 +185,31 @@ func (h *OnboardingHandler) ClaimPreview(c *fiber.Ctx) error {
 }
 
 // ClaimRequest is the body expected by POST /claim.
+//
+// Field-name policy (B5-P1, 2026-05-20): `token` is the canonical field. The
+// legacy `jwt` alias is still accepted for backward compatibility with the
+// dashboard, sdk-go, mcp, and existing curl recipes — when both are present,
+// `token` wins. The OpenAPI spec documents `token` as the primary field with
+// `jwt` marked deprecated. The wire `error` code on a missing/invalid value
+// is `missing_token` (the historical name); every human/agent message
+// consistently says "token" — closing the three-name drift (jwt / token /
+// INSTANODE_TOKEN) the brief flagged.
 type ClaimRequest struct {
-	JWT      string `json:"jwt"`
+	Token    string `json:"token"`
+	JWT      string `json:"jwt"` // deprecated — kept for backward compatibility; use `token`.
 	TeamName string `json:"team_name"`
 	Email    string `json:"email"`
+}
+
+// claimToken returns the canonical onboarding token from a ClaimRequest,
+// preferring the new `token` field and falling back to the deprecated `jwt`
+// field for backward compatibility. Centralised here so every read site
+// agrees on the precedence.
+func (r ClaimRequest) claimToken() string {
+	if r.Token != "" {
+		return r.Token
+	}
+	return r.JWT
 }
 
 const (
@@ -212,8 +235,20 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "invalid_body", "Request body must be valid JSON")
 	}
 
-	if body.JWT == "" {
-		return respondError(c, fiber.StatusBadRequest, "missing_token", "jwt field is required")
+	tokenStr := body.claimToken()
+	if tokenStr == "" {
+		// B5-P1 (2026-05-20): canonical field name is `token` (was `jwt`).
+		// Use respondErrorWithAgentAction so the agent_action sentence
+		// references the onboarding `token` field instead of the
+		// codeToAgentAction default for `missing_token` (which is auth-
+		// context: "no INSTANODE_TOKEN was provided"). The dashboard,
+		// sdk-go, and existing curl recipes still send `jwt` — both
+		// names are accepted (see ClaimRequest doc), but every
+		// human-facing string now says `token`.
+		return respondErrorWithAgentAction(c, fiber.StatusBadRequest, "missing_token",
+			"token field is required",
+			"Tell the user POST /claim requires a `token` field carrying the onboarding token (the upgrade_jwt value from any anonymous /db/new, /cache/new, /storage/new, ... response). See https://instanode.dev/docs/claim.",
+			"")
 	}
 	if body.Email == "" {
 		return respondError(c, fiber.StatusBadRequest, "missing_email", "email field is required")
@@ -229,8 +264,24 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 	if body.Email == "" {
 		return respondError(c, fiber.StatusBadRequest, "missing_email", "email field is required")
 	}
+	// B5-P0 (2026-05-20): RFC 5322 email validation. The previous gate
+	// only checked emptiness, so any string ("not-an-email", "x", a
+	// 1MB blob, etc.) created a user row whose `users.email` value
+	// could never receive a magic-link callback — silently breaking
+	// account recovery, billing emails, and the email-verified flow.
+	// Worse, it let abusers spray garbage emails to inflate the
+	// platform's user count and bypass the per-email dedup gates the
+	// downstream auth/billing stack relies on. mail.ParseAddress is the
+	// stdlib RFC-5322 parser (rejects missing @, length cap closes the
+	// obvious abuse vector); see isValidEmail for the full rule set.
+	if !isValidEmail(body.Email) {
+		return respondErrorWithAgentAction(c, fiber.StatusBadRequest, "invalid_email_format",
+			"email must be a valid RFC 5322 address (e.g. you@example.com)",
+			"Tell the user the email they entered is not a valid address. Have them retype it with an @ and a TLD (e.g. you@example.com) — see https://instanode.dev/docs/claim.",
+			"")
+	}
 
-	claims, err := crypto.VerifyOnboardingJWT([]byte(h.cfg.JWTSecret), body.JWT)
+	claims, err := crypto.VerifyOnboardingJWT([]byte(h.cfg.JWTSecret), tokenStr)
 	if err != nil {
 		return respondError(c, fiber.StatusBadRequest, "invalid_token", "JWT is invalid or expired")
 	}
@@ -573,6 +624,63 @@ func sendClaimVerificationEmail(db *sql.DB, mailer claimVerificationEmailMailer,
 	}
 	slog.Info("onboarding.claim.verification.sent",
 		"email_masked", maskEmailForLog(emailAddr))
+}
+
+// isValidEmail returns true when s is a syntactically-valid RFC 5322 email
+// address with a dotted domain part and total length within the RFC 5321
+// §4.5.3.1.3 limit of 254 characters. Used to gate POST /claim so a request
+// body cannot mint a user row with a structurally-invalid email — which
+// would silently break magic-link recovery, billing notifications, and the
+// email-verified gate downstream. Strict on the obvious failure modes:
+//   - empty
+//   - > 254 chars
+//   - missing @ (delegates to mail.ParseAddress)
+//   - any inner whitespace (kills "user @example.com" and quoted-string
+//     edge cases that mail.ParseAddress quietly tolerates)
+//   - display-name form ("Name <addr>") — /claim wants the bare address
+//   - dotless TLD (e.g. "x@localhost") — closes the most-common abuse
+//     path without rejecting "user@x.y" which mail.ParseAddress accepts
+//
+// Caller is expected to pass the already-NormalizeEmail'd value (lowercased
+// + trimmed) — that guarantees parser-equivalent inputs across the codebase.
+func isValidEmail(s string) bool {
+	if s == "" || len(s) > 254 {
+		return false
+	}
+	// Reject any inner whitespace before parsing — closes both leading-
+	// space (e.g. " you@x.com") and embedded tab/CRLF abuse vectors. The
+	// outer-trim from NormalizeEmail strips leading/trailing whitespace,
+	// but a body that bypassed normalisation would still reach here.
+	if strings.ContainsAny(s, " \t\r\n") {
+		return false
+	}
+	// mail.ParseAddress accepts both "you@example.com" and the display
+	// form "Name <you@example.com>". The /claim contract only wants
+	// the bare address — reject any display-name form by comparing the
+	// parsed address back against the input.
+	addr, err := mail.ParseAddress(s)
+	if err != nil {
+		return false
+	}
+	if addr.Address != s {
+		return false
+	}
+	// Require a dotted domain. mail.ParseAddress accepts "user@local"
+	// (RFC 5322 §3.4.1 permits it) but every real email has a dot in
+	// the domain; this is the cheapest abuse-spray gate.
+	at := strings.LastIndex(s, "@")
+	if at < 0 {
+		return false
+	}
+	domain := s[at+1:]
+	if domain == "" || !strings.Contains(domain, ".") {
+		return false
+	}
+	// Reject empty local-part and trailing dot in domain.
+	if at == 0 || strings.HasSuffix(domain, ".") || strings.HasPrefix(domain, ".") {
+		return false
+	}
+	return true
 }
 
 // maskEmailForLog returns the first character + "***" + the domain so a
