@@ -1360,8 +1360,16 @@ func emitRazorpayTeamNotFoundAudit(h *BillingHandler, c *fiber.Ctx, event rzpWeb
 	// Pull event identifiers + subscription context outside the goroutine
 	// so the values are pinned at call time (Fiber's *Ctx is not safe to
 	// share across goroutines after the response writes).
+	//
+	// The event_id resolution mirrors the dispatch in RazorpayWebhook
+	// (header is canonical, body `id` is the fallback) so an operator
+	// can join this audit row against the dedup table by the exact same
+	// id the rest of the pipeline uses.
 	eventType := event.Event
-	eventID := event.ID
+	eventID := c.Get("X-Razorpay-Event-Id")
+	if eventID == "" {
+		eventID = event.ID
+	}
 	var notesTeamID, subscriptionID string
 	if sub, ok := parseSubscriptionEntity(event); ok {
 		subscriptionID = sub.ID
