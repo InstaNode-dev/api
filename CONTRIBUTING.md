@@ -11,8 +11,8 @@
 
 ```bash
 # Clone and enter the repo
-git clone https://github.com/instant-dev/instant
-cd instant
+git clone https://github.com/InstaNode-dev/api
+cd api
 
 # Generate cryptographic secrets for local dev
 make gen-secrets
