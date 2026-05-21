@@ -1,0 +1,40 @@
+name: coverage
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: api
+      - uses: actions/checkout@v4
+        with:
+          repository: InstaNode-dev/common
+          path: common
+        continue-on-error: true
+      - uses: actions/checkout@v4
+        with:
+          repository: InstaNode-dev/proto
+          path: proto
+        continue-on-error: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+      - name: Generate coverage
+        working-directory: api
+        run: go test ./... -short -coverprofile=coverage.out -covermode=atomic || true
+      - uses: codecov/codecov-action@v4
+        with:
+          files: api/coverage.out
+          flags: api
+          fail_ci_if_error: false
