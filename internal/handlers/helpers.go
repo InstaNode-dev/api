@@ -453,6 +453,15 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"invalid_operation": {
 		AgentAction: "Tell the user the operation value is invalid. Use GET or PUT for /storage/:token/presign — see https://instanode.dev/docs/storage.",
 	},
+	"path_unsafe": {
+		AgentAction: "Tell the user the object path contains unsafe characters. Use a clean UTF-8 path with no '..', leading slash, or empty segments — see https://instanode.dev/docs/storage.",
+	},
+	"cross_team_session": {
+		AgentAction: "Tell the user their session belongs to a different team than the storage token. Re-authenticate as the token's owning team — see https://instanode.dev/docs/auth.",
+	},
+	"env_load_failed": {
+		AgentAction: "Tell the user the persisted environment variables could not be loaded for this stack. Retry the redeploy in 30 seconds — see https://instanode.dev/status. If it keeps failing, email support@instanode.dev with the request_id.",
+	},
 	"invalid_service": {
 		AgentAction: "Tell the user the service value is unknown. Use one of: postgres, redis, mongodb, queue, storage, webhook, vector — see https://instanode.dev/docs.",
 	},
