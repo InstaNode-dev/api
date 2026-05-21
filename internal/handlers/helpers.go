@@ -859,9 +859,6 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"provider_failed": {
 		AgentAction: "Tell the user the upstream provider hit a transient error. Retry in 30 seconds — see https://instanode.dev/status.",
 	},
-	"upstream_failed": {
-		AgentAction: "Tell the user the upstream dependency failed. Retry in 30 seconds — see https://instanode.dev/status.",
-	},
 	"vault_ref_failed": {
 		AgentAction: "Tell the user resolving the vault reference failed. Confirm the env+key exist at https://instanode.dev/app/vault and retry.",
 	},

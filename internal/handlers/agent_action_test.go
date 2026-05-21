@@ -184,19 +184,19 @@ func TestRespondError_KnownCode_PopulatesAgentAction(t *testing.T) {
 // upgrade.
 func TestRespondError_UnknownCode_5xx_FallsBackToContactSupport(t *testing.T) {
 	// Pick a 5xx code that is deliberately NOT in codeToAgentAction so the
-	// W7G fallback branch fires. Previously this test used `provision_failed`,
-	// but MR-P0-3 (BugBash 2026-05-20) added an explicit retry-with-backoff
-	// entry for that code — its 503 must instruct the agent to retry, not
-	// contact support, because the backend object was atomically rolled back.
-	// `db_error` is documented in helpers.go's curation principles as one of
-	// the "pure plumbing errors deliberately omitted" — exactly the shape this
-	// test is meant to exercise.
+	// W7G fallback branch fires. Successive registry additions kept catching
+	// us — `provision_failed` (MR-P0-3 2026-05-20) and `db_error` (wave-2
+	// helpers expansion 2026-05-21) both got real entries that broke this
+	// test's premise. The literal `__test_5xx_unregistered__` is fake by
+	// construction — anyone adding it to the registry will see the test
+	// fail loudly and pick a different sentinel.
+	const fakeUnregistered5xx = "__test_5xx_unregistered__"
 	status, body := doErrorRequest(t, func(c *fiber.Ctx) error {
-		return respondError(c, fiber.StatusServiceUnavailable, "db_error", "transient failure")
+		return respondError(c, fiber.StatusServiceUnavailable, fakeUnregistered5xx, "transient failure")
 	})
 	assert.Equal(t, fiber.StatusServiceUnavailable, status)
 	assert.Equal(t, false, body["ok"])
-	assert.Equal(t, "db_error", body["error"])
+	assert.Equal(t, fakeUnregistered5xx, body["error"])
 	assert.Equal(t, "transient failure", body["message"])
 
 	action, _ := body["agent_action"].(string)
@@ -211,8 +211,13 @@ func TestRespondError_UnknownCode_5xx_FallsBackToContactSupport(t *testing.T) {
 // path) still produce no agent_action — the agent should fix the request,
 // not relay generic copy that doesn't help.
 func TestRespondError_UnknownCode_4xx_OmitsAgentAction(t *testing.T) {
+	// Same sentinel-name pattern as the 5xx variant above. `invalid_payload`
+	// was added to the registry in the wave-2 helpers expansion, breaking the
+	// test's premise. The literal `__test_4xx_unregistered__` is fake by
+	// construction.
+	const fakeUnregistered4xx = "__test_4xx_unregistered__"
 	status, body := doErrorRequest(t, func(c *fiber.Ctx) error {
-		return respondError(c, fiber.StatusBadRequest, "invalid_payload", "field missing")
+		return respondError(c, fiber.StatusBadRequest, fakeUnregistered4xx, "field missing")
 	})
 	assert.Equal(t, fiber.StatusBadRequest, status)
 	_, hasAction := body["agent_action"]
