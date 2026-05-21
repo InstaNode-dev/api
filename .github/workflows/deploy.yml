@@ -28,11 +28,28 @@ name: Deploy
 on:
   push:
     branches: [master]
+    # CI-minute savings (2026-05-21): skip Deploy on docs-only commits.
+    # Markdown, CLAUDE.md, runbooks, design docs, and the BUGBASH ledger
+    # never change the binary — they don't need a 7-min test step + a 3-min
+    # image build + rollout. Push paths matching ONLY these globs are ignored.
+    # If a real code change happens to also touch a .md file in the same
+    # commit, the non-ignored path triggers Deploy normally.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'CLAUDE.md'
+      - '.gitignore'
+      - 'LICENSE'
+      - 'BUGBASH-*/**'
   workflow_dispatch:
 
 concurrency:
-  group: deploy-${{ github.workflow }}
-  cancel-in-progress: false
+  # CI-minute savings (2026-05-21): rapid-fire pushes now cancel the prior
+  # in-flight Deploy instead of running both to completion. The 5-pushes-
+  # in-10-minutes pattern that doubled today's burn now costs the duration
+  # of one final Deploy, not five.
+  group: deploy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
