@@ -1,0 +1,48 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  schedule:
+    - cron: '17 6 * * 1'
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze (Go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: api
+      - name: Checkout sibling InstaNode-dev/common
+        uses: actions/checkout@v4
+        with:
+          repository: InstaNode-dev/common
+          path: common
+      - name: Checkout sibling InstaNode-dev/proto
+        uses: actions/checkout@v4
+        with:
+          repository: InstaNode-dev/proto
+          path: proto
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: go
+          queries: security-extended
+      - name: Build
+        working-directory: api
+        run: go build ./...
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:go"

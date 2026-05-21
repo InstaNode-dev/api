@@ -1,0 +1,39 @@
+name: govulncheck
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  schedule:
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: api
+      - name: Checkout sibling InstaNode-dev/common
+        uses: actions/checkout@v4
+        with:
+          repository: InstaNode-dev/common
+          path: common
+      - name: Checkout sibling InstaNode-dev/proto
+        uses: actions/checkout@v4
+        with:
+          repository: InstaNode-dev/proto
+          path: proto
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          check-latest: true
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - working-directory: api
+        run: govulncheck ./...
