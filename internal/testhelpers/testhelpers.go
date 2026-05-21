@@ -669,6 +669,30 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`CREATE INDEX IF NOT EXISTS idx_forwarder_sent_real_audit_id
 			ON forwarder_sent (audit_id)
 			WHERE audit_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'`,
+		// 064_forwarder_sent_audit_fk — adds nullable audit_log_id UUID
+		// with a strict ON DELETE SET NULL FK to audit_log(id). Closes
+		// gap #6 (orphan ledger rows accumulating after team-deletion
+		// cascades). Existing audit_id stays as the TEXT primary key
+		// (legacy placeholder emitters keep working); audit_log_id is
+		// the new strict-FK breadcrumb. The CREATE TABLE IF NOT EXISTS
+		// above does not carry this column for already-populated test
+		// DBs; the ALTER + conditional FK below handles both fresh +
+		// reused DBs idempotently.
+		`ALTER TABLE forwarder_sent ADD COLUMN IF NOT EXISTS audit_log_id UUID NULL`,
+		`DO $$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_constraint
+				WHERE conname = 'forwarder_sent_audit_log_id_fkey'
+			) THEN
+				ALTER TABLE forwarder_sent
+					ADD CONSTRAINT forwarder_sent_audit_log_id_fkey
+					FOREIGN KEY (audit_log_id) REFERENCES audit_log(id) ON DELETE SET NULL;
+			END IF;
+		END $$`,
+		`CREATE INDEX IF NOT EXISTS idx_forwarder_sent_audit_log_id_not_null
+			ON forwarder_sent (audit_log_id)
+			WHERE audit_log_id IS NOT NULL`,
 		// 058_pending_propagations — durable retry queue for "tier elevated
 		// in DB but infra regrade not yet applied" scenarios. The api
 		// enqueues a row inside handleSubscriptionCharged AFTER the atomic
