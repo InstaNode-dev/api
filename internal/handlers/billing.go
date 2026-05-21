@@ -319,6 +319,9 @@ func (h *BillingHandler) razorpayPlanIDs() map[string]string {
 	if h.cfg.RazorpayPlanIDPro != "" {
 		m["pro"] = h.cfg.RazorpayPlanIDPro
 	}
+	if h.cfg.RazorpayPlanIDGrowth != "" {
+		m["growth"] = h.cfg.RazorpayPlanIDGrowth
+	}
 	if h.cfg.RazorpayPlanIDTeam != "" {
 		m["team"] = h.cfg.RazorpayPlanIDTeam
 	}
@@ -350,6 +353,14 @@ func (h *BillingHandler) razorpayPlanIDFor(tier, frequency string) string {
 			return h.cfg.RazorpayPlanIDProYearly
 		}
 		return h.cfg.RazorpayPlanIDPro
+	case "growth":
+		// D28 F3 (2026-05-21): Growth tier ($99/mo). Returns "" until
+		// the operator creates the RAZORPAY_PLAN_ID_GROWTH /
+		// _GROWTH_ANNUAL plans in the Razorpay dashboard.
+		if frequency == "yearly" {
+			return h.cfg.RazorpayPlanIDGrowthYearly
+		}
+		return h.cfg.RazorpayPlanIDGrowth
 	case "team":
 		if frequency == "yearly" {
 			return h.cfg.RazorpayPlanIDTeamYearly
@@ -398,6 +409,16 @@ func (h *BillingHandler) planIDToTier(planID string) string {
 	}
 	if h.cfg.RazorpayPlanIDTeamYearly != "" && planID == h.cfg.RazorpayPlanIDTeamYearly {
 		return "team"
+	}
+	// D28 F3 (2026-05-21): Growth tier added. Tier checks are ordered from
+	// most-paid to least-paid so a misconfigured shared plan_id resolves
+	// to the higher tier (least-bad outcome — customer paid more, gets
+	// more) rather than silently downgrading.
+	if h.cfg.RazorpayPlanIDGrowth != "" && planID == h.cfg.RazorpayPlanIDGrowth {
+		return "growth"
+	}
+	if h.cfg.RazorpayPlanIDGrowthYearly != "" && planID == h.cfg.RazorpayPlanIDGrowthYearly {
+		return "growth"
 	}
 	if h.cfg.RazorpayPlanIDPro != "" && planID == h.cfg.RazorpayPlanIDPro {
 		return "pro"
