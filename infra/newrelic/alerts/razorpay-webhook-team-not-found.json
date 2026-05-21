@@ -1,0 +1,31 @@
+{
+  "name": "instant-api — razorpay.webhook.team_not_found (signature passed, team unknown)",
+  "policyName": "instant-api alerts",
+  "description": "P2 informational. Fires when a Razorpay webhook arrives with a valid HMAC signature but the team referenced via notes.team_id (or the subscription_id fallback) does not exist in our DB. Each occurrence is one of: (a) a Razorpay-dashboard typo in subscription notes (operator paste error); (b) a team deleted while its Razorpay subscription survived (orphan-sweep race); (c) a synthetic chaos probe with a real signature but bogus team_id (Wave-3 test #6 fingerprint); (d) an attacker probing valid-signature paths with crafted payloads. NOT pageworthy in isolation — the matching customer (if any) was already redirected to deleted/typo handling. WARN at >5/h, no CRITICAL — investigate via the audit_log row (kind='razorpay.webhook.team_not_found') for event_id + notes_team_id + subscription_id. Source: webhookErrorStatus ErrTeamNotFound branch in api/internal/handlers/billing.go; counter razorpay_webhook_team_not_found_total. Counterpart to the signature-failed alert (instant-api — razorpay.webhook.unauthorized) — that one fires on bad signature, this one fires after signature passes.",
+  "enabled": true,
+  "nrql": {
+    "query": "SELECT count(*) FROM Log WHERE service = 'api' AND audit_kind = 'razorpay.webhook.team_not_found'"
+  },
+  "terms": [
+    {
+      "priority": "WARNING",
+      "operator": "ABOVE",
+      "threshold": 5,
+      "thresholdDuration": 3600,
+      "thresholdOccurrences": "ALL"
+    }
+  ],
+  "signal": {
+    "aggregationWindow": 60,
+    "aggregationMethod": "EVENT_FLOW",
+    "aggregationDelay": 120,
+    "fillOption": "STATIC",
+    "fillValue": 0
+  },
+  "expiration": {
+    "expirationDuration": 3600,
+    "openViolationOnExpiration": false,
+    "closeViolationsOnExpiration": true
+  },
+  "violationTimeLimitSeconds": 86400
+}
