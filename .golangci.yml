@@ -1,0 +1,31 @@
+# golangci-lint config — start conservative, expand once baseline is clean
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck       # checks unchecked errors
+    - gosimple       # simplification suggestions
+    - govet          # standard vet
+    - ineffassign    # ineffective assignments
+    - staticcheck    # bug detection
+    - unused         # unused code
+    - misspell       # spelling
+    - gocyclo        # cyclomatic complexity
+  disable:
+    - gosec          # security covered by govulncheck + CodeQL already
+    - dupl           # too noisy on fresh codebases
+
+linters-settings:
+  gocyclo:
+    min-complexity: 20  # generous default
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck     # tests routinely ignore err
+        - gocyclo
+  max-issues-per-linter: 0
+  max-same-issues: 0

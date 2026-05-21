@@ -1,0 +1,44 @@
+name: golangci-lint
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  schedule:
+    - cron: '23 6 * * 1'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: api
+      # Sibling checkouts (proto/common) for repos with replace directives.
+      # No-op for repos that don't need them.
+      - uses: actions/checkout@v4
+        if: ${{ hashFiles('api/go.mod') != '' }}
+        with:
+          repository: InstaNode-dev/common
+          path: common
+        continue-on-error: true
+      - uses: actions/checkout@v4
+        with:
+          repository: InstaNode-dev/proto
+          path: proto
+        continue-on-error: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: api
+          args: --timeout=5m
