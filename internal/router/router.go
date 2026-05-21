@@ -150,11 +150,14 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 
 	// ── Middleware chain (order matters) ─────────────────────────────────────
 	// SecurityHeaders runs BEFORE RequestID so the static defense-in-depth
-	// response headers (Permissions-Policy, Referrer-Policy,
-	// X-Content-Type-Options, and — in prod only — Strict-Transport-Security)
-	// land on every response including the cheap-path 404/405/livez surfaces
-	// that the request-id middleware also covers. The middleware is allocation-
-	// free per request; all values are static strings.
+	// response headers (X-Content-Type-Options, X-Frame-Options,
+	// Referrer-Policy, Permissions-Policy, Cross-Origin-Resource-Policy, and
+	// — in prod only — Strict-Transport-Security) land on every response
+	// including the cheap-path 404/405/livez surfaces that the request-id
+	// middleware also covers AND the 4xx/5xx envelopes returned by
+	// handler/middleware rejections downstream. The middleware is
+	// allocation-free per request; all values are static strings. Spec
+	// source: api task #311 wave-3 chaos-verify redo.
 	app.Use(middleware.SecurityHeaders(cfg.Environment == "production"))
 	app.Use(middleware.RequestID())
 	// LoggerContext copies request_id (and team_id once auth has run)

@@ -6,52 +6,96 @@ package middleware
 // Wired ahead of RequestID() in router.go so the headers land on every
 // path that flows through Fiber, INCLUDING the cheap-path responses
 // (livez, healthz, metrics, openapi.json, 404, 405) that the request-id
-// middleware would otherwise tag. The headers are static — no per-request
-// computation, no allocations — so the ordering cost is negligible.
+// middleware would otherwise tag — and the 4xx/5xx envelopes returned
+// from auth/quota/validation rejections inside handler bodies. The
+// headers are static — no per-request computation, no allocations — so
+// the ordering cost is negligible.
 //
-// Headers set:
+// Headers set (spec source: api task #311 wave-3 chaos-verify redo):
 //
-//   - Strict-Transport-Security (HSTS, prod only) — instructs every
-//     compliant browser to upgrade `http://api.instanode.dev` to https
-//     for the next 6 months WITHOUT touching the cleartext socket. Set
-//     only when the binary booted with ENVIRONMENT=production so local
-//     dev (http://localhost:8080) doesn't poison the host's HSTS cache
-//     and force browsers to refuse cleartext loopback. `includeSubDomains`
-//     extends the directive to *.api.instanode.dev (we own the apex too).
-//     `preload` is NOT set today — opting into the chromium preload list
-//     is a one-way door and operator-level decision.
+//   - Strict-Transport-Security: max-age=63072000; includeSubDomains
+//     (prod-only — gated by ENVIRONMENT=production). 2-year max-age,
+//     includeSubDomains so *.api.instanode.dev is also covered. Local
+//     dev MUST NOT advertise HSTS — a developer running `make run`
+//     against `http://localhost:8080` should not poison the host's
+//     browser HSTS cache and force every subsequent localhost service
+//     onto https.
 //
-//   - Permissions-Policy — declines every powerful browser API on this
-//     origin. The API surface is JSON and SSE only; the dashboard origin
-//     is a different host. A misconfigured proxy or a CDN rewrite that
-//     accidentally points a browser at the api host has no business
-//     reaching microphone/camera/geolocation/etc. Explicit "(),..." with
-//     empty allowlist denies the feature for any caller.
+//   - X-Content-Type-Options: nosniff — disables MIME sniffing. The
+//     api returns user-controlled bytes through webhook receive bodies
+//     and deploy logs SSE; nosniff is a belt-and-suspenders against a
+//     content-sniffing XSS that misinterprets JSON as HTML.
 //
-//   - Referrer-Policy: strict-origin-when-cross-origin — what every
-//     modern browser already defaults to, but pinning it makes the
-//     contract auditable. Same-origin requests keep the full Referer;
-//     cross-origin requests over https send only the origin; cross-origin
-//     downgrades to http send nothing. The API doesn't issue redirects
-//     to third-party hosts in the happy path, but the magic-link callback
-//     does redirect to the dashboard — strict-origin-when-cross-origin
-//     ensures the URL token never leaks via Referer.
+//   - X-Frame-Options: SAMEORIGIN — clickjacking defense. The api
+//     serves no HTML in the happy path, but error pages and 404s
+//     occasionally surface plain text the browser could render; pinning
+//     SAMEORIGIN ensures no third-party origin can frame any API
+//     response.
 //
-//   - X-Content-Type-Options: nosniff — disables MIME sniffing. Some
-//     browsers will guess "this looks like HTML even though the server
-//     said application/json" and execute scripts. Since this API returns
-//     user-controlled bytes in some surfaces (webhook receive bodies,
-//     deploy logs SSE), nosniff is a cheap belt-and-suspenders against
-//     a content-sniffing XSS.
+//   - Referrer-Policy: strict-origin-when-cross-origin — same-origin
+//     requests keep the full Referer; cross-origin requests over https
+//     send only the origin; cross-origin downgrades to http send
+//     nothing. The magic-link callback redirects to the dashboard with
+//     a token in the URL — strict-origin-when-cross-origin ensures the
+//     URL token never leaks via Referer.
 //
-// CSP is deliberately NOT set here — the API does not serve HTML on any
-// route, so a CSP would be meaningless. The dashboard host's CSP lives
-// in instanode-web's nginx config.
+//   - Permissions-Policy — declines the powerful browser APIs called
+//     out in the spec (geolocation, microphone, camera, payment) on
+//     this origin. The api surface is JSON and SSE only; a misconfigured
+//     proxy or CDN rewrite that points a browser at the api host has no
+//     business reaching any of these features. Explicit empty allowlist
+//     `feature=()` denies the feature for any caller including self.
 //
-// X-Frame-Options is also NOT set — there is no HTML to frame.
+//   - Cross-Origin-Resource-Policy: same-origin — blocks no-cors
+//     loads of api responses from third-party origins. Defense against
+//     speculative side-channel attacks (Spectre-class) that try to
+//     pull cross-origin responses into the victim renderer process.
+//
+// CSP is deliberately NOT set here — the api serves no HTML, so a CSP
+// would be meaningless. The dashboard host's CSP lives in instanode-web's
+// nginx config.
 
 import (
 	"github.com/gofiber/fiber/v2"
+)
+
+// Exported header constants — referenced by handler/middleware tests and
+// (eventually) by the OpenAPI response-headers documentation. Spec
+// values match the api task #311 wave-3 chaos-verify redo.
+const (
+	// HSTSValue: 2-year max-age + includeSubDomains. NOT preload — opting
+	// into chromium's preload list is a one-way door and requires
+	// operator-level sign-off (preload removal can take 6+ months).
+	HSTSValue = "max-age=63072000; includeSubDomains"
+
+	// PermissionsPolicyValue: the spec-mandated subset (geolocation,
+	// microphone, camera, payment). The wider "deny everything" set the
+	// previous iteration used was strictly safer but the canonical task
+	// spec is this exact string — locking it in here so any future
+	// drift fails a coverage test (TestSecurityHeaders_PermissionsPolicy_Exact).
+	PermissionsPolicyValue = "geolocation=(), microphone=(), camera=(), payment=()"
+
+	// ReferrerPolicyValue: same value every modern browser already
+	// defaults to, but pinning it makes the contract auditable.
+	ReferrerPolicyValue = "strict-origin-when-cross-origin"
+
+	// XContentTypeOptionsValue: only one legal value; pinning it as a
+	// constant so a refactor that "improves" the spelling fails the
+	// coverage test.
+	XContentTypeOptionsValue = "nosniff"
+
+	// XFrameOptionsValue: SAMEORIGIN, NOT DENY — the dashboard occasionally
+	// frames health checks/status pages from the same apex during incident
+	// reviews. DENY would break that without adding any real defense
+	// (frame-ancestors via CSP is the modern equivalent but the api
+	// doesn't serve HTML).
+	XFrameOptionsValue = "SAMEORIGIN"
+
+	// CrossOriginResourcePolicyValue: same-origin — only same-origin
+	// callers can fetch api responses. A third-party site that tries to
+	// `<img src="https://api.instanode.dev/...">` will have the browser
+	// reject the load.
+	CrossOriginResourcePolicyValue = "same-origin"
 )
 
 // SecurityHeaders returns a Fiber middleware that sets the static
@@ -63,33 +107,18 @@ import (
 // path Fiber serves, including livez/healthz/metrics/openapi/4xx-default
 // surfaces that the canonical request-id middleware also covers.
 func SecurityHeaders(envIsProd bool) fiber.Handler {
-	// Pre-compute the Permissions-Policy header string — it is static and
-	// the same value on every request. Each feature is set to "()" (empty
-	// allowlist) which denies the feature for any origin including self.
-	//
-	// The feature list is the canonical set of "powerful APIs" per
-	// W3C Permissions Policy spec; we deny every one because the API
-	// origin never legitimately needs any of them. Adding a new browser
-	// feature to the spec doesn't auto-grant it on this origin — the
-	// browser falls back to its own default, which is itself "deny" for
-	// every feature that requires user activation today.
-	const permissionsPolicy = "accelerometer=(),autoplay=(),camera=(),clipboard-read=(),clipboard-write=(),display-capture=(),encrypted-media=(),fullscreen=(),geolocation=(),gyroscope=(),hid=(),idle-detection=(),magnetometer=(),microphone=(),midi=(),payment=(),publickey-credentials-get=(),screen-wake-lock=(),serial=(),storage-access=(),usb=(),web-share=(),xr-spatial-tracking=()"
-
-	// HSTS pinning: 6 months. Long enough that a transient mis-deploy
-	// can't roll the directive back, short enough that an operator
-	// recovers in a year if a domain migration ever happens.
-	const hstsValue = "max-age=15552000; includeSubDomains"
-
 	return func(c *fiber.Ctx) error {
 		// Order matches the documented header list at the file head so an
 		// auditor reading the response sees them in this canonical
 		// sequence.
 		if envIsProd {
-			c.Set("Strict-Transport-Security", hstsValue)
+			c.Set("Strict-Transport-Security", HSTSValue)
 		}
-		c.Set("Permissions-Policy", permissionsPolicy)
-		c.Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		c.Set("X-Content-Type-Options", "nosniff")
+		c.Set("X-Content-Type-Options", XContentTypeOptionsValue)
+		c.Set("X-Frame-Options", XFrameOptionsValue)
+		c.Set("Referrer-Policy", ReferrerPolicyValue)
+		c.Set("Permissions-Policy", PermissionsPolicyValue)
+		c.Set("Cross-Origin-Resource-Policy", CrossOriginResourcePolicyValue)
 		return c.Next()
 	}
 }
