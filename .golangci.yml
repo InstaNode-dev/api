@@ -1,31 +1,31 @@
-# golangci-lint config — start conservative, expand once baseline is clean
+# golangci-lint v2 config — start conservative, expand once baseline is clean
+version: "2"
+
 run:
   timeout: 5m
   tests: true
 
 linters:
+  # Default linter set is govet+errcheck+ineffassign+staticcheck+unused.
+  # We explicitly add misspell + gocyclo on top. gosimple folded into staticcheck in v2.
   enable:
     - errcheck       # checks unchecked errors
-    - gosimple       # simplification suggestions
     - govet          # standard vet
     - ineffassign    # ineffective assignments
-    - staticcheck    # bug detection
+    - staticcheck    # bug detection (subsumes gosimple in v2)
     - unused         # unused code
     - misspell       # spelling
     - gocyclo        # cyclomatic complexity
-  disable:
-    - gosec          # security covered by govulncheck + CodeQL already
-    - dupl           # too noisy on fresh codebases
-
-linters-settings:
-  gocyclo:
-    min-complexity: 20  # generous default
+  settings:
+    gocyclo:
+      min-complexity: 20
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocyclo
 
 issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck     # tests routinely ignore err
-        - gocyclo
   max-issues-per-linter: 0
   max-same-issues: 0

@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [master, main]
   schedule:
-    - cron: '23 6 * * 1'
+    - cron: "23 6 * * 1"
 
 permissions:
   contents: read
@@ -22,7 +22,7 @@ jobs:
         with:
           path: api
       # Sibling checkouts (proto/common) for repos with replace directives.
-      # No-op for repos that don't need them.
+      # No-op for repos that do not need them.
       - uses: actions/checkout@v4
         if: ${{ hashFiles('api/go.mod') != '' }}
         with:
@@ -37,7 +37,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: api/go.mod
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v8
         with:
           version: latest
           working-directory: api
