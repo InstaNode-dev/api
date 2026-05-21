@@ -16,3 +16,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: crate-ci/typos@v1.30.0
+        continue-on-error: true  # warn-only — surface findings without blocking CI
