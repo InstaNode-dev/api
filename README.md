@@ -5,7 +5,7 @@ webhook receiver, or object storage bucket — no account, no Docker, no setup.
 
 ```bash
 # Provision a Postgres database — no auth required
-curl -s -X POST https://instanode.dev/db/new | jq .
+curl -s -X POST https://api.instanode.dev/db/new | jq .
 ```
 ```json
 {
