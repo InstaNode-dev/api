@@ -93,6 +93,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Pool-saturation observability (Wave-3 chaos verify, 2026-05-21).
+	// A goroutine ticks every 5s and re-publishes *sql.DB.Stats onto
+	// instant_pg_pool_* Prometheus gauges so an operator can SEE the
+	// pool fill up before downstream consumers (worker email
+	// forwarder) start failing with "remaining connection slots are
+	// reserved for non-replication superuser connections". Lives for
+	// the process lifetime — the goroutine returns when poolStatsCtx
+	// is cancelled at shutdown (see Phase A/B handlers below).
+	poolStatsCtx, poolStatsCancel := context.WithCancel(context.Background())
+	defer poolStatsCancel()
+	go db.StartPoolStatsExporter(poolStatsCtx, database, "platform_db")
+
 	// Deploy-audit self-report. Idempotent on (service, commit_id,
 	// image_digest) — every pod startup of the same image is a no-op
 	// at the DB level, so a 10-replica autoscale or a routine restart
