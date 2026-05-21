@@ -12,27 +12,104 @@ permissions:
 jobs:
   coverage:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    # Service containers mirror ci.yml's build-and-test job. Without these
+    # `go test ./...` failed with `dial tcp [::1]:5432: connect: connection
+    # refused` and coverage measured only the handful of pure-unit packages
+    # that don't touch a DB. See CLAUDE.md rule 23 (the local gate must
+    # equal CI) — coverage.yml must run the same hermetic suite ci.yml does.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: instant_dev_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      mongo:
+        image: mongo:6
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/instant_dev_test?sslmode=disable
+      TEST_REDIS_URL: redis://localhost:6379/15
+      # db-provider admin target — internal/providers/db/local.go CREATEs a
+      # customer database per /db/new and connects here. Without this DB,
+      # every postgres-provisioning test 503'd. Mirrors ci.yml.
+      TEST_POSTGRES_CUSTOMERS_URL: postgres://postgres:postgres@localhost:5432/instant_customers?sslmode=disable
+      # Mongo provider tests skip cleanly when unset; wire it so the
+      # nosql package contributes to coverage too.
+      TEST_MONGO_URI: mongodb://localhost:27017
     steps:
       - uses: actions/checkout@v4
         with:
           path: api
-      - uses: actions/checkout@v4
+
+      - name: Checkout proto sibling (for go.mod replace ../proto)
+        uses: actions/checkout@v4
         with:
-          repository: InstaNode-dev/common
-          path: common
-        continue-on-error: true
-      - uses: actions/checkout@v4
-        with:
-          repository: InstaNode-dev/proto
+          repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
           path: proto
-        continue-on-error: true
+
+      - name: Checkout common sibling (for go.mod replace ../common)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          path: common
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: api/go.mod
+
+      - name: Apply DB migrations to the test database
+        # Mirrors ci.yml — applies the REAL migration files (not the
+        # hand-maintained testhelpers.runMigrations mirror) and creates
+        # the instant_customers DB the db-provider admin target points at.
+        env:
+          PGPASSWORD: postgres
+        working-directory: api
+        run: |
+          for f in $(ls internal/db/migrations/*.sql | sort); do
+            echo "→ applying $(basename "$f")"
+            psql -h localhost -U postgres -d instant_dev_test -f "$f" >/dev/null
+          done
+          echo "all migrations applied to instant_dev_test"
+          psql -h localhost -U postgres -d postgres -c "CREATE DATABASE instant_customers" >/dev/null
+          echo "created instant_customers (db-provider admin target)"
+
       - name: Generate coverage
         working-directory: api
-        run: go test ./... -short -coverprofile=coverage.out -covermode=atomic || true
+        # `-p 1` matches ci.yml — every package shares the single
+        # instant_dev_test DB + redis/15; default parallelism corrupts
+        # shared state mid-test. `-short` matches deploy.yml's hermetic
+        # suite (e2e-tagged tests are excluded from ./... anyway).
+        # continue-on-error so a single flaky test doesn't drop the
+        # entire coverage artifact — codecov still ingests cov.out.
+        continue-on-error: true
+        run: go test ./... -short -count=1 -p 1 -coverprofile=coverage.out -covermode=atomic
+
       - uses: codecov/codecov-action@v4
         with:
           files: api/coverage.out
