@@ -29,6 +29,12 @@ type Config struct {
 	// dashboard and set this env var before checkout will work.
 	RazorpayPlanIDHobbyPlus  string // RAZORPAY_PLAN_ID_HOBBY_PLUS — plan_id for hobby_plus tier (monthly)
 	RazorpayPlanIDPro        string // RAZORPAY_PLAN_ID_PRO — plan_id for pro tier (monthly)
+	// RazorpayPlanIDGrowth — plan_id for the W12 growth tier ($99/mo,
+	// monthly). When unset, /api/v1/billing/checkout with plan="growth"
+	// returns 503 billing_not_configured; the reconciler also logs
+	// `billing.plan_id_to_tier.unrecognised` for any incoming Growth
+	// webhook so the operator notices the gap. D28 F3 (2026-05-21).
+	RazorpayPlanIDGrowth     string // RAZORPAY_PLAN_ID_GROWTH — plan_id for growth tier (monthly)
 	RazorpayPlanIDTeam       string // RAZORPAY_PLAN_ID_TEAM — plan_id for team tier (monthly)
 	// Yearly billing variants. When unset, the corresponding yearly checkout
 	// returns 503 billing_not_configured so partial rollout (monthly already
@@ -36,6 +42,7 @@ type Config struct {
 	RazorpayPlanIDHobbyYearly     string // RAZORPAY_PLAN_ID_HOBBY_YEARLY — plan_id for hobby tier (yearly)
 	RazorpayPlanIDHobbyPlusYearly string // RAZORPAY_PLAN_ID_HOBBY_PLUS_ANNUAL — plan_id for hobby_plus tier (yearly)
 	RazorpayPlanIDProYearly       string // RAZORPAY_PLAN_ID_PRO_YEARLY — plan_id for pro tier (yearly)
+	RazorpayPlanIDGrowthYearly    string // RAZORPAY_PLAN_ID_GROWTH_ANNUAL — plan_id for growth tier (yearly)
 	RazorpayPlanIDTeamYearly      string // RAZORPAY_PLAN_ID_TEAM_YEARLY — plan_id for team tier (yearly)
 	ResendAPIKey             string
 	// EmailProvider explicitly selects the outbound email backend. Accepted
@@ -262,6 +269,10 @@ func Load() *Config {
 		RazorpayPlanIDHobby:           os.Getenv("RAZORPAY_PLAN_ID_HOBBY"),
 		RazorpayPlanIDHobbyPlus:       os.Getenv("RAZORPAY_PLAN_ID_HOBBY_PLUS"),
 		RazorpayPlanIDPro:             os.Getenv("RAZORPAY_PLAN_ID_PRO"),
+		// D28 F3 (2026-05-21): Growth tier — was previously missing from
+		// the env-mapping, causing every subscription.charged webhook for
+		// a Growth customer to fall back to "hobby" and silently downgrade.
+		RazorpayPlanIDGrowth:          os.Getenv("RAZORPAY_PLAN_ID_GROWTH"),
 		RazorpayPlanIDTeam:            os.Getenv("RAZORPAY_PLAN_ID_TEAM"),
 		// 2026-05-15: the live instant-secrets uses the `_ANNUAL` suffix
 		// for every yearly plan id. config.go previously read `_YEARLY`
@@ -275,6 +286,7 @@ func Load() *Config {
 		RazorpayPlanIDHobbyYearly:     os.Getenv("RAZORPAY_PLAN_ID_HOBBY_ANNUAL"),
 		RazorpayPlanIDHobbyPlusYearly: os.Getenv("RAZORPAY_PLAN_ID_HOBBY_PLUS_ANNUAL"),
 		RazorpayPlanIDProYearly:       os.Getenv("RAZORPAY_PLAN_ID_PRO_ANNUAL"),
+		RazorpayPlanIDGrowthYearly:    os.Getenv("RAZORPAY_PLAN_ID_GROWTH_ANNUAL"),
 		RazorpayPlanIDTeamYearly:      os.Getenv("RAZORPAY_PLAN_ID_TEAM_ANNUAL"),
 		ResendAPIKey:             os.Getenv("RESEND_API_KEY"),
 		EmailProvider:            os.Getenv("EMAIL_PROVIDER"),

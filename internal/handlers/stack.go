@@ -1366,9 +1366,33 @@ func (h *StackHandler) Redeploy(c *fiber.Ctx) error {
 		// #11: a no-env resource must never silently read production secrets.
 		vaultEnv = models.EnvDefault
 	}
+	// A08 F1 + B14 F1 (2026-05-21): merge stacks.env_vars (set via PATCH
+	// /stacks/:slug/env) over the manifest. Without this load, every key
+	// set via PATCH is silently dropped on the next redeploy — migration
+	// 062 persists env_vars correctly but the redeploy path never reads
+	// it. Manifest wins on key collision so an in-manifest override of
+	// a PATCH'd key (e.g. agent fixed a typo in the manifest itself)
+	// takes precedence over the older PATCH value.
+	persistedEnv, envErr := models.GetStackEnvVars(c.Context(), h.db, stack.ID)
+	if envErr != nil {
+		slog.Error("stack.redeploy.env_vars_load_failed",
+			"error", envErr, "slug", slug, "stack_id", stack.ID,
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusServiceUnavailable, "env_load_failed",
+			"Failed to load stack env_vars")
+	}
+
 	services := make([]compute.StackServiceDef, 0, len(m.Services))
 	for svcName, svc := range m.Services {
-		envVars := svc.Env
+		// Merge: start with the PATCH'd env_vars, then layer the manifest
+		// values on top so manifest wins on collision.
+		envVars := make(map[string]string, len(persistedEnv)+len(svc.Env))
+		for k, v := range persistedEnv {
+			envVars[k] = v
+		}
+		for k, v := range svc.Env {
+			envVars[k] = v
+		}
 		resolved, vaultErr := ResolveVaultRefs(c.Context(), h.db, h.cfg.AESKey, team.ID, vaultEnv, envVars)
 		if vaultErr != nil {
 			slog.Error("stack.redeploy.vault_resolve_failed",
@@ -2170,23 +2194,50 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 		vaultEnv = to
 	}
 
+	// A08 F1 + B14 F1 (2026-05-21): load env_vars from BOTH source and
+	// target stack so PATCH /stacks/:slug/env contributions survive a
+	// promote. Without this, a key set on a staging stack is lost when
+	// promoted to prod. We prefer target's PATCH'd env over source's so
+	// per-env overrides on the target take precedence; the source's env
+	// then layers below. (The manifest is not re-evaluated here — promote
+	// rolls out the cached image — but the env_vars contract still applies
+	// at runtime through the StackServiceDef.EnvVars field.)
+	sourcePatchEnv, srcEnvErr := models.GetStackEnvVars(c.Context(), h.db, source.ID)
+	if srcEnvErr != nil {
+		slog.Error("stack.promote.source_env_vars_load_failed",
+			"error", srcEnvErr, "slug", slug, "stack_id", source.ID,
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusServiceUnavailable, "env_load_failed",
+			"Failed to load source env_vars")
+	}
+	targetPatchEnv, tgtEnvErr := models.GetStackEnvVars(c.Context(), h.db, target.ID)
+	if tgtEnvErr != nil {
+		slog.Error("stack.promote.target_env_vars_load_failed",
+			"error", tgtEnvErr, "slug", target.Slug, "stack_id", target.ID,
+			"request_id", middleware.GetRequestID(c))
+		return respondError(c, fiber.StatusServiceUnavailable, "env_load_failed",
+			"Failed to load target env_vars")
+	}
+
 	services := make([]compute.StackServiceDef, 0, len(sourceSvcs))
 	for _, src := range sourceSvcs {
 		// Vault refs on the source's manifest were resolved at /stacks/new
 		// time, so the source service rows don't store the raw `vault://`
-		// strings — only the resolved values. To re-resolve against the
-		// target env we'd need to keep the original manifest around. Until
-		// /stacks/new persists the manifest, the promote path skips re-
-		// resolution and trusts what's on the deployed image. The target's
-		// env is still set correctly on the stack row, so future redeploys
-		// (with a tarball) WILL resolve against the right vault namespace.
+		// strings — only the resolved values. The target's env is set
+		// correctly on the stack row, so future redeploys (with a tarball)
+		// WILL resolve against the right vault namespace.
 		//
-		// We DO still pass through the vaultEnv into a no-op ResolveVaultRefs
-		// call so any future inline vault refs (e.g. env vars set via
-		// PATCH /stacks/:slug/env on the target) get resolved against the
-		// target's namespace and not the source's. Today envVars is empty,
-		// so this is a placeholder for the env_overrides workstream.
-		envVars := map[string]string{}
+		// envVars now carries both source and target PATCH'd env_vars
+		// (target wins on collision). ResolveVaultRefs runs against the
+		// target's vault namespace so vault://KEY references resolve from
+		// the env we're promoting INTO, not the env we're promoting FROM.
+		envVars := make(map[string]string, len(sourcePatchEnv)+len(targetPatchEnv))
+		for k, v := range sourcePatchEnv {
+			envVars[k] = v
+		}
+		for k, v := range targetPatchEnv {
+			envVars[k] = v
+		}
 		resolved, vaultErr := ResolveVaultRefs(c.Context(), h.db, h.cfg.AESKey, team.ID, vaultEnv, envVars)
 		if vaultErr != nil {
 			slog.Error("stack.promote.vault_resolve_failed",
