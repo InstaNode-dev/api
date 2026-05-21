@@ -408,6 +408,9 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"invalid_signature": {
 		AgentAction: "Tell the user the webhook signature did not verify. Confirm the webhook secret in your dashboard and retry — see https://instanode.dev/docs/webhooks.",
 	},
+	"timestamp_outside_window": {
+		AgentAction: "Tell the user the webhook timestamp is outside the accepted ±5-minute window. Stop replaying captured webhook payloads — retry with a fresh delivery. If clock skew is suspected, sync the sender's clock via NTP.",
+	},
 	"signature_invalid": {
 		AgentAction: "Tell the user the request signature failed verification. Confirm the signing key and the canonical request body and retry — see https://instanode.dev/docs.",
 	},
