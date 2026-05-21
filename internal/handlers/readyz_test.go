@@ -42,7 +42,7 @@ func TestReadyz_AllOK(t *testing.T) {
 	app := fiber.New()
 	app.Get("/readyz", h.Get)
 
-	resp, err := app.Test(httptest.NewRequest("GET", "/readyz", nil))
+	resp, err := app.Test(httptest.NewRequest("GET", "/readyz", nil), 30000)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
@@ -88,7 +88,7 @@ func TestReadyz_CriticalFailure_Returns503(t *testing.T) {
 	app := fiber.New()
 	app.Get("/readyz", h.Get)
 
-	resp, err := app.Test(httptest.NewRequest("GET", "/readyz", nil))
+	resp, err := app.Test(httptest.NewRequest("GET", "/readyz", nil), 30000)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
@@ -168,7 +168,10 @@ func TestReadyz_DoesNotLeakSecrets(t *testing.T) {
 	app := fiber.New()
 	app.Get("/readyz", h.Get)
 
-	resp, err := app.Test(httptest.NewRequest("GET", "/readyz", nil))
+	// 30s timeout (default 1000ms flaked under loaded CI runners — the
+	// /readyz handler runs real upstream pings: platform_db, redis,
+	// brevo HTTP, etc. that take >1s on a busy runner).
+	resp, err := app.Test(httptest.NewRequest("GET", "/readyz", nil), 30000)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -199,7 +202,7 @@ func TestReadyz_ResponseShape(t *testing.T) {
 	app := fiber.New()
 	app.Get("/readyz", h.Get)
 
-	resp, err := app.Test(httptest.NewRequest("GET", "/readyz", nil))
+	resp, err := app.Test(httptest.NewRequest("GET", "/readyz", nil), 30000)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
@@ -246,7 +249,7 @@ func TestReadyz_DrainingReturns503(t *testing.T) {
 	app := fiber.New()
 	app.Get("/readyz", h.Get)
 
-	resp, err := app.Test(httptest.NewRequest("GET", "/readyz", nil))
+	resp, err := app.Test(httptest.NewRequest("GET", "/readyz", nil), 30000)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
