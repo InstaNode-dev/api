@@ -482,8 +482,14 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	//     this, an agent's retry of a transient 5xx mints two presigned
 	//     URLs from the same logical request, each consuming a slot in
 	//     the per-token rate limit.
+	// H46 F1 (2026-05-21): OptionalAuthStrict (not bare OptionalAuth) so
+	// a malformed/expired JWT 401s instead of silently falling through
+	// to anonymous. The token in the URL remains the primary auth
+	// boundary for the anonymous case; strict mode ensures a caller who
+	// *thinks* they're authenticated but presents a stale session
+	// doesn't sign for an unowned tenant prefix.
 	app.Post("/storage/:token/presign",
-		middleware.OptionalAuth(cfg),
+		middleware.OptionalAuthStrict(cfg),
 		middleware.PresignTokenRateLimit(rdb),
 		middleware.Idempotency(rdb, "storage.presign"),
 		storageH.PresignStorage,
