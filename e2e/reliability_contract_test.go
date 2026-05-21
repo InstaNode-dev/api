@@ -193,6 +193,14 @@ var auditConsumerSpec = map[string]auditConsumerExpectation{
 	// a customer notification.
 	"webhook.brevo.unauthorized":    {IntentionallyNoConsumer: true},
 	"webhook.razorpay.unauthorized": {IntentionallyNoConsumer: true},
+
+	// Wave-3 chaos verify P3 (2026-05-21) — Razorpay webhook with valid
+	// signature but a notes.team_id (or subscription_id) referencing a team
+	// that does not exist. Operator-only alert; counterpart to
+	// webhook.razorpay.unauthorized (signature-failed) — this is the
+	// signature-passed-but-team-unknown signal. No customer email: the
+	// affected "customer" either does not exist or was deleted.
+	"razorpay.webhook.team_not_found": {IntentionallyNoConsumer: true},
 }
 
 // ─── Test 1: every constant has a spec entry ──────────────────────────────────

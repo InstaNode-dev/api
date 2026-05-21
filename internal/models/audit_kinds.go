@@ -468,6 +468,43 @@ const (
 	// only (never the raw signature or webhook secret). Detects probing
 	// attempts against the billing-webhook path with crafted payloads.
 	AuditKindRazorpayWebhookUnauthorized = "webhook.razorpay.unauthorized"
+
+	// AuditKindRazorpayWebhookTeamNotFound fires from POST /razorpay/webhook
+	// when a Razorpay webhook arrives with a VALID signature but the team
+	// referenced via notes.team_id (or the subscription_id fallback) does
+	// not exist in our DB — i.e. models.UpgradeTeamAllTiersWithSubscription
+	// returned models.ErrTeamNotFound (Wave-3 chaos verify P3, 2026-05-21).
+	//
+	// Operationally interesting cases all map to this row:
+	//   - Razorpay-dashboard typo in subscription `notes` (operator paste error)
+	//   - A team that was deleted while its Razorpay subscription survived
+	//     (cancel-first abort gate raced; orphan-sweep reconciler will pick
+	//     it up but the leaked webhook is the loudest signal)
+	//   - A synthetic chaos probe with a real signature but bogus team_id
+	//     (Wave-3 test #6 is exactly this shape)
+	//   - An attacker who somehow obtained the webhook secret probing for
+	//     valid-signature paths (signature already verified to land here —
+	//     unlike webhook.razorpay.unauthorized, which is the signature-fail
+	//     case)
+	//
+	// Counterpart to AuditKindRazorpayWebhookUnauthorized: that kind is the
+	// "signature failed" signal; this kind is the "signature passed but the
+	// payload references a non-existent team" signal. Both are operator-only
+	// (IntentionallyNoConsumer in the reliability_contract spec) — sending an
+	// automated customer email here would only confuse a deleted/typo'd team.
+	//
+	// Persisted best-effort via safego.Go with a 3s bounded-timeout context
+	// (matches the resource.read / brevo.unauthorized pattern, NEVER
+	// context.Background — see CLAUDE.md rule 16 + the bounded-context audit
+	// in 2026-05-20). Metadata carries:
+	//   - event_type:     Razorpay webhook event name (e.g. "subscription.charged")
+	//   - event_id:       Razorpay X-Razorpay-Event-Id (replay-protection id)
+	//   - notes_team_id:  the team_id the payload claimed (safe to log raw —
+	//                     UUID shape; correlates with operator dashboard search)
+	//   - subscription_id: from the parsed subscription entity
+	// Deliberately NO email, no PII, no payload body — operator-visibility
+	// only (mirrors webhook.razorpay.unauthorized + billing.charge_undeliverable).
+	AuditKindRazorpayWebhookTeamNotFound = "razorpay.webhook.team_not_found"
 )
 
 // PropagationKind* are the discriminator values for pending_propagations.kind.

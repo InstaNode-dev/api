@@ -228,6 +228,21 @@ var (
 		Help: "POST /auth/email/start requests silently absorbed by the per-email rate limit (B4-F1, BugBash 2026-05-20).",
 	})
 
+	// RazorpayWebhookTeamNotFound counts /razorpay/webhook deliveries that
+	// pass signature verification BUT reference a team that does not exist
+	// (notes.team_id misses or matches no team row → ErrTeamNotFound).
+	// Wave-3 chaos verify P3 (2026-05-21): the unauthorized (signature
+	// failed) counter already exists; this one is the signature-passed
+	// counterpart that surfaces probing / dashboard-typo / deleted-team /
+	// synthetic-chaos signals. Counter rather than Gauge — each occurrence is
+	// independently meaningful for the NR rate alert. No labels: the metric
+	// is informational and we deliberately do not break out by team_id or
+	// event_type (those land in the matching audit_log row + slog line).
+	RazorpayWebhookTeamNotFound = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "razorpay_webhook_team_not_found_total",
+		Help: "Razorpay webhooks whose signature verified but whose notes.team_id (or subscription_id fallback) referenced a non-existent team — operator signal for typo/deleted-team/probing (Wave-3 chaos verify P3, 2026-05-21).",
+	})
+
 	// readyzCheckStatusGauge is the per-component readiness status for
 	// /readyz. Value: 1 = ok, 0.5 = degraded, 0 = failed. Labels:
 	//   - service:  "instant-api", "instant-worker", "instant-provisioner"

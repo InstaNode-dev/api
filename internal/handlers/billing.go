@@ -1079,7 +1079,7 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 			// the same payload) — exactly what we want for a synthetic
 			// or stale notes.team_id. Releasing the dedup claim above
 			// still allows a corrected payload to land later.
-			return webhookErrorStatus(c, upgradeErr, "upgrade_failed")
+			return webhookErrorStatus(c, upgradeErr, "upgrade_failed", h, event)
 		}
 	case "subscription.charged":
 		if upgradeErr := h.handleSubscriptionCharged(ctx, c, event); upgradeErr != nil {
@@ -1087,7 +1087,7 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 				"error", upgradeErr, "event_id", eventID)
 			// P4: release the claim on failure — see the activated branch.
 			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
-			return webhookErrorStatus(c, upgradeErr, "upgrade_failed")
+			return webhookErrorStatus(c, upgradeErr, "upgrade_failed", h, event)
 		}
 	case "subscription.cancelled":
 		// P1-W3-09: a swallowed downgrade failure used to leave the team on
@@ -1236,7 +1236,7 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 			slog.Error("billing.webhook.subscription_updated.failed",
 				"error", hErr, "event_id", eventID)
 			h.deleteRazorpayWebhookClaim(ctx, eventID, claimedHere)
-			return webhookErrorStatus(c, hErr, "subscription_updated_failed")
+			return webhookErrorStatus(c, hErr, "subscription_updated_failed", h, event)
 		}
 	case "refund.processed":
 		// B11-F1 (BugBash 2026-05-20): refund.processed is a record-keeping
@@ -1305,9 +1305,28 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 // envelope (e.g. "upgrade_failed", "subscription_cancelled_failed"). It is
 // echoed verbatim in the 500 envelope; on a 404 it is overridden to the
 // stable "team_not_found" code so consumers can identify the case.
-func webhookErrorStatus(c *fiber.Ctx, err error, errorCode string) error {
+//
+// Wave-3 chaos verify P3 (2026-05-21): the ErrTeamNotFound branch also fires
+// a best-effort audit_log row (kind=razorpay.webhook.team_not_found) so the
+// operator dashboard can chart signature-passed-but-unknown-team probes
+// without grepping NR. Counterpart to the unauthorized (signature-failed)
+// emit at the top of RazorpayWebhook. Persisted via safego.Go with a 3s
+// bounded-timeout context (NEVER context.Background — CLAUDE.md rule 16 +
+// 2026-05-20 bounded-context audit). Receiver `h` is allowed to be nil here
+// for the legacy callers that did not pass it; emit is skipped in that
+// case (test-only paths). The event context (event_type, event_id,
+// notes_team_id, subscription_id) is captured at the call site and threaded
+// in so this central helper can keep its narrow signature responsibility.
+//
+// emitTeamNotFoundAudit returns immediately when h or h.db is nil so the
+// helper stays safe to call from test paths that wire a nil DB.
+func webhookErrorStatus(c *fiber.Ctx, err error, errorCode string, h *BillingHandler, event rzpWebhookEvent) error {
 	var notFound *models.ErrTeamNotFound
 	if errors.As(err, &notFound) {
+		// Best-effort: bump Prom counter + insert audit row in the
+		// background. NEVER block the 404 we owe Razorpay.
+		metrics.RazorpayWebhookTeamNotFound.Inc()
+		emitRazorpayTeamNotFoundAudit(h, c, event)
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"ok":    false,
 			"error": "team_not_found",
@@ -1316,6 +1335,74 @@ func webhookErrorStatus(c *fiber.Ctx, err error, errorCode string) error {
 	return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 		"ok":    false,
 		"error": errorCode,
+	})
+}
+
+// emitRazorpayTeamNotFoundAudit persists one best-effort audit_log row +
+// emits the structured slog line consumed by the NR alert. Mirrors the
+// brevo.webhook.unauthorized emit pattern (safego.Go background goroutine
+// with a 3s bounded-timeout context — NEVER context.Background).
+//
+// Metadata is deliberately minimal: event_type, event_id, notes_team_id (UUID
+// shape, no PII), subscription_id, masked source-IP subnet. NEVER includes
+// payload.email or any caller-controlled string beyond the team_id (which is
+// a UUID and is already in the audit_log column as the dashboard FK target).
+//
+// The bounded 3s context means a DB outage can drop this row — that is the
+// explicit fail-open contract. The Prometheus counter increments
+// synchronously in the caller, so even on a DB-down event the operator
+// dashboard still sees the rate. Slog line emits at WARN so the NR
+// log-based alert can fire on either the audit row or the log line.
+func emitRazorpayTeamNotFoundAudit(h *BillingHandler, c *fiber.Ctx, event rzpWebhookEvent) {
+	if h == nil || h.db == nil {
+		return
+	}
+	// Pull event identifiers + subscription context outside the goroutine
+	// so the values are pinned at call time (Fiber's *Ctx is not safe to
+	// share across goroutines after the response writes).
+	eventType := event.Event
+	eventID := event.ID
+	var notesTeamID, subscriptionID string
+	if sub, ok := parseSubscriptionEntity(event); ok {
+		subscriptionID = sub.ID
+		if sub.Notes != nil {
+			notesTeamID = sub.Notes["team_id"]
+		}
+	}
+	subnet := maskSourceIP(c.IP())
+
+	// WARN-level slog so NR alerts can key on the log line if the audit
+	// row write fails on a DB outage.
+	slog.Warn("billing.webhook.team_not_found",
+		"event_type", eventType,
+		"event_id", eventID,
+		"notes_team_id", notesTeamID,
+		"subscription_id", subscriptionID,
+		"source_ip_subnet", subnet,
+	)
+
+	db := h.db
+	safego.Go("razorpay.webhook.team_not_found.audit", func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		meta, _ := json.Marshal(map[string]any{
+			"event_type":       eventType,
+			"event_id":         eventID,
+			"notes_team_id":    notesTeamID,
+			"subscription_id":  subscriptionID,
+			"source_ip_subnet": subnet,
+		})
+		if err := models.InsertAuditEvent(ctx, db, models.AuditEvent{
+			Actor:    "system",
+			Kind:     models.AuditKindRazorpayWebhookTeamNotFound,
+			Summary:  "Razorpay webhook references a non-existent team (signature valid, team_id unknown)",
+			Metadata: meta,
+		}); err != nil {
+			slog.Warn("audit.emit.failed",
+				"kind", models.AuditKindRazorpayWebhookTeamNotFound,
+				"error", err,
+			)
+		}
 	})
 }
 
