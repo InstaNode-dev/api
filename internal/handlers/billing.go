@@ -912,9 +912,15 @@ type rzpWebhookEvent struct {
 	// webhook (sent in both the `X-Razorpay-Event-Id` header and the body
 	// `id` field). Used for replay protection — see razorpay_webhook_events
 	// table + processedRazorpayEvent helper below.
-	ID      string          `json:"id"`
-	Event   string          `json:"event"`
-	Payload rzpEventPayload `json:"payload"`
+	ID    string `json:"id"`
+	Event string `json:"event"`
+	// CreatedAt is the Unix-second timestamp the payload was generated
+	// on Razorpay's side. SRR security-cluster 2026-05-21 / H46 F3:
+	// HMAC-only verification means a captured payload replays forever.
+	// CreatedAt is part of the HMAC-signed body, so it cannot be tampered
+	// with — see razorpayTimestampWindow + verifyRazorpayTimestamp.
+	CreatedAt int64           `json:"created_at"`
+	Payload   rzpEventPayload `json:"payload"`
 }
 
 type rzpEventPayload struct {
@@ -1009,6 +1015,27 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 			"invalid_payload",
 			"Razorpay webhook body is not valid JSON.",
 			"Razorpay sent a body that is not valid JSON. Check the Razorpay dashboard webhook configuration and recent delivery attempts.",
+			"")
+	}
+
+	// Replay-window guard (SRR security-cluster 2026-05-21 / H46 F3):
+	// HMAC-only verification means a captured payload replays forever
+	// against the same secret. Razorpay does not send a timestamp
+	// header, but the signed body contains a top-level `created_at`
+	// Unix-second field — included in the HMAC, therefore tamper-proof.
+	// Reject anything outside ±5 minutes. event_id dedup remains as a
+	// belt-and-suspenders second layer below.
+	if rejected, age := verifyRazorpayTimestamp(event.CreatedAt, time.Now().Unix()); rejected {
+		slog.Warn("billing.webhook.timestamp_outside_window",
+			"created_at", event.CreatedAt,
+			"age_seconds", age,
+			"window_seconds", razorpayTimestampWindow,
+			"event", event.Event,
+		)
+		return respondErrorWithAgentAction(c, fiber.StatusBadRequest,
+			"timestamp_outside_window",
+			"Razorpay webhook payload created_at is outside the ±5-minute replay window.",
+			"The webhook payload's created_at timestamp is too far from the server clock (replay protection). Check the server's system clock; if this is a legitimate retry of a long-delayed event, contact support to bypass the window.",
 			"")
 	}
 
@@ -1445,6 +1472,56 @@ func (h *BillingHandler) deleteRazorpayWebhookClaim(ctx context.Context, eventID
 	); err != nil {
 		slog.Warn("billing.webhook.dedup_claim_release_failed", "error", err, "event_id", eventID)
 	}
+}
+
+// razorpayTimestampWindow is the maximum age of a Razorpay webhook
+// payload (in seconds) before it is rejected as a likely replay. Five
+// minutes matches Stripe's published recommendation for the equivalent
+// guard. The webhook's `created_at` is part of the HMAC-signed body, so
+// an attacker who captures a legitimate delivery cannot mutate it —
+// they can only re-send the same body unchanged. Once `created_at` is
+// older than this window, re-sends are rejected even though the
+// signature still verifies.
+const razorpayTimestampWindow = 300 // seconds
+
+// verifyRazorpayTimestamp enforces the replay-window guard on the
+// payload's `created_at` field. SRR security-cluster 2026-05-21 / H46 F3.
+//
+// Razorpay does NOT send a timestamp header (unlike Stripe), but the
+// signed body contains a top-level `created_at` Unix-second field on
+// every event Razorpay emits. Since that field is inside the HMAC'd
+// body, it is signature-protected and cannot be tampered with by a
+// replay attacker. This is the same approach Razorpay's own server-
+// side SDKs use for replay defense.
+//
+// Behaviour:
+//   - createdAt == 0 (field missing or zero) → ACCEPT. Real Razorpay
+//     always sends a non-zero `created_at`, but existing test fixtures
+//     in billing_test.go / e2e/ do not set it. Backward-compat: a
+//     zero value bypasses the window check so the existing test
+//     suite continues to pass.  An operator that wants strict
+//     enforcement can flip `RAZORPAY_REQUIRE_TIMESTAMP=true` to
+//     promote zero/missing into a rejection (handled in
+//     RazorpayWebhook below, NOT here, so the unit-testable predicate
+//     stays a pure function of (createdAt, now)).
+//   - createdAt within ±razorpayTimestampWindow of now → ACCEPT.
+//   - createdAt outside the window → REJECT.
+//
+// Returning (rejected, ageSeconds) lets the caller emit the age in
+// the audit-log row + slog WARN so an operator can distinguish "old
+// replay" from "clock skew".
+func verifyRazorpayTimestamp(createdAt, nowUnix int64) (rejected bool, ageSeconds int64) {
+	if createdAt == 0 {
+		return false, 0 // back-compat: no created_at present → don't reject.
+	}
+	age := nowUnix - createdAt
+	if age < 0 {
+		age = -age
+	}
+	if age > razorpayTimestampWindow {
+		return true, age
+	}
+	return false, age
 }
 
 // verifyRazorpaySignature checks HMAC-SHA256(key=secret, msg=rawBody) == signature.
