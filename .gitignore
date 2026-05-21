@@ -5,3 +5,6 @@ GeoLite2-*.mmdb
 .env.*
 !.env.example
 node_modules
+
+# Internal Claude Code skills (per-repo)
+.claude/
