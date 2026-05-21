@@ -63,10 +63,30 @@ import (
 // (eventually) by the OpenAPI response-headers documentation. Spec
 // values match the api task #311 wave-3 chaos-verify redo.
 const (
-	// HSTSValue: 2-year max-age + includeSubDomains. NOT preload — opting
-	// into chromium's preload list is a one-way door and requires
-	// operator-level sign-off (preload removal can take 6+ months).
-	HSTSValue = "max-age=63072000; includeSubDomains"
+	// HSTSValue: 2-year max-age + includeSubDomains + preload.
+	//
+	// SRR security-cluster 2026-05-21 / PB03: added the `preload` directive
+	// so api.instanode.dev is eligible for inclusion on the Chromium HSTS
+	// preload list (https://hstspreload.org). Browser preload moves the
+	// TLS-only guarantee from "after first successful HTTPS visit" to
+	// "from the very first navigation", closing the bootstrap-MITM window
+	// where a hostile network could downgrade the initial HTTP request.
+	//
+	// Preload is operationally a one-way door — removal from the list
+	// can take 6+ months once Chrome ships the update — so the value is
+	// only safe to advertise when ALL of the following are true:
+	//   1. The apex domain (and every subdomain referenced via
+	//      includeSubDomains) serves HTTPS, with a valid cert, full-time.
+	//   2. No HTTP-only sibling service exists on any subdomain that a
+	//      browser might try to load (e.g. a legacy `staging.` HTTP host).
+	//   3. The deployment plan accepts the rollback latency.
+	//
+	// Local dev / docker-compose builds NEVER emit this header — see the
+	// SecurityHeaders constructor's `envIsProd` gate below — so a developer
+	// running `make run` against http://localhost:8080 cannot poison their
+	// browser's HSTS cache and force every subsequent localhost service
+	// onto https.
+	HSTSValue = "max-age=63072000; includeSubDomains; preload"
 
 	// PermissionsPolicyValue: the spec-mandated subset (geolocation,
 	// microphone, camera, payment). The wider "deny everything" set the

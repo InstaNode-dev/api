@@ -57,3 +57,16 @@ func LookupCodeToAgentActionForTest(code string) (CodeToAgentActionMetaForTest, 
 		UpgradeURL:  meta.UpgradeURL,
 	}, true
 }
+
+// VerifyRazorpayTimestampForTest re-exports the unexported timestamp-window
+// predicate for the SRR security-cluster H46-F3 regression tests. Pure
+// function (no I/O), so a unit test can lock in the boundary semantics
+// without spinning up the HTTP app. Returns (rejected, ageSeconds).
+func VerifyRazorpayTimestampForTest(createdAt, nowUnix int64) (bool, int64) {
+	return verifyRazorpayTimestamp(createdAt, nowUnix)
+}
+
+// RazorpayTimestampWindowForTest re-exports the window constant so a
+// test that wants to compute "boundary-1 / boundary / boundary+1" stays
+// in sync with the production value automatically.
+const RazorpayTimestampWindowForTest = razorpayTimestampWindow

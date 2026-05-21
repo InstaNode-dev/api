@@ -504,7 +504,44 @@ func (c *Config) IsServiceEnabled(serviceName string) bool {
 	return false
 }
 
+// warnIfMetricsTokenMissing emits a loud startup WARN when /metrics is
+// publicly readable in a non-development environment. SRR security-
+// cluster 2026-05-21 / C19 P0 / PB03: the prod api on 2026-05-21 was
+// serving /metrics with no auth because METRICS_TOKEN was unset; the
+// exposed counters leaked internal infra topology + abuse-block rates
+// to anyone on the public internet. Silent fallthrough hid this from
+// the operator. Promoting it to a startup WARN ensures it lands in
+// k8s `kubectl logs` and any log aggregator on the first boot after
+// the env var is dropped.
+//
+// We intentionally do NOT fail-closed (panic / refuse to boot) — the
+// local-dev / docker-compose flow runs without METRICS_TOKEN by design
+// (open metrics is the cheapest dev affordance), and the equivalent
+// flag flip on the worker / provisioner sidecars would also need to be
+// fail-closed for consistency. Loud WARN is the appropriate guardrail:
+// the operator sees the gap in the first deploy log, has time to
+// rotate a token, and we don't accidentally hard-bounce prod over a
+// monitoring side-channel.
+//
+// Split out so the path is independently testable
+// (TestWarnIfMetricsTokenMissing_Prod_Emits etc.).
+func warnIfMetricsTokenMissing(cfg *Config) {
+	if cfg.MetricsToken != "" {
+		return
+	}
+	// In local dev metrics-open is intentional; emit nothing.
+	if cfg.Environment == "development" || cfg.Environment == "test" {
+		return
+	}
+	slog.Warn("config.metrics_token.missing",
+		"environment", cfg.Environment,
+		"impact", "Prometheus /metrics endpoint is publicly readable — internal infra topology, abuse-block rates, and circuit-breaker state leak to any caller",
+		"fix", "set METRICS_TOKEN to a random 32-byte hex (openssl rand -hex 32) and update the Prometheus scrape config to send Authorization: Bearer <token>",
+	)
+}
+
 func logStartupConfig(cfg *Config) {
+	warnIfMetricsTokenMissing(cfg)
 	slog.Info("config.loaded",
 		"port", cfg.Port,
 		"environment", cfg.Environment,

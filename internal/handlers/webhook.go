@@ -838,13 +838,31 @@ func (h *WebhookHandler) ListRequests(c *fiber.Ctx) error {
 			"This webhook token has expired. Sign up to keep your webhook alive.")
 	}
 
-	// Authorization: token in the URL IS the credential (token == resource.Token).
-	// If the caller also has a session, verify they own the team resource.
-	// Anonymous resources (no team_id) are readable with just the token.
+	// Authorization (H46-F2, SRR security-cluster 2026-05-21):
+	//   - Token in the URL IS the credential (token == resource.Token). An
+	//     unauthenticated caller in possession of the token can read.
+	//   - If the caller ALSO presents a session JWT, the session must match
+	//     the resource's owning team. A cross-team session (team A's user
+	//     submitting team B's token) is a 403 `cross_team_session` — the
+	//     token was leaked into a third-party log (Stripe delivery history,
+	//     GitHub delivery log, etc.) and the foreign session is the strong
+	//     signal that this is a poach attempt, not a legitimate read by
+	//     the resource owner.
+	//   - Anonymous resources (resource.TeamID not set) bypass the
+	//     ownership check — anyone with the token can read, by design.
+	//
+	// This intentionally permits unauthenticated reads of claimed webhooks
+	// (token-as-bearer) while blocking the higher-risk cross-team-session
+	// case where an authenticated user is using a token outside their team
+	// boundary. Test: webhook_idor_test.go::TestWebhookListRequests_CrossTeamSession_403.
 	if resource.TeamID.Valid {
-		teamID, authErr := parseTeamID(middleware.GetTeamID(c))
-		if authErr != nil || resource.TeamID.UUID != teamID {
-			return respondError(c, fiber.StatusForbidden, "forbidden", "Valid session token required for team-owned webhooks")
+		sessionTeamID := middleware.GetTeamID(c)
+		if sessionTeamID != "" {
+			teamID, authErr := parseTeamID(sessionTeamID)
+			if authErr != nil || resource.TeamID.UUID != teamID {
+				return respondError(c, fiber.StatusForbidden, "cross_team_session",
+					"This session belongs to a different team than the webhook token. Drop the Authorization header to use the token as a bearer credential, or sign in to the team that owns this webhook.")
+			}
 		}
 	}
 

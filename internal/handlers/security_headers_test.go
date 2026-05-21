@@ -208,12 +208,27 @@ func TestSecurityHeaders_PermissionsPolicy_Exact(t *testing.T) {
 }
 
 // TestSecurityHeaders_HSTS_TwoYearMaxAge pins the HSTS max-age at exactly
-// 63072000 (= 2 years in seconds). RFC 6797 §6.1.1 mandates max-age in
-// seconds; the spec target is 2y; this test fails loudly if a refactor
-// rolls it back to a shorter window.
+// 63072000 (= 2 years in seconds), the includeSubDomains directive, AND
+// the preload directive. RFC 6797 §6.1.1 mandates max-age in seconds;
+// the spec target is 2y; SRR security-cluster 2026-05-21 / PB03 added
+// the `preload` directive so api.instanode.dev is eligible for inclusion
+// on the Chromium HSTS preload list (https://hstspreload.org). This test
+// fails loudly if a refactor rolls any of the three directives back.
 func TestSecurityHeaders_HSTS_TwoYearMaxAge(t *testing.T) {
 	require.Equal(t,
-		"max-age=63072000; includeSubDomains",
+		"max-age=63072000; includeSubDomains; preload",
 		middleware.HSTSValue,
-		"HSTS max-age must be 63072000 (2 years) per spec")
+		"HSTS value must be max-age=2y + includeSubDomains + preload per spec")
+}
+
+// TestSecurityHeaders_HSTS_PreloadDirective asserts the preload
+// directive is advertised on every prod response. PB03 (2026-05-21)
+// found api.instanode.dev was emitting HSTS WITHOUT `preload`, blocking
+// HSTS-preload-list submission. This test is the coverage gate (rule 17)
+// that a future "minor cleanup" can't silently strip it.
+func TestSecurityHeaders_HSTS_PreloadDirective(t *testing.T) {
+	require.Contains(t, middleware.HSTSValue, "preload",
+		"Strict-Transport-Security must include the preload directive — required for browser HSTS preload list submission")
+	require.Contains(t, middleware.HSTSValue, "includeSubDomains",
+		"preload eligibility also requires includeSubDomains; do not strip it")
 }
