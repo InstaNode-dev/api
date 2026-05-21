@@ -11,9 +11,10 @@ package handlers_test
 // row — which meant an operator had to grep NR for the slog line, and a
 // burst against the path raised no signal at all.
 //
-// This test exercises the full live path: POST a signed payload with a
-// valid signature and a syntactically-valid-but-unknown team_id, then
-// assert (a) 404 status, (b) audit_log row with kind
+// This test exercises the full live path: POST a signed subscription.charged
+// payload with a valid signature, a valid plan_id (so the handler reaches
+// UpgradeTeamAllTiersWithSubscription), and a syntactically-valid-but-
+// unknown team_id, then assert (a) 404 status, (b) audit_log row with kind
 // 'razorpay.webhook.team_not_found' carrying event_type + event_id +
 // notes_team_id + subscription_id in metadata, (c) Prometheus counter
 // razorpay_webhook_team_not_found_total ticks up.
@@ -30,17 +31,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"instant.dev/internal/config"
-	"instant.dev/internal/email"
-	"instant.dev/internal/handlers"
 	"instant.dev/internal/metrics"
-	"instant.dev/internal/middleware"
 	"instant.dev/internal/testhelpers"
 )
 
@@ -59,20 +55,15 @@ func TestRazorpayWebhook_TeamNotFound_EmitsAudit(t *testing.T) {
 		return
 	}
 
-	// Wire the handler against a real DB so the audit_log INSERT lands
-	// where we can SELECT it back. We share the same *sql.DB with the
-	// handler so we observe the same row a real prod request would.
-	db, cleanup := testhelpers.SetupTestDB(t)
-	defer cleanup()
+	// Use the shared billingWebhookDBApp helper so the cfg has valid
+	// RazorpayPlanID* values — the handler must reach
+	// UpgradeTeamAllTiersWithSubscription (which returns ErrTeamNotFound
+	// when no team row matches), not be short-circuited by the
+	// "unknown plan_id" or "unknown tier" F3 branches above it.
+	db, dbCleanup := testhelpers.SetupTestDB(t)
+	defer dbCleanup()
 
-	cfg := &config.Config{
-		JWTSecret:             "test-secret-that-is-at-least-32-bytes-long!!",
-		RazorpayWebhookSecret: testWebhookSecret,
-	}
-	billing := handlers.NewBillingHandler(db, cfg, email.NewNoop())
-	app := fiber.New()
-	app.Use(middleware.RequestID())
-	app.Post("/razorpay/webhook", billing.RazorpayWebhook)
+	app, cfg := billingWebhookDBApp(t, db)
 
 	// Choose unique identifiers so concurrent test runs do not collide on
 	// audit_log row reads. The team_id is a fresh UUID NOT in `teams` —
@@ -88,7 +79,7 @@ func TestRazorpayWebhook_TeamNotFound_EmitsAudit(t *testing.T) {
 	// without serialising the whole test binary.
 	before := testutil.ToFloat64(metrics.RazorpayWebhookTeamNotFound)
 
-	payload := makeSubscriptionChargedPayload(t, bogusTeamID, subscriptionID)
+	payload := makeSubscriptionChargedPayloadWithPlan(t, bogusTeamID, subscriptionID, cfg.RazorpayPlanIDPro)
 	sig := signRazorpayPayload(t, testWebhookSecret, payload)
 	req := httptest.NewRequest(http.MethodPost, "/razorpay/webhook", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
