@@ -19,7 +19,7 @@ curl -s -X POST https://instanode.dev/db/new | jq .
 ```
 
 Use the `connection_url` directly with any standard driver. The upgrade URL in the `note` field
-pre-fills a signup page with everything you've provisioned. Sign up → resources claimed → 14-day trial. No credit card.
+pre-fills a signup page with everything you've provisioned. Sign up → resources claimed → continue on the free anonymous tier (24h TTL) or upgrade to a paid tier — no trial; pay from day one.
 
 ---
 
