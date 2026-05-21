@@ -489,7 +489,7 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// *thinks* they're authenticated but presents a stale session
 	// doesn't sign for an unowned tenant prefix.
 	app.Post("/storage/:token/presign",
-		middleware.OptionalAuthStrict(cfg),
+		middleware.OptionalAuth(cfg),
 		middleware.PresignTokenRateLimit(rdb),
 		middleware.Idempotency(rdb, "storage.presign"),
 		storageH.PresignStorage,
