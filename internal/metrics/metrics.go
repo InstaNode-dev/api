@@ -257,6 +257,57 @@ var (
 		Name: "readyz_check_status",
 		Help: "Per-component readiness status (1=ok, 0.5=degraded, 0=failed). Set by /readyz on every probe.",
 	}, []string{"service", "check"})
+
+	// PGPoolInUse and PGPoolWaiting expose the live state of api's
+	// *sql.DB pool. Set on a 5-second tick from main.go (see
+	// startPGPoolStatsExporter).
+	//
+	// Wave-3 chaos verify (2026-05-21): a 50-concurrent /db/new burst
+	// exhausted the DigitalOcean Managed Postgres connection pool and
+	// caused worker's event_email_forwarder to fail with "remaining
+	// connection slots are reserved for non-replication superuser
+	// connections". The api pool was at 25/10 with handlers holding
+	// connections through the full provisioner gRPC round-trip (~160s
+	// on the worst-case path). Without these gauges the saturation was
+	// invisible in /metrics — operators had to infer it from worker
+	// errors after the fact.
+	//
+	// Labels:
+	//   - pool: "platform_db" (api's main pool) — additional pools may
+	//     be added later (per-customer-DB connections are not pooled
+	//     and so are not surfaced here).
+	//
+	// NR alert: `instant_pg_pool_in_use / instant_pg_pool_max > 0.8`
+	// for 5min — pages the operator before the pool actually saturates.
+	PGPoolInUse = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "instant_pg_pool_in_use",
+		Help: "Postgres connections currently in use by the api process pool. Sampled every 5s. Wave-3 chaos verify 2026-05-21.",
+	}, []string{"pool"})
+
+	PGPoolIdle = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "instant_pg_pool_idle",
+		Help: "Postgres connections currently idle in the api process pool. Sampled every 5s.",
+	}, []string{"pool"})
+
+	PGPoolOpen = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "instant_pg_pool_open",
+		Help: "Postgres connections currently open (in-use + idle) in the api process pool. Sampled every 5s.",
+	}, []string{"pool"})
+
+	PGPoolMax = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "instant_pg_pool_max",
+		Help: "Postgres connections ceiling (SetMaxOpenConns). Constant for the process lifetime; re-published every 5s as a safety belt.",
+	}, []string{"pool"})
+
+	PGPoolWaitCount = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "instant_pg_pool_wait_count",
+		Help: "Cumulative count of connection-acquisition waits since process start (sql.DBStats.WaitCount). A flat line == no saturation; a steepening slope == pool saturated.",
+	}, []string{"pool"})
+
+	PGPoolWaitDurationSeconds = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "instant_pg_pool_wait_duration_seconds",
+		Help: "Cumulative time spent waiting for a connection since process start, in seconds (sql.DBStats.WaitDuration). Pairs with instant_pg_pool_wait_count.",
+	}, []string{"pool"})
 )
 
 // ReadyzCheckStatus updates the gauge for one check in this service.
