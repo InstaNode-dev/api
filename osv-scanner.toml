@@ -1,0 +1,26 @@
+# OSV-Scanner config
+#
+# These CVEs are TRANSITIVE-ONLY findings. govulncheck (call-graph
+# aware) confirms zero reachable vulnerabilities on master HEAD.
+# OSV-Scanner has no reachability filter so it flags any module-graph
+# entry without considering whether our code actually reaches it.
+#
+# Per CLAUDE.md rule 25: every suppression carries explicit rationale
+# and an exit condition. These auto-lift when upstream consumers
+# upgrade past the affected version.
+
+[[IgnoredVulns]]
+id = "GHSA-8rm2-7qqf-34qm"
+reason = "prometheus/prometheus v0.303.0 transitive (server-binary module pulled in by OTel/Grafana consumers). govulncheck confirms 0 reachable. Not called by api code."
+
+[[IgnoredVulns]]
+id = "GHSA-fw8g-cg8f-9j28"
+reason = "prometheus/prometheus v0.303.0 transitive — not called per govulncheck. Same as above."
+
+[[IgnoredVulns]]
+id = "GHSA-vffh-x6r8-xx99"
+reason = "prometheus/prometheus v0.303.0 transitive — not called per govulncheck. Same as above."
+
+[[IgnoredVulns]]
+id = "GHSA-wg65-39gg-5wfj"
+reason = "prometheus/prometheus v0.303.0 transitive — not called per govulncheck. Same as above."
