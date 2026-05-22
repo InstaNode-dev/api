@@ -9,9 +9,21 @@ import (
 	"context"
 	"database/sql"
 
+	"github.com/google/uuid"
+
 	"instant.dev/internal/config"
 	"instant.dev/internal/models"
 )
+
+// PersistMagicLinkSendStatusForTest re-exports the unexported
+// persistMagicLinkSendStatus helper so the external handlers_test package can
+// drive its two error branches (MarkMagicLinkSendFailed / MarkMagicLinkSent
+// failure) against an isolated DB without an import cycle. The helper logs +
+// swallows on failure (the user-visible 202 is unchanged), so a direct call is
+// the only way to reach those branches.
+func PersistMagicLinkSendStatusForTest(ctx context.Context, db *sql.DB, id uuid.UUID, sendErr error, requestID string) {
+	persistMagicLinkSendStatus(ctx, db, id, sendErr, requestID)
+}
 
 // ErrProvisionPersistFailedForTest re-exports the persistence-failure sentinel
 // for MR-P0-3 regression tests.
@@ -70,3 +82,30 @@ func VerifyRazorpayTimestampForTest(createdAt, nowUnix int64) (bool, int64) {
 // test that wants to compute "boundary-1 / boundary / boundary+1" stays
 // in sync with the production value automatically.
 const RazorpayTimestampWindowForTest = razorpayTimestampWindow
+
+// SetOAuthURLsForTest repoints the package-level OAuth provider endpoint vars
+// at a test server (httptest.Server.URL + per-endpoint suffixes) so the
+// external handlers_test package can drive the full OAuth exchange path
+// without hitting the real github.com / accounts.google.com. Returns a restore
+// func the caller defers. base="" restores nothing and is a no-op guard.
+func SetOAuthURLsForTest(base string) (restore func()) {
+	prev := []*string{
+		&githubTokenURL, &githubUserURL, &githubUserEmailURL,
+		&googleTokenInfoURL, &googleTokenURL, &googleUserInfoURL,
+	}
+	saved := make([]string, len(prev))
+	for i, p := range prev {
+		saved[i] = *p
+	}
+	githubTokenURL = base + "/gh/token"
+	githubUserURL = base + "/gh/user"
+	githubUserEmailURL = base + "/gh/emails"
+	googleTokenInfoURL = base + "/g/tokeninfo"
+	googleTokenURL = base + "/g/token"
+	googleUserInfoURL = base + "/g/userinfo"
+	return func() {
+		for i, p := range prev {
+			*p = saved[i]
+		}
+	}
+}
