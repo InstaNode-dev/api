@@ -92,7 +92,7 @@ var allProvisioningEndpoints = append([]provisioningEndpoint{
 // #S18. A BOM-prefixed body is malformed JSON; every provisioning handler
 // must now surface that as 400 invalid_body instead of silently treating
 // it as an empty body and 201-provisioning a nameless resource.
-func TestProvisioningBodyValidation_BOMJSON_Rejected(t *testing.T) {
+func TestResourceProvisioningBodyValidation_BOMJSON_Rejected(t *testing.T) {
 	for _, ep := range provisioningEndpoints {
 		ep := ep
 		t.Run(ep.name, func(t *testing.T) {
@@ -128,7 +128,7 @@ func TestProvisioningBodyValidation_BOMJSON_Rejected(t *testing.T) {
 // #Q67. `{"name": 12345}` is structurally valid JSON but `name` is the
 // wrong type. Before this wave Fiber's BodyParser silently coerced it to
 // "" and returned 201 with an empty name; now it must 400 invalid_body.
-func TestProvisioningBodyValidation_WrongTypeField_Rejected(t *testing.T) {
+func TestResourceProvisioningBodyValidation_WrongTypeField_Rejected(t *testing.T) {
 	// Body with a numeric `name` — JSON-parses but cannot decode into the
 	// `Name string` field of provisionRequestBody.
 	wrongType := `{"name": 12345}`
@@ -175,7 +175,7 @@ func TestProvisioningBodyValidation_WrongTypeField_Rejected(t *testing.T) {
 // That 503 is fine for our purpose — what we're proving here is that the
 // EMPTY body itself does NOT fail with 400 invalid_body. We accept any
 // non-400 status as proof body parsing didn't fire on an empty body.
-func TestProvisioningBodyValidation_EmptyBody_StillWorks(t *testing.T) {
+func TestResourceProvisioningBodyValidation_EmptyBody_StillWorks(t *testing.T) {
 	for _, ep := range allProvisioningEndpoints {
 		ep := ep
 		t.Run(ep.name, func(t *testing.T) {
@@ -219,7 +219,7 @@ func TestProvisioningBodyValidation_EmptyBody_StillWorks(t *testing.T) {
 // A bare `{}` therefore 400s `name_required` by design; this test's intent
 // is "valid JSON parses cleanly" so we send a minimal `{"name":"…"}` — still
 // a "happy path" JSON object, no other fields, just with the required label.
-func TestProvisioningBodyValidation_EmptyJSONObject_StillWorks(t *testing.T) {
+func TestResourceProvisioningBodyValidation_EmptyJSONObject_StillWorks(t *testing.T) {
 	for _, ep := range allProvisioningEndpoints {
 		ep := ep
 		t.Run(ep.name, func(t *testing.T) {
@@ -281,7 +281,7 @@ func TestCLIAuth_BOMJSON_Rejected(t *testing.T) {
 // env_override_reason="default_no_env_specified" so the agent can tell
 // the difference between "I asked for dev" and "I sent nothing and got
 // dev." When the caller IS explicit, the field is absent.
-func TestProvisioning_NoEnv_SurfacesOverrideReason(t *testing.T) {
+func TestResourceProvisioning_NoEnv_SurfacesOverrideReason(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -333,7 +333,7 @@ func TestProvisioning_NoEnv_SurfacesOverrideReason(t *testing.T) {
 // rewrite as U+FFFD before this wave) must now be rejected with 400
 // invalid_name. The body itself is valid JSON — only the embedded string
 // is malformed UTF-8.
-func TestProvisioning_InvalidUTF8Name_Rejected(t *testing.T) {
+func TestResourceProvisioning_InvalidUTF8Name_Rejected(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -377,7 +377,7 @@ func TestProvisioning_InvalidUTF8Name_Rejected(t *testing.T) {
 // CRLF in a name silently passed through before and corrupted audit log
 // summaries. Stripped (not rejected) so a stray \r from a paste doesn't
 // 400 the caller — but it must NOT make it into the persisted name.
-func TestProvisioning_ControlCharsInName_Stripped(t *testing.T) {
+func TestResourceProvisioning_ControlCharsInName_Stripped(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -429,7 +429,7 @@ var provisioningJSONEndpoints = []string{
 // empty-after-trim with 400 name_required. This is a BREAKING contract change:
 // before 2026-05-16 a name-less POST returned 201 and the dashboard showed a
 // raw hash like `db_fcb890cde09d`.
-func TestProvisioning_NameRequired_MissingOrEmpty_Returns400(t *testing.T) {
+func TestResourceProvisioning_NameRequired_MissingOrEmpty_Returns400(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -477,7 +477,7 @@ func TestProvisioning_NameRequired_MissingOrEmpty_Returns400(t *testing.T) {
 // TestProvisioning_InvalidName_BadFormat_Returns400 verifies that a `name`
 // which is present but fails the length / character contract is rejected
 // with 400 invalid_name.
-func TestProvisioning_InvalidName_BadFormat_Returns400(t *testing.T) {
+func TestResourceProvisioning_InvalidName_BadFormat_Returns400(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -521,7 +521,7 @@ func TestProvisioning_InvalidName_BadFormat_Returns400(t *testing.T) {
 
 // TestProvisioning_ValidName_TrimmedAndAccepted verifies that a valid name
 // with surrounding whitespace is trimmed and the resource provisions 201.
-func TestProvisioning_ValidName_TrimmedAndAccepted(t *testing.T) {
+func TestResourceProvisioning_ValidName_TrimmedAndAccepted(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)

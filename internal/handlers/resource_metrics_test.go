@@ -93,7 +93,7 @@ func doMetrics(t *testing.T, app metricsApp, jwt, token, window string) *http.Re
 
 // TestMetrics_Pro_DefaultWindow_HappyPath — a Pro team gets the default 1h
 // window without specifying ?window=. Validates the full response shape.
-func TestMetrics_Pro_DefaultWindow_HappyPath(t *testing.T) {
+func TestResourceMetricsLegacy_Pro_DefaultWindow_HappyPath(t *testing.T) {
 	fix := setupMetricsFixture(t, "pro", "postgres")
 
 	resp := doMetrics(t, fix.app, fix.jwt, fix.resourceToken, "")
@@ -130,7 +130,7 @@ func TestMetrics_Pro_DefaultWindow_HappyPath(t *testing.T) {
 
 // TestMetrics_Pro_24hWindow — pro tier accepts 24h. Asserts the resolved
 // window_seconds and samples_count scale correctly.
-func TestMetrics_Pro_24hWindow(t *testing.T) {
+func TestResourceMetricsLegacy_Pro_24hWindow(t *testing.T) {
 	fix := setupMetricsFixture(t, "pro", "redis")
 
 	resp := doMetrics(t, fix.app, fix.jwt, fix.resourceToken, "24h")
@@ -146,7 +146,7 @@ func TestMetrics_Pro_24hWindow(t *testing.T) {
 
 // TestMetrics_Hobby_24hWindow_402 — hobby tier's max window is 1h. A 24h
 // request returns 402 with a tier-specific agent_action.
-func TestMetrics_Hobby_24hWindow_402(t *testing.T) {
+func TestResourceMetricsLegacy_Hobby_24hWindow_402(t *testing.T) {
 	fix := setupMetricsFixture(t, "hobby", "postgres")
 
 	resp := doMetrics(t, fix.app, fix.jwt, fix.resourceToken, "24h")
@@ -169,7 +169,7 @@ func TestMetrics_Hobby_24hWindow_402(t *testing.T) {
 }
 
 // TestMetrics_Hobby_1hWindow_OK — hobby tier accepts a 1h window (the cap).
-func TestMetrics_Hobby_1hWindow_OK(t *testing.T) {
+func TestResourceMetricsLegacy_Hobby_1hWindow_OK(t *testing.T) {
 	fix := setupMetricsFixture(t, "hobby", "postgres")
 
 	resp := doMetrics(t, fix.app, fix.jwt, fix.resourceToken, "1h")
@@ -185,7 +185,7 @@ func TestMetrics_Hobby_1hWindow_OK(t *testing.T) {
 // agent_action must NOT mention a window cap — it must say the feature itself
 // requires upgrade. Distinguishes "you hit a ceiling" from "you have no
 // access at all".
-func TestMetrics_Anonymous_402(t *testing.T) {
+func TestResourceMetricsLegacy_Anonymous_402(t *testing.T) {
 	fix := setupMetricsFixture(t, "anonymous", "postgres")
 
 	resp := doMetrics(t, fix.app, fix.jwt, fix.resourceToken, "")
@@ -205,7 +205,7 @@ func TestMetrics_Anonymous_402(t *testing.T) {
 
 // TestMetrics_Free_402 — symmetric with anonymous; "free" tier (used by
 // claimed-but-unpaid teams in some flows) gets the same 402.
-func TestMetrics_Free_402(t *testing.T) {
+func TestResourceMetricsLegacy_Free_402(t *testing.T) {
 	fix := setupMetricsFixture(t, "free", "postgres")
 
 	resp := doMetrics(t, fix.app, fix.jwt, fix.resourceToken, "")
@@ -218,7 +218,7 @@ func TestMetrics_Free_402(t *testing.T) {
 }
 
 // TestMetrics_GrowthTier_7d_OK — growth tier accepts the 7d max window.
-func TestMetrics_GrowthTier_7d_OK(t *testing.T) {
+func TestResourceMetricsLegacy_GrowthTier_7d_OK(t *testing.T) {
 	fix := setupMetricsFixture(t, "growth", "mongodb")
 
 	resp := doMetrics(t, fix.app, fix.jwt, fix.resourceToken, "168h") // 7 days
@@ -232,7 +232,7 @@ func TestMetrics_GrowthTier_7d_OK(t *testing.T) {
 
 // TestMetrics_CrossTeam_404 — Team B cannot read Team A's resource metrics.
 // Returns 404 (not 403) — cross-team access must not leak existence.
-func TestMetrics_CrossTeam_404(t *testing.T) {
+func TestResourceMetricsLegacy_CrossTeam_404(t *testing.T) {
 	db, _ := testhelpers.SetupTestDB(t)
 	t.Cleanup(func() { db.Close() })
 	rdb, _ := testhelpers.SetupTestRedis(t)
@@ -268,7 +268,7 @@ func TestMetrics_CrossTeam_404(t *testing.T) {
 }
 
 // TestMetrics_InvalidUUID_400 — bad :id param.
-func TestMetrics_InvalidUUID_400(t *testing.T) {
+func TestResourceMetricsLegacy_InvalidUUID_400(t *testing.T) {
 	fix := setupMetricsFixture(t, "pro", "postgres")
 	resp := doMetrics(t, fix.app, fix.jwt, "not-a-uuid", "")
 	defer resp.Body.Close()
@@ -282,7 +282,7 @@ func TestMetrics_InvalidUUID_400(t *testing.T) {
 // TestMetrics_NotFound_404 — well-formed UUID that doesn't exist → 404.
 // The 404 path runs BEFORE the team-ownership check, so a non-existent
 // resource never leaks owner-team information.
-func TestMetrics_NotFound_404(t *testing.T) {
+func TestResourceMetricsLegacy_NotFound_404(t *testing.T) {
 	fix := setupMetricsFixture(t, "pro", "postgres")
 	// Random UUID — guaranteed not to exist in the test DB.
 	resp := doMetrics(t, fix.app, fix.jwt, "00000000-0000-0000-0000-000000000000", "")
@@ -295,7 +295,7 @@ func TestMetrics_NotFound_404(t *testing.T) {
 }
 
 // TestMetrics_Unauthenticated_401 — no Bearer token → 401.
-func TestMetrics_Unauthenticated_401(t *testing.T) {
+func TestResourceMetricsLegacy_Unauthenticated_401(t *testing.T) {
 	fix := setupMetricsFixture(t, "pro", "postgres")
 	resp := doMetrics(t, fix.app, "", fix.resourceToken, "")
 	defer resp.Body.Close()
@@ -303,7 +303,7 @@ func TestMetrics_Unauthenticated_401(t *testing.T) {
 }
 
 // TestMetrics_InvalidWindow_400 — garbage window param → 400 invalid_window.
-func TestMetrics_InvalidWindow_400(t *testing.T) {
+func TestResourceMetricsLegacy_InvalidWindow_400(t *testing.T) {
 	fix := setupMetricsFixture(t, "pro", "postgres")
 	resp := doMetrics(t, fix.app, fix.jwt, fix.resourceToken, "garbage")
 	defer resp.Body.Close()
@@ -316,7 +316,7 @@ func TestMetrics_InvalidWindow_400(t *testing.T) {
 
 // TestMetrics_BareSecondsWindow_OK — "3600" is accepted as 1 hour. Documented
 // in the OpenAPI spec as the ergonomic alternative to "1h".
-func TestMetrics_BareSecondsWindow_OK(t *testing.T) {
+func TestResourceMetricsLegacy_BareSecondsWindow_OK(t *testing.T) {
 	fix := setupMetricsFixture(t, "pro", "postgres")
 	resp := doMetrics(t, fix.app, fix.jwt, fix.resourceToken, "3600")
 	defer resp.Body.Close()
@@ -332,7 +332,7 @@ func TestMetrics_BareSecondsWindow_OK(t *testing.T) {
 // would visibly thrash. Once Option A / real Option C lands, this contract
 // stops mattering (real data CHANGES every poll) — at that point this test
 // should be deleted with the stub.
-func TestMetrics_StubDeterminism(t *testing.T) {
+func TestResourceMetricsLegacy_StubDeterminism(t *testing.T) {
 	fix := setupMetricsFixture(t, "pro", "postgres")
 
 	resp1 := doMetrics(t, fix.app, fix.jwt, fix.resourceToken, "")
