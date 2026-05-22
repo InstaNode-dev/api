@@ -80,6 +80,15 @@ func (h *StackHandler) SetEmailClient(c email.Mailer) {
 	h.emailClient = c
 }
 
+// SetStackProvider swaps the stack compute backend. Production code never
+// calls this — NewStackHandler selects the backend from config. It exists so
+// coverage tests can inject a compute.StackProvider double and exercise the
+// runStackDeploy / runStackRedeploy failure branches without standing up k8s.
+// Mirrors DeployHandler.SetComputeProvider (keep the constructor stable).
+func (h *StackHandler) SetStackProvider(p compute.StackProvider) {
+	h.stackProv = p
+}
+
 // NewStackHandler initialises the handler and selects the stack compute backend
 // based on cfg.ComputeProvider. Falls back to noop if k8s init fails.
 // planRegistry must be non-nil (use plans.Load at startup or plans.Default() in tests).

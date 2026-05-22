@@ -9,10 +9,12 @@ import (
 	"context"
 	"database/sql"
 
+	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 
 	"instant.dev/internal/config"
 	"instant.dev/internal/models"
+	"instant.dev/internal/providers/compute"
 )
 
 // PersistMagicLinkSendStatusForTest re-exports the unexported
@@ -23,6 +25,66 @@ import (
 // the only way to reach those branches.
 func PersistMagicLinkSendStatusForTest(ctx context.Context, db *sql.DB, id uuid.UUID, sendErr error, requestID string) {
 	persistMagicLinkSendStatus(ctx, db, id, sendErr, requestID)
+}
+
+// ── deploy.go / stack.go unexported helpers (coverage push) ──────────────────
+
+// TruncateForAuditForTest re-exports the audit-summary truncation helper.
+func TruncateForAuditForTest(s string, max int) string { return truncateForAudit(s, max) }
+
+// GenerateAppIDForTest re-exports the app-id generator.
+func GenerateAppIDForTest() (string, error) { return generateAppID() }
+
+// ResourceEnvKeyForTest re-exports the resource-type → env-var-name helper.
+func ResourceEnvKeyForTest(resourceType string, index int) string {
+	return resourceEnvKey(resourceType, index)
+}
+
+// ParseResourceTokenForTest re-exports the UUID token parser.
+func ParseResourceTokenForTest(tokenStr string) ([16]byte, error) {
+	return parseResourceToken(tokenStr)
+}
+
+// RewriteToInternalURLForTest re-exports the public→internal URL rewriter.
+func RewriteToInternalURLForTest(publicURL, resourceType, providerResourceID string) string {
+	return rewriteToInternalURL(publicURL, resourceType, providerResourceID)
+}
+
+// ToStringForTest re-exports the optional-UUID stringifier.
+func ToStringForTest(p *uuid.UUID) string { return toString(p) }
+
+// DeploymentToMapForTest re-exports deploymentToMap (nil-db path).
+func DeploymentToMapForTest(d *models.Deployment) fiber.Map { return deploymentToMap(d) }
+
+// DeploymentToMapWithDBForTest re-exports deploymentToMapWithDB.
+func DeploymentToMapWithDBForTest(d *models.Deployment, db *sql.DB) fiber.Map {
+	return deploymentToMapWithDB(d, db)
+}
+
+// RunDeployForTest invokes the unexported runDeploy goroutine body
+// synchronously so the failure/success branches can be asserted on the DB row.
+func RunDeployForTest(h *DeployHandler, d *models.Deployment, tarball []byte) {
+	h.runDeploy(d, tarball)
+}
+
+// CaptureAutopsyForTest re-exports captureAutopsy.
+func CaptureAutopsyForTest(ctx context.Context, db *sql.DB, deploymentID uuid.UUID, reason, event string, lastLines []string) {
+	captureAutopsy(ctx, db, deploymentID, reason, event, lastLines)
+}
+
+// RunStackDeployForTest invokes runStackDeploy synchronously.
+func RunStackDeployForTest(h *StackHandler, ctx context.Context, stack *models.Stack, serviceRows map[string]*models.StackService, opts compute.StackDeployOptions) {
+	h.runStackDeploy(ctx, stack, serviceRows, opts)
+}
+
+// RunStackRedeployForTest invokes runStackRedeploy synchronously.
+func RunStackRedeployForTest(h *StackHandler, ctx context.Context, stack *models.Stack, serviceRows map[string]*models.StackService, ns string, services []compute.StackServiceDef) {
+	h.runStackRedeploy(ctx, stack, serviceRows, ns, services)
+}
+
+// CheckStackDeployLimitForTest re-exports checkStackDeployLimit.
+func CheckStackDeployLimitForTest(h *StackHandler, ctx context.Context, fp string) (bool, error) {
+	return h.checkStackDeployLimit(ctx, fp)
 }
 
 // ErrProvisionPersistFailedForTest re-exports the persistence-failure sentinel
