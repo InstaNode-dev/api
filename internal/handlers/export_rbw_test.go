@@ -8,9 +8,15 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"sync"
 
 	"instant.dev/common/readiness"
 )
+
+// resetOpenAPIOnceForTest resets the cached-prod-spec sync.Once to a fresh
+// zero value so a test can re-exercise ServeOpenAPI's Do() body. Assigning a
+// zero-value Once is copylocks-clean (no existing lock is copied).
+func resetOpenAPIOnceForTest() { openAPISpecOnce = sync.Once{} }
 
 // CustomerDBCheckForTest exposes the unexported customerDBCheck CheckFunc so a
 // test can drive the empty-DSN defensive arm directly (the public path only
