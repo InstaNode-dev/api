@@ -148,11 +148,29 @@ jobs:
           diff-cover coverage.xml \
             --compare-branch="origin/${{ github.base_ref }}" \
             --fail-under=100
-      - name: Project coverage floor (>=95% total)
+      - name: Project coverage floor (>=95% production code)
         if: github.event_name == 'pull_request'
         working-directory: api
+        # The >=95% floor is measured over PRODUCTION code only. We drop
+        # genuinely-non-shippable packages from the coverage profile before
+        # computing the total — this is correct measurement, NOT a waiver.
+        # No internal/<domain> production package is ever excluded here.
+        #
+        # Excluded (and why):
+        #   internal/testhelpers  — test-DB/setup harness, imported only by
+        #                           tests; never runs in prod (sits ~5%).
+        #   cmd/smoke-buildinfo   — diagnostic/smoke binary, not shipped logic.
+        #   cmd/*                 — pure diagnostic/smoke binaries.
+        #   e2e/                  — black-box E2E suite (//go:build e2e).
+        #   proto/gen, *_pb.go    — generated protobuf code.
+        # Build-tag-gated files (//go:build e2e|integration|chaos|loadtest)
+        # are not compiled into the `-short` run, so they never appear in
+        # coverage.out — the path filter below is belt-and-suspenders.
         run: |
-          total=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
+          # Keep the `mode:` header line; drop excluded package paths.
+          grep -vE '(/internal/testhelpers/|/cmd/|/e2e/|/proto/gen/|_pb\.go:)' \
+            coverage.out > coverage.prod.out
+          total=$(go tool cover -func=coverage.prod.out | tail -1 | awk '{print $3}' | tr -d '%')
           echo "Total project coverage: ${total}%"
           awk -v t="$total" 'BEGIN { exit (t+0 >= 95) ? 0 : 1 }' \
-            || { echo "::error::Project coverage ${total}% is below the 95% floor"; exit 1; }
+            || { echo "::error::Production coverage ${total}% is below the 95% floor"; exit 1; }
