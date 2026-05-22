@@ -87,6 +87,12 @@ func ComputeMRRForTest(h *AdminCustomersHandler, tier string) (int, int) {
 }
 func ParsePromoAuditSinceForTest(raw string) (time.Time, error) { return parsePromoAuditSince(raw) }
 
+// ── billing.go pure-helper re-exports ──
+
+func FormatChargedAmountForTest(amountMinor int64, currency string) string {
+	return formatChargedAmount(amountMinor, currency)
+}
+
 // resetOpenAPIOnceForTest resets the cached-prod-spec sync.Once to a fresh
 // zero value so a test can re-exercise ServeOpenAPI's Do() body. Assigning a
 // zero-value Once is copylocks-clean (no existing lock is copied).
