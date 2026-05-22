@@ -273,9 +273,10 @@ func (p *K8sStackProvider) CertificateReady(
 }
 
 // newDynamicClient builds a dynamic.Interface using the same in-cluster /
-// kubeconfig fallback chain as newClientset above. Kept as a free function
-// so callers can construct ad-hoc clients without holding a K8sProvider.
-func newDynamicClient() (dynamic.Interface, error) {
+// kubeconfig fallback chain as newClientset above. Kept as a package-level
+// var so tests can swap in a fake dynamic client without spinning up a real
+// cluster — production code paths keep the original constructor.
+var newDynamicClient = func() (dynamic.Interface, error) {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		cfg, err = clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
