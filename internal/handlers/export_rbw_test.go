@@ -75,6 +75,18 @@ func SendClaimVerificationEmailForTest(db *sql.DB, mailer *ClaimMailerForTest, e
 	sendClaimVerificationEmail(db, mailer, email, returnTo)
 }
 
+// ── admin_customers.go / admin_promos_audit.go re-exports ──
+
+func AdminParseTierFilterForTest(raw string) ([]string, bool) { return adminParseTierFilter(raw) }
+func AdminParseLimitForTest(raw string, def, max int) int     { return adminParseLimit(raw, def, max) }
+func AdminParseOffsetForTest(raw string) int                  { return adminParseOffset(raw) }
+func AdminOrderClauseForTest(sortBy string) (string, error)   { return adminOrderClause(sortBy) }
+func EscapeLikePatternForTest(s string) string                { return escapeLikePattern(s) }
+func ComputeMRRForTest(h *AdminCustomersHandler, tier string) (int, int) {
+	return h.computeMRR(tier)
+}
+func ParsePromoAuditSinceForTest(raw string) (time.Time, error) { return parsePromoAuditSince(raw) }
+
 // resetOpenAPIOnceForTest resets the cached-prod-spec sync.Once to a fresh
 // zero value so a test can re-exercise ServeOpenAPI's Do() body. Assigning a
 // zero-value Once is copylocks-clean (no existing lock is copied).
