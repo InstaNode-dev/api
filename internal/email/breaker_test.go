@@ -368,3 +368,102 @@ func TestBrevoProvider_SetsIdempotencyHeaders(t *testing.T) {
 func jsonMarshal(v interface{}) ([]byte, error) {
 	return []byte(fmt.Sprintf(`%v`, v)), nil
 }
+
+// noopClient builds a *Client whose underlying provider succeeds silently
+// (ProviderNoop). Used to drive the closed-state success paths of the
+// keyless wrappers so record(nil) and the inner happy path are covered.
+func noopClient() *Client {
+	return New(Config{Provider: string(ProviderNoop)})
+}
+
+// TestNewBreakingClient_ProductionDefaults exercises the production
+// constructor (the test ctor is used everywhere else) and pins the
+// package-default threshold + cooldown + metric label name.
+func TestNewBreakingClient_ProductionDefaults(t *testing.T) {
+	b := NewBreakingClient(noopClient())
+	if b.threshold != transactionalCircuitThreshold {
+		t.Errorf("threshold = %d, want %d", b.threshold, transactionalCircuitThreshold)
+	}
+	if b.cooldown != transactionalCircuitCooldown {
+		t.Errorf("cooldown = %v, want %v", b.cooldown, transactionalCircuitCooldown)
+	}
+	if b.name != "email_transactional" {
+		t.Errorf("name = %q, want email_transactional", b.name)
+	}
+	// A fresh production breaker must admit (closed state).
+	if err := b.SendPaymentFailed(context.Background(), "u@example.com", 1, nil); err != nil {
+		t.Errorf("fresh production breaker rejected a send: %v", err)
+	}
+}
+
+// TestBreakingClient_ProviderName covers the forwarding accessor plus its two
+// defensive nil branches (nil receiver and nil inner → ProviderNoop).
+func TestBreakingClient_ProviderName(t *testing.T) {
+	b := NewBreakingClient(noopClient())
+	if got := b.ProviderName(); got != ProviderNoop {
+		t.Errorf("ProviderName() = %v, want ProviderNoop", got)
+	}
+
+	var nilB *BreakingClient
+	if got := nilB.ProviderName(); got != ProviderNoop {
+		t.Errorf("nil receiver ProviderName() = %v, want ProviderNoop", got)
+	}
+
+	nilInner := &BreakingClient{inner: nil}
+	if got := nilInner.ProviderName(); got != ProviderNoop {
+		t.Errorf("nil inner ProviderName() = %v, want ProviderNoop", got)
+	}
+}
+
+// TestBreakingClient_KeylessWrappersSucceedClosed drives every keyless Send*
+// wrapper through the closed-state success path (inner returns nil), covering
+// the 40%-covered methods' happy branch + record(nil) reset.
+func TestBreakingClient_KeylessWrappersSucceedClosed(t *testing.T) {
+	b := NewBreakingClient(noopClient())
+	ctx := context.Background()
+
+	if err := b.SendPaymentSucceeded(ctx, "u@example.com", PaymentReceipt{Plan: "pro", AmountKnown: true, AmountDisplay: "$49"}); err != nil {
+		t.Errorf("SendPaymentSucceeded: %v", err)
+	}
+	if err := b.SendTeamInvite(ctx, "u@example.com", "Acme", "https://instanode.dev/accept"); err != nil {
+		t.Errorf("SendTeamInvite: %v", err)
+	}
+	if err := b.SendDeletionConfirmation(ctx, "u@example.com", "db-abc", "https://instanode.dev/confirm", 30); err != nil {
+		t.Errorf("SendDeletionConfirmation: %v", err)
+	}
+	if err := b.SendMagicLink(ctx, "u@example.com", "https://instanode.dev/magic"); err != nil {
+		t.Errorf("SendMagicLink: %v", err)
+	}
+
+	// consecutive must be 0 after a run of successes (record(nil) resets).
+	if got := b.consecutive.Load(); got != 0 {
+		t.Errorf("consecutive after successes = %d, want 0", got)
+	}
+}
+
+// TestBreakingClient_KeylessWrappersRejectWhenOpen drives the four keyless
+// wrappers' fast-fail branch: once the breaker is open, each returns
+// ErrCircuitOpen without touching the inner provider.
+func TestBreakingClient_KeylessWrappersRejectWhenOpen(t *testing.T) {
+	inner := failingClient()
+	b := newBreakingClientWithConfig(inner, 1, 5*time.Second)
+	ctx := context.Background()
+
+	// One failure trips the breaker (threshold=1).
+	_ = b.SendPaymentSucceeded(ctx, "u@example.com", PaymentReceipt{})
+
+	sends := []struct {
+		name string
+		fn   func() error
+	}{
+		{"SendPaymentSucceeded", func() error { return b.SendPaymentSucceeded(ctx, "u@example.com", PaymentReceipt{}) }},
+		{"SendTeamInvite", func() error { return b.SendTeamInvite(ctx, "u@example.com", "Acme", "x") }},
+		{"SendDeletionConfirmation", func() error { return b.SendDeletionConfirmation(ctx, "u@example.com", "db", "x", 30) }},
+		{"SendMagicLink", func() error { return b.SendMagicLink(ctx, "u@example.com", "x") }},
+	}
+	for _, s := range sends {
+		if err := s.fn(); !errors.Is(err, ErrCircuitOpen) {
+			t.Errorf("%s when open: want ErrCircuitOpen, got %v", s.name, err)
+		}
+	}
+}
