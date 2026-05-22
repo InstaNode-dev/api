@@ -396,6 +396,59 @@ func TestStackPromote_CreatesNewTarget(t *testing.T) {
 	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
 }
 
+// TestStackPromote_InPlaceUpdate — a pre-existing target stack in the same
+// family is re-used (action="updated_existing"), exercising the in-place
+// branch: updating an existing target service's image_ref AND creating a
+// target service the source has but the target lacks.
+func TestStackPromote_InPlaceUpdate(t *testing.T) {
+	gapCovNeedsDB(t)
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	ensureStackTables(t, db)
+
+	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
+	jwt := testhelpers.MustSignSessionJWT(t, uuid.NewString(), teamID, "inplace@example.com")
+
+	// Source (staging) is the family root. Two services with image_refs.
+	srcSlug, srcID := seedPromoteSourceStackNoImageRef(t, db, teamID, "staging", "ip-src")
+	for _, svc := range []string{"api", "worker"} {
+		_, err := db.ExecContext(context.Background(), `
+			INSERT INTO stack_services (stack_id, name, expose, port, image_ref, status)
+			VALUES ($1::uuid, $2, true, 8080, $3, 'healthy')
+		`, srcID, svc, "registry.local/"+svc+":v2")
+		require.NoError(t, err)
+	}
+
+	// Pre-existing target (development) in the SAME family (parent = source).
+	tgtSlug := "stk-iptgt-" + randHex(t, 4)
+	var tgtID string
+	require.NoError(t, db.QueryRowContext(context.Background(), `
+		INSERT INTO stacks (team_id, name, slug, namespace, status, tier, env, parent_stack_id)
+		VALUES ($1, 'ip-tgt', $2, $3, 'healthy', 'pro', 'development', $4::uuid)
+		RETURNING id::text
+	`, teamID, tgtSlug, "instant-stack-"+tgtSlug, srcID).Scan(&tgtID))
+	// Target has only "api" (old image_ref) — "worker" is missing so the
+	// create-new-service branch fires.
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO stack_services (stack_id, name, expose, port, image_ref, status)
+		VALUES ($1::uuid, 'api', true, 8080, 'registry.local/api:v1', 'healthy')
+	`, tgtID)
+	require.NoError(t, err)
+
+	app := newStackTestApp(t, db)
+	resp := postPromote(t, app, jwt, srcSlug, map[string]any{"from": "staging", "to": "development"})
+	defer resp.Body.Close()
+	// Existing target -> 200 updated_existing.
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// The target's "worker" service must have been created with the source image.
+	var n int
+	require.NoError(t, db.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM stack_services WHERE stack_id = $1::uuid AND name = 'worker'`,
+		tgtID).Scan(&n))
+	assert.Equal(t, 1, n, "missing target service must be created during in-place promote")
+}
+
 // ── copyVaultRefsForPromote — direct unit coverage ───────────────────────────
 
 // TestCopyVaultRefsForPromote_NoSourceKeys returns nil,nil (the no-op branch).
