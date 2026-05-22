@@ -261,6 +261,31 @@ func TestRunServerWithGracefulShutdown_TimeoutKillsStuckRequest(t *testing.T) {
 	}
 }
 
+// TestRunServerWithGracefulShutdown_ListenErrorReturnsBeforeSignal — when
+// app.Listen fails fast (a bind error: malformed addr, port already held),
+// the serve goroutine pushes the fatal error onto serveErr and the helper
+// MUST return it via the serveErr-before-signal select arm, NOT block waiting
+// for SIGTERM. This is the "pod CrashLoopBackoffs instead of going green with
+// no listener" contract.
+func TestRunServerWithGracefulShutdown_ListenErrorReturnsBeforeSignal(t *testing.T) {
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	// A syntactically invalid bind address makes net.Listen fail immediately
+	// with a non-ErrClosed error, so the goroutine takes the serveErr<-err arm.
+	badAddr := "256.256.256.256:99999"
+
+	done := make(chan error, 1)
+	go func() {
+		done <- runServerWithGracefulShutdown(app, badAddr, time.Second, router.ShutdownHooks{})
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err, "a fatal Listen error must propagate out of the helper")
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper blocked on a bind failure — the serveErr-before-signal arm is broken")
+	}
+}
+
 // Compile-time guard against a regression that removes the helper or changes
 // its signature in a way that would silently bypass the MR-P0-7 fix.
 var _ = func(app *fiber.App) error {
