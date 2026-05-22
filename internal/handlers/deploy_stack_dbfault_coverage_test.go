@@ -67,6 +67,9 @@ func closedDBApp(t *testing.T) (*fiber.App, *config.Config) {
 	app.Patch("/deploy/:id/env", middleware.RequireAuth(cfg), dh.UpdateEnv)
 	app.Get("/api/v1/stacks", middleware.RequireAuth(cfg), sh.List)
 	app.Get("/stacks/:slug", middleware.OptionalAuth(cfg), sh.Get)
+	app.Patch("/stacks/:slug/env", middleware.RequireAuth(cfg), sh.UpdateEnv)
+	app.Post("/api/v1/stacks/:slug/promote", middleware.RequireAuth(cfg), sh.Promote)
+	app.Get("/stacks/:slug/family", middleware.RequireAuth(cfg), sh.Family)
 	return app, cfg
 }
 
@@ -132,6 +135,49 @@ func TestStackGet_DBClosed_Returns503(t *testing.T) {
 	dbFaultNeedsDB(t)
 	app, _ := closedDBApp(t)
 	req := httptest.NewRequest(http.MethodGet, "/stacks/some-slug", nil)
+	req.Header.Set("Authorization", "Bearer "+dbFaultJWT(t))
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
+
+// TestStackUpdateEnv_DBClosed_Returns503 — GetStackBySlug fails on the closed
+// DB so UpdateEnv returns 503 fetch_failed (line 1141).
+func TestStackUpdateEnv_DBClosed_Returns503(t *testing.T) {
+	dbFaultNeedsDB(t)
+	app, _ := closedDBApp(t)
+	req := httptest.NewRequest(http.MethodPatch, "/stacks/some-slug/env",
+		strings.NewReader(`{"env":{"FOO":"bar"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+dbFaultJWT(t))
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
+
+// TestStackPromote_DBClosed_Returns503 — requireStackTeam's GetTeamByID fails
+// on the closed DB, exercising Promote's requireStackTeam error arm (503).
+func TestStackPromote_DBClosed_Returns503(t *testing.T) {
+	dbFaultNeedsDB(t)
+	app, _ := closedDBApp(t)
+	jwt := dbFaultJWT(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/stacks/some-slug/promote",
+		strings.NewReader(`{"from":"staging","to":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
+
+// TestStackFamily_DBClosed_Returns503 — Family's first DB query fails.
+func TestStackFamily_DBClosed_Returns503(t *testing.T) {
+	dbFaultNeedsDB(t)
+	app, _ := closedDBApp(t)
+	req := httptest.NewRequest(http.MethodGet, "/stacks/some-slug/family", nil)
 	req.Header.Set("Authorization", "Bearer "+dbFaultJWT(t))
 	resp, err := app.Test(req, 5000)
 	require.NoError(t, err)

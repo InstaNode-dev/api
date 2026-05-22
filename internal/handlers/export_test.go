@@ -87,6 +87,13 @@ func CheckStackDeployLimitForTest(h *StackHandler, ctx context.Context, fp strin
 	return h.checkStackDeployLimit(ctx, fp)
 }
 
+// CopyVaultRefsForPromoteForTest re-exports copyVaultRefsForPromote so the
+// vault-promote helper's branches (empty-source no-op, per-key copy, skip
+// existing target key, audit emit) can be exercised directly against the DB.
+func CopyVaultRefsForPromoteForTest(ctx context.Context, db *sql.DB, teamID, userID uuid.UUID, fromEnv, toEnv string) ([]string, error) {
+	return copyVaultRefsForPromote(ctx, db, teamID, userID, fromEnv, toEnv)
+}
+
 // ErrProvisionPersistFailedForTest re-exports the persistence-failure sentinel
 // for MR-P0-3 regression tests.
 var ErrProvisionPersistFailedForTest = errProvisionPersistFailed
