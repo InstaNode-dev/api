@@ -64,6 +64,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: api
+          # Full history so diff-cover can resolve origin/<base_ref> for the
+          # patch-coverage gate below (shallow clones lack the base commit).
+          fetch-depth: 0
 
       - name: Checkout proto sibling (for go.mod replace ../proto)
         uses: actions/checkout@v4
@@ -115,3 +118,41 @@ jobs:
           files: api/coverage.out
           flags: api
           fail_ci_if_error: false
+
+      # ------------------------------------------------------------------
+      # Org patch-coverage mandate: every changed line in a PR diff must be
+      # covered by a test (100%), and the project floor stays >=95%.
+      # Tool: diff-cover (https://github.com/Bachmann1234/diff-cover) reads a
+      # Cobertura report + the git diff vs the base branch. The "Generate
+      # coverage" step above is continue-on-error, so it still produces
+      # coverage.out even if a flaky test trips — the gate reads that file.
+      # ------------------------------------------------------------------
+      - uses: actions/setup-python@v5
+        if: github.event_name == 'pull_request'
+        with:
+          python-version: '3.12'
+      - name: Install diff-cover + cobertura converter
+        if: github.event_name == 'pull_request'
+        run: |
+          pip install diff-cover
+          go install github.com/boumenot/gocover-cobertura@latest
+      - name: Convert coverage to Cobertura
+        if: github.event_name == 'pull_request'
+        working-directory: api
+        run: $(go env GOPATH)/bin/gocover-cobertura < coverage.out > coverage.xml
+      - name: Patch coverage gate (100% of changed lines)
+        if: github.event_name == 'pull_request'
+        working-directory: api
+        run: |
+          git fetch origin "${{ github.base_ref }}" --depth=1 || true
+          diff-cover coverage.xml \
+            --compare-branch="origin/${{ github.base_ref }}" \
+            --fail-under=100
+      - name: Project coverage floor (>=95% total)
+        if: github.event_name == 'pull_request'
+        working-directory: api
+        run: |
+          total=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "Total project coverage: ${total}%"
+          awk -v t="$total" 'BEGIN { exit (t+0 >= 95) ? 0 : 1 }' \
+            || { echo "::error::Project coverage ${total}% is below the 95% floor"; exit 1; }
