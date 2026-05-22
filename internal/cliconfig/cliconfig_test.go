@@ -212,3 +212,120 @@ func TestRoundTrip_EffectiveTierAfterLoad(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "hobby", loaded.EffectiveTier())
 }
+
+// ---------------------------------------------------------------------------
+// configPath error branches (UserHomeDir failure)
+// ---------------------------------------------------------------------------
+
+// unsetHome removes HOME for the duration of the test so os.UserHomeDir()
+// fails. t.Setenv with an empty value still leaves HOME defined, so we must
+// Unsetenv and restore manually.
+func unsetHome(t *testing.T) {
+	t.Helper()
+	orig, had := os.LookupEnv("HOME")
+	require.NoError(t, os.Unsetenv("HOME"))
+	t.Cleanup(func() {
+		if had {
+			_ = os.Setenv("HOME", orig)
+		} else {
+			_ = os.Unsetenv("HOME")
+		}
+	})
+}
+
+func TestLoad_ReturnsEmptyConfigWhenHomeUnresolvable(t *testing.T) {
+	unsetHome(t)
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	assert.Empty(t, cfg.path, "path stays empty when configPath() errors")
+	assert.Empty(t, cfg.APIKey)
+}
+
+func TestSave_ErrorsWhenHomeUnresolvable(t *testing.T) {
+	unsetHome(t)
+	// Empty path forces Save to call configPath(), which fails with no HOME.
+	cfg := &Config{APIKey: "inst_live_x"}
+	err := cfg.Save()
+	require.Error(t, err, "Save must surface the configPath() error")
+}
+
+func TestClear_ErrorsWhenHomeUnresolvable(t *testing.T) {
+	unsetHome(t)
+	err := Clear()
+	require.Error(t, err, "Clear must surface the configPath() error")
+}
+
+// ---------------------------------------------------------------------------
+// Load error branches: malformed JSON + unreadable file
+// ---------------------------------------------------------------------------
+
+func TestLoad_ReturnsErrorOnMalformedJSON(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	path := filepath.Join(dir, ".instant-config")
+	require.NoError(t, os.WriteFile(path, []byte("{not valid json"), 0600))
+
+	cfg, err := Load()
+	require.Error(t, err, "malformed JSON must produce a parse error")
+	assert.Nil(t, cfg)
+}
+
+func TestLoad_ReturnsErrorWhenPathIsADirectory(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	// Create a *directory* at the config path so os.ReadFile returns a
+	// non-NotExist error (EISDIR), exercising the generic read-error branch.
+	require.NoError(t, os.Mkdir(filepath.Join(dir, ".instant-config"), 0700))
+
+	cfg, err := Load()
+	require.Error(t, err, "reading a directory must produce a read error")
+	assert.Nil(t, cfg)
+}
+
+// ---------------------------------------------------------------------------
+// Save error branch: rename target unwritable (temp write fails)
+// ---------------------------------------------------------------------------
+
+func TestSave_ErrorsWhenTempWriteFails(t *testing.T) {
+	// Point path at a file inside a non-existent directory so the temp-file
+	// WriteFile (path + ".tmp") fails with ENOENT.
+	cfg := &Config{path: filepath.Join(t.TempDir(), "no-such-dir", "cfg")}
+	err := cfg.Save()
+	require.Error(t, err, "Save must surface the temp-file write error")
+	assert.Contains(t, err.Error(), "writing")
+}
+
+// ---------------------------------------------------------------------------
+// Save with empty path resolves via configPath() (path == "" branch)
+// ---------------------------------------------------------------------------
+
+func TestSave_ResolvesPathViaConfigPathWhenEmpty(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	cfg := &Config{APIKey: "inst_live_resolve"} // path intentionally empty
+	require.NoError(t, cfg.Save())
+
+	// Save must have resolved and persisted the path.
+	assert.Equal(t, filepath.Join(dir, ".instant-config"), cfg.path)
+	_, err := os.Stat(cfg.path)
+	require.NoError(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// Clear error branch: Remove fails for a non-NotExist reason
+// ---------------------------------------------------------------------------
+
+func TestClear_ErrorsWhenTargetIsNonEmptyDirectory(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	// A non-empty directory at the config path makes os.Remove fail with
+	// ENOTEMPTY — a non-NotExist error that Clear must surface.
+	cfgDir := filepath.Join(dir, ".instant-config")
+	require.NoError(t, os.Mkdir(cfgDir, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(cfgDir, "child"), []byte("x"), 0600))
+
+	err := Clear()
+	require.Error(t, err, "Clear must surface a non-NotExist Remove error")
+}

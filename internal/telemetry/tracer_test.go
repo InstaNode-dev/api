@@ -77,3 +77,58 @@ func TestStripScheme(t *testing.T) {
 		}
 	}
 }
+
+// TestInitTracer_ServiceNameOverride — OTEL_SERVICE_NAME, when set, overrides
+// the passed serviceName. We can't read the resource back out, but exercising
+// the branch + booting cleanly is what coverage needs; the shutdown must be
+// callable.
+func TestInitTracer_ServiceNameOverride(t *testing.T) {
+	t.Setenv("OTEL_SERVICE_NAME", "override-svc")
+	t.Setenv("NEW_RELIC_LICENSE_KEY", "")
+	shutdown := InitTracer("instant-api", "https://otlp.nr-data.net:4317")
+	if shutdown == nil {
+		t.Fatal("nil shutdown")
+	}
+	if err := shutdown(context.Background()); err != nil {
+		t.Errorf("shutdown: %v", err)
+	}
+}
+
+// TestInitTracer_InsecureEndpoint — a plaintext (http://) endpoint takes the
+// WithInsecure() branch instead of WithTLSCredentials.
+func TestInitTracer_InsecureEndpoint(t *testing.T) {
+	t.Setenv("NEW_RELIC_LICENSE_KEY", "")
+	shutdown := InitTracer("instant-api", "http://localhost:4317")
+	if shutdown == nil {
+		t.Fatal("nil shutdown")
+	}
+	if err := shutdown(context.Background()); err != nil {
+		t.Errorf("shutdown: %v", err)
+	}
+}
+
+// TestInitTracer_WithLicenseKey — a real (non-sentinel) license key takes the
+// WithHeaders(api-key) branch.
+func TestInitTracer_WithLicenseKey(t *testing.T) {
+	t.Setenv("NEW_RELIC_LICENSE_KEY", "real-license-key-1234567890")
+	shutdown := InitTracer("instant-api", "https://otlp.nr-data.net:4317")
+	if shutdown == nil {
+		t.Fatal("nil shutdown")
+	}
+	if err := shutdown(context.Background()); err != nil {
+		t.Errorf("shutdown: %v", err)
+	}
+}
+
+// TestInitTracer_SentinelLicenseKeyTreatedAsMissing — the CHANGE_ME sentinel
+// must take the license-missing warning branch (no api-key header).
+func TestInitTracer_SentinelLicenseKeyTreatedAsMissing(t *testing.T) {
+	t.Setenv("NEW_RELIC_LICENSE_KEY", "CHANGE_ME")
+	shutdown := InitTracer("instant-api", "otlp.nr-data.net:4317")
+	if shutdown == nil {
+		t.Fatal("nil shutdown")
+	}
+	if err := shutdown(context.Background()); err != nil {
+		t.Errorf("shutdown: %v", err)
+	}
+}
