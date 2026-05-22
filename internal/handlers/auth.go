@@ -66,6 +66,21 @@ var allowedReturnOriginsDev = []string{
 	"http://localhost:3000",
 }
 
+// OAuth provider endpoint base URLs. Declared as package vars (not consts)
+// solely so the test suite can repoint them at an httptest server — production
+// never mutates them. Each is the exact URL the corresponding helper used to
+// hardcode inline; behaviour is unchanged in prod.
+var (
+	githubTokenURL     = "https://github.com/login/oauth/access_token"
+	githubUserURL      = "https://api.github.com/user"
+	githubUserEmailURL = "https://api.github.com/user/emails"
+	githubAuthorizeURL = "https://github.com/login/oauth/authorize"
+	googleTokenInfoURL = "https://oauth2.googleapis.com/tokeninfo"
+	googleTokenURL     = "https://oauth2.googleapis.com/token"
+	googleUserInfoURL  = "https://www.googleapis.com/oauth2/v2/userinfo"
+	googleAuthorizeURL = "https://accounts.google.com/o/oauth2/v2/auth"
+)
+
 // returnToAllowsLocalhost controls whether validateReturnTo treats
 // http://localhost:5173 and http://localhost:3000 as allowed return-to
 // origins. Set to true in development at startup, false in production.
@@ -409,7 +424,7 @@ func (h *AuthHandler) GoogleAuthURL(c *fiber.Ctx) error {
 	// url.Parse of a compile-time-constant string never errors — the err
 	// branch was dead code. GoogleStart handles the identical parse the same
 	// way (u, _ := url.Parse(...)).
-	u, _ := url.Parse("https://accounts.google.com/o/oauth2/v2/auth")
+	u, _ := url.Parse(googleAuthorizeURL)
 	q := u.Query()
 	q.Set("client_id", h.cfg.GoogleClientID)
 	q.Set("redirect_uri", redirectURI)
@@ -479,7 +494,7 @@ func exchangeGitHubCode(ctx context.Context, clientID, clientSecret, code string
 		"client_secret": {clientSecret},
 		"code":          {code},
 	}
-	req, _ := http.NewRequestWithContext(ctx, "POST", "https://github.com/login/oauth/access_token", strings.NewReader(form.Encode()))
+	req, _ := http.NewRequestWithContext(ctx, "POST", githubTokenURL, strings.NewReader(form.Encode()))
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
@@ -502,7 +517,7 @@ func exchangeGitHubCode(ctx context.Context, clientID, clientSecret, code string
 	}
 
 	// Step 2: fetch user profile
-	userReq, _ := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/user", nil)
+	userReq, _ := http.NewRequestWithContext(ctx, "GET", githubUserURL, nil)
 	userReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
 	userReq.Header.Set("Accept", "application/vnd.github+json")
 
@@ -523,7 +538,7 @@ func exchangeGitHubCode(ctx context.Context, clientID, clientSecret, code string
 
 	if profile.Email == "" {
 		// Fetch primary email separately
-		emailReq, _ := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/user/emails", nil)
+		emailReq, _ := http.NewRequestWithContext(ctx, "GET", githubUserEmailURL, nil)
 		emailReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
 		emailResp, err := client.Do(emailReq)
 		if err == nil {
@@ -646,7 +661,7 @@ type googleUser struct {
 }
 
 func verifyGoogleIDToken(ctx context.Context, clientID, idToken string) (*googleUser, error) {
-	verifyURL := fmt.Sprintf("https://oauth2.googleapis.com/tokeninfo?id_token=%s", url.QueryEscape(idToken))
+	verifyURL := fmt.Sprintf("%s?id_token=%s", googleTokenInfoURL, url.QueryEscape(idToken))
 	req, _ := http.NewRequestWithContext(ctx, "GET", verifyURL, nil)
 
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -692,7 +707,7 @@ func exchangeGoogleAuthorizationCode(ctx context.Context, clientID, clientSecret
 		"redirect_uri":  {redirectURI},
 		"grant_type":    {"authorization_code"},
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://oauth2.googleapis.com/token", strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", googleTokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", err
 	}
@@ -723,7 +738,7 @@ func exchangeGoogleAuthorizationCode(ctx context.Context, clientID, clientSecret
 }
 
 func fetchGoogleUserInfoOAuth2V2(ctx context.Context, accessToken string) (*googleUser, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://www.googleapis.com/oauth2/v2/userinfo", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", googleUserInfoURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -964,7 +979,7 @@ func (h *AuthHandler) GitHubStart(c *fiber.Ctx) error {
 	h.registerOAuthState(c.Context(), state)
 
 	authURL := fmt.Sprintf(
-		"https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&state=%s&scope=%s",
+		githubAuthorizeURL+"?client_id=%s&redirect_uri=%s&state=%s&scope=%s",
 		url.QueryEscape(h.cfg.GitHubClientID),
 		url.QueryEscape(canonicalAPIBase+"/auth/github/callback"),
 		url.QueryEscape(state),
@@ -1050,7 +1065,7 @@ func (h *AuthHandler) GoogleStart(c *fiber.Ctx) error {
 	// P1-K: record the state in Redis so the callback can consume it once.
 	h.registerOAuthState(c.Context(), state)
 
-	u, _ := url.Parse("https://accounts.google.com/o/oauth2/v2/auth")
+	u, _ := url.Parse(googleAuthorizeURL)
 	q := u.Query()
 	q.Set("client_id", h.cfg.GoogleClientID)
 	q.Set("redirect_uri", canonicalAPIBase+"/auth/google/callback")
