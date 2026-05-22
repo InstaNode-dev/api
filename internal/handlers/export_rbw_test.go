@@ -9,9 +9,42 @@ import (
 	"context"
 	"database/sql"
 	"sync"
+	"time"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 
 	"instant.dev/common/readiness"
 )
+
+// ── webhook.go re-exports ──
+
+func WebhookMaxStoredForTest(h *WebhookHandler, tier string) int64 { return h.webhookMaxStored(tier) }
+
+func StoreEncryptedURLForTest(h *WebhookHandler, ctx context.Context, resourceID uuid.UUID, rURL, requestID string) error {
+	return h.storeEncryptedURL(ctx, resourceID, rURL, requestID)
+}
+
+func DecryptWebhookURLForTest(h *WebhookHandler, encrypted, requestID string) string {
+	return h.decryptWebhookURL(encrypted, requestID)
+}
+
+func LookupIdempotentReceiveForTest(h *WebhookHandler, ctx context.Context, token, key string) (fiber.Map, bool) {
+	return h.lookupIdempotentReceive(ctx, token, key)
+}
+
+func StoreIdempotentReceiveForTest(h *WebhookHandler, ctx context.Context, token, key string, resp fiber.Map, ttl time.Duration) {
+	h.storeIdempotentReceive(ctx, token, key, resp, ttl)
+}
+
+func VerifyWebhookHMACForTest(secret string, body []byte, header string) bool {
+	return verifyWebhookHMAC(secret, body, header)
+}
+
+func WebhookRedisForTest(h *WebhookHandler) *redis.Client { return h.rdb }
+
+func WebhookIdempotencyKeyForTest(token, key string) string { return webhookIdempotencyKey(token, key) }
 
 // resetOpenAPIOnceForTest resets the cached-prod-spec sync.Once to a fresh
 // zero value so a test can re-exercise ServeOpenAPI's Do() body. Assigning a
