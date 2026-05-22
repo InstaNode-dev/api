@@ -24,7 +24,7 @@ import (
 // them call respondProvisionFailed(..., err.Error()). The non-twin paths
 // already use static messages — this guard makes sure no future edit
 // regresses any of them back to err.Error().
-func TestProvisionForTwin_NoDSNLeak(t *testing.T) {
+func TestResourceProvisionForTwin_NoDSNLeak(t *testing.T) {
 	t.Parallel()
 
 	// Files in this package that own a /xxx/new (or twin) provisioning
