@@ -46,6 +46,35 @@ func WebhookRedisForTest(h *WebhookHandler) *redis.Client { return h.rdb }
 
 func WebhookIdempotencyKeyForTest(token, key string) string { return webhookIdempotencyKey(token, key) }
 
+// ── onboarding.go re-exports ──
+
+func IsValidEmailForTest(s string) bool { return isValidEmail(s) }
+
+func MaskEmailForLogForTest(s string) string { return maskEmailForLog(s) }
+
+func EmitOnboardingClaimedAuditForTest(db *sql.DB, teamID, userID uuid.UUID, n int, email string) {
+	emitOnboardingClaimedAudit(db, teamID, userID, n, email)
+}
+
+// claimMailerForTest is a test double for the claimVerificationEmailMailer.
+type ClaimMailerForTest struct {
+	Err    error
+	Called bool
+}
+
+func (m *ClaimMailerForTest) SendMagicLink(ctx context.Context, to, link string) error {
+	m.Called = true
+	return m.Err
+}
+
+func SendClaimVerificationEmailForTest(db *sql.DB, mailer *ClaimMailerForTest, email, returnTo string) {
+	if mailer == nil {
+		sendClaimVerificationEmail(db, nil, email, returnTo)
+		return
+	}
+	sendClaimVerificationEmail(db, mailer, email, returnTo)
+}
+
 // resetOpenAPIOnceForTest resets the cached-prod-spec sync.Once to a fresh
 // zero value so a test can re-exercise ServeOpenAPI's Do() body. Assigning a
 // zero-value Once is copylocks-clean (no existing lock is copied).
