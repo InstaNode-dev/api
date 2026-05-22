@@ -12,12 +12,37 @@ import (
 	"math/big"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const defaultCustomersURL = "postgres://instant_cust:instant_cust@postgres-customers:5432/instant_customers?sslmode=disable"
 
 // alphanumChars is the charset for generated passwords.
 const alphanumChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+// randInt is the entropy source for generatePassword. It defaults to
+// crypto/rand.Int and is a package var only so a test can substitute a
+// fault-injecting source to exercise the (otherwise unreachable) RNG-failure
+// branch. Production behaviour is identical to calling crypto/rand.Int.
+var randInt = rand.Int
+
+// pgConn is the minimal slice of *pgx.Conn that this backend exercises. Routing
+// through an interface lets a deterministic fake force the otherwise-unreachable
+// defensive branches: a Close that errors (defer-error log), and a REVOKE / GRANT
+// / DROP USER exec that errors (non-fatal log). *pgx.Conn satisfies it directly,
+// so production wiring is unchanged.
+type pgConn interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Close(ctx context.Context) error
+}
+
+// pgxConnect is the connection factory the backend uses. It defaults to a thin
+// wrapper over pgx.Connect and is a package var only so a test can inject a fake
+// pgConn. Production behaviour is identical to calling pgx.Connect.
+var pgxConnect = func(ctx context.Context, connString string) (pgConn, error) {
+	return pgx.Connect(ctx, connString)
+}
 
 // LocalBackend provisions databases on the shared postgres-customers instance.
 type LocalBackend struct {
@@ -37,7 +62,7 @@ func generatePassword(n int) (string, error) {
 	buf := make([]byte, n)
 	charsetLen := big.NewInt(int64(len(alphanumChars)))
 	for i := range buf {
-		idx, err := rand.Int(rand.Reader, charsetLen)
+		idx, err := randInt(rand.Reader, charsetLen)
 		if err != nil {
 			return "", fmt.Errorf("generatePassword: %w", err)
 		}
@@ -72,7 +97,7 @@ func (b *LocalBackend) ProvisionWithExtensions(ctx context.Context, token, tier 
 	}
 
 	// Connect as admin.
-	conn, err := pgx.Connect(ctx, b.customersURL)
+	conn, err := pgxConnect(ctx, b.customersURL)
 	if err != nil {
 		return nil, fmt.Errorf("db.local.Provision: connect: %w", err)
 	}
@@ -110,7 +135,7 @@ func (b *LocalBackend) ProvisionWithExtensions(ctx context.Context, token, tier 
 	// run as a superuser/admin, not the per-token user (which lacks
 	// CREATE-on-pg_catalog privileges).
 	newDBURL := b.buildDBURL(username, pass, dbName)
-	adminNewDB, err := pgx.Connect(ctx, b.buildAdminNewDBURL(dbName))
+	adminNewDB, err := pgxConnect(ctx, b.buildAdminNewDBURL(dbName))
 	if err != nil {
 		slog.Error("db.local.Provision: connect new db for schema grant (non-fatal)", "error", err)
 		// If extensions were requested and we couldn't connect to the new
@@ -158,7 +183,7 @@ func (b *LocalBackend) ProvisionWithExtensions(ctx context.Context, token, tier 
 
 // StorageBytes returns the size of db_{token} in bytes using pg_database_size.
 func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResourceID string) (int64, error) {
-	conn, err := pgx.Connect(ctx, b.customersURL)
+	conn, err := pgxConnect(ctx, b.customersURL)
 	if err != nil {
 		return 0, fmt.Errorf("db.local.StorageBytes: connect: %w", err)
 	}
@@ -181,7 +206,7 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 	dbName := "db_" + token
 	username := "usr_" + token
 
-	conn, err := pgx.Connect(ctx, b.customersURL)
+	conn, err := pgxConnect(ctx, b.customersURL)
 	if err != nil {
 		return fmt.Errorf("db.local.Deprovision: connect: %w", err)
 	}
