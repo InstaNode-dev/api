@@ -18,7 +18,6 @@ package handlers
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -79,6 +78,15 @@ var privateDeployAllowedTiers = map[string]bool{
 	"growth":      true,
 }
 
+// newK8sComputeProvider constructs the k8s-backed compute.Provider. It is a
+// package-level indirection (defaulting to k8s.New) so coverage tests can inject
+// a fake without standing up a live cluster and thereby exercise the
+// cfg.ComputeProvider=="k8s" success branch of NewDeployHandler. Production
+// behaviour is identical.
+var newK8sComputeProvider = func(namespace string, bc k8s.BuildContextConfig) (compute.Provider, error) {
+	return k8s.New(namespace, bc)
+}
+
 // DeployHandler handles all /deploy endpoints.
 type DeployHandler struct {
 	db           *sql.DB
@@ -106,7 +114,7 @@ func NewDeployHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, planReg
 	var cp compute.Provider
 	switch cfg.ComputeProvider {
 	case "k8s":
-		k8sProv, err := k8s.New(cfg.KubeNamespaceApps, buildContextConfigFromCfg(cfg))
+		k8sProv, err := newK8sComputeProvider(cfg.KubeNamespaceApps, buildContextConfigFromCfg(cfg))
 		if err != nil {
 			slog.Error("deploy: k8s provider init failed — falling back to noop", "error", err)
 			cp = noop.New()
@@ -187,7 +195,7 @@ func emitDeployAudit(db *sql.DB, kind string, d *models.Deployment, extra map[st
 // generateAppID produces an 8-char lowercase hex string via crypto/rand.
 func generateAppID() (string, error) {
 	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := randRead(b); err != nil {
 		return "", fmt.Errorf("rand.Read: %w", err)
 	}
 	return hex.EncodeToString(b), nil
@@ -547,7 +555,7 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "tarball_too_large",
 			"Tarball must be at most 50 MB")
 	}
-	f, err := fh.Open()
+	f, err := openMultipartFile(fh)
 	if err != nil {
 		return respondError(c, fiber.StatusBadRequest, "tarball_open_failed",
 			"Failed to read tarball")
@@ -1242,7 +1250,7 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "tarball_too_large",
 			"Tarball must be at most 50 MB")
 	}
-	f, err := fh.Open()
+	f, err := openMultipartFile(fh)
 	if err != nil {
 		return respondError(c, fiber.StatusBadRequest, "tarball_open_failed",
 			"Failed to read tarball")

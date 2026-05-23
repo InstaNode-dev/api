@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -327,7 +326,7 @@ func (h *CLIAuthHandler) GetCurrentUser(c *fiber.Ctx) error {
 // generateSessionID produces a cryptographically random 16-byte hex string.
 func generateSessionID() (string, error) {
 	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := randRead(b); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil

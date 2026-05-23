@@ -124,7 +124,7 @@ func decodeErr(t *testing.T, resp *http.Response) twinErrorBody {
 //  1. Hobby tier → 402 with agent_action + upgrade_url. Multi-env is a
 //     Pro+ differentiator (see plans.yaml + PricingPage.tsx); the response
 //     must hand an agent enough context to know what to ask the user.
-func TestProvisionTwin_HobbyTier_Returns402(t *testing.T) {
+func TestResourceProvisionTwin_HobbyTier_Returns402(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -151,7 +151,7 @@ func TestProvisionTwin_HobbyTier_Returns402(t *testing.T) {
 //     belongs to a different team. The response must NOT confirm that the
 //     resource exists in another tenant — 404 keeps it indistinguishable
 //     from a non-existent id.
-func TestProvisionTwin_CrossTeam_Returns404(t *testing.T) {
+func TestResourceProvisionTwin_CrossTeam_Returns404(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -178,7 +178,7 @@ func TestProvisionTwin_CrossTeam_Returns404(t *testing.T) {
 
 //  3. Source not found → 404. Caller passes a syntactically-valid UUID
 //     that doesn't exist in the resources table.
-func TestProvisionTwin_SourceNotFound_Returns404(t *testing.T) {
+func TestResourceProvisionTwin_SourceNotFound_Returns404(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -201,7 +201,7 @@ func TestProvisionTwin_SourceNotFound_Returns404(t *testing.T) {
 //  4. env == source.env → 400 same_env. Without this guard the agent would
 //     get a confusing 409 twin_exists (the source itself occupies the env).
 //     A typed 400 lets the agent prompt the user for the right env.
-func TestProvisionTwin_SameEnv_Returns400(t *testing.T) {
+func TestResourceProvisionTwin_SameEnv_Returns400(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -232,7 +232,7 @@ func TestProvisionTwin_SameEnv_Returns400(t *testing.T) {
 //     gate is bypassed (dev-env twins execute immediately). The
 //     duplicate-twin guard is the contract under test here, not the
 //     approval flow — that lives in promote_approval_test.go.
-func TestProvisionTwin_DuplicateInEnv_Returns409(t *testing.T) {
+func TestResourceProvisionTwin_DuplicateInEnv_Returns409(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -259,7 +259,7 @@ func TestProvisionTwin_DuplicateInEnv_Returns409(t *testing.T) {
 //     queue / storage types either have no per-env infra (webhook stores a
 //     token, queue is a logical NATS subject) or model env at the prefix
 //     level (storage). The handler refuses cleanly with an actionable code.
-func TestProvisionTwin_UnsupportedType_Returns400(t *testing.T) {
+func TestResourceProvisionTwin_UnsupportedType_Returns400(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -283,7 +283,7 @@ func TestProvisionTwin_UnsupportedType_Returns400(t *testing.T) {
 //  7. Missing or invalid env → 400 missing_env / invalid_env. Covers the
 //     two body-validation paths in one table-driven test so they don't
 //     drift apart silently.
-func TestProvisionTwin_BadEnv_Returns400(t *testing.T) {
+func TestResourceProvisionTwin_BadEnv_Returns400(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -331,7 +331,7 @@ func TestProvisionTwin_BadEnv_Returns400(t *testing.T) {
 //     contract under test here, NOT the approval flow. Non-dev happy-
 //     path coverage lives in promote_approval_test.go via the
 //     manual-trigger approval_id branch.
-func TestProvisionTwin_Pro_HappyPath_Returns201(t *testing.T) {
+func TestResourceProvisionTwin_Pro_HappyPath_Returns201(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)

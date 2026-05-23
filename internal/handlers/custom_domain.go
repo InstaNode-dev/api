@@ -575,13 +575,19 @@ func (h *CustomDomainHandler) Verify(c *fiber.Ctx) error {
 	})
 }
 
+// lookupTXT is a package-level seam over net.DefaultResolver.LookupTXT so
+// tests can drive the TXT-match success path without real DNS. Production
+// keeps the default resolver; tests swap it via SetLookupTXTForTest.
+var lookupTXT = func(ctx context.Context, name string) ([]string, error) {
+	return net.DefaultResolver.LookupTXT(ctx, name)
+}
+
 // checkTXT runs net.LookupTXT against the verification record and reports
 // whether the expected payload appears in any returned record.
 func (h *CustomDomainHandler) checkTXT(ctx context.Context, dom *models.CustomDomain) (bool, error) {
 	lookupCtx, cancel := context.WithTimeout(ctx, dnsLookupTimeout)
 	defer cancel()
-	resolver := net.DefaultResolver
-	records, err := resolver.LookupTXT(lookupCtx, txtChallengeRecordName(dom.Hostname))
+	records, err := lookupTXT(lookupCtx, txtChallengeRecordName(dom.Hostname))
 	if err != nil {
 		return false, fmt.Errorf("TXT lookup for %s failed: %w", txtChallengeRecordName(dom.Hostname), err)
 	}

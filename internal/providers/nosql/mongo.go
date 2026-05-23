@@ -22,6 +22,20 @@ import (
 // Short to fail-fast in tests and when MongoDB is not reachable.
 const connectTimeout = 3 * time.Second
 
+// randRead is the entropy source for the user password. It defaults to
+// crypto/rand.Read and is a package var only so a test can substitute a
+// fault-injecting reader to exercise the (otherwise unreachable) RNG-failure
+// branch in Provision. Production behaviour is identical to crypto/rand.Read.
+var randRead = rand.Read
+
+// mongoDisconnect is the seam through which every Provider method closes its
+// client. It defaults to (*mongo.Client).Disconnect and is a package var only
+// so a test can force it to error and exercise the disconnect defer-error log
+// branches. Production behaviour is identical to calling client.Disconnect.
+var mongoDisconnect = func(client *mongo.Client, ctx context.Context) error {
+	return client.Disconnect(ctx)
+}
+
 // Credentials holds the MongoDB connection details returned after provisioning.
 type Credentials struct {
 	// URL is the mongodb:// connection string the caller can use immediately.
@@ -65,14 +79,14 @@ func (p *Provider) Provision(ctx context.Context, token, tier string) (*Credenti
 		return nil, fmt.Errorf("nosql.Provision: connect: %w", err)
 	}
 	defer func() {
-		if discErr := client.Disconnect(ctx); discErr != nil {
+		if discErr := mongoDisconnect(client, ctx); discErr != nil {
 			slog.Error("nosql.Provision: disconnect", "error", discErr)
 		}
 	}()
 
 	// Generate random 16-byte password.
 	pwBytes := make([]byte, 16)
-	if _, err := rand.Read(pwBytes); err != nil {
+	if _, err := randRead(pwBytes); err != nil {
 		return nil, fmt.Errorf("nosql.Provision: generate password: %w", err)
 	}
 	password := hex.EncodeToString(pwBytes)
@@ -133,7 +147,7 @@ func (p *Provider) StorageBytes(ctx context.Context, token string) (int64, error
 		return 0, nil
 	}
 	defer func() {
-		if discErr := client.Disconnect(ctx); discErr != nil {
+		if discErr := mongoDisconnect(client, ctx); discErr != nil {
 			slog.Error("nosql.StorageBytes: disconnect", "error", discErr)
 		}
 	}()
@@ -147,16 +161,25 @@ func (p *Provider) StorageBytes(ctx context.Context, token string) (int64, error
 		return 0, nil
 	}
 
-	switch v := result["storageSize"].(type) {
-	case int32:
-		return int64(v), nil
-	case int64:
-		return v, nil
-	case float64:
-		return int64(v), nil
-	}
+	return storageSizeToInt64(result["storageSize"]), nil
+}
 
-	return 0, nil
+// storageSizeToInt64 normalises the dbStats.storageSize field, which MongoDB
+// returns as one of several numeric BSON types depending on magnitude and
+// server version, into an int64. Unknown / nil types yield 0 (fail-open).
+// Extracted as a free function so every type arm is unit-testable without
+// depending on which numeric type a given mongod build happens to return.
+func storageSizeToInt64(v any) int64 {
+	switch n := v.(type) {
+	case int32:
+		return int64(n)
+	case int64:
+		return n
+	case float64:
+		return int64(n)
+	default:
+		return 0
+	}
 }
 
 // Deprovision drops the user and database for the given token.
@@ -168,7 +191,7 @@ func (p *Provider) Deprovision(ctx context.Context, token string) error {
 		return fmt.Errorf("nosql.Deprovision: connect: %w", err)
 	}
 	defer func() {
-		if discErr := client.Disconnect(ctx); discErr != nil {
+		if discErr := mongoDisconnect(client, ctx); discErr != nil {
 			slog.Error("nosql.Deprovision: disconnect", "error", discErr)
 		}
 	}()

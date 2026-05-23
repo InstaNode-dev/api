@@ -45,6 +45,17 @@ func NewResourceHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, reg *
 	return &ResourceHandler{db: db, rdb: rdb, cfg: cfg, plans: reg, provisioner: prov, storageProvider: storageProv}
 }
 
+// Seams over the lazy-init driver entry points used by the pause/resume/rotate
+// provider helpers. lib/pq's sql.Open and the mongo driver's Connect are both
+// lazy and never error on a DSN, so the open/connect error arms in those
+// helpers are only reachable in tests by swapping these vars.
+var (
+	resourcePGOpen       = sql.Open
+	resourceMongoConnect = func(ctx context.Context, uri string) (*mongo.Client, error) {
+		return mongo.Connect(ctx, mongooptions.Client().ApplyURI(uri).SetServerSelectionTimeout(3*time.Second))
+	}
+)
+
 // List handles GET /api/v1/resources — lists resources for the authenticated team.
 // Accepts an optional ?env=<name> query parameter to filter by environment.
 // Omitting it returns all envs (backward compat with pre-slice-1 callers).
@@ -897,7 +908,7 @@ func revokePostgresConnect(ctx context.Context, dsn, dbName, username string) er
 	if err := validateSQLIdent(username); err != nil {
 		return fmt.Errorf("revokePostgresConnect: user: %w", err)
 	}
-	conn, err := sql.Open("postgres", dsn)
+	conn, err := resourcePGOpen("postgres", dsn)
 	if err != nil {
 		return fmt.Errorf("revokePostgresConnect: open: %w", err)
 	}
@@ -929,7 +940,7 @@ func grantPostgresConnect(ctx context.Context, dsn, dbName, username string) err
 	if err := validateSQLIdent(username); err != nil {
 		return fmt.Errorf("grantPostgresConnect: user: %w", err)
 	}
-	conn, err := sql.Open("postgres", dsn)
+	conn, err := resourcePGOpen("postgres", dsn)
 	if err != nil {
 		return fmt.Errorf("grantPostgresConnect: open: %w", err)
 	}
@@ -966,8 +977,7 @@ func setRedisACLEnabled(ctx context.Context, originalURL, username string, enabl
 // the customer DB. The user itself stays — only the role is dropped — so a
 // resume can re-grant cleanly without recreating the user.
 func revokeMongoRoles(ctx context.Context, adminURI, username, dbName string) error {
-	client, err := mongo.Connect(ctx, mongooptions.Client().ApplyURI(adminURI).
-		SetServerSelectionTimeout(3*time.Second))
+	client, err := resourceMongoConnect(ctx, adminURI)
 	if err != nil {
 		return fmt.Errorf("revokeMongoRoles: connect: %w", err)
 	}
@@ -993,8 +1003,7 @@ func revokeMongoRoles(ctx context.Context, adminURI, username, dbName string) er
 
 // grantMongoRoles is the inverse — re-grants readWrite on the customer DB.
 func grantMongoRoles(ctx context.Context, adminURI, username, dbName string) error {
-	client, err := mongo.Connect(ctx, mongooptions.Client().ApplyURI(adminURI).
-		SetServerSelectionTimeout(3*time.Second))
+	client, err := resourceMongoConnect(ctx, adminURI)
 	if err != nil {
 		return fmt.Errorf("grantMongoRoles: connect: %w", err)
 	}
@@ -1144,7 +1153,7 @@ func resourceToMap(r *models.Resource, reg *plans.Registry) fiber.Map {
 // new password. The username is derived from our own token — no user input —
 // so fmt.Sprintf is safe here.
 func rotatePostgresPassword(ctx context.Context, dsn, username, newPassword string) error {
-	db, err := sql.Open("postgres", dsn)
+	db, err := resourcePGOpen("postgres", dsn)
 	if err != nil {
 		return fmt.Errorf("rotatePostgresPassword: open: %w", err)
 	}
@@ -1189,8 +1198,7 @@ func rotateRedisPassword(ctx context.Context, originalURL, username, newPassword
 // Connects using the admin URI and runs updateUser on the admin database
 // (where users are created by the provisioner).
 func rotateMongoPassword(ctx context.Context, adminURI, username, newPassword string) error {
-	client, err := mongo.Connect(ctx, mongooptions.Client().ApplyURI(adminURI).
-		SetServerSelectionTimeout(3*time.Second))
+	client, err := resourceMongoConnect(ctx, adminURI)
 	if err != nil {
 		return fmt.Errorf("rotateMongoPassword: connect: %w", err)
 	}

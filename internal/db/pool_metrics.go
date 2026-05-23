@@ -54,12 +54,20 @@ func StartPoolStatsExporter(ctx context.Context, pool *sql.DB, label string) {
 	// Prom rules can't distinguish from "process unreachable").
 	publishStats(pool, label)
 
+	runExporterLoop(ctx, pool, label, ticker.C)
+}
+
+// runExporterLoop is the blocking sample-or-stop select loop, split out so a
+// unit test can drive both arms synchronously (on the test goroutine, so the
+// atomic coverage counters are recorded deterministically rather than racing
+// the spawning goroutine's exit).
+func runExporterLoop(ctx context.Context, pool *sql.DB, label string, tick <-chan time.Time) {
 	for {
 		select {
 		case <-ctx.Done():
 			slog.Info("db.pool_metrics.exporter_stopped", "label", label)
 			return
-		case <-ticker.C:
+		case <-tick:
 			publishStats(pool, label)
 		}
 	}

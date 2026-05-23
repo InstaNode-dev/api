@@ -33,7 +33,6 @@ import (
 	"instant.dev/internal/plans"
 	dbprovider "instant.dev/internal/providers/db"
 	"instant.dev/internal/provisioner"
-	"instant.dev/internal/quota"
 	"instant.dev/internal/safego"
 	"instant.dev/internal/urls"
 )
@@ -311,7 +310,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 	}
 
 	storageLimitMB := h.plans.StorageLimitMB("anonymous", "postgres")
-	_, storageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
+	_, storageExceeded, _ := checkStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
 
 	// internal_url intentionally omitted on the anonymous path — see
 	// setInternalURL doc comment in internal_url.go. Anon callers can't run
@@ -450,7 +449,7 @@ func (h *DBHandler) newDBAuthenticated(
 	middleware.RecordProvisionSuccess("postgres")
 
 	authStorageLimitMB := h.plans.StorageLimitMB(tier, "postgres")
-	_, authStorageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, authStorageLimitMB)
+	_, authStorageExceeded, _ := checkStorageQuota(ctx, h.db, resource.ID, authStorageLimitMB)
 
 	authResp := fiber.Map{
 		"ok":             true,
@@ -659,7 +658,7 @@ func (h *DBHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionForTwi
 	middleware.RecordProvisionSuccess(models.ResourceTypePostgres)
 
 	storageLimitMB := h.plans.StorageLimitMB(in.Tier, models.ResourceTypePostgres)
-	_, storageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
+	_, storageExceeded, _ := checkStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
 
 	return TwinProvisionResult{
 		ID:            resource.ID.String(),

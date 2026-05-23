@@ -40,12 +40,53 @@ import (
 // transaction all join cleanly in queries.
 const serviceName = "api"
 
+// External boundaries are routed through package-level function variables so
+// the run() seam can be exercised end-to-end (boot → ready → teardown, plus
+// every failure arm) in a unit test without a real Postgres, Redis, GeoIP
+// volume, or a bound TCP listener. In production every var holds its real
+// implementation, so behaviour is byte-for-byte identical to inlining the
+// call — this is a test seam, not a behaviour change. Do NOT change what the
+// production defaults point at (notably telemetry.InitTracer — P0-2 OTel
+// tracing contract); only override them in tests.
+var (
+	initTracer            = telemetry.InitTracer
+	connectPostgres       = db.ConnectPostgres
+	runMigrations         = db.RunMigrations
+	startPoolStatsExporter = db.StartPoolStatsExporter
+	connectRedis          = db.ConnectRedis
+	loadGeoLite2          = middleware.LoadGeoLite2
+	newProvisionerClient  = provisioner.NewClient
+	newRouterWithHooks    = router.NewWithHooks
+	serveFunc             = runServerWithGracefulShutdown
+
+	// runFunc / osExit are seams so main() — the one statement that calls
+	// os.Exit and thus can't run in-process under `go test` — is exercised
+	// with a stubbed exit. In production runFunc == run and osExit ==
+	// os.Exit, so behaviour is identical.
+	runFunc = run
+	osExit  = os.Exit
+)
+
 func main() {
+	if err := runFunc(); err != nil {
+		slog.Error("server.fatal", "error", err)
+		osExit(1)
+	}
+}
+
+// run is the extracted body of main(). It returns an error instead of
+// calling os.Exit so it can be driven from a unit test; main() is the only
+// production caller and turns a non-nil error into os.Exit(1). The boot
+// ordering, defers, and fail-open contracts are identical to the previous
+// inline main() — every external call goes through a package-level seam var
+// (defaulting to the real implementation) purely so a test can substitute a
+// stub. A nil return is a clean SIGTERM-triggered graceful shutdown.
+func run() (runErr error) {
 	// Structured JSON logging — wrapped in logctx.Handler so every record
 	// is decorated with service, commit_id, trace_id, team_id, tid.
 	//
 	// AddSource gives file:line of the slog call site (caller field in
-	// the design doc). Done before any other slog call in main so even
+	// the design doc). Done before any other slog call in run so even
 	// telemetry init failures land enriched.
 	base := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level:     slog.LevelInfo,
@@ -59,7 +100,7 @@ func main() {
 	// contain the prefix value anyway (the prefix is unread at this point).
 	slog.SetDefault(slog.New(ctxH))
 
-	shutdownTracer := telemetry.InitTracer("instant-api", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+	shutdownTracer := initTracer("instant-api", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 	defer func() {
 		if err := shutdownTracer(context.Background()); err != nil {
 			slog.Error("telemetry.shutdown_failed", "error", err)
@@ -85,12 +126,12 @@ func main() {
 	// admin routes are disabled.
 	slog.SetDefault(slog.New(middleware.NewLogScrubber(ctxH, cfg.AdminPathPrefix)))
 
-	database := db.ConnectPostgres(cfg.DatabaseURL)
+	database := connectPostgres(cfg.DatabaseURL)
 	defer database.Close()
 
-	if err := db.RunMigrations(database); err != nil {
+	if err := runMigrations(database); err != nil {
 		slog.Error("main.migrations_failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("migrations: %w", err)
 	}
 
 	// Pool-saturation observability (Wave-3 chaos verify, 2026-05-21).
@@ -103,7 +144,7 @@ func main() {
 	// is cancelled at shutdown (see Phase A/B handlers below).
 	poolStatsCtx, poolStatsCancel := context.WithCancel(context.Background())
 	defer poolStatsCancel()
-	go db.StartPoolStatsExporter(poolStatsCtx, database, "platform_db")
+	go startPoolStatsExporter(poolStatsCtx, database, "platform_db")
 
 	// Deploy-audit self-report. Idempotent on (service, commit_id,
 	// image_digest) — every pod startup of the same image is a no-op
@@ -113,10 +154,10 @@ func main() {
 	// must not stop the server from listening.
 	emitDeployAuditSelfReport(database)
 
-	rdb := db.ConnectRedis(cfg.RedisURL)
+	rdb := connectRedis(cfg.RedisURL)
 	defer rdb.Close()
 
-	geoDbs := middleware.LoadGeoLite2(cfg.GeoLite2DBPath)
+	geoDbs := loadGeoLite2(cfg.GeoLite2DBPath)
 	if geoDbs != nil && geoDbs.City != nil {
 		defer geoDbs.City.Close()
 	}
@@ -157,16 +198,16 @@ func main() {
 		// so a misconfigured prod pod surfaces as CrashLoopBackoff
 		// (operator-visible) instead of green /healthz with wrong limits.
 		slog.Error("plans.load_failed", "error", err, "path", plansPath, "environment", cfg.Environment)
-		os.Exit(1)
+		return fmt.Errorf("plans load: %w", err)
 	}
 
 	var provClient *provisioner.Client
 	if cfg.ProvisionerAddr != "" {
 		var conn *grpc.ClientConn
-		provClient, conn, err = provisioner.NewClient(cfg.ProvisionerAddr, cfg.ProvisionerSecret)
+		provClient, conn, err = newProvisionerClient(cfg.ProvisionerAddr, cfg.ProvisionerSecret)
 		if err != nil {
 			slog.Error("main.provisioner_connect_failed", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("provisioner connect: %w", err)
 		}
 		defer conn.Close()
 		slog.Info("main.provisioner_connected", "addr", cfg.ProvisionerAddr)
@@ -174,7 +215,7 @@ func main() {
 		slog.Info("main.provisioner_local", "note", "PROVISIONER_ADDR not set, using local providers")
 	}
 
-	app, hooks := router.NewWithHooks(cfg, database, rdb, geoDbs, emailClient, planRegistry, provClient, nrApp)
+	app, hooks := newRouterWithHooks(cfg, database, rdb, geoDbs, emailClient, planRegistry, provClient, nrApp)
 
 	slog.Info("server.starting",
 		"port", cfg.Port,
@@ -183,10 +224,11 @@ func main() {
 		"build_time", buildinfo.BuildTime,
 		"version", buildinfo.Version,
 	)
-	if err := runServerWithGracefulShutdown(app, ":"+cfg.Port, gracefulShutdownTimeout, hooks); err != nil {
+	if err := serveFunc(app, ":"+cfg.Port, gracefulShutdownTimeout, hooks); err != nil {
 		slog.Error("server.fatal", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("serve: %w", err)
 	}
+	return nil
 }
 
 // gracefulShutdownTimeout is the budget Fiber gets to drain in-flight requests

@@ -151,3 +151,60 @@ func TestSaltIsolation_DifferentSaltsDiffer(t *testing.T) {
 			disagree, N, N*40/100)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// register panic branches + pickFromVariants empty guard
+// ---------------------------------------------------------------------------
+
+// TestRegister_PanicsOnDuplicate verifies a second registration of the same
+// name fails loudly — duplicate registration is always a programmer error.
+func TestRegister_PanicsOnDuplicate(t *testing.T) {
+	const name = "test_dup_experiment"
+	register(Experiment{Name: name, Variants: []string{"a", "b"}, Salt: "s"})
+	t.Cleanup(func() { delete(registry, name) })
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on duplicate registration")
+		}
+		msg, _ := r.(string)
+		if msg != "experiments: duplicate registration: "+name {
+			t.Fatalf("unexpected panic message: %v", r)
+		}
+	}()
+	register(Experiment{Name: name, Variants: []string{"x"}, Salt: "s2"})
+}
+
+// TestRegister_PanicsOnEmptyVariants verifies an experiment with no variants
+// fails loudly at startup rather than silently producing "" buckets.
+func TestRegister_PanicsOnEmptyVariants(t *testing.T) {
+	const name = "test_empty_variants_experiment"
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on empty variants")
+		}
+		msg, _ := r.(string)
+		if msg != "experiments: variants empty: "+name {
+			t.Fatalf("unexpected panic message: %v", r)
+		}
+		// Ensure the failed registration did not leak into the registry.
+		if _, ok := registry[name]; ok {
+			delete(registry, name)
+			t.Fatal("empty-variant experiment must not be registered")
+		}
+	}()
+	register(Experiment{Name: name, Variants: nil, Salt: "s"})
+}
+
+// TestPickFromVariants_EmptyReturnsEmpty exercises the defensive empty-slice
+// guard that Pick relies on for unknown experiments.
+func TestPickFromVariants_EmptyReturnsEmpty(t *testing.T) {
+	if got := pickFromVariants(nil, "salt", "id"); got != "" {
+		t.Fatalf("empty variants must return \"\", got %q", got)
+	}
+	if got := pickFromVariants([]string{}, "salt", "id"); got != "" {
+		t.Fatalf("empty variants must return \"\", got %q", got)
+	}
+}
