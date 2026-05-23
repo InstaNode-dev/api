@@ -232,7 +232,7 @@ func (h *StatusHandler) listComponents(ctx context.Context) ([]listedComponent, 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]listedComponent, 0, 8)
 	for rows.Next() {
@@ -260,7 +260,7 @@ func (h *StatusHandler) computeOne(ctx context.Context, comp listedComponent, no
 	if err != nil {
 		return componentRow{}, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	samples := make([]uptimeSample, 0, 256)
 	for rows.Next() {

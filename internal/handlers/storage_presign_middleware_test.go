@@ -55,15 +55,6 @@ type presignErrEnvelope struct {
 	RetryAfterSeconds *int   `json:"retry_after_seconds,omitempty"`
 }
 
-// presignOKEnvelope is the success shape returned by PresignStorage.
-type presignOKEnvelope struct {
-	OK        bool   `json:"ok"`
-	URL       string `json:"url"`
-	Method    string `json:"method"`
-	Key       string `json:"key"`
-	ObjectKey string `json:"object_key"`
-	ExpiresAt string `json:"expires_at"`
-}
 
 // ---------------------------------------------------------------------------
 // Registry-iterating regression test (CLAUDE.md rule 18).

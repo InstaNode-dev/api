@@ -912,7 +912,7 @@ func revokePostgresConnect(ctx context.Context, dsn, dbName, username string) er
 	if err != nil {
 		return fmt.Errorf("revokePostgresConnect: open: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err := conn.ExecContext(ctx,
 		fmt.Sprintf(`REVOKE CONNECT ON DATABASE %q FROM %q`, dbName, username)); err != nil {
 		return fmt.Errorf("revokePostgresConnect: REVOKE: %w", err)
@@ -944,7 +944,7 @@ func grantPostgresConnect(ctx context.Context, dsn, dbName, username string) err
 	if err != nil {
 		return fmt.Errorf("grantPostgresConnect: open: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err := conn.ExecContext(ctx,
 		fmt.Sprintf(`GRANT CONNECT ON DATABASE %q TO %q`, dbName, username)); err != nil {
 		return fmt.Errorf("grantPostgresConnect: GRANT: %w", err)
@@ -962,7 +962,7 @@ func setRedisACLEnabled(ctx context.Context, originalURL, username string, enabl
 		return fmt.Errorf("setRedisACLEnabled: parse url: %w", err)
 	}
 	client := redis.NewClient(opts)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	state := "off"
 	if enable {
 		state = "on"
@@ -1157,7 +1157,7 @@ func rotatePostgresPassword(ctx context.Context, dsn, username, newPassword stri
 	if err != nil {
 		return fmt.Errorf("rotatePostgresPassword: open: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Validate username is safe (must match usr_<uuid> pattern from provisioner).
 	for _, ch := range username {
@@ -1185,7 +1185,7 @@ func rotateRedisPassword(ctx context.Context, originalURL, username, newPassword
 		return fmt.Errorf("rotateRedisPassword: parse url: %w", err)
 	}
 	client := redis.NewClient(opts)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// ACL SETUSER <username> resetpass ><newPassword> keeps all other ACL rules intact.
 	if err := client.Do(ctx, "ACL", "SETUSER", username, "resetpass", ">"+newPassword).Err(); err != nil {

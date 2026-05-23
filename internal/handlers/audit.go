@@ -450,7 +450,7 @@ func lookupMaskedEmails(ctx context.Context, db *sql.DB, events []*models.AuditE
 		slog.Warn("audit.email_lookup_failed", "error", err)
 		return out
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var id, email string
 		if err := rows.Scan(&id, &email); err != nil {

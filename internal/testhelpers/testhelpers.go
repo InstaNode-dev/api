@@ -68,7 +68,7 @@ func SetupTestDB(t *testing.T) (*sql.DB, func()) {
 
 	runMigrations(t, db)
 
-	return db, func() { db.Close() }
+	return db, func() { _ = db.Close() }
 }
 
 // runMigrations applies the full platform schema.
@@ -828,7 +828,7 @@ func SetupTestRedis(t *testing.T) (*redis.Client, func()) {
 
 	return rdb, func() {
 		rdb.FlushDB(context.Background())
-		rdb.Close()
+		_ = rdb.Close()
 	}
 }
 
@@ -1205,7 +1205,7 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	api.Get("/audit", auditH.List)
 	api.Get("/audit.csv", auditH.ListCSV)
 
-	return app, func() { app.Shutdown() }
+	return app, func() { _ = app.Shutdown() }
 }
 
 // MustProvisionDB POSTs to /db/new and returns the token.
@@ -1220,7 +1220,7 @@ func MustProvisionDB(t *testing.T, app *fiber.App, ip string) string {
 	if err != nil {
 		t.Fatalf("MustProvisionDB: app.Test: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
@@ -1257,7 +1257,7 @@ func MustProvisionCache(t *testing.T, app *fiber.App, ip string) string {
 	if err != nil {
 		t.Fatalf("MustProvisionCache: app.Test: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -1293,7 +1293,7 @@ func MustProvisionCacheWithBody(t *testing.T, app *fiber.App, ip, body string) s
 	if err != nil {
 		t.Fatalf("MustProvisionCacheWithBody: app.Test: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -1323,7 +1323,7 @@ func MustProvisionNoSQL(t *testing.T, app *fiber.App, ip string) string {
 	if err != nil {
 		t.Fatalf("MustProvisionNoSQL: app.Test: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
@@ -1372,7 +1372,7 @@ func MustProvisionCacheFull(t *testing.T, app *fiber.App, fingerprint string) Pr
 	if err != nil {
 		t.Fatalf("MustProvisionCacheFull: app.Test: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -1483,7 +1483,7 @@ func GetReq(t *testing.T, app *fiber.App, path string) *http.Response {
 // DecodeJSON decodes the response body into v and closes the body.
 func DecodeJSON(t *testing.T, resp *http.Response, v any) {
 	t.Helper()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
 		t.Fatalf("DecodeJSON: %v", err)
 	}

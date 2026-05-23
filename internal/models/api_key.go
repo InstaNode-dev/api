@@ -115,7 +115,7 @@ func ListAPIKeysByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]*AP
 	if err != nil {
 		return nil, fmt.Errorf("models.ListAPIKeysByTeam: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	keys := make([]*APIKey, 0)
 	for rows.Next() {

@@ -41,11 +41,11 @@ func TestRazorpayHTTPTimeout_Is30Seconds(t *testing.T) {
 func TestApplyHTTPTimeout_InstallsThirtySecondClient(t *testing.T) {
 	c := razorpay.NewClient("rzp_test_dummy_key", "secret_dummy")
 	// Before patch — SDK default is 10s.
-	if got := c.Request.HTTPClient.Timeout; got != 10*time.Second {
+	if got := c.HTTPClient.Timeout; got != 10*time.Second {
 		t.Logf("SDK default changed: was 10s, now %s — update doc & this test", got)
 	}
 	c = ApplyHTTPTimeout(c)
-	if got := c.Request.HTTPClient.Timeout; got != 30*time.Second {
+	if got := c.HTTPClient.Timeout; got != 30*time.Second {
 		t.Errorf("after ApplyHTTPTimeout: want 30s, got %s", got)
 	}
 }
@@ -59,7 +59,7 @@ func TestNewTimeoutClient_ConvenienceConstructorInstalls30s(t *testing.T) {
 	if c == nil {
 		t.Fatal("NewTimeoutClient returned nil")
 	}
-	if got := c.Request.HTTPClient.Timeout; got != 30*time.Second {
+	if got := c.HTTPClient.Timeout; got != 30*time.Second {
 		t.Errorf("NewTimeoutClient: want 30s timeout, got %s", got)
 	}
 }
@@ -89,7 +89,7 @@ func TestNewTimeoutClient_AbortsBeforeMinutesLongHang(t *testing.T) {
 	}
 
 	c := NewTimeoutClient("rzp_test", "secret")
-	c.Request.BaseURL = ts.URL
+	c.BaseURL = ts.URL
 	// For the test we tighten the timeout to 1s — the production value is
 	// pinned by the constant test above. SetTimeout takes int16 seconds.
 	c.Request.SetTimeout(1)

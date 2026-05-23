@@ -379,7 +379,7 @@ func GetAllActiveResourcesByFingerprint(ctx context.Context, db *sql.DB, fingerp
 	if err != nil {
 		return nil, fmt.Errorf("models.GetAllActiveResourcesByFingerprint: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var resources []*Resource
 	for rows.Next() {
@@ -546,7 +546,7 @@ func ListResourcesByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]*
 	if err != nil {
 		return nil, fmt.Errorf("models.ListResourcesByTeam: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []*Resource
 	for rows.Next() {
@@ -579,7 +579,7 @@ func ListResourcesByTeamAndEnv(ctx context.Context, db *sql.DB, teamID uuid.UUID
 	if err != nil {
 		return nil, fmt.Errorf("models.ListResourcesByTeamAndEnv: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []*Resource
 	for rows.Next() {

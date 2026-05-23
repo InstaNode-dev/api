@@ -1,0 +1,57 @@
+# golangci-lint v2 config — start conservative, expand once baseline is clean
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  # Default linter set is govet+errcheck+ineffassign+staticcheck+unused.
+  # We explicitly add misspell + gocyclo on top. gosimple folded into staticcheck in v2.
+  enable:
+    - errcheck       # checks unchecked errors
+    - govet          # standard vet
+    - ineffassign    # ineffective assignments
+    - staticcheck    # bug detection (subsumes gosimple in v2)
+    - unused         # unused code
+    - misspell       # spelling
+    - gocyclo        # cyclomatic complexity
+  settings:
+    gocyclo:
+      # Baseline threshold for an existing mature codebase. The largest pre-existing
+      # offender at the time golangci-lint was introduced (StackHandler.New) measured
+      # cyclomatic complexity 68; this is set just above it so the linter does not force
+      # 33 risky refactors of production request handlers as a precondition for adoption.
+      # This is a ratchet baseline: lower it incrementally as functions are decomposed in
+      # follow-up work, never raise it.
+      min-complexity: 69
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocyclo
+      # SA1019 (deprecated madmin.New / SetPolicy) in the MinIO provider. MinIO is a
+      # local-dev-only object-store backend; the suggested replacements
+      # (NewWithOptions / AttachPolicy) have different call shapes and semantics, so a
+      # mechanical swap would risk a behavior change on the credential-issuance path.
+      # Excluded as a targeted, file-scoped suppression rather than disabling SA1019
+      # globally; revisit when the madmin dependency is next upgraded.
+      - path: internal/providers/storage/minio/minio\.go
+        linters:
+          - staticcheck
+        text: "SA1019"
+      # QF1001 (De Morgan's law) fires on two SQL-injection identifier validators in
+      # resource.go (the unsafe-identifier and rotatePostgresPassword username guards).
+      # Mechanically inverting the boolean logic of a security guard is exactly the
+      # class of change that introduces subtle off-by-one acceptance bugs; the current
+      # !(...) form is intentional and readable in context. Suppressed by check, not by
+      # disabling staticcheck.
+      - path: internal/handlers/resource\.go
+        linters:
+          - staticcheck
+        text: "QF1001"
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

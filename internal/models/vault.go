@@ -121,7 +121,7 @@ func ListVaultKeys(ctx context.Context, db *sql.DB, teamID uuid.UUID, env string
 	if err != nil {
 		return nil, fmt.Errorf("models.ListVaultKeys: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	keys := make([]string, 0)
 	for rows.Next() {

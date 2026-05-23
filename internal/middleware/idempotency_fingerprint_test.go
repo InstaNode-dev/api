@@ -520,9 +520,10 @@ func TestFingerprint_AppliedToAllCreateRoutes(t *testing.T) {
 				block.WriteString(lines[i])
 				block.WriteString("\n")
 				for _, ch := range lines[i] {
-					if ch == '(' {
+					switch ch {
+					case '(':
 						depth++
-					} else if ch == ')' {
+					case ')':
 						depth--
 					}
 				}

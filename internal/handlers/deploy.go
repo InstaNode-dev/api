@@ -560,7 +560,7 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "tarball_open_failed",
 			"Failed to read tarball")
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// P0-3: io.ReadAll, not a single f.Read — a lone Read short-reads on
 	// disk-spilled multipart files (n is discarded), truncating large tarballs.
@@ -1255,7 +1255,7 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "tarball_open_failed",
 			"Failed to read tarball")
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// P0-3: io.ReadAll, not a single f.Read — a lone Read short-reads on
 	// disk-spilled multipart files (n is discarded), truncating large tarballs.

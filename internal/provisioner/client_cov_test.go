@@ -191,11 +191,10 @@ func TestNewClient_OnOpenLogger(t *testing.T) {
 	}
 	// We can't assert the log line directly without plumbing a writer; but
 	// the line is executed (covered) as a side effect of crossing the threshold.
-	// The breaker should now be OPEN.
-	if !br.Allow() {
-		// Allowed since Allow returns true for first half-open trial in some
-		// configurations — main point is the OnOpen closure ran.
-	}
+	// The breaker should now be OPEN. We don't assert on the result: Allow may
+	// return true for the first half-open trial in some configurations — the
+	// point is simply that the OnOpen closure ran (a covered side effect).
+	_ = br.Allow()
 }
 
 // --- Breaker accessor --------------------------------------------------------

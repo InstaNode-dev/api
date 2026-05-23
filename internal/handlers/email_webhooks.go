@@ -325,19 +325,7 @@ func (h *EmailWebhookHandler) SES(c *fiber.Ctx) error {
 	// when the test path injects a nil verifier (handlers built via
 	// NewEmailWebhookHandler always have one).
 	if h.snsVerifier != nil {
-		if err := h.snsVerifier.verify(snsMessage{
-			Type:             env.Type,
-			MessageID:        env.MessageID,
-			Token:            env.Token,
-			TopicArn:         env.TopicArn,
-			Subject:          env.Subject,
-			Message:          env.Message,
-			Timestamp:        env.Timestamp,
-			SignatureVersion: env.SignatureVersion,
-			Signature:        env.Signature,
-			SigningCertURL:   env.SigningCertURL,
-			SubscribeURL:     env.SubscribeURL,
-		}); err != nil {
+		if err := h.snsVerifier.verify(snsMessage(env)); err != nil {
 			slog.Warn("email.webhook.ses.sns_signature_failed",
 				"error", err,
 				"signing_cert_url", env.SigningCertURL,

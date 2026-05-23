@@ -260,7 +260,7 @@ func ListAuditEventsForCustomerExport(ctx context.Context, db *sql.DB, q AuditCu
 	if err != nil {
 		return nil, fmt.Errorf("models.ListAuditEventsForCustomerExport: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]*AuditEvent, 0)
 	for rows.Next() {
@@ -321,7 +321,7 @@ func ListAuditEventsByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID, li
 	if err != nil {
 		return nil, fmt.Errorf("models.ListAuditEventsByTeam: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]*AuditEvent, 0)
 	for rows.Next() {

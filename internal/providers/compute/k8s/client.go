@@ -61,10 +61,6 @@ const (
 // editing an inline string in one call site only.
 
 const (
-	// capNetBindService is the only Linux capability we re-add after dropping ALL.
-	// It allows customer apps to bind ports < 1024 (e.g. 80/443) without root.
-	capNetBindService = corev1.Capability("NET_BIND_SERVICE")
-
 	// seccompRuntimeDefault requests the container runtime's default seccomp
 	// profile (equivalent to Docker's default profile on most runtimes).
 	seccompRuntimeDefault = corev1.SeccompProfileTypeRuntimeDefault
@@ -1287,7 +1283,7 @@ func (p *K8sProvider) streamKanikoLogs(ctx context.Context, ns, jobName string) 
 	if err != nil {
 		return nil, fmt.Errorf("stream logs for pod %q container kaniko: %w", podName, err)
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	var lines []string
 	scanner := bufio.NewScanner(stream)
@@ -2197,7 +2193,7 @@ func extractTarGz(data []byte, destDir string) error {
 	if err != nil {
 		return fmt.Errorf("gzip reader: %w", err)
 	}
-	defer gr.Close()
+	defer func() { _ = gr.Close() }()
 
 	tr := tar.NewReader(gr)
 	var written int64
@@ -2233,7 +2229,7 @@ func extractTarGz(data []byte, destDir string) error {
 			// LimitReader+EOF check detects truncation against the ceiling.
 			remaining := maxExtractedTarBytes - written
 			n, err := io.Copy(f, io.LimitReader(tr, remaining+1))
-			f.Close()
+			_ = f.Close() // best-effort extraction; loop continues on next entry
 			if err != nil {
 				return fmt.Errorf("write file %q: %w", target, err)
 			}
