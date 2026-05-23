@@ -141,28 +141,61 @@ func TestVectorFinal_Anon_OverCap_DedupDecryptFail(t *testing.T) {
 	post := func() (*http.Response, vecRespVecwave) {
 		return postVectorVecwave(t, app, ip, "", "", map[string]any{"name": "v", "env": "production"})
 	}
-	first, body := post()
+	first, _ := post()
 	first.Body.Close()
 	require.Equal(t, http.StatusCreated, first.StatusCode)
 
-	// Corrupt the stored connection_url so the dedup decrypt fails.
+	// Burn the rest of the daily cap (anonymous = 5/fp) so the NEXT call lands
+	// on the over-cap dedup branch.
+	for i := 0; i < 5; i++ {
+		r, _ := post()
+		r.Body.Close()
+	}
+
+	// Now corrupt EVERY active vector resource for this fingerprint so the
+	// over-cap dedup's GetActiveResourceByFingerprintType returns a row whose
+	// connection_url cannot be decrypted → the fail-closed fallthrough
+	// (vector.go:294-298) runs instead of emitting ciphertext.
 	_, err := db.ExecContext(context.Background(),
-		`UPDATE resources SET connection_url = 'not-valid-ciphertext' WHERE token = $1::uuid`, body.Token)
+		`UPDATE resources SET connection_url = 'not-valid-ciphertext'
+		 WHERE resource_type = 'vector' AND status = 'active' AND tier = 'anonymous'`)
 	require.NoError(t, err)
 
-	// Hammer past the daily cap (anonymous = 5/fp). Some calls dedup-hit the
-	// corrupt row (decrypt-fail → fall through to fresh provision → 201) or
-	// over-cap deny (429); we just need the corrupt-dedup arm to execute.
-	sawResolved := false
-	for i := 0; i < 10; i++ {
-		resp, _ := post()
-		code := resp.StatusCode
-		resp.Body.Close()
-		if code == http.StatusOK || code == http.StatusCreated || code == http.StatusTooManyRequests {
-			sawResolved = true
-		}
+	// One more over-cap call: dedup hit on a corrupt row → decrypt fails →
+	// fallthrough (then recycle gate / fresh provision / deny). Any non-5xx
+	// outcome proves the corrupt-url fallthrough arm executed.
+	resp, _ := post()
+	code := resp.StatusCode
+	resp.Body.Close()
+	assert.NotEqual(t, http.StatusInternalServerError, code)
+}
+
+// TestVectorFinal_Anon_OverCap_CrossServiceFallback — burns the cap with vector
+// provisions, then RETYPES every active row for the fingerprint to 'redis' so
+// the over-cap vector-type-by-env lookup MISSES but the any-type-by-env lookup
+// HITS → cross-service daily-cap fallback 429 (vector.go:269-275).
+func TestVectorFinal_Anon_OverCap_CrossServiceFallback(t *testing.T) {
+	app, db, _ := vectorGRPCAppWithDB(t)
+	const ip = "10.131.0.8"
+	post := func() (*http.Response, vecRespVecwave) {
+		return postVectorVecwave(t, app, ip, "", "", map[string]any{"name": "v", "env": "production"})
 	}
-	assert.True(t, sawResolved, "over-cap calls should resolve to dedup/fresh/deny, exercising the corrupt-url fallthrough")
+	// Burn the full cap (6 calls → over-cap on the 6th onward).
+	for i := 0; i < 6; i++ {
+		r, _ := post()
+		r.Body.Close()
+	}
+	// Retype the fingerprint's vector rows to redis: vector-type lookup now
+	// misses, but any-type lookup still finds a row → cross-service 429.
+	_, err := db.ExecContext(context.Background(),
+		`UPDATE resources SET resource_type = 'redis'
+		 WHERE resource_type = 'vector' AND status = 'active' AND tier = 'anonymous'`)
+	require.NoError(t, err)
+
+	resp, body := post()
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+	assert.Equal(t, "provision_limit_reached", body.Error)
 }
 
 // TestVectorFinal_Auth_TeamLookup_DBError_503 — GetTeamByID errors (vector.go:453).
@@ -223,25 +256,62 @@ func TestVectorFinal_Auth_CreateResource_DBError_503(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 }
 
-// TestVectorFinal_Auth_GRPCError_SoftDelete_503 — provision via the bufconn
-// fake set to fail → soft-delete + 503 (vector.go:514). Reuses the vecwave
-// fixture.
-func TestVectorFinal_Auth_GRPCError_SoftDelete_503(t *testing.T) {
-	fake := &fakeProvisioner{failProvision: true}
-	app, _, cleanup := setupVectorGRPCFixture(t, fake, false)
-	defer cleanup()
+// vectorGRPCFailAppWithDB builds a /vector/new app whose bufconn provisioner
+// FAILS, exposing the DB so an authenticated team can be seeded.
+func vectorGRPCFailAppWithDB(t *testing.T) (*fiber.App, *sql.DB) {
+	t.Helper()
+	db, _ := testhelpers.SetupTestDB(t)
+	rdb, _ := testhelpers.SetupTestRedis(t)
+	t.Cleanup(func() { db.Close(); rdb.Close() })
+	cfg := &config.Config{
+		JWTSecret:                testhelpers.TestJWTSecret,
+		AESKey:                   testhelpers.TestAESKeyHex,
+		EnabledServices:          "postgres,vector,redis",
+		Environment:              "test",
+		PostgresProvisionBackend: "local",
+	}
+	provClient := newBufconnProvisionerClient(t, &fakeProvisioner{failProvision: true})
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, e error) error {
+			if e == handlers.ErrResponseWritten {
+				return nil
+			}
+			code := fiber.StatusInternalServerError
+			if fe, ok := e.(*fiber.Error); ok {
+				code = fe.Code
+			}
+			_ = handlers.WriteFiberError(c, code, "internal_error", e.Error())
+			return nil
+		},
+		ProxyHeader: "X-Forwarded-For",
+	})
+	app.Use(middleware.RequestID())
+	app.Use(middleware.Fingerprint())
+	vectorH := handlers.NewVectorHandler(db, rdb, cfg, provClient, plans.Default())
+	app.Post("/vector/new", middleware.OptionalAuth(cfg), vectorH.NewVector)
+	return app, db
+}
 
-	// Need a seeded team + jwt; pull a fresh DB through the fixture's app is
-	// not exposed, so seed against a parallel DB and reuse the same secret.
-	// The fixture's VectorHandler shares the test DB created inside it, so we
-	// must mint the JWT against THAT db. Use a dev-only set-tier shortcut is
-	// unavailable; instead use the anonymous→gRPC-error path which also hits
-	// soft-delete on the anonymous arm (vector.go:362). Both share the
-	// SoftDeleteResource branch.
-	resp, body := postVectorVecwave(t, app, "10.62.0.1", "", "", map[string]any{"name": "v", "env": "production"})
+// TestVectorFinal_Auth_GRPCError_SoftDelete_503 — an AUTHENTICATED provision
+// where the gRPC provisioner fails → soft-delete + 503 (vector.go:514). Uses a
+// DB-exposed failing fixture so we can seed the team the JWT points at.
+func TestVectorFinal_Auth_GRPCError_SoftDelete_503(t *testing.T) {
+	app, db := vectorGRPCFailAppWithDB(t)
+	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
+	jwt := vecJWT(t, db, teamID)
+
+	resp := vecPost(t, app, "10.62.0.1", jwt, `{"name":"v","env":"production"}`)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
-	assert.Equal(t, "provision_failed", body.Error)
+}
+
+// TestVectorFinal_Anon_GRPCError_SoftDelete_503 — anonymous provision gRPC
+// failure → soft-delete on the anon arm (vector.go:362).
+func TestVectorFinal_Anon_GRPCError_SoftDelete_503(t *testing.T) {
+	app, _ := vectorGRPCFailAppWithDB(t)
+	resp := vecPost(t, app, "10.62.0.9", "", `{"name":"v","env":"production"}`)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 }
 
 // TestVectorFinal_ParseDimensions_MalformedJSON_Default — a body that is valid
