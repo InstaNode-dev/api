@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"instant.dev/internal/config"
+	"instant.dev/internal/crypto"
 	"instant.dev/internal/handlers"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/plans"
@@ -91,6 +92,17 @@ func rfErr(t *testing.T, resp *http.Response) string {
 		return s
 	}
 	return ""
+}
+
+// rfEncryptURL encrypts a connection URL with the test AES key so a seeded
+// resource's stored URL decrypts cleanly in the handler.
+func rfEncryptURL(t *testing.T, plain string) string {
+	t.Helper()
+	key, err := crypto.ParseAESKey(testhelpers.TestAESKeyHex)
+	require.NoError(t, err)
+	enc, err := crypto.Encrypt(key, plain)
+	require.NoError(t, err)
+	return enc
 }
 
 // Pause: GetResourceByToken errors → fetch_failed (resource.go:567). failAfter=0.
@@ -179,4 +191,29 @@ func TestResourceFinal_Rotate_LookupError_503(t *testing.T) {
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 	assert.Equal(t, "fetch_failed", rfErr(t, resp))
+}
+
+// RotateCredentials: UpdateConnectionURL errors → update_failed
+// (resource.go:499). The resource must have a DECRYPTABLE connection_url so the
+// rotate reaches the persist step; seed it with a real encrypted URL. resource
+// lookup(1) succeeds, the postgres ALTER ROLE is a no-op (nil customer DB), the
+// UpdateConnectionURL UPDATE(2) errors. failAfter=1.
+func TestResourceFinal_Rotate_UpdateFailed_503(t *testing.T) {
+	seedDB, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	teamID := testhelpers.MustCreateTeamDB(t, seedDB, "pro")
+	// Encrypt a real postgres URL with the test AES key so decrypt + url-parse
+	// succeed and the handler reaches UpdateConnectionURL.
+	enc := rfEncryptURL(t, "postgres://usr:pw@host:5432/db_x")
+	var token string
+	require.NoError(t, seedDB.QueryRowContext(context.Background(),
+		`INSERT INTO resources (team_id, resource_type, tier, status, connection_url)
+		 VALUES ($1::uuid, 'postgres', 'pro', 'active', $2) RETURNING token::text`,
+		teamID, enc).Scan(&token))
+
+	app := resourceFaultApp(t, openFaultDB(t, 1), teamID)
+	resp := rfPost(t, app, "/r/"+token+"/rotate")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	assert.Equal(t, "update_failed", rfErr(t, resp))
 }
