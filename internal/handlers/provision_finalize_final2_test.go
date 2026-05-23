@@ -72,7 +72,7 @@ func badAESProvisionApp(t *testing.T) (*fiber.App, *redis.Client) {
 		ObjectStoreEndpoint:      "nyc3.test.local",
 		ObjectStoreAccessKey:     "MK",
 		ObjectStoreSecretKey:     "MS",
-		NATSHost:                 "127.0.0.1", // 8222 probe unreachable → queue provision fails (soft-delete arm)
+		NATSHost:                 "nats.test", // reserved non-resolvable host → 8222 probe fails → queue provision fails (soft-delete arm). Not 127.0.0.1: CI now runs a live NATS on localhost:8222.
 	}
 	planReg := plans.Default()
 

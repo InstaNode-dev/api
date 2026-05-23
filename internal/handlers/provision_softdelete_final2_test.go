@@ -63,8 +63,10 @@ func badBackendApp(t *testing.T) (*fiber.App, *redis.Client, *sql.DB) {
 		PostgresCustomersURL: "postgres://nope:nope@127.0.0.1:1/none?sslmode=disable&connect_timeout=1",
 		// Unreachable Mongo admin → mongo provider Provision fails.
 		MongoAdminURI: "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=800&connectTimeoutMS=800",
-		// Unreachable NATS monitor (8222) → queue provider provision fails.
-		NATSHost: "127.0.0.1",
+		// Reserved non-resolvable host → NATS monitor (8222) probe fails → queue
+		// provider provision fails. Not 127.0.0.1: CI now runs a live NATS on
+		// localhost:8222, which would make 127.0.0.1:8222 reachable.
+		NATSHost: "nats.test",
 	}
 	planReg := plans.Default()
 
