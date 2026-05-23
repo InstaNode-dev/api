@@ -33,6 +33,12 @@ func (h *TeamMembersHandler) EmitInviteAuditForTest(ctx context.Context, teamID,
 	h.emitInviteAudit(ctx, teamID, actorID, invID, inviteEmail, role)
 }
 
+// InjectMessageIDForTest exposes injectMessageID (email_webhooks.go) so the
+// empty-id / unmarshal-error / happy arms can be exercised directly.
+func InjectMessageIDForTest(body []byte, messageID string) []byte {
+	return []byte(injectMessageID(body, messageID))
+}
+
 // VaultAuditForTest exposes (*VaultHandler).audit so the AppendVaultAudit-error
 // arm (best-effort warn) can be driven with a fault DB.
 func (h *VaultHandler) VaultAuditForTest(c *fiber.Ctx, teamID uuid.UUID, userID uuid.NullUUID, action, env, key, ip string) {
