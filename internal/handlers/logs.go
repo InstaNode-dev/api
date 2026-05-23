@@ -67,9 +67,17 @@ var resourceTypeToPodLabel = map[string]string{
 }
 
 // LogsHandler handles GET /resources/:token/logs.
+//
+// clientset is typed against the kubernetes.Interface (not the concrete
+// *kubernetes.Clientset) so coverage tests can inject a k8s fake clientset and
+// exercise the pod-list / tier / status / stream-error arms without a live
+// cluster. Production wiring (NewLogsHandler) still builds a real in-cluster
+// clientset; the only behaviour the seam changes is that the field is now an
+// interface — every call site below already goes through CoreV1(), which is on
+// the interface.
 type LogsHandler struct {
 	db        *sql.DB
-	clientset *kubernetes.Clientset // nil when k8s is unavailable (no kubeconfig in local dev)
+	clientset kubernetes.Interface // nil when k8s is unavailable (no kubeconfig in local dev)
 }
 
 // NewLogsHandler builds a LogsHandler. Falls back gracefully if k8s is unreachable.
@@ -82,6 +90,14 @@ func NewLogsHandler(db *sql.DB) *LogsHandler {
 	}
 	h.clientset = cs
 	return h
+}
+
+// SetClientset injects a kubernetes.Interface (used by coverage tests to wire a
+// fake clientset). Production never calls this — NewLogsHandler builds the real
+// in-cluster client. Kept tiny + side-effect-free so the seam itself is fully
+// covered by a single test.
+func (h *LogsHandler) SetClientset(cs kubernetes.Interface) {
+	h.clientset = cs
 }
 
 // buildLogsK8sClientset prefers in-cluster config, falls back to ~/.kube/config for local dev.
