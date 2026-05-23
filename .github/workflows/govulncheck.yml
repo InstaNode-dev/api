@@ -17,20 +17,20 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: api
       - name: Checkout sibling InstaNode-dev/common
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: InstaNode-dev/common
           path: common
       - name: Checkout sibling InstaNode-dev/proto
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: InstaNode-dev/proto
           path: proto
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: api/go.mod
           check-latest: true

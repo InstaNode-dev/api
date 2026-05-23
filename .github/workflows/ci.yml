@@ -49,7 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Fail if PR branch is behind its base branch
@@ -100,10 +100,10 @@ jobs:
       # exactly as deploy.yml's proven-green gate does.
       TEST_POSTGRES_CUSTOMERS_URL: postgres://postgres:postgres@localhost:5432/instant_customers?sslmode=disable
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout proto sibling (for go.mod replace ../proto)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
@@ -113,7 +113,7 @@ jobs:
         run: mv _proto_ci ../proto
 
       - name: Checkout common sibling (for go.mod replace ../common)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
@@ -122,7 +122,7 @@ jobs:
       - name: Place ../common for Go replace directive
         run: mv _common_ci ../common
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
 
@@ -168,10 +168,10 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkout proto sibling
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
@@ -180,14 +180,14 @@ jobs:
       - run: mv _proto_ci ../proto
 
       - name: Checkout common sibling
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
           path: _common_ci
       - run: mv _common_ci ../common
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
 
