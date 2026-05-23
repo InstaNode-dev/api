@@ -54,6 +54,8 @@ func resourceFaultApp(t *testing.T, db *sql.DB, teamID string) *fiber.App {
 	app.Post("/r/:id/pause", h.Pause)
 	app.Post("/r/:id/resume", h.Resume)
 	app.Post("/r/:id/rotate", h.RotateCredentials)
+	app.Get("/r/:id/family", h.Family)
+	app.Get("/r/families", h.ListFamilies)
 	return app
 }
 
@@ -80,6 +82,13 @@ func rfSeedPausedPG(t *testing.T, db *sql.DB, teamID string) string {
 func rfPost(t *testing.T, app *fiber.App, path string) *http.Response {
 	t.Helper()
 	resp, err := app.Test(httptest.NewRequest(http.MethodPost, path, nil), 10000)
+	require.NoError(t, err)
+	return resp
+}
+
+func rfGet(t *testing.T, app *fiber.App, path string) *http.Response {
+	t.Helper()
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, path, nil), 10000)
 	require.NoError(t, err)
 	return resp
 }
@@ -175,6 +184,42 @@ func TestResourceFinal_Resume_DBFlipError_503(t *testing.T) {
 
 	app := resourceFaultApp(t, openFaultDB(t, 1), teamID)
 	resp := rfPost(t, app, "/r/"+token+"/resume")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
+
+// Family: GetResourceByToken errors → fetch_failed (resource_family.go:89).
+// failAfter=0.
+func TestResourceFinal_Family_LookupError_503(t *testing.T) {
+	seedDB, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	teamID := testhelpers.MustCreateTeamDB(t, seedDB, "pro")
+	token := rfSeedActivePG(t, seedDB, teamID)
+
+	app := resourceFaultApp(t, openFaultDB(t, 0), teamID)
+	resp := rfGet(t, app, "/r/"+token+"/family")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
+
+// Family: bad :id → invalid_id (resource_family.go:60).
+func TestResourceFinal_Family_BadID_400(t *testing.T) {
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
+	app := resourceFaultApp(t, db, teamID)
+	resp := rfGet(t, app, "/r/not-a-uuid/family")
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+// ListFamilies: DB error → 503 (resource_family.go:144-153). failAfter=0.
+func TestResourceFinal_ListFamilies_DBError_503(t *testing.T) {
+	seedDB, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	teamID := testhelpers.MustCreateTeamDB(t, seedDB, "pro")
+	app := resourceFaultApp(t, openFaultDB(t, 0), teamID)
+	resp := rfGet(t, app, "/r/families")
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 }
