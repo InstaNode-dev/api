@@ -21,6 +21,24 @@ import (
 	"instant.dev/internal/providers/compute/k8s"
 )
 
+// CacheInviteResponseForTest exposes (*TeamMembersHandler).cacheInviteResponse
+// so the nil-rdb / dead-rdb store-error arms can be driven directly.
+func (h *TeamMembersHandler) CacheInviteResponseForTest(ctx context.Context, teamID uuid.UUID, key string, status int, body fiber.Map) {
+	h.cacheInviteResponse(ctx, teamID, key, status, body)
+}
+
+// EmitInviteAuditForTest exposes (*TeamMembersHandler).emitInviteAudit so the
+// audit-insert-error arm can be driven with a fault DB.
+func (h *TeamMembersHandler) EmitInviteAuditForTest(ctx context.Context, teamID, actorID, invID uuid.UUID, inviteEmail, role string) {
+	h.emitInviteAudit(ctx, teamID, actorID, invID, inviteEmail, role)
+}
+
+// EmitPromoteAuditEventForTest exposes emitPromoteAuditEvent so the
+// InsertAuditEvent-error arm can be driven with a fault DB.
+func EmitPromoteAuditEventForTest(ctx context.Context, db *sql.DB, row *models.PromoteApproval, kind, summary string, extras map[string]any) {
+	emitPromoteAuditEvent(ctx, db, row, kind, summary, extras)
+}
+
 // ResolveResourceBindingsForTest exposes resolveResourceBindings so its many
 // rejection arms (bad-AES-key, invalid-UUID, family-disabled, family-not-found,
 // cross-team, no-env-twin, token-not-found, deleted) can be driven directly
