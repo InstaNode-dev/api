@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -65,13 +66,16 @@ func TestPromoteApproval_CheckRateLimit(t *testing.T) {
 		t.Fatalf("empty IP: exceeded=%v err=%v; want false,nil", exceeded, err)
 	}
 
-	// Under the budget: the first call for an IP must not be limited.
-	if exceeded, err := h.checkApproveRateLimit(ctx, "203.0.113.7"); err != nil || exceeded {
+	// Under the budget: the first call for a FRESH per-run IP must not be
+	// limited. Use a uuid-derived IP so a leftover Redis count from a prior
+	// run (the bucket key has a 2s TTL) never makes the first call trip.
+	freshIP := "rl-fresh-" + uuid.NewString()
+	if exceeded, err := h.checkApproveRateLimit(ctx, freshIP); err != nil || exceeded {
 		t.Fatalf("first call: exceeded=%v err=%v; want false,nil", exceeded, err)
 	}
 
 	// Drive past the per-second budget so the limited branch returns true.
-	ip := "203.0.113.99"
+	ip := "rl-burst-" + uuid.NewString()
 	var sawLimited bool
 	for i := 0; i < promoteApprovalRateLimitPerSec+5; i++ {
 		exceeded, err := h.checkApproveRateLimit(ctx, ip)

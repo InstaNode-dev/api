@@ -132,8 +132,13 @@ func TestCustomDomain_Create_HappyAndArms(t *testing.T) {
 	app := customDomainFullApp(t, db, teamID, &stubCustomDomainProvider{})
 	slug, _ := cdSeedStackWithService(t, db, teamID, true)
 
+	// custom_domains.hostname is GLOBALLY unique, so use a per-run-unique
+	// hostname to avoid colliding with a leftover row from a prior run or a
+	// sibling test in the same package.
+	host := cdUniqueHost(t)
+
 	// Happy path.
-	resp := cdReq(t, app, http.MethodPost, "/api/v1/stacks/"+slug+"/domains", `{"hostname":"app.example.com"}`)
+	resp := cdReq(t, app, http.MethodPost, "/api/v1/stacks/"+slug+"/domains", `{"hostname":"`+host+`"}`)
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 	var created struct {
 		Domain struct {
@@ -162,9 +167,15 @@ func TestCustomDomain_Create_HappyAndArms(t *testing.T) {
 	resp.Body.Close()
 
 	// hostname_taken (re-create the same hostname).
-	resp = cdReq(t, app, http.MethodPost, "/api/v1/stacks/"+slug+"/domains", `{"hostname":"app.example.com"}`)
+	resp = cdReq(t, app, http.MethodPost, "/api/v1/stacks/"+slug+"/domains", `{"hostname":"`+host+`"}`)
 	assert.Equal(t, http.StatusConflict, resp.StatusCode)
 	resp.Body.Close()
+}
+
+// cdUniqueHost returns a globally-unique custom-domain hostname for a test run.
+func cdUniqueHost(t *testing.T) string {
+	t.Helper()
+	return "h" + uuid.NewString()[:12] + ".example.com"
 }
 
 func TestCustomDomain_Create_UpgradeAndNotOwned(t *testing.T) {
@@ -200,7 +211,7 @@ func TestCustomDomain_List(t *testing.T) {
 	teamID := seedTeamWithTier(t, db, "pro")
 	app := customDomainFullApp(t, db, teamID, &stubCustomDomainProvider{})
 	slug, stackID := cdSeedStackWithService(t, db, teamID, true)
-	_, err := models.CreateCustomDomain(context.Background(), db, teamID, stackID, "list1.example.com")
+	_, err := models.CreateCustomDomain(context.Background(), db, teamID, stackID, cdUniqueHost(t))
 	require.NoError(t, err)
 
 	resp := cdReq(t, app, http.MethodGet, "/api/v1/stacks/"+slug+"/domains", "")
@@ -222,7 +233,7 @@ func TestCustomDomain_Verify_Arms(t *testing.T) {
 		app := customDomainFullApp(t, db, teamID, &stubCustomDomainProvider{})
 		slug, stackID := cdSeedStackWithService(t, db, teamID, true)
 		// Use a .invalid TLD so the real resolver fails fast (no TXT record).
-		dom, err := models.CreateCustomDomain(context.Background(), db, teamID, stackID, "pending.example.invalid")
+		dom, err := models.CreateCustomDomain(context.Background(), db, teamID, stackID, "p"+cdUniqueHost(t)+".invalid")
 		require.NoError(t, err)
 		resp := cdReq(t, app, http.MethodPost, "/api/v1/stacks/"+slug+"/domains/"+dom.ID.String()+"/verify", "")
 		// TXT lookup fails → still 200 with the failure recorded.
@@ -233,7 +244,7 @@ func TestCustomDomain_Verify_Arms(t *testing.T) {
 	t.Run("verified_no_k8s_terminal", func(t *testing.T) {
 		app := customDomainFullApp(t, db, teamID, nil) // nil provider
 		slug, stackID := cdSeedStackWithService(t, db, teamID, true)
-		dom, err := models.CreateCustomDomain(context.Background(), db, teamID, stackID, "vnk.example.com")
+		dom, err := models.CreateCustomDomain(context.Background(), db, teamID, stackID, cdUniqueHost(t))
 		require.NoError(t, err)
 		require.NoError(t, models.MarkCustomDomainVerified(context.Background(), db, dom.ID))
 		resp := cdReq(t, app, http.MethodPost, "/api/v1/stacks/"+slug+"/domains/"+dom.ID.String()+"/verify", "")
@@ -245,7 +256,7 @@ func TestCustomDomain_Verify_Arms(t *testing.T) {
 		prov := &stubCustomDomainProvider{ensureURL: "https://ingress", certReady: true}
 		app := customDomainFullApp(t, db, teamID, prov)
 		slug, stackID := cdSeedStackWithService(t, db, teamID, true)
-		dom, err := models.CreateCustomDomain(context.Background(), db, teamID, stackID, "ic.example.com")
+		dom, err := models.CreateCustomDomain(context.Background(), db, teamID, stackID, cdUniqueHost(t))
 		require.NoError(t, err)
 		require.NoError(t, models.MarkCustomDomainVerified(context.Background(), db, dom.ID))
 		resp := cdReq(t, app, http.MethodPost, "/api/v1/stacks/"+slug+"/domains/"+dom.ID.String()+"/verify", "")
@@ -263,7 +274,7 @@ func TestCustomDomain_Verify_Arms(t *testing.T) {
 		prov := &stubCustomDomainProvider{ensureErr: errors.New("ingress boom")}
 		app := customDomainFullApp(t, db, teamID, prov)
 		slug, stackID := cdSeedStackWithService(t, db, teamID, true)
-		dom, err := models.CreateCustomDomain(context.Background(), db, teamID, stackID, "ierr.example.com")
+		dom, err := models.CreateCustomDomain(context.Background(), db, teamID, stackID, cdUniqueHost(t))
 		require.NoError(t, err)
 		require.NoError(t, models.MarkCustomDomainVerified(context.Background(), db, dom.ID))
 		resp := cdReq(t, app, http.MethodPost, "/api/v1/stacks/"+slug+"/domains/"+dom.ID.String()+"/verify", "")
@@ -275,7 +286,7 @@ func TestCustomDomain_Verify_Arms(t *testing.T) {
 		prov := &stubCustomDomainProvider{}
 		app := customDomainFullApp(t, db, teamID, prov)
 		slug, stackID := cdSeedStackWithService(t, db, teamID, false) // no exposed svc
-		dom, err := models.CreateCustomDomain(context.Background(), db, teamID, stackID, "nosvc.example.com")
+		dom, err := models.CreateCustomDomain(context.Background(), db, teamID, stackID, cdUniqueHost(t))
 		require.NoError(t, err)
 		require.NoError(t, models.MarkCustomDomainVerified(context.Background(), db, dom.ID))
 		resp := cdReq(t, app, http.MethodPost, "/api/v1/stacks/"+slug+"/domains/"+dom.ID.String()+"/verify", "")
@@ -307,7 +318,7 @@ func TestCustomDomain_Delete(t *testing.T) {
 	prov := &stubCustomDomainProvider{}
 	app := customDomainFullApp(t, db, teamID, prov)
 	slug, stackID := cdSeedStackWithService(t, db, teamID, true)
-	dom, err := models.CreateCustomDomain(context.Background(), db, teamID, stackID, "del.example.com")
+	dom, err := models.CreateCustomDomain(context.Background(), db, teamID, stackID, cdUniqueHost(t))
 	require.NoError(t, err)
 
 	resp := cdReq(t, app, http.MethodDelete, "/api/v1/stacks/"+slug+"/domains/"+dom.ID.String(), "")
