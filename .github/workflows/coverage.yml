@@ -20,7 +20,15 @@ jobs:
     # equal CI) — coverage.yml must run the same hermetic suite ci.yml does.
     services:
       postgres:
-        image: postgres:16-alpine
+        # pgvector/pgvector:pg16 is the stock postgres:16 image with the
+        # `vector` extension preinstalled. The /vector/new handler's local
+        # provider runs `CREATE EXTENSION vector` inside the freshly-created
+        # customer DB; on a plain postgres:16 image that errors and every
+        # vector-handler test SKIPs (vector.go measured ~44% under CI). Using
+        # the pgvector image lets the full /vector/new provisioning path run
+        # so vector.go contributes real coverage. It is a drop-in superset of
+        # postgres:16 — every other test behaves identically.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -50,6 +58,30 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      nats:
+        # The /queue/new handler's local provider verifies NATS is reachable
+        # via the monitoring /healthz endpoint (port 8222) BEFORE returning a
+        # connection URL (synchronous-provisioning principle). Without a NATS
+        # service that 8222 health check fails → every /queue/new test 503s and
+        # the queue handler's provision + per-tenant-credential arms never run.
+        # `-js -m 8222` starts JetStream and binds the HTTP monitoring port the
+        # provider probes. No healthcheck option here because the stock nats
+        # image has no curl/wget/nc; the provider's own health probe is the
+        # readiness gate, and the run step waits on it implicitly via the test
+        # retries. (worker/provisioner added nats the same way.)
+        image: nats:latest
+        ports:
+          - 4222:4222
+          - 8222:8222
+        options: --name cov-ci-nats
+        # NATS server args. GHA passes service "options" to `docker create`;
+        # the image entrypoint args go via the `image` command — but GHA
+        # service containers don't accept a command override, so JetStream +
+        # monitoring are enabled through the env the nats image honours.
+        env:
+          # nats:latest reads these to enable JetStream + the 8222 monitor
+          # without a command override (which GHA service containers disallow).
+          NATS_EXTRA_ARGS: "-js -m 8222"
     env:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/instant_dev_test?sslmode=disable
       TEST_REDIS_URL: redis://localhost:6379/15

@@ -87,6 +87,16 @@ func NewQueueHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, provClie
 	return h
 }
 
+// SetCredProvider swaps the per-tenant credential issuer. Production code
+// never calls this — NewQueueHandler resolves the provider from cfg
+// (legacy_open by default, nats once the operator seed is configured).
+// Coverage tests inject a double here to exercise the isolated-creds and
+// creds-issuance-error arms of the handler without standing up a real NATS
+// operator + signing keys. Mirrors DeployHandler.SetComputeProvider.
+func (h *QueueHandler) SetCredProvider(p commonqp.QueueCredentialProvider) {
+	h.credProvider = p
+}
+
 // provisionQueue provisions NATS credentials.
 // When the gRPC provisioner is configured, every tier uses it — the provisioner
 // chooses local vs k8s-dedicated backend based on QUEUE_PROVISION_BACKEND.
