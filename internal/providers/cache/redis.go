@@ -23,6 +23,20 @@ import (
 // of a nil-pointer panic.
 var errNilRedisClient = errors.New("redis admin client is not configured")
 
+// randRead is the entropy source for ACL passwords. It defaults to
+// crypto/rand.Read and is a package var only so a test can substitute a
+// fault-injecting reader to exercise the (otherwise unreachable) RNG-failure
+// branch in provisionLocal. Production behaviour is identical to calling
+// crypto/rand.Read directly.
+var randRead = rand.Read
+
+// storageBytesScanCap is the hard ceiling on keys inspected per StorageBytes
+// call. It defaults to storageMaxKeys (200k). It is a package var only so a
+// test can lower it to a handful and deterministically exercise the
+// truncation branch without writing 200k keys. Production uses the 200k
+// default — see the storageMaxKeys doc comment for the rationale.
+var storageBytesScanCap = storageMaxKeys
+
 // aclAllowlist is the safe command allowlist applied to every provisioned ACL
 // user on the shared Redis backend. It replaces "+@all" which would grant
 // dangerous cross-tenant commands such as FLUSHDB, MONITOR, and CONFIG SET.
@@ -157,7 +171,7 @@ func (p *Provider) provisionLocal(ctx context.Context, token string) (*Credentia
 
 	// Generate a random password for the ACL user.
 	pwBytes := make([]byte, 16)
-	if _, err := rand.Read(pwBytes); err != nil {
+	if _, err := randRead(pwBytes); err != nil {
 		return nil, fmt.Errorf("cache.provisionLocal: generate password: %w", err)
 	}
 	password := hex.EncodeToString(pwBytes)
@@ -222,6 +236,24 @@ func (p *Provider) StorageBytes(ctx context.Context, token string) (int64, error
 	if p.rdb == nil {
 		return 0, fmt.Errorf("cache.StorageBytes: %w", errNilRedisClient)
 	}
+	return storageBytes(ctx, p.rdb, token)
+}
+
+// redisScanner is the minimal slice of *redis.Client that storageBytes needs.
+// It exists only so a deterministic fake can drive the mid-scan vanished-key
+// skip and the truncation ceiling without a live Redis race. *redis.Client
+// satisfies it directly, so production wiring is unchanged.
+type redisScanner interface {
+	Scan(ctx context.Context, cursor uint64, match string, count int64) *redis.ScanCmd
+	MemoryUsage(ctx context.Context, key string, samples ...int) *redis.IntCmd
+}
+
+// storageBytes is the seam-friendly implementation behind Provider.StorageBytes.
+// It takes the scanner as an interface so a test fake can return a SCAN key that
+// the subsequent MEMORY USAGE reports as missing (deterministic skip branch),
+// and so storageBytesScanCap can be lowered to fire the truncation branch with a
+// handful of keys.
+func storageBytes(ctx context.Context, rdb redisScanner, token string) (int64, error) {
 	prefix := token + ":*"
 
 	var (
@@ -231,20 +263,20 @@ func (p *Provider) StorageBytes(ctx context.Context, token string) (int64, error
 	)
 
 	for {
-		keys, nextCursor, err := p.rdb.Scan(ctx, cursor, prefix, storageScanBatch).Result()
+		keys, nextCursor, err := rdb.Scan(ctx, cursor, prefix, storageScanBatch).Result()
 		if err != nil {
 			return 0, fmt.Errorf("cache.StorageBytes scan: %w", err)
 		}
 
 		for _, key := range keys {
-			if totalKeys >= storageMaxKeys {
+			if totalKeys >= storageBytesScanCap {
 				break
 			}
 			totalKeys++
 
 			// MEMORY USAGE returns bytes used by the key including metadata.
 			// Err is non-nil if the key doesn't exist (just deleted).
-			mem, err := p.rdb.MemoryUsage(ctx, key).Result()
+			mem, err := rdb.MemoryUsage(ctx, key).Result()
 			if err != nil {
 				// Key was deleted between SCAN and MEMORY USAGE — skip it.
 				if strings.Contains(err.Error(), "ERR") || err == redis.Nil {
@@ -256,16 +288,16 @@ func (p *Provider) StorageBytes(ctx context.Context, token string) (int64, error
 		}
 
 		cursor = nextCursor
-		if cursor == 0 || totalKeys >= storageMaxKeys {
+		if cursor == 0 || totalKeys >= storageBytesScanCap {
 			break
 		}
 	}
 
-	if totalKeys >= storageMaxKeys {
+	if totalKeys >= storageBytesScanCap {
 		slog.Warn("cache.StorageBytes.truncated",
 			"token", token,
 			"keys_scanned", totalKeys,
-			"max_keys", storageMaxKeys,
+			"max_keys", storageBytesScanCap,
 			"impact", "storage_bytes under-reported — tenant exceeds the per-call key ceiling",
 		)
 	}

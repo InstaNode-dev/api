@@ -1,7 +1,6 @@
 package crypto
 
 import (
-	"errors"
 	"fmt"
 	"time"
 
@@ -64,33 +63,26 @@ func SignJWT(secret []byte, claims InstantClaims) (string, error) {
 }
 
 // VerifyJWT parses and verifies an InstantClaims JWT.
-// Errors from the underlying jwt library are returned unwrapped so callers can
-// use errors.Is(err, jwt.ErrTokenExpired) etc.
+// Errors from the underlying jwt library are returned as *jwt.ValidationError
+// so callers can use errors.Is(err, jwt.ErrTokenExpired) etc.
+//
+// jwt/v4 validates exp / iat / nbf in RegisteredClaims.Valid(), so no follow-up
+// time check is needed here. WithValidMethods pins HS256 — any other alg is
+// rejected before the keyfunc runs, so the keyfunc just returns the secret.
+// jwt/v4 ParseWithClaims always returns a *jwt.ValidationError on failure (see
+// parser.go) and Valid=true on success with the concrete claims type we pass —
+// so we don't need a !ok || !parsed.Valid fallback.
 func VerifyJWT(secret []byte, tokenStr string) (*InstantClaims, error) {
 	parsed, err := jwt.ParseWithClaims(tokenStr, &InstantClaims{}, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-		}
 		return secret, nil
 	}, jwt.WithValidMethods([]string{jwtSigningAlg}))
 	if err != nil {
-		// Return jwt.ValidationError directly so callers can use errors.Is
-		// with sentinels like jwt.ErrTokenExpired.
-		var ve *jwt.ValidationError
-		if errors.As(err, &ve) {
-			return nil, ve
-		}
+		// jwt/v4's *jwt.ValidationError implements errors.Is for its bitfield
+		// of sentinels (ErrTokenExpired, ErrTokenNotValidYet, ...), so callers
+		// can do errors.Is(err, jwt.ErrTokenExpired) without unwrapping here.
 		return nil, err
 	}
-	claims, ok := parsed.Claims.(*InstantClaims)
-	if !ok || !parsed.Valid {
-		return nil, &ErrJWTVerify{Cause: fmt.Errorf("invalid token claims")}
-	}
-	// Enforce IssuedAt must not be in the future (jwt/v4 doesn't check iat by default).
-	if claims.IssuedAt != nil && time.Now().UTC().Before(claims.IssuedAt.Time) {
-		return nil, jwt.NewValidationError("token issued in the future", jwt.ValidationErrorIssuedAt)
-	}
-	return claims, nil
+	return parsed.Claims.(*InstantClaims), nil
 }
 
 // SignOnboardingJWT creates a signed HMAC-SHA256 JWT with a 7-day TTL.
@@ -114,27 +106,16 @@ func SignOnboardingJWT(secret []byte, claims OnboardingClaims) (string, string, 
 	return signed, jti, nil
 }
 
-// VerifyOnboardingJWT parses and verifies an onboarding JWT, returning the embedded claims.
+// VerifyOnboardingJWT parses and verifies an onboarding JWT, returning the
+// embedded claims. WithValidMethods pins HS256 and jwt/v4's
+// RegisteredClaims.Valid() handles exp / iat / nbf — see VerifyJWT for the
+// same simplification rationale.
 func VerifyOnboardingJWT(secret []byte, tokenStr string) (*OnboardingClaims, error) {
 	parsed, err := jwt.ParseWithClaims(tokenStr, &OnboardingClaims{}, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-		}
 		return secret, nil
 	}, jwt.WithValidMethods([]string{jwtSigningAlg}))
 	if err != nil {
 		return nil, &ErrJWTVerify{Cause: err}
 	}
-
-	claims, ok := parsed.Claims.(*OnboardingClaims)
-	if !ok || !parsed.Valid {
-		return nil, &ErrJWTVerify{Cause: fmt.Errorf("invalid token claims")}
-	}
-
-	// Enforce IssuedAt must not be in the future (jwt/v4 does not check iat by default).
-	if claims.IssuedAt != nil && time.Now().UTC().Before(claims.IssuedAt.Time) {
-		return nil, jwt.NewValidationError("token issued in the future", jwt.ValidationErrorIssuedAt)
-	}
-
-	return claims, nil
+	return parsed.Claims.(*OnboardingClaims), nil
 }

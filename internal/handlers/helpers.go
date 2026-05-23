@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"crypto/rand"
 	"errors"
 	"strconv"
 
@@ -8,6 +9,13 @@ import (
 	"instant.dev/internal/circuit"
 	"instant.dev/internal/middleware"
 )
+
+// randRead is a package-level indirection over crypto/rand.Read so coverage
+// tests can force the (otherwise practically unreachable) rand.Read error arm
+// of the secure-token generators (generateAppID, generateOAuthState,
+// generateSessionID). It defaults to crypto/rand.Read; production behaviour is
+// byte-for-byte identical.
+var randRead = rand.Read
 
 // init wires the Idempotency middleware's ErrResponseWritten check.
 //

@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/url"
 	"strings"
 	"time"
@@ -58,6 +59,24 @@ import (
 // legitimate request.
 const stackStatusDeleting = "deleting"
 
+// openMultipartFile opens an uploaded multipart file. It is a package-level
+// indirection (defaulting to the real (*multipart.FileHeader).Open) so coverage
+// tests can force the open-but-fail-read and open-error arms of the stack/deploy
+// tarball loops without a real filesystem fault. Production behaviour is
+// identical — the var always holds fh.Open.
+var openMultipartFile = func(fh *multipart.FileHeader) (multipart.File, error) {
+	return fh.Open()
+}
+
+// newK8sStackProvider constructs the k8s-backed StackProvider. It is a
+// package-level indirection (defaulting to k8s.NewStackProvider) so coverage
+// tests can inject a fake without standing up a live cluster and thereby
+// exercise the cfg.ComputeProvider=="k8s" success branch of NewStackHandler.
+// Production behaviour is identical.
+var newK8sStackProvider = func(namespace string, bc k8s.BuildContextConfig) (compute.StackProvider, error) {
+	return k8s.NewStackProvider(namespace, bc)
+}
+
 // StackHandler handles all /stacks endpoints.
 type StackHandler struct {
 	db        *sql.DB
@@ -80,13 +99,22 @@ func (h *StackHandler) SetEmailClient(c email.Mailer) {
 	h.emailClient = c
 }
 
+// SetStackProvider swaps the stack compute backend. Production code never
+// calls this — NewStackHandler selects the backend from config. It exists so
+// coverage tests can inject a compute.StackProvider double and exercise the
+// runStackDeploy / runStackRedeploy failure branches without standing up k8s.
+// Mirrors DeployHandler.SetComputeProvider (keep the constructor stable).
+func (h *StackHandler) SetStackProvider(p compute.StackProvider) {
+	h.stackProv = p
+}
+
 // NewStackHandler initialises the handler and selects the stack compute backend
 // based on cfg.ComputeProvider. Falls back to noop if k8s init fails.
 // planRegistry must be non-nil (use plans.Load at startup or plans.Default() in tests).
 func NewStackHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, planRegistry *plans.Registry) *StackHandler {
 	var sp compute.StackProvider
 	if cfg.ComputeProvider == "k8s" {
-		ksp, err := k8s.NewStackProvider(cfg.KubeNamespaceApps, buildContextConfigFromCfg(cfg))
+		ksp, err := newK8sStackProvider(cfg.KubeNamespaceApps, buildContextConfigFromCfg(cfg))
 		if err != nil {
 			slog.Warn("stack.k8s_provider_unavailable — using noop", "error", err)
 			sp = noop.NewStack()
@@ -479,7 +507,7 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 			return respondError(c, fiber.StatusBadRequest, "missing_tarball",
 				"missing tarball for service: "+name)
 		}
-		f, openErr := fileHeaders[0].Open()
+		f, openErr := openMultipartFile(fileHeaders[0])
 		if openErr != nil {
 			return respondError(c, fiber.StatusBadRequest, "tarball_open_failed",
 				"failed to open tarball for service: "+name)
@@ -1337,7 +1365,7 @@ func (h *StackHandler) Redeploy(c *fiber.Ctx) error {
 			return respondError(c, fiber.StatusBadRequest, "missing_tarball",
 				"missing tarball for service: "+name)
 		}
-		f, openErr := fileHeaders[0].Open()
+		f, openErr := openMultipartFile(fileHeaders[0])
 		if openErr != nil {
 			return respondError(c, fiber.StatusBadRequest, "tarball_open_failed",
 				"failed to open tarball for service: "+name)

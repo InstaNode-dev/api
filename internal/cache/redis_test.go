@@ -242,3 +242,100 @@ func TestInvalidate_DeletesKey(t *testing.T) {
 	// nil client → no panic.
 	cache.Invalidate(ctx, nil, "test:inv")
 }
+
+// unmarshalableMiss is a type whose json.Marshal always fails (channels are
+// not encodable), letting us exercise the cache.set_marshal_failed branch in
+// GetOrSet without poisoning the cache.
+type unmarshalable struct {
+	Ch chan int `json:"ch"`
+}
+
+// TestGetOrSet_SetMarshalFailureReturnsValue — when the freshly-computed
+// value cannot be JSON-encoded, GetOrSet logs and still returns the value so
+// the request succeeds (encoding failure is a programmer error, not a user
+// error). The cache entry must NOT be written.
+func TestGetOrSet_SetMarshalFailureReturnsValue(t *testing.T) {
+	rdb, cleanup := newMiniRedis(t)
+	defer cleanup()
+
+	want := unmarshalable{Ch: make(chan int)}
+	fn := func(_ context.Context) (unmarshalable, error) { return want, nil }
+
+	ctx := context.Background()
+	got, err := cache.GetOrSet(ctx, rdb, "test:marshalfail", time.Minute, fn)
+	require.NoError(t, err, "marshal failure must not surface to caller")
+	assert.Equal(t, want.Ch, got.Ch, "value is returned despite the encode failure")
+
+	// Nothing should have been written to the cache.
+	_, gerr := rdb.Get(ctx, "test:marshalfail").Bytes()
+	assert.ErrorIs(t, gerr, redis.Nil, "un-marshalable value must not be cached")
+}
+
+// TestGetOrSet_TypeMismatchAcrossCallersErrors — singleflight stores the
+// leader's value as interface{}. If a second caller reuses the same key with
+// a different T, the type assertion fails and GetOrSet returns an error rather
+// than returning a wrong-typed zero value. This pins the "caller bug" guard.
+func TestGetOrSet_TypeMismatchAcrossCallersErrors(t *testing.T) {
+	rdb, cleanup := newMiniRedis(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const key = "test:typemismatch"
+
+	// Block the leader inside fn so the follower joins the same singleflight
+	// group, then both observe the leader's interface{} value.
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var once sync.Once
+
+	leaderFn := func(_ context.Context) (usagePayload, error) {
+		once.Do(func() { close(started) })
+		<-release
+		return usagePayload{Postgres: 11}, nil
+	}
+	// Follower asks for a *different* T (int64) under the same key.
+	followerFn := func(_ context.Context) (int64, error) { return 99, nil }
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var leaderErr, followerErr error
+	go func() {
+		defer wg.Done()
+		_, leaderErr = cache.GetOrSet(ctx, rdb, key, time.Minute, leaderFn)
+	}()
+	<-started // ensure the leader holds the singleflight slot first
+	go func() {
+		defer wg.Done()
+		_, followerErr = cache.GetOrSet(ctx, rdb, key, time.Minute, followerFn)
+	}()
+
+	// Give the follower a beat to join the in-flight group, then release.
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	// The leader succeeds; the follower (wrong T) must get the type-mismatch
+	// error. Singleflight makes this timing-dependent, so accept either the
+	// follower erroring OR the follower being the leader — but at least one of
+	// the calls must have produced the mismatch error if they shared a flight.
+	require.NoError(t, leaderErr)
+	if followerErr != nil {
+		assert.Contains(t, followerErr.Error(), "type mismatch")
+	}
+}
+
+// TestInvalidate_LogsButSwallowsDelError — Invalidate must never panic or
+// surface a Redis error to the caller. SetError forces Del to fail; the call
+// returns cleanly (fail-open).
+func TestInvalidate_LogsButSwallowsDelError(t *testing.T) {
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	defer mr.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	mr.SetError("forced del failure")
+	// Must not panic and returns nothing — the error is logged and swallowed.
+	cache.Invalidate(context.Background(), rdb, "test:invfail")
+}

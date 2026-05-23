@@ -50,19 +50,19 @@ jobs:
     if: ${{ vars.INTEGRATION_BACKUP_ENABLED == 'true' }}
     steps:
       - name: Check out api
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: api
       - name: Check out infra (sibling repo with restore-drill.sh)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ github.repository_owner }}/infra
           path: infra
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
       - name: Install kubectl
-        uses: azure/setup-kubectl@v4
+        uses: azure/setup-kubectl@v5
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: api/go.mod
       - name: Materialise drill kubeconfig

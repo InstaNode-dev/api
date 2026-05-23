@@ -245,3 +245,94 @@ func TestBreaker_ErrOpenIsStableSentinel(t *testing.T) {
 		t.Fatal("errors.Is should detect ErrOpen through errors.Join")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// NewBreaker input-clamping + accessors
+// ---------------------------------------------------------------------------
+
+// TestNewBreaker_ClampsInvalidThreshold verifies a threshold < 1 is clamped
+// to 1, so a single failure trips the breaker rather than never tripping.
+func TestNewBreaker_ClampsInvalidThreshold(t *testing.T) {
+	b := NewBreaker("clamp_threshold", 0, time.Second)
+	if got := b.threshold; got != 1 {
+		t.Fatalf("threshold 0 must clamp to 1, got %d", got)
+	}
+	b2 := NewBreaker("clamp_threshold_neg", -5, time.Second)
+	if got := b2.threshold; got != 1 {
+		t.Fatalf("threshold -5 must clamp to 1, got %d", got)
+	}
+}
+
+// TestNewBreaker_ClampsInvalidCooldown verifies a non-positive cooldown is
+// replaced by the 30s default so the breaker never reopens instantly.
+func TestNewBreaker_ClampsInvalidCooldown(t *testing.T) {
+	b := NewBreaker("clamp_cooldown", 3, 0)
+	if got := b.cooldown; got != 30*time.Second {
+		t.Fatalf("cooldown 0 must default to 30s, got %v", got)
+	}
+	b2 := NewBreaker("clamp_cooldown_neg", 3, -time.Minute)
+	if got := b2.cooldown; got != 30*time.Second {
+		t.Fatalf("negative cooldown must default to 30s, got %v", got)
+	}
+}
+
+// TestBreaker_NameReturnsLabel verifies Name() echoes the metric-label name.
+func TestBreaker_NameReturnsLabel(t *testing.T) {
+	b := NewBreaker("name_accessor", 3, time.Second)
+	if got := b.Name(); got != "name_accessor" {
+		t.Fatalf("Name() = %q, want name_accessor", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// State() — all three branches
+// ---------------------------------------------------------------------------
+
+// TestState_ClosedWhenFresh covers the openUntil==0 closed branch.
+func TestState_ClosedWhenFresh(t *testing.T) {
+	b := NewBreaker("state_fresh", 3, time.Second)
+	if got := b.State(); got != StateClosed {
+		t.Fatalf("fresh breaker State() = %v, want StateClosed", got)
+	}
+}
+
+// TestState_HalfOpenAfterCooldown covers the halfOpen==true branch: trip the
+// breaker, wait past cooldown, then Allow() grabs the trial slot moving it to
+// half-open, which State() must report.
+func TestState_HalfOpenAfterCooldown(t *testing.T) {
+	b := NewBreaker("state_halfopen", 1, 20*time.Millisecond)
+	b.Record(errors.New("boom")) // trip → open
+	if got := b.State(); got != StateOpen {
+		t.Fatalf("after trip State() = %v, want StateOpen", got)
+	}
+	time.Sleep(40 * time.Millisecond) // wait out cooldown
+	if !b.Allow() {
+		t.Fatal("Allow() should grant the half-open trial slot after cooldown")
+	}
+	if got := b.State(); got != StateHalfOpen {
+		t.Fatalf("after trial slot State() = %v, want StateHalfOpen", got)
+	}
+}
+
+// TestState_OpenWhileCoolingDown covers the openUntil>now open branch.
+func TestState_OpenWhileCoolingDown(t *testing.T) {
+	b := NewBreaker("state_open", 1, time.Hour)
+	b.Record(errors.New("boom"))
+	if got := b.State(); got != StateOpen {
+		t.Fatalf("during cooldown State() = %v, want StateOpen", got)
+	}
+}
+
+// TestState_OpenAfterCooldownButNoProbeYet covers the final State() branch:
+// cooldown has elapsed but no Allow() has grabbed the trial slot, so the
+// dashboard still treats the breaker as open until something probes it.
+func TestState_OpenAfterCooldownButNoProbeYet(t *testing.T) {
+	b := NewBreaker("state_open_unprobed", 1, 15*time.Millisecond)
+	b.Record(errors.New("boom")) // open, openUntil ≈ now+15ms
+	time.Sleep(35 * time.Millisecond)
+	// Deliberately do NOT call Allow() — halfOpen stays false, openUntil
+	// is non-zero but now > openUntil, hitting the trailing return StateOpen.
+	if got := b.State(); got != StateOpen {
+		t.Fatalf("State() after elapsed cooldown w/o probe = %v, want StateOpen", got)
+	}
+}

@@ -136,6 +136,13 @@ type Portal struct {
 	Cfg *config.Config
 }
 
+// newClientForPortal is the factory used by Portal.client(). It is a
+// package-level variable so unit tests in this package can install a
+// version that points its BaseURL at an httptest.Server mock of the
+// Razorpay API. Production code path is unchanged — the default is
+// NewTimeoutClient verbatim.
+var newClientForPortal = NewTimeoutClient
+
 func (p *Portal) client() (*razorpay.Client, error) {
 	if p.Cfg.RazorpayKeyID == "" || p.Cfg.RazorpayKeySecret == "" {
 		return nil, fmt.Errorf("billing not configured")
@@ -143,7 +150,7 @@ func (p *Portal) client() (*razorpay.Client, error) {
 	// P0-2: 30s HTTP timeout via ApplyHTTPTimeout — never the bare SDK
 	// default (10s) which is below Razorpay's documented p99 for
 	// subscription create.
-	return NewTimeoutClient(p.Cfg.RazorpayKeyID, p.Cfg.RazorpayKeySecret), nil
+	return newClientForPortal(p.Cfg.RazorpayKeyID, p.Cfg.RazorpayKeySecret), nil
 }
 
 // SubscriptionID returns the Razorpay subscription id stored on the team (stripe_customer_id column).

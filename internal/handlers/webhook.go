@@ -122,6 +122,12 @@ func (h *WebhookHandler) webhookMaxStored(tier string) int64 {
 	return int64(n)
 }
 
+// cryptoEncrypt is a package-level indirection over crypto.Encrypt so a test
+// can drive storeEncryptedURL's encrypt-failed branch. AES-256-GCM encryption
+// with a valid key essentially never fails in production, so a seam is the
+// only deterministic way to cover that defensive arm.
+var cryptoEncrypt = crypto.Encrypt
+
 // WebhookHandler handles POST /webhook/new, POST /webhook/receive/:token,
 // and GET /api/v1/webhooks/:token/requests.
 type WebhookHandler struct {
@@ -901,7 +907,7 @@ func (h *WebhookHandler) storeEncryptedURL(ctx context.Context, resourceID uuid.
 	if err != nil {
 		return fmt.Errorf("storeEncryptedURL: parse key: %w", err)
 	}
-	encrypted, err := crypto.Encrypt(aesKey, rURL)
+	encrypted, err := cryptoEncrypt(aesKey, rURL)
 	if err != nil {
 		return fmt.Errorf("storeEncryptedURL: encrypt: %w", err)
 	}

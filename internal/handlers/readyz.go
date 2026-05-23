@@ -238,7 +238,7 @@ func (h *ReadyzHandler) customerDBCheck() readiness.CheckFunc {
 		if dsn == "" {
 			return readiness.CheckResult{Status: readiness.StatusFailed, LastError: "customer_db_not_configured"}
 		}
-		db, err := sql.Open("postgres", dsn)
+		db, err := readyzSQLOpen("postgres", dsn)
 		if err != nil {
 			return readiness.CheckResult{Status: readiness.StatusFailed, LastError: "open_failed"}
 		}
@@ -251,6 +251,12 @@ func (h *ReadyzHandler) customerDBCheck() readiness.CheckFunc {
 		return readiness.CheckResult{Status: readiness.StatusOK}
 	}
 }
+
+// readyzSQLOpen is a seam over sql.Open for the customer-DB readiness check.
+// lib/pq's Open is fully lazy and never errors on a DSN, so the open-failure
+// arm of customerDBCheck (a defensive guard for a future eager driver) is
+// only reachable in tests via this var.
+var readyzSQLOpen = sql.Open
 
 // redisPinger adapts *redis.Client to the readiness.Pinger interface.
 // We keep the adapter in this file (not common/) so common/ doesn't

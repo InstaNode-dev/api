@@ -56,6 +56,15 @@ func New(natsHost string) *Provider {
 	}
 }
 
+// monitorHealthURL builds the NATS monitoring /healthz URL for a host. It is a
+// package var (not a method) purely as a test seam: tests point it at an
+// httptest.Server so the reachable/healthy and unhealthy-status branches of
+// Provision can be exercised without a real NATS pod. Production keeps the real
+// "http://{host}:8222/healthz" form.
+var monitorHealthURL = func(natsHost string) string {
+	return fmt.Sprintf("http://%s:8222/healthz", natsHost)
+}
+
 // Provision verifies NATS is reachable and returns a connection URL for the token.
 //
 // NATS runs without authentication — the returned URL requires no credentials.
@@ -64,7 +73,7 @@ func New(natsHost string) *Provider {
 // principle: never return a URL for a server that isn't running).
 func (p *Provider) Provision(ctx context.Context, token, tier string) (*Credentials, error) {
 	// Verify NATS is reachable via monitoring API.
-	monitorURL := fmt.Sprintf("http://%s:8222/healthz", p.natsHost)
+	monitorURL := monitorHealthURL(p.natsHost)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, monitorURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("queue.Provision: build health request: %w", err)

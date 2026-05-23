@@ -10,12 +10,28 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"google.golang.org/grpc/credentials"
+)
+
+// newExporter / newResource are package-level indirections over the OTel
+// constructors so tests can override them to drive the otherwise-unreachable
+// constructor-failure arms in InitTracer. Production behaviour is identical:
+// they are plain forwards to otlptracegrpc.New / resource.New. Do NOT change
+// the wired constructors (P0-2 OTel tracing contract) — these seams only let
+// a test substitute an erroring stub.
+var (
+	newExporter = func(ctx context.Context, opts ...otlptracegrpc.Option) (*otlptrace.Exporter, error) {
+		return otlptracegrpc.New(ctx, opts...)
+	}
+	newResource = func(ctx context.Context, opts ...resource.Option) (*resource.Resource, error) {
+		return resource.New(ctx, opts...)
+	}
 )
 
 // InitTracer configures the global OpenTelemetry tracer provider.
@@ -90,13 +106,13 @@ func InitTracer(serviceName, otlpEndpoint string) func(context.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	exporter, err := otlptracegrpc.New(ctx, opts...)
+	exporter, err := newExporter(ctx, opts...)
 	if err != nil {
 		slog.Error("telemetry.otlp_exporter_failed", "error", err, "endpoint", ep, "tls", useTLS)
 		return func(context.Context) error { return nil }
 	}
 
-	res, err := resource.New(ctx,
+	res, err := newResource(ctx,
 		resource.WithAttributes(semconv.ServiceName(serviceName)),
 	)
 	if err != nil {
