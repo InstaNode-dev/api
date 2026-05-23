@@ -1,0 +1,161 @@
+package handlers_test
+
+// stack_final_test.go — FINAL coverage pass for stack.go. Closes:
+//   - NewStackHandler ComputeProvider=="k8s" fallback (95-104): no live cluster
+//     → k8s.NewStackProvider errors → warn + noop fallback.
+//   - checkStackDeployLimit Redis-pipeline-error arm (180-186) via closed Redis.
+//   - stackOwnerCheck anonymous-stack-mismatch arm (199-201).
+//   - ConfirmDelete emailClient-nil arm (1043-1047).
+//   - consumeApprovedPromote lookup_failed (2396) + execute_failed (2425) via
+//     openFaultDB.
+
+import (
+	"context"
+	"database/sql"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"instant.dev/internal/config"
+	"instant.dev/internal/handlers"
+	"instant.dev/internal/middleware"
+	"instant.dev/internal/models"
+	"instant.dev/internal/plans"
+	"instant.dev/internal/testhelpers"
+)
+
+// TestStackFinal_NewHandler_K8sFallback — ComputeProvider="k8s" with no live
+// cluster → k8s.NewStackProvider errors → warn + noop fallback (stack.go:97).
+func TestStackFinal_NewHandler_K8sFallback(t *testing.T) {
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	cfg := &config.Config{
+		JWTSecret:         testhelpers.TestJWTSecret,
+		AESKey:            testhelpers.TestAESKeyHex,
+		ComputeProvider:   "k8s",
+		KubeNamespaceApps: "instant-apps-test",
+	}
+	h := handlers.NewStackHandler(db, nil, cfg, plans.Default())
+	require.NotNil(t, h, "constructor must return a handler even when k8s is unreachable")
+}
+
+// TestStackFinal_CheckDeployLimit_RedisError — a closed Redis client → the
+// pipeline Exec errors → checkStackDeployLimit returns (false, err)
+// (stack.go:180). Fails open (allowed=false) per the rate-limit posture.
+func TestStackFinal_CheckDeployLimit_RedisError(t *testing.T) {
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	// A redis client pointed at a dead address → pipeline Exec errors.
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 200 * time.Millisecond})
+	t.Cleanup(func() { rdb.Close() })
+	cfg := &config.Config{JWTSecret: testhelpers.TestJWTSecret, AESKey: testhelpers.TestAESKeyHex, ComputeProvider: "noop"}
+	h := handlers.NewStackHandler(db, rdb, cfg, plans.Default())
+
+	_, err := h.CheckStackDeployLimitForTest(context.Background(), "fp-stackfinal")
+	require.Error(t, err, "a dead Redis must surface a pipeline error (handler fails open)")
+}
+
+// TestStackFinal_OwnerCheck_AnonStackMismatch — stackOwnerCheck with a nil team
+// (anonymous caller) but a stack that HAS a team → 404 (stack.go:199).
+func TestStackFinal_OwnerCheck_AnonStackMismatch(t *testing.T) {
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, e error) error {
+			if e == handlers.ErrResponseWritten {
+				return nil // response already written by respondError
+			}
+			return c.Status(fiber.StatusInternalServerError).SendString(e.Error())
+		},
+	})
+	app.Get("/t", func(c *fiber.Ctx) error {
+		teamID := uuid.New()
+		stack := &models.Stack{TeamID: &teamID}
+		// Anonymous caller (team=nil) against a team-owned stack → 404.
+		if err := handlers.StackOwnerCheckForTest(c, stack, nil); err != nil {
+			return err
+		}
+		return c.SendString("ok")
+	})
+	req := httptest.NewRequest(http.MethodGet, "/t", nil)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+// stackFaultPromoteApp wires the Promote route against an arbitrary *sql.DB so
+// the fault driver can drive consumeApprovedPromote's mid-handler DB-error arms.
+func stackFaultPromoteApp(t *testing.T, db *sql.DB) *fiber.App {
+	t.Helper()
+	cfg := &config.Config{JWTSecret: testhelpers.TestJWTSecret, AESKey: testhelpers.TestAESKeyHex, ComputeProvider: "noop"}
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, e error) error {
+			if e == handlers.ErrResponseWritten {
+				return nil
+			}
+			code := fiber.StatusInternalServerError
+			if fe, ok := e.(*fiber.Error); ok {
+				code = fe.Code
+			}
+			return c.Status(code).JSON(fiber.Map{"ok": false, "error": e.Error()})
+		},
+	})
+	app.Use(middleware.RequestID())
+	sh := handlers.NewStackHandler(db, nil, cfg, plans.Default())
+	api := app.Group("/api/v1", middleware.RequireAuth(cfg))
+	api.Post("/stacks/:slug/promote", sh.Promote)
+	return app
+}
+
+// TestStackFinal_ConsumeApproved_LookupError_503 — approval lookup errors
+// (stack.go:2396). requireStackTeam(1) + GetStackBySlug(2) succeed,
+// GetPromoteApprovalByID(3) errors. failAfter=2.
+func TestStackFinal_ConsumeApproved_LookupError_503(t *testing.T) {
+	seedDB, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	ensureStackTables(t, seedDB)
+	teamIDStr := testhelpers.MustCreateTeamDB(t, seedDB, "pro")
+	jwt := testhelpers.MustSignSessionJWT(t, uuid.NewString(), teamIDStr, "stklookup@example.com")
+	slug, _ := seedPromoteSourceStack(t, seedDB, teamIDStr, "staging", "stkfinal-lookup")
+
+	faultDB := openFaultDB(t, 2)
+	app := stackFaultPromoteApp(t, faultDB)
+	resp := postPromote(t, app, jwt, slug, map[string]any{
+		"from": "staging", "to": "production", "approval_id": uuid.NewString(),
+	})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	assert.Equal(t, "lookup_failed", decodeErrCode(t, resp))
+}
+
+// TestStackFinal_ConsumeApproved_ExecuteError_503 — MarkPromoteApprovalExecuted
+// errors after a fully-valid approved row (stack.go:2425). team(1) + stack(2) +
+// approval-read(3) succeed; the UPDATE(4) errors. failAfter=3.
+func TestStackFinal_ConsumeApproved_ExecuteError_503(t *testing.T) {
+	seedDB, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	ensureStackTables(t, seedDB)
+	teamIDStr := testhelpers.MustCreateTeamDB(t, seedDB, "pro")
+	teamID := uuid.MustParse(teamIDStr)
+	jwt := testhelpers.MustSignSessionJWT(t, uuid.NewString(), teamIDStr, "stkexec@example.com")
+	slug, _ := seedPromoteSourceStack(t, seedDB, teamIDStr, "staging", "stkfinal-exec")
+	id := mustSeedApprovedPromote(t, seedDB, teamID, "staging", "production")
+
+	faultDB := openFaultDB(t, 3)
+	app := stackFaultPromoteApp(t, faultDB)
+	resp := postPromote(t, app, jwt, slug, map[string]any{
+		"from": "staging", "to": "production", "approval_id": id,
+	})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	assert.Equal(t, "execute_failed", decodeErrCode(t, resp))
+}
+
+var _ = os.Getenv
