@@ -389,8 +389,5 @@ func looksLikeEmail(s string) bool {
 		return false
 	}
 	host := s[at+1:]
-	if !strings.Contains(host, ".") {
-		return false
-	}
-	return true
+	return strings.Contains(host, ".")
 }

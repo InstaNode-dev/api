@@ -61,10 +61,6 @@ const (
 // editing an inline string in one call site only.
 
 const (
-	// capNetBindService is the only Linux capability we re-add after dropping ALL.
-	// It allows customer apps to bind ports < 1024 (e.g. 80/443) without root.
-	capNetBindService = corev1.Capability("NET_BIND_SERVICE")
-
 	// seccompRuntimeDefault requests the container runtime's default seccomp
 	// profile (equivalent to Docker's default profile on most runtimes).
 	seccompRuntimeDefault = corev1.SeccompProfileTypeRuntimeDefault

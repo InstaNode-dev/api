@@ -755,8 +755,8 @@ func (h *AdminCustomersHandler) cancelOnDemote(c *fiber.Ctx, teamID uuid.UUID, t
 		SubscriptionID: subID,
 	}
 
-	switch {
-	case subID == "":
+	switch subID {
+	case "":
 		// No subscription on file. Still emit an audit row so the BI/Loops
 		// consumer sees the demote transition uniformly — but with
 		// cancel_attempted=false so the email template knows nothing was

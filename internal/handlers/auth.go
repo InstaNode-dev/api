@@ -171,10 +171,11 @@ func emitAuthLoginAudit(db *sql.DB, teamID, userID uuid.UUID, email, provider, i
 	// c.Get("User-Agent") results, whose backing bytes live inside the
 	// fasthttp request Ctx. fiber recycles that Ctx into a pool the instant
 	// the handler returns, so the background goroutine below MUST read
-	// heap-owned copies, never aliases into the recycled Ctx. email/provider
-	// are already heap-owned (DB column / package const) but cloned for
-	// symmetry; teamID/userID are value types.
-	email = strings.Clone(email)
+	// heap-owned copies, never aliases into the recycled Ctx. provider is
+	// already heap-owned (DB column / package const) but cloned for symmetry;
+	// teamID/userID are value types. email is accepted for call-site symmetry
+	// but is not read in the background goroutine below, so it is intentionally
+	// not cloned (cloning it was an ineffectual assignment).
 	provider = strings.Clone(provider)
 	ip = strings.Clone(ip)
 	userAgent = strings.Clone(userAgent)

@@ -367,7 +367,9 @@ func TestEmitDeployAuditSelfReport_DBErrorIsSwallowed(t *testing.T) {
 // the documented error-returning contract that main() depends on.
 func TestRun_IsErrorReturning(t *testing.T) {
 	// Documents the seam contract relied on by main(): run returns an error.
-	var fn func() error = run
+	// fn's type is inferred from run, which is declared func() error in run.go —
+	// the assignment below would not compile if that contract changed.
+	var fn = run
 	require.NotNil(t, fn)
 	// envProduction sanity — run()'s plans branch keys off it.
 	require.True(t, strings.EqualFold(envProduction, "production"))

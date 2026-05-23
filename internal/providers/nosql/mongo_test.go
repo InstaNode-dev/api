@@ -72,9 +72,8 @@ func cleanupMongo(t *testing.T, uri, token string) {
 func TestMongoProvider_Provision_Success(t *testing.T) {
 	uri := requireMongo(t)
 	host := mongoHost(uri)
-	token := "test-prov-success-" + t.Name()
 	// Use a short safe token for MongoDB username limits.
-	token = "provok123"
+	token := "provok123"
 	defer cleanupMongo(t, uri, token)
 
 	p := nosqlprovider.New(uri, host)

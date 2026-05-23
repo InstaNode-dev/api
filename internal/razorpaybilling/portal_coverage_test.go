@@ -59,7 +59,7 @@ func installMockFactory(t *testing.T, srv *httptest.Server) {
 	orig := newClientForPortal
 	newClientForPortal = func(keyID, secret string) *razorpay.Client {
 		c := razorpay.NewClient(keyID, secret)
-		c.Request.BaseURL = srv.URL
+		c.BaseURL = srv.URL
 		// Tight test timeout — production code uses 30s but tests should
 		// fail fast on a misconfigured mock.
 		c.Request.SetTimeout(5)
@@ -208,7 +208,7 @@ func TestClient_ConfiguredReturnsClient(t *testing.T) {
 	if c == nil {
 		t.Fatal("client nil")
 	}
-	if got := c.Request.HTTPClient.Timeout; got != 30*time.Second {
+	if got := c.HTTPClient.Timeout; got != 30*time.Second {
 		t.Errorf("client timeout = %s; want 30s", got)
 	}
 }
@@ -1245,7 +1245,7 @@ func TestZ_SingletonBreakerOpensAndRejects(t *testing.T) {
 	orig := newClientForPortal
 	newClientForPortal = func(keyID, secret string) *razorpay.Client {
 		c := razorpay.NewClient(keyID, secret)
-		c.Request.BaseURL = srv.URL
+		c.BaseURL = srv.URL
 		c.Request.SetTimeout(5)
 		return c
 	}

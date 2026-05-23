@@ -108,6 +108,9 @@ func notesAppWithDB(t *testing.T, db *sql.DB, callerEmail string) *fiber.App {
 func TestAdminNotes_CreateFailed_Sqlmock(t *testing.T) {
 	t.Setenv("ADMIN_EMAILS", adminCallerEmail)
 	db, mock, err := sqlmockNewRegexp(t)
+	if err != nil {
+		t.Fatalf("sqlmockNewRegexp: %v", err)
+	}
 	defer db.Close()
 	tid := uuid.New()
 	mock.ExpectQuery(`SELECT .* FROM teams WHERE id`).WithArgs(tid).WillReturnRows(adminTeamRow(tid, "hobby"))
