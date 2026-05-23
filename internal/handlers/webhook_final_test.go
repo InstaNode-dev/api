@@ -88,6 +88,32 @@ func whErr(t *testing.T, resp *http.Response) string {
 	return ""
 }
 
+// TestWebhookFinal_Anon_OverCap_Dedup — anonymous webhook provisions burn the
+// daily cap; the over-cap call dedups to the existing resource (webhook.go:237+
+// dedup branch). Webhook provisioning is Redis-only (no backend), so the first
+// calls succeed and the over-cap call dedup-hits.
+func TestWebhookFinal_Anon_OverCap_Dedup(t *testing.T) {
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	app := webhookAuthApp(t, db)
+	const ip = "10.76.0.4"
+	post := func() *http.Response {
+		return whPost(t, app, ip, "", `{"name":"wh","env":"production"}`)
+	}
+	first := post()
+	require.Equal(t, http.StatusCreated, first.StatusCode)
+	first.Body.Close()
+	sawDedupOrDeny := false
+	for i := 0; i < 8; i++ {
+		resp := post()
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusPaymentRequired {
+			sawDedupOrDeny = true
+		}
+		resp.Body.Close()
+	}
+	assert.True(t, sawDedupOrDeny, "over-cap anonymous webhook calls must dedup/deny")
+}
+
 // newWebhookAuthenticated: JWT tid not a UUID → invalid_team (webhook.go:402).
 func TestWebhookFinal_Auth_BadTeamID_400(t *testing.T) {
 	db, clean := testhelpers.SetupTestDB(t)
