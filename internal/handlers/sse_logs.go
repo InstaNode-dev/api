@@ -51,7 +51,7 @@ const sseEndMarker = "data: [end]\n\n"
 //     connection leak on an idle follow=true tail.
 func streamLogsSSE(w *bufio.Writer, logStream io.ReadCloser, cancel func()) {
 	defer cancel()
-	defer logStream.Close()
+	defer func() { _ = logStream.Close() }()
 
 	scanner := bufio.NewScanner(logStream)
 	for scanner.Scan() {

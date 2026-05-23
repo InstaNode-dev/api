@@ -229,7 +229,7 @@ func ListBackupsByResource(ctx context.Context, db *sql.DB, resourceID uuid.UUID
 	if err != nil {
 		return nil, fmt.Errorf("models.ListBackupsByResource: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]*ResourceBackup, 0)
 	for rows.Next() {
@@ -325,7 +325,7 @@ func ListRestoresByResource(ctx context.Context, db *sql.DB, resourceID uuid.UUI
 	if err != nil {
 		return nil, fmt.Errorf("models.ListRestoresByResource: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]*ResourceRestore, 0)
 	for rows.Next() {

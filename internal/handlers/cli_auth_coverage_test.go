@@ -336,7 +336,8 @@ func TestCLI_GenerateSessionID_HexShape(t *testing.T) {
 	assert.NotEqual(t, a, b, "two consecutive session ids must differ")
 	// Every char must be lower-case hex.
 	for i, r := range a {
-		if !(r >= '0' && r <= '9') && !(r >= 'a' && r <= 'f') {
+		isHex := (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')
+		if !isHex {
 			t.Errorf("session id contains non-hex byte at idx %d: %q", i, r)
 		}
 	}

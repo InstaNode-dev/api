@@ -127,7 +127,7 @@ func ListRBACInvitations(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]R
 	if err != nil {
 		return nil, fmt.Errorf("models.ListRBACInvitations: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []RBACInvitation
 	for rows.Next() {

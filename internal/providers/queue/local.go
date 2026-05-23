@@ -82,7 +82,7 @@ func (p *Provider) Provision(ctx context.Context, token, tier string) (*Credenti
 	if err != nil {
 		return nil, fmt.Errorf("queue.Provision: NATS health check failed (%s): %w — is the NATS pod running?", monitorURL, err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close() // health check only reads StatusCode; body discarded
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("queue.Provision: NATS unhealthy (HTTP %d from %s)", resp.StatusCode, monitorURL)
 	}

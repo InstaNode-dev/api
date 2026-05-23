@@ -242,7 +242,7 @@ func (h *ReadyzHandler) customerDBCheck() readiness.CheckFunc {
 		if err != nil {
 			return readiness.CheckResult{Status: readiness.StatusFailed, LastError: "open_failed"}
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 		db.SetMaxOpenConns(1)
 		db.SetMaxIdleConns(0)
 		if err := db.PingContext(callCtx); err != nil {

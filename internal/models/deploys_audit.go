@@ -207,7 +207,7 @@ func ListDeploys(ctx context.Context, db *sql.DB, p ListDeploysParams) ([]*Deplo
 	if err != nil {
 		return nil, fmt.Errorf("models.ListDeploys: query: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]*DeployAudit, 0, limit)
 	for rows.Next() {

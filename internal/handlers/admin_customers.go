@@ -326,7 +326,7 @@ func (h *AdminCustomersHandler) List(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "db_failed",
 			"Failed to list customers")
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]CustomerListItem, 0, limit)
 	var total int
@@ -481,13 +481,13 @@ func (h *AdminCustomersHandler) Detail(c *fiber.Ctx) error {
 		var u CustomerDetailUser
 		var id uuid.UUID
 		if err := userRows.Scan(&id, &u.Email, &u.Role, &u.CreatedAt); err != nil {
-			userRows.Close()
+			_ = userRows.Close() // result set fully consumed; close error irrelevant
 			return respondError(c, fiber.StatusServiceUnavailable, "db_failed", "Failed to scan user row")
 		}
 		u.ID = id.String()
 		out.Users = append(out.Users, u)
 	}
-	userRows.Close()
+	_ = userRows.Close() // result set fully consumed; close error irrelevant
 
 	// Resource summary.
 	resRows, err := h.db.QueryContext(c.Context(), `
@@ -504,12 +504,12 @@ func (h *AdminCustomersHandler) Detail(c *fiber.Ctx) error {
 	for resRows.Next() {
 		var rs CustomerDetailResourceSummary
 		if err := resRows.Scan(&rs.ResourceType, &rs.Count, &rs.StorageBytes); err != nil {
-			resRows.Close()
+			_ = resRows.Close() // result set fully consumed; close error irrelevant
 			return respondError(c, fiber.StatusServiceUnavailable, "db_failed", "Failed to scan resource row")
 		}
 		out.Resources = append(out.Resources, rs)
 	}
-	resRows.Close()
+	_ = resRows.Close() // result set fully consumed; close error irrelevant
 
 	// Deployment count.
 	deployCount, err := models.CountActiveDeploymentsByTeam(c.Context(), h.db, teamID)
@@ -536,7 +536,7 @@ func (h *AdminCustomersHandler) Detail(c *fiber.Ctx) error {
 		var id uuid.UUID
 		var meta sql.NullString
 		if err := auditRows.Scan(&id, &ai.Actor, &ai.Kind, &ai.Summary, &meta, &ai.CreatedAt); err != nil {
-			auditRows.Close()
+			_ = auditRows.Close() // result set fully consumed; close error irrelevant
 			return respondError(c, fiber.StatusServiceUnavailable, "db_failed", "Failed to scan audit row")
 		}
 		ai.ID = id.String()
@@ -545,7 +545,7 @@ func (h *AdminCustomersHandler) Detail(c *fiber.Ctx) error {
 		}
 		out.RecentAudit = append(out.RecentAudit, ai)
 	}
-	auditRows.Close()
+	_ = auditRows.Close() // result set fully consumed; close error irrelevant
 
 	return c.JSON(fiber.Map{
 		"ok":       true,

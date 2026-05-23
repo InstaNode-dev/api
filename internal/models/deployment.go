@@ -355,7 +355,7 @@ func GetDeploymentsByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]
 	if err != nil {
 		return nil, fmt.Errorf("models.GetDeploymentsByTeam: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []*Deployment
 	for rows.Next() {
@@ -390,7 +390,7 @@ func GetDeploymentsByTeamAndEnv(ctx context.Context, db *sql.DB, teamID uuid.UUI
 	if err != nil {
 		return nil, fmt.Errorf("models.GetDeploymentsByTeamAndEnv: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []*Deployment
 	for rows.Next() {
@@ -602,7 +602,7 @@ func GetDeploymentsExpiringSoon(ctx context.Context, db *sql.DB, window, reminde
 	if err != nil {
 		return nil, fmt.Errorf("models.GetDeploymentsExpiringSoon: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var results []*Deployment
 	for rows.Next() {
 		d, err := scanDeployment(rows)
@@ -672,7 +672,7 @@ func GetExpiredDeployments(ctx context.Context, db *sql.DB, limit int) ([]*Deplo
 	if err != nil {
 		return nil, fmt.Errorf("models.GetExpiredDeployments: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var results []*Deployment
 	for rows.Next() {
 		d, err := scanDeployment(rows)
@@ -817,7 +817,7 @@ func GetExpiredDeploymentsAwaitingTeardown(ctx context.Context, tx *sql.Tx, limi
 	if err != nil {
 		return nil, fmt.Errorf("models.GetExpiredDeploymentsAwaitingTeardown: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var results []*Deployment
 	for rows.Next() {
 		d, err := scanDeployment(rows)

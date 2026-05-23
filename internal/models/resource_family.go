@@ -87,7 +87,7 @@ func GetResourceFamily(ctx context.Context, db *sql.DB, id uuid.UUID) ([]*Resour
 	if err != nil {
 		return nil, fmt.Errorf("models.GetResourceFamily: fetch: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []*Resource
 	for rows.Next() {
@@ -144,7 +144,7 @@ func ListResourceFamiliesByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUI
 	if err != nil {
 		return nil, fmt.Errorf("models.ListResourceFamiliesByTeam: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	// Group by family root id. root_id = parent_resource_id when set,
 	// else the row's own id.

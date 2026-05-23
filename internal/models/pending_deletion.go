@@ -314,7 +314,7 @@ func ExpireOldPendingDeletions(ctx context.Context, db *sql.DB) ([]ExpiredPendin
 	if err != nil {
 		return nil, fmt.Errorf("ExpireOldPendingDeletions: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []ExpiredPendingDeletion
 	for rows.Next() {

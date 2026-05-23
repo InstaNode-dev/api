@@ -242,7 +242,7 @@ func CountAndEnqueueGitHubDeployLocked(
 	if err != nil {
 		return uuid.Nil, err
 	}
-	defer tx.Rollback() //nolint:errcheck — no-op after a successful Commit
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck — no-op after a successful Commit
 
 	// Serialize all concurrent webhook deliveries for this connection.
 	var locked uuid.UUID

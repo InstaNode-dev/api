@@ -503,7 +503,7 @@ func exchangeGitHubCode(ctx context.Context, clientID, clientSecret, code string
 	if err != nil {
 		return nil, fmt.Errorf("github token exchange: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var tokenResp struct {
 		AccessToken string `json:"access_token"`
@@ -525,7 +525,7 @@ func exchangeGitHubCode(ctx context.Context, clientID, clientSecret, code string
 	if err != nil {
 		return nil, fmt.Errorf("github user fetch: %w", err)
 	}
-	defer userResp.Body.Close()
+	defer func() { _ = userResp.Body.Close() }()
 
 	var profile struct {
 		ID    int    `json:"id"`
@@ -542,7 +542,7 @@ func exchangeGitHubCode(ctx context.Context, clientID, clientSecret, code string
 		emailReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
 		emailResp, err := client.Do(emailReq)
 		if err == nil {
-			defer emailResp.Body.Close()
+			defer func() { _ = emailResp.Body.Close() }()
 			body, _ := io.ReadAll(emailResp.Body)
 			var emails []struct {
 				Email    string `json:"email"`
@@ -669,7 +669,7 @@ func verifyGoogleIDToken(ctx context.Context, clientID, idToken string) (*google
 	if err != nil {
 		return nil, fmt.Errorf("google token verify: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("google token invalid (status %d)", resp.StatusCode)
@@ -718,7 +718,7 @@ func exchangeGoogleAuthorizationCode(ctx context.Context, clientID, clientSecret
 	if err != nil {
 		return "", fmt.Errorf("google token exchange: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var tokenResp struct {
 		AccessToken string `json:"access_token"`
@@ -749,7 +749,7 @@ func fetchGoogleUserInfoOAuth2V2(ctx context.Context, accessToken string) (*goog
 	if err != nil {
 		return nil, fmt.Errorf("google userinfo: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

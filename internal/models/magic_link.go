@@ -200,7 +200,7 @@ func ListMagicLinksForReconcile(ctx context.Context, db *sql.DB, before time.Tim
 	if err != nil {
 		return nil, fmt.Errorf("models.ListMagicLinksForReconcile: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []MagicLinkReconcileRow
 	for rows.Next() {

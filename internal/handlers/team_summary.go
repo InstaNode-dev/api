@@ -172,7 +172,7 @@ func (h *TeamSummaryHandler) countResourcesByType(ctx context.Context, teamID uu
 	if err != nil {
 		return out, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var t string

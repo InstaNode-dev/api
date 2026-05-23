@@ -471,7 +471,7 @@ func (p *brevoProvider) Send(ctx context.Context, to, subject, plainText, htmlBo
 		)
 		return fmt.Errorf("email.brevo.do: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Brevo: 201 Created on success. 400 surfaces sender-not-verified, 401
 	// is bad api-key, 4xx generally are payload problems. Surface the
