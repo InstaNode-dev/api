@@ -133,10 +133,7 @@ func LookupCodeToAgentActionForTest(code string) (CodeToAgentActionMetaForTest, 
 	if !ok {
 		return CodeToAgentActionMetaForTest{}, false
 	}
-	return CodeToAgentActionMetaForTest{
-		AgentAction: meta.AgentAction,
-		UpgradeURL:  meta.UpgradeURL,
-	}, true
+	return CodeToAgentActionMetaForTest(meta), true
 }
 
 // VerifyRazorpayTimestampForTest re-exports the unexported timestamp-window

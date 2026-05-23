@@ -46,7 +46,7 @@ func TestFailureHintMap_AllReasonsHaveHints(t *testing.T) {
 func TestHintForReason_KnownReasons(t *testing.T) {
 	for _, reason := range knownReasons {
 		got := HintForReason(reason)
-		want, _ := FailureHint[reason]
+		want := FailureHint[reason]
 		if got != want {
 			t.Errorf("HintForReason(%q) = %q, want %q", reason, got, want)
 		}

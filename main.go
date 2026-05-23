@@ -127,7 +127,7 @@ func run() (runErr error) {
 	slog.SetDefault(slog.New(middleware.NewLogScrubber(ctxH, cfg.AdminPathPrefix)))
 
 	database := connectPostgres(cfg.DatabaseURL)
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 
 	if err := runMigrations(database); err != nil {
 		slog.Error("main.migrations_failed", "error", err)
@@ -155,14 +155,14 @@ func run() (runErr error) {
 	emitDeployAuditSelfReport(database)
 
 	rdb := connectRedis(cfg.RedisURL)
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 
 	geoDbs := loadGeoLite2(cfg.GeoLite2DBPath)
 	if geoDbs != nil && geoDbs.City != nil {
-		defer geoDbs.City.Close()
+		defer func() { _ = geoDbs.City.Close() }()
 	}
 	if geoDbs != nil && geoDbs.ASN != nil {
-		defer geoDbs.ASN.Close()
+		defer func() { _ = geoDbs.ASN.Close() }()
 	}
 
 	emailClient := email.New(email.Config{
@@ -209,7 +209,7 @@ func run() (runErr error) {
 			slog.Error("main.provisioner_connect_failed", "error", err)
 			return fmt.Errorf("provisioner connect: %w", err)
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		slog.Info("main.provisioner_connected", "addr", cfg.ProvisionerAddr)
 	} else {
 		slog.Info("main.provisioner_local", "note", "PROVISIONER_ADDR not set, using local providers")

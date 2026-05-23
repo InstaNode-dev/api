@@ -513,7 +513,7 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 				"failed to open tarball for service: "+name)
 		}
 		data, readErr := io.ReadAll(f)
-		f.Close()
+		_ = f.Close() // read-only: data already in memory
 		if readErr != nil {
 			return respondError(c, fiber.StatusBadRequest, "tarball_read_failed",
 				"failed to read tarball for service: "+name)
@@ -1371,7 +1371,7 @@ func (h *StackHandler) Redeploy(c *fiber.Ctx) error {
 				"failed to open tarball for service: "+name)
 		}
 		data, readErr := io.ReadAll(f)
-		f.Close()
+		_ = f.Close() // read-only: data already in memory
 		if readErr != nil {
 			return respondError(c, fiber.StatusBadRequest, "tarball_read_failed",
 				"failed to read tarball for service: "+name)

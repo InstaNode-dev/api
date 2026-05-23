@@ -88,7 +88,7 @@ func FindUnresolvedPendingCheckouts(ctx context.Context, db *sql.DB, teamID uuid
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []PendingCheckout
 	for rows.Next() {
 		var pc PendingCheckout

@@ -80,7 +80,7 @@ func ListTeamMembers(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]TeamM
 	if err != nil {
 		return nil, fmt.Errorf("models.ListTeamMembers: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []TeamMember
 	for rows.Next() {
@@ -206,7 +206,7 @@ func ListInvitations(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]TeamI
 	if err != nil {
 		return nil, fmt.Errorf("models.ListInvitations: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []TeamInvitation
 	for rows.Next() {

@@ -163,7 +163,7 @@ type sessionClaims struct {
 // iat-in-future errors cause spurious 401s when there is any sub-second clock
 // skew between the token issuer and the API server. exp still enforces expiry.
 func (c sessionClaims) Valid() error {
-	c.RegisteredClaims.IssuedAt = nil
+	c.IssuedAt = nil
 	return c.RegisteredClaims.Valid()
 }
 

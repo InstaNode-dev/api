@@ -329,7 +329,7 @@ func ListPromoteApprovals(ctx context.Context, db *sql.DB, p ListPromoteApproval
 	if err != nil {
 		return nil, fmt.Errorf("models.ListPromoteApprovals: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]*PromoteApproval, 0)
 	for rows.Next() {

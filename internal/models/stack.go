@@ -271,7 +271,7 @@ func GetStacksByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) ([]*Stac
 	if err != nil {
 		return nil, fmt.Errorf("models.GetStacksByTeam: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []*Stack
 	for rows.Next() {
@@ -335,7 +335,7 @@ func GetStackFamily(ctx context.Context, db *sql.DB, teamID uuid.UUID, anyMember
 	if err != nil {
 		return nil, fmt.Errorf("models.GetStackFamily fetch: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []*Stack
 	for rows.Next() {
@@ -395,7 +395,7 @@ func GetExpiredStacks(ctx context.Context, db *sql.DB) ([]*Stack, error) {
 	if err != nil {
 		return nil, fmt.Errorf("models.GetExpiredStacks: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []*Stack
 	for rows.Next() {
@@ -481,7 +481,7 @@ func GetStackServicesByStack(ctx context.Context, db *sql.DB, stackID uuid.UUID)
 	if err != nil {
 		return nil, fmt.Errorf("models.GetStackServicesByStack: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []*StackService
 	for rows.Next() {

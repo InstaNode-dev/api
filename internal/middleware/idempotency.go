@@ -527,10 +527,10 @@ func canonicalMultipartBody(c *fiber.Ctx) (string, error) {
 			}
 			h := sha256.New()
 			if _, cerr := io.Copy(h, f); cerr != nil {
-				f.Close()
+				_ = f.Close() // read-only fingerprint hash; close error irrelevant
 				return "", cerr
 			}
-			f.Close()
+			_ = f.Close() // read-only fingerprint hash; close error irrelevant
 			parts = append(parts, fmt.Sprintf("file:%s:%s:%d:%x",
 				name, fh.Filename, fh.Size, h.Sum(nil)))
 		}

@@ -85,15 +85,15 @@ func (f *fakeOAuthServer) handler() http.Handler {
 		if id == "" {
 			id = "424242"
 		}
-		_, _ = w.Write([]byte(fmt.Sprintf(`{"id":%s,"login":"octocat","email":%q}`, id, f.ghEmail)))
+		_, _ = fmt.Fprintf(w, `{"id":%s,"login":"octocat","email":%q}`, id, f.ghEmail)
 	})
 	mux.HandleFunc("/gh/emails", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(fmt.Sprintf(`[{"email":%q,"primary":true,"verified":true}]`, f.ghPrimaryEmail)))
+		_, _ = fmt.Fprintf(w, `[{"email":%q,"primary":true,"verified":true}]`, f.ghPrimaryEmail)
 	})
 	mux.HandleFunc("/g/tokeninfo", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(fmt.Sprintf(`{"sub":%q,"email":%q,"name":"G User","aud":%q}`, f.gSubOr(), f.gEmailOr(), f.gAud)))
+		_, _ = fmt.Fprintf(w, `{"sub":%q,"email":%q,"name":"G User","aud":%q}`, f.gSubOr(), f.gEmailOr(), f.gAud)
 	})
 	mux.HandleFunc("/g/token", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -105,7 +105,7 @@ func (f *fakeOAuthServer) handler() http.Handler {
 	})
 	mux.HandleFunc("/g/userinfo", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(fmt.Sprintf(`{"id":%q,"email":%q,"name":"G User"}`, f.gSubOr(), f.gEmailOr())))
+		_, _ = fmt.Fprintf(w, `{"id":%q,"email":%q,"name":"G User"}`, f.gSubOr(), f.gEmailOr())
 	})
 	return mux
 }

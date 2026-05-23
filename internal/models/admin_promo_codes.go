@@ -406,7 +406,7 @@ func ListPromoAuditEvents(ctx context.Context, db *sql.DB, p ListPromoAuditEvent
 	if err != nil {
 		return nil, fmt.Errorf("models.ListPromoAuditEvents: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]*PromoAuditEvent, 0)
 	for rows.Next() {
@@ -503,12 +503,12 @@ func ComputePromoStats(ctx context.Context, db *sql.DB) (PromoStats, error) {
 	for issuerRows.Next() {
 		var row PromoStatsTopIssuer
 		if scanErr := issuerRows.Scan(&row.Email, &row.Count); scanErr != nil {
-			issuerRows.Close()
+			_ = issuerRows.Close() // result set fully consumed; close error irrelevant
 			return s, fmt.Errorf("models.ComputePromoStats issuers scan: %w", scanErr)
 		}
 		s.TopIssuers = append(s.TopIssuers, row)
 	}
-	issuerRows.Close()
+	_ = issuerRows.Close() // result set fully consumed; close error irrelevant
 
 	// Top redeemed codes. Single-use today, but the GROUP BY + COUNT shape
 	// stays correct if redeemability becomes multi-use later.
@@ -527,12 +527,12 @@ func ComputePromoStats(ctx context.Context, db *sql.DB) (PromoStats, error) {
 	for codeRows.Next() {
 		var row PromoStatsTopCode
 		if scanErr := codeRows.Scan(&row.Code, &row.Count); scanErr != nil {
-			codeRows.Close()
+			_ = codeRows.Close() // result set fully consumed; close error irrelevant
 			return s, fmt.Errorf("models.ComputePromoStats codes scan: %w", scanErr)
 		}
 		s.TopCodesByRedemption = append(s.TopCodesByRedemption, row)
 	}
-	codeRows.Close()
+	_ = codeRows.Close() // result set fully consumed; close error irrelevant
 
 	return s, nil
 }

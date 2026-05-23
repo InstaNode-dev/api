@@ -299,8 +299,6 @@ func TestIsolation_ManagementAPI_TeamA_CannotReadTeamB_Resources(t *testing.T) {
 	setB := listResources(jwtB)
 	assert.True(t, setB[tokenB], "team B must see its own token")
 	assert.False(t, setB[tokenA], "team B must NOT see team A's token — isolation failure")
-
-	_ = fmt.Sprint("") // keep fmt imported
 }
 
 // ── Phase 2/3/4 provisioning isolation ────────────────────────────────────────

@@ -38,13 +38,7 @@ type BVRequestDeletionDeps struct {
 }
 
 func (d BVRequestDeletionDeps) toInternal() requestDeletionDeps {
-	return requestDeletionDeps{
-		DB:               d.DB,
-		Email:            d.Email,
-		APIPublicURL:     d.APIPublicURL,
-		DashboardBaseURL: d.DashboardBaseURL,
-		TTLMinutes:       d.TTLMinutes,
-	}
+	return requestDeletionDeps(d)
 }
 
 // BVRequestEmailConfirmedDeletion exposes requestEmailConfirmedDeletion.

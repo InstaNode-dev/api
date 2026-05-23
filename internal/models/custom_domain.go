@@ -189,7 +189,7 @@ func ListCustomDomainsByStack(ctx context.Context, db *sql.DB, stackID uuid.UUID
 	if err != nil {
 		return nil, fmt.Errorf("models.ListCustomDomainsByStack: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]*CustomDomain, 0)
 	for rows.Next() {
@@ -213,7 +213,7 @@ func ListCustomDomainsByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) 
 	if err != nil {
 		return nil, fmt.Errorf("models.ListCustomDomainsByTeam: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]*CustomDomain, 0)
 	for rows.Next() {

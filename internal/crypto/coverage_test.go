@@ -342,7 +342,7 @@ func TestSignJWT_AutoStampsIssuedAt(t *testing.T) {
 	got, err := crypto.VerifyJWT([]byte(coverageJWTSecret), tok)
 	require.NoError(t, err)
 	require.NotNil(t, got.IssuedAt)
-	assert.True(t, !got.IssuedAt.Time.Before(before) && !got.IssuedAt.Time.After(after),
+	assert.True(t, !got.IssuedAt.Before(before) && !got.IssuedAt.After(after),
 		"IssuedAt must be auto-stamped to ~now")
 }
 

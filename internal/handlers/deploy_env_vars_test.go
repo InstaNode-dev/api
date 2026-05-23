@@ -139,9 +139,3 @@ func TestDeployNew_EnvVarsInvalidJSON_Returns400(t *testing.T) {
 	assert.Equal(t, "invalid_env_vars", errBody.Error,
 		"error key must be invalid_env_vars so agents can branch on it; got: %s", errBody.Error)
 }
-
-func readBody(t *testing.T, resp *http.Response) string {
-	t.Helper()
-	b, _ := io.ReadAll(resp.Body)
-	return string(b)
-}

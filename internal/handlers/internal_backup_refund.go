@@ -216,8 +216,8 @@ func verifyInternalBackupRefundJWT(c *fiber.Ctx, secret string, pathTeamID uuid.
 		return errors.New("missing iat claim")
 	}
 	now := time.Now()
-	if claims.IssuedAt.Time.Before(now.Add(-internalBackupRefundMaxClockSkew)) ||
-		claims.IssuedAt.Time.After(now.Add(internalBackupRefundMaxClockSkew)) {
+	if claims.IssuedAt.Before(now.Add(-internalBackupRefundMaxClockSkew)) ||
+		claims.IssuedAt.After(now.Add(internalBackupRefundMaxClockSkew)) {
 		return errors.New("iat outside clock skew window")
 	}
 	claimTeamID, err := uuid.Parse(strings.TrimSpace(claims.TeamID))

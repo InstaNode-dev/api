@@ -109,7 +109,7 @@ func ListAdminCustomerNotes(ctx context.Context, db *sql.DB, teamID uuid.UUID, l
 	if err != nil {
 		return nil, fmt.Errorf("models.ListAdminCustomerNotes: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]*AdminCustomerNote, 0)
 	for rows.Next() {

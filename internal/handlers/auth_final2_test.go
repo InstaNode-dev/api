@@ -146,7 +146,7 @@ func startEmptyNameGoogleOAuth(t *testing.T, sub, email string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/g/tokeninfo", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(fmt.Sprintf(`{"sub":%q,"email":%q,"name":"","aud":"g-client"}`, sub, email)))
+		_, _ = fmt.Fprintf(w, `{"sub":%q,"email":%q,"name":"","aud":"g-client"}`, sub, email)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)

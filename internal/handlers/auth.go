@@ -171,10 +171,11 @@ func emitAuthLoginAudit(db *sql.DB, teamID, userID uuid.UUID, email, provider, i
 	// c.Get("User-Agent") results, whose backing bytes live inside the
 	// fasthttp request Ctx. fiber recycles that Ctx into a pool the instant
 	// the handler returns, so the background goroutine below MUST read
-	// heap-owned copies, never aliases into the recycled Ctx. email/provider
-	// are already heap-owned (DB column / package const) but cloned for
-	// symmetry; teamID/userID are value types.
-	email = strings.Clone(email)
+	// heap-owned copies, never aliases into the recycled Ctx. provider is
+	// already heap-owned (DB column / package const) but cloned for symmetry;
+	// teamID/userID are value types. email is accepted for call-site symmetry
+	// but is not read in the background goroutine below, so it is intentionally
+	// not cloned (cloning it was an ineffectual assignment).
 	provider = strings.Clone(provider)
 	ip = strings.Clone(ip)
 	userAgent = strings.Clone(userAgent)
@@ -502,7 +503,7 @@ func exchangeGitHubCode(ctx context.Context, clientID, clientSecret, code string
 	if err != nil {
 		return nil, fmt.Errorf("github token exchange: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var tokenResp struct {
 		AccessToken string `json:"access_token"`
@@ -524,7 +525,7 @@ func exchangeGitHubCode(ctx context.Context, clientID, clientSecret, code string
 	if err != nil {
 		return nil, fmt.Errorf("github user fetch: %w", err)
 	}
-	defer userResp.Body.Close()
+	defer func() { _ = userResp.Body.Close() }()
 
 	var profile struct {
 		ID    int    `json:"id"`
@@ -541,7 +542,7 @@ func exchangeGitHubCode(ctx context.Context, clientID, clientSecret, code string
 		emailReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
 		emailResp, err := client.Do(emailReq)
 		if err == nil {
-			defer emailResp.Body.Close()
+			defer func() { _ = emailResp.Body.Close() }()
 			body, _ := io.ReadAll(emailResp.Body)
 			var emails []struct {
 				Email    string `json:"email"`
@@ -668,7 +669,7 @@ func verifyGoogleIDToken(ctx context.Context, clientID, idToken string) (*google
 	if err != nil {
 		return nil, fmt.Errorf("google token verify: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("google token invalid (status %d)", resp.StatusCode)
@@ -717,7 +718,7 @@ func exchangeGoogleAuthorizationCode(ctx context.Context, clientID, clientSecret
 	if err != nil {
 		return "", fmt.Errorf("google token exchange: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var tokenResp struct {
 		AccessToken string `json:"access_token"`
@@ -748,7 +749,7 @@ func fetchGoogleUserInfoOAuth2V2(ctx context.Context, accessToken string) (*goog
 	if err != nil {
 		return nil, fmt.Errorf("google userinfo: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
