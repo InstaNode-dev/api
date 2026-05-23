@@ -94,6 +94,40 @@ func TestDeletionAuditResourceType(t *testing.T) {
 	}
 }
 
+func TestShouldSkipEmailConfirmation_bvwave(t *testing.T) {
+	app := fiber.New()
+	defer app.Shutdown()
+	app.Get("/h", func(c *fiber.Ctx) error {
+		return c.SendString(map[bool]string{true: "skip", false: "noskip"}[shouldSkipEmailConfirmation(c)])
+	})
+	read := func(hdr string) string {
+		req := httptest.NewRequest("GET", "/h", nil)
+		if hdr != "" {
+			req.Header.Set(SkipEmailConfirmationHeader, hdr)
+		}
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		buf := make([]byte, 16)
+		n, _ := resp.Body.Read(buf)
+		return string(buf[:n])
+	}
+	// "yes" / "YES" / " Yes " (case-insensitive, trimmed) → skip.
+	for _, v := range []string{"yes", "YES", " Yes "} {
+		if read(v) != "skip" {
+			t.Errorf("header %q should skip", v)
+		}
+	}
+	// Empty / other values → no skip.
+	for _, v := range []string{"", "no", "true", "1"} {
+		if read(v) != "noskip" {
+			t.Errorf("header %q should NOT skip", v)
+		}
+	}
+}
+
 func TestEmailConfirmDeletionRedirectHandler(t *testing.T) {
 	h := EmailConfirmDeletionRedirectHandler("https://dash.local/")
 	app := fiber.New()
