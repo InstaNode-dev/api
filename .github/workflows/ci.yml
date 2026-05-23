@@ -149,6 +149,23 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
 
+      - name: Start NATS with monitoring (queue provider health-checks :8222)
+        # internal/providers/queue/local.go Provision() health-checks
+        # http://<NATSHost>:8222/healthz then returns nats://<host>:4222.
+        # TestQueue_* build a handler with an empty NATSHost, which defaults to
+        # "localhost" (queueprovider.New("")), so they need a real NATS
+        # reachable on localhost:8222. GitHub service containers can't pass the
+        # `-m` monitoring flag, so we run nats-server here instead. NATS-DOWN
+        # tests use the reserved non-resolvable host `nats.test`, so a live NATS
+        # on localhost does not collide with their 503 expectations.
+        run: |
+          docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2.10-alpine -m 8222
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:8222/healthz >/dev/null && { echo "NATS healthy after ${i}s"; break; }
+            echo "waiting for NATS monitoring endpoint (${i}/15)"; sleep 1
+          done
+          curl -sf http://localhost:8222/healthz >/dev/null || { echo "::error::NATS monitoring never came up"; exit 1; }
+
       # The gate. This MUST stay equal to deploy.yml's proven-green
       # invocation (`go test ./... -short -count=1 -p 1`) PLUS `-race`:
       #   - `-p 1` is load-bearing: every package shares the single

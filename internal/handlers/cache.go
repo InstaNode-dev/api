@@ -23,7 +23,6 @@ import (
 	"instant.dev/internal/plans"
 	cacheprovider "instant.dev/internal/providers/cache"
 	"instant.dev/internal/provisioner"
-	"instant.dev/internal/quota"
 	"instant.dev/internal/safego"
 	"instant.dev/internal/urls"
 )
@@ -273,7 +272,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 	}
 
 	cacheStorageLimitMB := h.plans.StorageLimitMB("anonymous", "redis")
-	_, cacheStorageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, cacheStorageLimitMB)
+	_, cacheStorageExceeded, _ := checkStorageQuota(ctx, h.db, resource.ID, cacheStorageLimitMB)
 
 	// internal_url omitted on the anonymous path — see internal_url.go.
 	resp := fiber.Map{
@@ -405,7 +404,7 @@ func (h *CacheHandler) newCacheAuthenticated(
 	middleware.RecordProvisionSuccess("redis")
 
 	cacheAuthStorageLimitMB := h.plans.StorageLimitMB(tier, "redis")
-	_, cacheAuthStorageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, cacheAuthStorageLimitMB)
+	_, cacheAuthStorageExceeded, _ := checkStorageQuota(ctx, h.db, resource.ID, cacheAuthStorageLimitMB)
 
 	authResp := fiber.Map{
 		"ok":             true,
@@ -581,7 +580,7 @@ func (h *CacheHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 	middleware.RecordProvisionSuccess(models.ResourceTypeRedis)
 
 	storageLimitMB := h.plans.StorageLimitMB(in.Tier, models.ResourceTypeRedis)
-	_, storageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
+	_, storageExceeded, _ := checkStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
 
 	return TwinProvisionResult{
 		ID:            resource.ID.String(),
