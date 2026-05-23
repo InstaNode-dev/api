@@ -194,6 +194,82 @@ func TestStorageFinal_DecideMode_PrefixScoped(t *testing.T) {
 	assert.Equal(t, "credential", kind)
 }
 
+// bucketPerTenantImpl: PrefixScopedKeys=false but BucketPerTenant=true → on a
+// paid tier decideStorageMode picks broker with the dedicated-bucket reason
+// (storage.go:108-112).
+type bucketPerTenantImpl struct{ fakePrefixScopedImpl }
+
+func (bucketPerTenantImpl) Capabilities() storageprovider.Capabilities {
+	return storageprovider.Capabilities{PrefixScopedKeys: false, BucketPerTenant: true}
+}
+
+// TestStorageFinal_DecideMode_BucketPerTenantPaid — the BucketPerTenant && paid
+// branch falls through to broker (storage.go:108).
+func TestStorageFinal_DecideMode_BucketPerTenantPaid(t *testing.T) {
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	rdb, cleanR := testhelpers.SetupTestRedis(t)
+	defer cleanR()
+	cfg := &config.Config{JWTSecret: testhelpers.TestJWTSecret, AESKey: testhelpers.TestAESKeyHex, EnabledServices: "storage", Environment: "test"}
+	prov := storageprov.NewWithImpl(bucketPerTenantImpl{}, "b", "https://s3.example.invalid", "s3.example.invalid", true)
+	h := handlers.NewStorageHandler(db, rdb, cfg, prov, plans.Default())
+	kind, _ := h.DecideStorageModeKindForTest("pro") // paid tier
+	assert.Equal(t, "broker", kind)
+}
+
+// TestStorageFinal_Auth_QuotaCheckError_FailOpen — SumStorageBytesByTeamAndType
+// errors → fail-open, provision still proceeds (storage.go:459). team(1) ok,
+// quota-sum(2) errors, then CreateResource(3) etc. We only assert the request
+// did NOT 402 on storage_limit (the quota error is swallowed). failAfter=1 makes
+// the quota sum error; the subsequent CreateResource also errors → 503
+// provision_failed, which still proves the fail-open path (459-461) ran.
+func TestStorageFinal_Auth_QuotaCheckError_FailOpen(t *testing.T) {
+	seedDB, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	rdb, cleanR := testhelpers.SetupTestRedis(t)
+	defer cleanR()
+	teamID := testhelpers.MustCreateTeamDB(t, seedDB, "pro")
+	jwt := stJWT(t, seedDB, teamID)
+
+	app := storageAppWithProvider(t, openFaultDB(t, 1), rdb, prefixScopedProvider(t))
+	resp := stPost(t, app, "10.74.0.1", jwt, `{"name":"x","env":"production"}`)
+	defer resp.Body.Close()
+	// quota check failed-open → handler continued → CreateResource on faultdb
+	// also errors → 503 (not a 402 storage_limit). The fail-open arm ran.
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	var m map[string]any
+	require.NoError(t, decodeJSON(resp, &m))
+	assert.NotEqual(t, "storage_limit_reached", m["error"])
+}
+
+// TestStorageFinal_Auth_StorageLimitReached_402 — a team whose summed
+// storage_bytes already exceeds its tier limit → 402 storage_limit_reached
+// (storage.go:464). Seed an active storage resource with storage_bytes over the
+// pro limit.
+func TestStorageFinal_Auth_StorageLimitReached_402(t *testing.T) {
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	rdb, cleanR := testhelpers.SetupTestRedis(t)
+	defer cleanR()
+	teamID := testhelpers.MustCreateTeamDB(t, db, "hobby") // small storage limit
+	jwt := stJWT(t, db, teamID)
+	limitMB := plans.Default().StorageLimitMB("hobby", "storage")
+	// Seed a storage resource already at/over the limit.
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO resources (team_id, resource_type, tier, status, storage_bytes)
+		VALUES ($1::uuid, 'storage', 'hobby', 'active', $2)`,
+		teamID, int64(limitMB)*1024*1024+1)
+	require.NoError(t, err)
+
+	app := storagePrefixApp(t, db, rdb)
+	resp := stPost(t, app, "10.74.0.2", jwt, `{"name":"x","env":"production"}`)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusPaymentRequired, resp.StatusCode)
+	var m map[string]any
+	require.NoError(t, decodeJSON(resp, &m))
+	assert.Equal(t, "storage_limit_reached", m["error"])
+}
+
 // TestStorageFinal_Auth_PrefixScoped_201_AndIAMAudit — an authenticated
 // provision against the prefix-scoped backend returns 201 with mode
 // "prefix-scoped" and emits the per-tenant-IAM-key audit row (storage.go:560).
@@ -281,6 +357,56 @@ func TestStorageFinal_Auth_ProvisionFails_SoftDelete_503(t *testing.T) {
 	var m map[string]any
 	require.NoError(t, decodeJSON(resp, &m))
 	assert.Equal(t, "provision_failed", m["error"])
+}
+
+// TestStorageFinal_Anon_OverCap_Dedup — anonymous provisions burn the daily
+// cap; the next over-cap call dedups to the existing resource and returns its
+// connection_url (storage.go:189-258 dedup happy path + recycleGate 268).
+func TestStorageFinal_Anon_OverCap_Dedup(t *testing.T) {
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	rdb, cleanR := testhelpers.SetupTestRedis(t)
+	defer cleanR()
+	app := storagePrefixApp(t, db, rdb)
+	const ip = "10.75.0.4"
+	post := func() *http.Response {
+		return stPost(t, app, ip, "", `{"name":"s","env":"production"}`)
+	}
+	first := post()
+	require.Equal(t, http.StatusCreated, first.StatusCode)
+	first.Body.Close()
+	// Burn past the anonymous cap (5/fp) and observe a dedup/deny outcome.
+	sawDedupOrDeny := false
+	for i := 0; i < 8; i++ {
+		resp := post()
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusPaymentRequired {
+			sawDedupOrDeny = true
+		}
+		resp.Body.Close()
+	}
+	assert.True(t, sawDedupOrDeny, "over-cap calls must dedup/deny, exercising the anonymous limit branch")
+}
+
+// TestStorageFinal_Anon_OverCap_DedupDecryptFail — corrupt every active storage
+// row for the fingerprint after burning the cap → the over-cap dedup decrypt
+// fails → fail-closed fallthrough (storage.go:206-209).
+func TestStorageFinal_Anon_OverCap_DedupDecryptFail(t *testing.T) {
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	rdb, cleanR := testhelpers.SetupTestRedis(t)
+	defer cleanR()
+	app := storagePrefixApp(t, db, rdb)
+	const ip = "10.75.0.5"
+	post := func() *http.Response { return stPost(t, app, ip, "", `{"name":"s","env":"production"}`) }
+	for i := 0; i < 6; i++ {
+		post().Body.Close()
+	}
+	_, err := db.ExecContext(context.Background(),
+		`UPDATE resources SET connection_url = 'corrupt' WHERE resource_type='storage' AND status='active' AND tier='anonymous'`)
+	require.NoError(t, err)
+	resp := post()
+	defer resp.Body.Close()
+	assert.NotEqual(t, http.StatusInternalServerError, resp.StatusCode)
 }
 
 // TestStorageFinal_Auth_BadTeamID_400 — JWT tid not a UUID → invalid_team

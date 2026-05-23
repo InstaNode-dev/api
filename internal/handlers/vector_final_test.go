@@ -198,6 +198,29 @@ func TestVectorFinal_Anon_OverCap_CrossServiceFallback(t *testing.T) {
 	assert.Equal(t, "provision_limit_reached", body.Error)
 }
 
+// TestVectorFinal_Anon_OverCap_DedupHappy — over-cap calls dedup to the
+// existing (valid-url) vector resource and return 200 with its connection_url
+// (vector.go:282-318 dedup happy path).
+func TestVectorFinal_Anon_OverCap_DedupHappy(t *testing.T) {
+	app, _, _ := vectorGRPCAppWithDB(t)
+	const ip = "10.132.0.9"
+	post := func() (*http.Response, vecRespVecwave) {
+		return postVectorVecwave(t, app, ip, "", "", map[string]any{"name": "v", "env": "production"})
+	}
+	first, _ := post()
+	require.Equal(t, http.StatusCreated, first.StatusCode)
+	first.Body.Close()
+	sawDedup := false
+	for i := 0; i < 8; i++ {
+		resp, body := post()
+		if resp.StatusCode == http.StatusOK && body.Token != "" {
+			sawDedup = true
+		}
+		resp.Body.Close()
+	}
+	assert.True(t, sawDedup, "over-cap calls should dedup-hit (200) the existing vector resource")
+}
+
 // TestVectorFinal_Auth_TeamLookup_DBError_503 — GetTeamByID errors (vector.go:453).
 // failAfter=0 — the team lookup is the first DB call after JWT auth.
 func TestVectorFinal_Auth_TeamLookup_DBError_503(t *testing.T) {
