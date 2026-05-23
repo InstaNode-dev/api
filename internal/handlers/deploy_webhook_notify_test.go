@@ -10,12 +10,15 @@ package handlers
 
 import (
 	"errors"
+	"mime/multipart"
 	"net"
 	"strings"
 	"testing"
 
+	"github.com/gofiber/fiber/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/valyala/fasthttp"
 )
 
 // stubResolver returns the supplied IPs for any hostname. Used to bypass
@@ -152,22 +155,22 @@ func TestValidateNotifyWebhookURL_RejectsUnresolvable(t *testing.T) {
 func TestIsBlockedIP_CoversFullCIDRSet(t *testing.T) {
 	cases := map[string]bool{
 		// Blocked
-		"127.0.0.1":            true,
-		"127.255.255.254":      true,
-		"10.0.0.1":             true,
-		"172.16.0.1":           true,
-		"172.31.255.254":       true,
-		"192.168.0.1":          true,
-		"169.254.169.254":      true, // AWS/GCP metadata
-		"100.64.0.1":           true, // CGNAT
-		"100.127.255.254":      true, // CGNAT upper
-		"224.0.0.1":            true, // multicast
-		"255.255.255.255":      true, // limited broadcast
-		"0.0.0.0":              true, // unspecified
-		"::1":                  true,
-		"fe80::1":              true,
-		"fc00::1":              true,
-		"::":                   true,
+		"127.0.0.1":       true,
+		"127.255.255.254": true,
+		"10.0.0.1":        true,
+		"172.16.0.1":      true,
+		"172.31.255.254":  true,
+		"192.168.0.1":     true,
+		"169.254.169.254": true, // AWS/GCP metadata
+		"100.64.0.1":      true, // CGNAT
+		"100.127.255.254": true, // CGNAT upper
+		"224.0.0.1":       true, // multicast
+		"255.255.255.255": true, // limited broadcast
+		"0.0.0.0":         true, // unspecified
+		"::1":             true,
+		"fe80::1":         true,
+		"fc00::1":         true,
+		"::":              true,
 
 		// Public — must NOT be blocked
 		"8.8.8.8":              false,
@@ -187,6 +190,71 @@ func TestIsBlockedIP_CoversFullCIDRSet(t *testing.T) {
 				"isBlockedIP(%q): want %v, got %v", ipStr, expected, got)
 		})
 	}
+}
+
+// TestSeam2_ValidateNotifyWebhookURL_PublicIPLiteral covers the return-nil arm
+// after a PUBLIC IP literal passes isBlockedIP (line 165) — no DNS, accepted.
+func TestSeam2_ValidateNotifyWebhookURL_PublicIPLiteral(t *testing.T) {
+	restoreResolver(t, errResolver()) // must NOT be consulted for an IP literal
+	err := validateNotifyWebhookURL("https://8.8.8.8/webhook")
+	assert.NoError(t, err, "a public IP literal must be accepted without DNS")
+}
+
+// TestSeam2_ValidateNotifyWebhookURL_NoRecords covers the empty-resolution arm
+// (line 175): the hostname resolves but yields zero A/AAAA records.
+func TestSeam2_ValidateNotifyWebhookURL_NoRecords(t *testing.T) {
+	restoreResolver(t, func(string) ([]net.IP, error) { return nil, nil }) // ok, but empty
+	err := validateNotifyWebhookURL("https://hooks.example.com/webhook")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no A/AAAA records")
+}
+
+// TestSeam2_DefaultNotifyWebhookResolver invokes the REAL default resolver
+// closure (line 60-62) so its body — net.LookupIP — is covered. The lookup may
+// succeed or fail depending on the test host's network; either way the line
+// executes.
+func TestSeam2_DefaultNotifyWebhookResolver(t *testing.T) {
+	prev := notifyWebhookResolver
+	t.Cleanup(func() { notifyWebhookResolver = prev })
+	notifyWebhookResolver = func(host string) ([]net.IP, error) { return net.LookupIP(host) }
+	_, _ = notifyWebhookResolver("localhost")
+}
+
+// TestSeam2_ParseNotifyWebhookFields_BadAESKey covers the AES-key-parse-error
+// arm (line 120-127): a valid public URL + a present secret + a malformed AES
+// key → 503 encryption_unavailable.
+func TestSeam2_ParseNotifyWebhookFields_BadAESKey(t *testing.T) {
+	restoreResolver(t, stubResolver("8.8.8.8"))
+
+	app := fiber.New()
+	c := app.AcquireCtx(&fasthttp.RequestCtx{})
+	defer app.ReleaseCtx(c)
+
+	form := &multipart.Form{Value: map[string][]string{
+		"notify_webhook":        {"https://hooks.example.com/webhook"},
+		"notify_webhook_secret": {"super-secret-value"},
+	}}
+	_, _, err := parseNotifyWebhookFields(c, form, "not-a-valid-aes-key-hex")
+	require.Error(t, err, "a malformed AES key must surface an error")
+	assert.Equal(t, fiber.StatusServiceUnavailable, c.Response().StatusCode())
+}
+
+// TestSeam2_ParseNotifyWebhookFields_NoSecret covers the URL-ok-no-secret arm
+// (line 113-114) — returns (url, "", nil).
+func TestSeam2_ParseNotifyWebhookFields_NoSecret(t *testing.T) {
+	restoreResolver(t, stubResolver("8.8.8.8"))
+
+	app := fiber.New()
+	c := app.AcquireCtx(&fasthttp.RequestCtx{})
+	defer app.ReleaseCtx(c)
+
+	form := &multipart.Form{Value: map[string][]string{
+		"notify_webhook": {"https://hooks.example.com/webhook"},
+	}}
+	url, secret, err := parseNotifyWebhookFields(c, form, "anyhex")
+	require.NoError(t, err)
+	assert.Equal(t, "https://hooks.example.com/webhook", url)
+	assert.Empty(t, secret, "no secret field → empty ciphertext")
 }
 
 // TestValidateNotifyWebhookURL_RejectsMalformed guards the url.Parse failure
