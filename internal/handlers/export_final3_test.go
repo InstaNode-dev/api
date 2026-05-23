@@ -33,6 +33,12 @@ func (h *TeamMembersHandler) EmitInviteAuditForTest(ctx context.Context, teamID,
 	h.emitInviteAudit(ctx, teamID, actorID, invID, inviteEmail, role)
 }
 
+// VaultAuditForTest exposes (*VaultHandler).audit so the AppendVaultAudit-error
+// arm (best-effort warn) can be driven with a fault DB.
+func (h *VaultHandler) VaultAuditForTest(c *fiber.Ctx, teamID uuid.UUID, userID uuid.NullUUID, action, env, key, ip string) {
+	h.audit(c, teamID, userID, action, env, key, ip)
+}
+
 // EmitPromoteAuditEventForTest exposes emitPromoteAuditEvent so the
 // InsertAuditEvent-error arm can be driven with a fault DB.
 func EmitPromoteAuditEventForTest(ctx context.Context, db *sql.DB, row *models.PromoteApproval, kind, summary string, extras map[string]any) {
