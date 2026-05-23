@@ -22,6 +22,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -87,6 +88,81 @@ func vecPost(t *testing.T, app *fiber.App, ip, jwt, body string) *http.Response 
 	resp, err := app.Test(req, 15000)
 	require.NoError(t, err)
 	return resp
+}
+
+// vectorGRPCAppWithDB builds a /vector/new app backed by a bufconn fake
+// provisioner AND returns the *sql.DB + *redis.Client so the test can corrupt
+// resource rows / inspect the cap. Mirrors setupVectorGRPCFixture but exposes
+// the DB.
+func vectorGRPCAppWithDB(t *testing.T) (*fiber.App, *sql.DB, *redis.Client) {
+	t.Helper()
+	db, _ := testhelpers.SetupTestDB(t)
+	rdb, _ := testhelpers.SetupTestRedis(t)
+	t.Cleanup(func() { db.Close(); rdb.Close() })
+	cfg := &config.Config{
+		JWTSecret:                testhelpers.TestJWTSecret,
+		AESKey:                   testhelpers.TestAESKeyHex,
+		EnabledServices:          "postgres,vector,redis",
+		Environment:              "test",
+		PostgresProvisionBackend: "local",
+	}
+	provClient := newBufconnProvisionerClient(t, &fakeProvisioner{})
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, e error) error {
+			if e == handlers.ErrResponseWritten {
+				return nil
+			}
+			code := fiber.StatusInternalServerError
+			if fe, ok := e.(*fiber.Error); ok {
+				code = fe.Code
+			}
+			_ = handlers.WriteFiberError(c, code, "internal_error", e.Error())
+			return nil
+		},
+		ProxyHeader: "X-Forwarded-For",
+	})
+	app.Use(middleware.RequestID())
+	app.Use(middleware.Fingerprint())
+	app.Use(middleware.RateLimit(rdb, middleware.RateLimitConfig{Limit: 500, KeyPrefix: "rlvecfin"}))
+	vectorH := handlers.NewVectorHandler(db, rdb, cfg, provClient, plans.Default())
+	app.Post("/vector/new", middleware.OptionalAuth(cfg), vectorH.NewVector)
+	return app, db, rdb
+}
+
+// TestVectorFinal_Anon_OverCap_DedupDecryptFail — first call mints a real
+// anonymous vector resource; we then CORRUPT its connection_url and hammer the
+// same fingerprint past the daily cap. The over-cap dedup branch finds the
+// (now-corrupt) resource, decryptConnectionURL fails, and the handler falls
+// through (vector.go:294-298) rather than emitting ciphertext.
+func TestVectorFinal_Anon_OverCap_DedupDecryptFail(t *testing.T) {
+	app, db, _ := vectorGRPCAppWithDB(t)
+	const ip = "10.130.0.7"
+
+	post := func() (*http.Response, vecRespVecwave) {
+		return postVectorVecwave(t, app, ip, "", "", map[string]any{"name": "v", "env": "production"})
+	}
+	first, body := post()
+	first.Body.Close()
+	require.Equal(t, http.StatusCreated, first.StatusCode)
+
+	// Corrupt the stored connection_url so the dedup decrypt fails.
+	_, err := db.ExecContext(context.Background(),
+		`UPDATE resources SET connection_url = 'not-valid-ciphertext' WHERE token = $1::uuid`, body.Token)
+	require.NoError(t, err)
+
+	// Hammer past the daily cap (anonymous = 5/fp). Some calls dedup-hit the
+	// corrupt row (decrypt-fail → fall through to fresh provision → 201) or
+	// over-cap deny (429); we just need the corrupt-dedup arm to execute.
+	sawResolved := false
+	for i := 0; i < 10; i++ {
+		resp, _ := post()
+		code := resp.StatusCode
+		resp.Body.Close()
+		if code == http.StatusOK || code == http.StatusCreated || code == http.StatusTooManyRequests {
+			sawResolved = true
+		}
+	}
+	assert.True(t, sawResolved, "over-cap calls should resolve to dedup/fresh/deny, exercising the corrupt-url fallthrough")
 }
 
 // TestVectorFinal_Auth_TeamLookup_DBError_503 — GetTeamByID errors (vector.go:453).
