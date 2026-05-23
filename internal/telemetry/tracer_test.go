@@ -2,8 +2,69 @@ package telemetry
 
 import (
 	"context"
+	"errors"
 	"testing"
+
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/sdk/resource"
 )
+
+// withExporterStub temporarily replaces the package-level newExporter seam,
+// restoring it on cleanup. Lets a test drive the otlptracegrpc.New failure
+// arm without touching production wiring.
+func withExporterStub(t *testing.T, fn func(context.Context, ...otlptracegrpc.Option) (*otlptrace.Exporter, error)) {
+	t.Helper()
+	prev := newExporter
+	t.Cleanup(func() { newExporter = prev })
+	newExporter = fn
+}
+
+// withResourceStub temporarily replaces the package-level newResource seam.
+func withResourceStub(t *testing.T, fn func(context.Context, ...resource.Option) (*resource.Resource, error)) {
+	t.Helper()
+	prev := newResource
+	t.Cleanup(func() { newResource = prev })
+	newResource = fn
+}
+
+// TestInitTracer_ExporterConstructionFails — when otlptracegrpc.New errors
+// (network stack misconfig, bad creds object, etc.), InitTracer MUST log and
+// return a working no-op shutdown rather than crash. This is the fail-open
+// contract: a broken exporter can never block service boot.
+func TestInitTracer_ExporterConstructionFails(t *testing.T) {
+	t.Setenv("NEW_RELIC_LICENSE_KEY", "")
+	withExporterStub(t, func(context.Context, ...otlptracegrpc.Option) (*otlptrace.Exporter, error) {
+		return nil, errors.New("boom: exporter construction failed")
+	})
+
+	shutdown := InitTracer("instant-api", "https://otlp.nr-data.net:4317")
+	if shutdown == nil {
+		t.Fatal("InitTracer must return a non-nil no-op shutdown when the exporter fails")
+	}
+	if err := shutdown(context.Background()); err != nil {
+		t.Fatalf("no-op shutdown after exporter failure must return nil, got %v", err)
+	}
+}
+
+// TestInitTracer_ResourceConstructionFails — when resource.New errors,
+// InitTracer MUST shut down the already-built exporter and return a working
+// no-op shutdown. Same fail-open contract as the exporter arm.
+func TestInitTracer_ResourceConstructionFails(t *testing.T) {
+	t.Setenv("NEW_RELIC_LICENSE_KEY", "")
+	// Real exporter constructs fine (lazy dial); force the resource arm.
+	withResourceStub(t, func(context.Context, ...resource.Option) (*resource.Resource, error) {
+		return nil, errors.New("boom: resource construction failed")
+	})
+
+	shutdown := InitTracer("instant-api", "http://localhost:4317")
+	if shutdown == nil {
+		t.Fatal("InitTracer must return a non-nil no-op shutdown when resource.New fails")
+	}
+	if err := shutdown(context.Background()); err != nil {
+		t.Fatalf("no-op shutdown after resource failure must return nil, got %v", err)
+	}
+}
 
 // TestInitTracer_EmptyEndpointNoop — when the endpoint is unset, the
 // returned shutdown must be a working no-op. This is the fail-open

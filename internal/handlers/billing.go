@@ -217,6 +217,41 @@ func (h *BillingHandler) WithRedis(rdb *redis.Client) *BillingHandler {
 	return h
 }
 
+// BillingPortal is the slice of *razorpaybilling.Portal that the
+// subscription-management API methods (ListInvoicesAPI / UpdatePaymentMethodAPI
+// / ChangePlanAPI) depend on. Defined as an interface so a test can inject a
+// fake that returns canned responses (and error responses for the failure
+// arms, including circuit.ErrOpen) WITHOUT a live Razorpay account — never the
+// rzp_live key, never a real network call. Production uses
+// defaultBillingPortal, which returns a real *razorpaybilling.Portal.
+//
+// The method set is exactly the Portal methods these three endpoints call.
+// Adding a new Razorpay-backed billing endpoint that needs a different Portal
+// method means widening this interface deliberately (a fresh contract
+// decision), mirroring the email.Mailer convention.
+type BillingPortal interface {
+	SubscriptionID(ctx context.Context, teamID uuid.UUID) (string, error)
+	ListSubscriptionInvoices(subscriptionID string) ([]razorpaybilling.Invoice, error)
+	PaymentUpdateURL(subscriptionID string) (string, error)
+	ChangePlan(ctx context.Context, teamID uuid.UUID, targetPlan string, planIDs map[string]string) (*razorpaybilling.ChangePlanResult, error)
+}
+
+// billingPortalFactory builds the BillingPortal the three subscription-
+// management endpoints use. Indirected through a package var (not an inline
+// `&razorpaybilling.Portal{...}`) purely so SetBillingPortalForTest can swap in
+// a fake — the production default is a thin closure returning the real Portal,
+// preserving the previous behaviour exactly. Never mutated at runtime in
+// production; only a test (single-goroutine, before the handler is exercised)
+// reassigns it via the seam.
+var billingPortalFactory = func(db *sql.DB, h *BillingHandler) BillingPortal {
+	return &razorpaybilling.Portal{DB: db, Cfg: h.cfg}
+}
+
+// billingPortal returns the BillingPortal for this handler via the factory.
+func (h *BillingHandler) billingPortal() BillingPortal {
+	return billingPortalFactory(h.db, h)
+}
+
 // reusablePendingCheckout scans the team's unresolved pending_checkouts rows
 // (newest first) and returns the subscription_id + short_url of the first one
 // Razorpay still reports as payable (status in reusableSubscriptionStatuses).
@@ -2825,7 +2860,7 @@ func (h *BillingHandler) ListInvoicesAPI(c *fiber.Ctx) error {
 	if h.cfg.RazorpayKeyID == "" || h.cfg.RazorpayKeySecret == "" {
 		return respondError(c, fiber.StatusServiceUnavailable, "billing_not_configured", "Billing is not configured")
 	}
-	portal := &razorpaybilling.Portal{DB: h.db, Cfg: h.cfg}
+	portal := h.billingPortal()
 	subID, err := portal.SubscriptionID(c.Context(), teamID)
 	if err != nil {
 		return c.JSON(fiber.Map{"ok": true, "invoices": []any{}})
@@ -2864,7 +2899,7 @@ func (h *BillingHandler) UpdatePaymentMethodAPI(c *fiber.Ctx) error {
 	if h.cfg.RazorpayKeyID == "" || h.cfg.RazorpayKeySecret == "" {
 		return respondError(c, fiber.StatusServiceUnavailable, "billing_not_configured", "Billing is not configured")
 	}
-	portal := &razorpaybilling.Portal{DB: h.db, Cfg: h.cfg}
+	portal := h.billingPortal()
 	subID, err := portal.SubscriptionID(c.Context(), teamID)
 	if err != nil {
 		return respondError(c, fiber.StatusBadRequest, "no_subscription", err.Error())
@@ -2966,7 +3001,7 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "tier_unavailable",
 			"Team tier is under active development. Email support@instanode.dev to join the early access list.")
 	}
-	portal := &razorpaybilling.Portal{DB: h.db, Cfg: h.cfg}
+	portal := h.billingPortal()
 	if _, err := portal.SubscriptionID(c.Context(), teamID); err != nil {
 		return respondError(c, fiber.StatusBadRequest, "no_subscription", "no active subscription to change")
 	}

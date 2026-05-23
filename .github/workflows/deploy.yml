@@ -97,12 +97,12 @@ jobs:
           --health-retries 12
     steps:
       - name: Checkout api (this repo) into ./api
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: api
 
       - name: Checkout common sibling into ./common
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
           # 2026-05-15: GITHUB_TOKEN is scoped to THIS repo only and 404s
@@ -114,7 +114,7 @@ jobs:
           path: common
 
       - name: Checkout proto sibling into ./proto
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
@@ -132,7 +132,7 @@ jobs:
           echo "Built ${VERSION} (${BUILD_TIME})"
 
       - name: Set up Go (for unit tests + go.mod replace directives)
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.25'
 
@@ -173,6 +173,23 @@ jobs:
           psql -h localhost -U postgres -d postgres -c "CREATE DATABASE instant_customers" >/dev/null
           echo "created instant_customers (db-provider admin target)"
 
+      - name: Start NATS with monitoring (queue provider health-checks :8222)
+        # Mirror of ci.yml's NATS step. internal/providers/queue/local.go
+        # Provision() health-checks http://localhost:8222/healthz (NATSHost
+        # defaults to "localhost"), so the TestQueue_* coverage tests need a
+        # real NATS reachable on localhost:8222. Service containers can't pass
+        # the `-m` monitoring flag, so we run nats-server here. NATS-DOWN tests
+        # use the reserved non-resolvable host `nats.test`, so this does not
+        # collide with their 503 expectations. Without this, the unit-test gate
+        # below 503s on TestQueue_* and the deploy aborts before building.
+        run: |
+          docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2.10-alpine -m 8222
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:8222/healthz >/dev/null && { echo "NATS healthy after ${i}s"; break; }
+            echo "waiting for NATS monitoring endpoint (${i}/15)"; sleep 1
+          done
+          curl -sf http://localhost:8222/healthz >/dev/null || { echo "::error::NATS monitoring never came up"; exit 1; }
+
       - name: Run unit tests (short, no integration deps)
         working-directory: api
         env:
@@ -205,7 +222,7 @@ jobs:
           go test ./... -short -count=1 -p 1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
         # 2026-05-17: the per-job GITHUB_TOKEN (even with packages: write)
@@ -213,7 +230,7 @@ jobs:
         # org-owned package ghcr.io/instanode-dev/instant-api — every push
         # 403'd. GHCR_PUSH_TOKEN is a classic PAT with write:packages owned
         # by a user who has write access to that package. See task #121.
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -235,7 +252,7 @@ jobs:
             .
 
       - name: Set up kubectl
-        uses: azure/setup-kubectl@v3
+        uses: azure/setup-kubectl@v5
         with:
           version: 'latest'
 

@@ -67,15 +67,46 @@ var resourceTypeToPodLabel = map[string]string{
 }
 
 // LogsHandler handles GET /resources/:token/logs.
+//
+// clientset is typed against the kubernetes.Interface (not the concrete
+// *kubernetes.Clientset) so coverage tests can inject a k8s fake clientset and
+// exercise the pod-list / tier / status / stream-error arms without a live
+// cluster. Production wiring (NewLogsHandler) still builds a real in-cluster
+// clientset; the only behaviour the seam changes is that the field is now an
+// interface — every call site below already goes through CoreV1(), which is on
+// the interface.
 type LogsHandler struct {
 	db        *sql.DB
-	clientset *kubernetes.Clientset // nil when k8s is unavailable (no kubeconfig in local dev)
+	clientset kubernetes.Interface // nil when k8s is unavailable (no kubeconfig in local dev)
 }
+
+// buildLogsClientset is a package-level indirection over buildLogsK8sClientset
+// so coverage tests can drive NewLogsHandler's success arm (h.clientset = cs)
+// with an injected fake kubernetes.Interface — without a live cluster or a
+// kubeconfig on disk. It returns a kubernetes.Interface (not the concrete
+// *kubernetes.Clientset) so a fake can be substituted. The default closure
+// calls the real builder; production behaviour is byte-for-byte identical.
+var buildLogsClientset = func() (kubernetes.Interface, error) {
+	return buildLogsK8sClientset()
+}
+
+// inClusterConfig and kubeconfigFromFlags are package-level indirections over
+// the client-go config loaders so a coverage test can drive both arms of
+// buildLogsK8sClientset's in-cluster→kubeconfig fallback deterministically
+// (in-cluster succeeds vs. in-cluster fails then kubeconfig is consulted)
+// without depending on the test host's environment. They default to the real
+// client-go functions; production behaviour is unchanged.
+var (
+	inClusterConfig     = rest.InClusterConfig
+	kubeconfigFromFlags = func() (*rest.Config, error) {
+		return clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+	}
+)
 
 // NewLogsHandler builds a LogsHandler. Falls back gracefully if k8s is unreachable.
 func NewLogsHandler(db *sql.DB) *LogsHandler {
 	h := &LogsHandler{db: db}
-	cs, err := buildLogsK8sClientset()
+	cs, err := buildLogsClientset()
 	if err != nil {
 		slog.Warn("logs: k8s unavailable — log streaming disabled", "error", err)
 		return h
@@ -84,11 +115,19 @@ func NewLogsHandler(db *sql.DB) *LogsHandler {
 	return h
 }
 
+// SetClientset injects a kubernetes.Interface (used by coverage tests to wire a
+// fake clientset). Production never calls this — NewLogsHandler builds the real
+// in-cluster client. Kept tiny + side-effect-free so the seam itself is fully
+// covered by a single test.
+func (h *LogsHandler) SetClientset(cs kubernetes.Interface) {
+	h.clientset = cs
+}
+
 // buildLogsK8sClientset prefers in-cluster config, falls back to ~/.kube/config for local dev.
 func buildLogsK8sClientset() (*kubernetes.Clientset, error) {
-	cfg, err := rest.InClusterConfig()
+	cfg, err := inClusterConfig()
 	if err != nil {
-		cfg, err = clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+		cfg, err = kubeconfigFromFlags()
 		if err != nil {
 			return nil, fmt.Errorf("k8s config: %w", err)
 		}

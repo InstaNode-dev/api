@@ -181,7 +181,7 @@ func (h *AdminImpersonateHandler) Impersonate(c *fiber.Ctx) error {
 		},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	signed, err := token.SignedString([]byte(h.cfg.JWTSecret))
+	signed, err := signImpersonationToken(token, []byte(h.cfg.JWTSecret))
 	if err != nil {
 		slog.Error("admin.impersonate.sign_failed", "error", err, "team_id", teamID)
 		return respondError(c, fiber.StatusServiceUnavailable, "sign_failed", "Failed to mint impersonation token")
@@ -216,6 +216,15 @@ func (h *AdminImpersonateHandler) Impersonate(c *fiber.Ctx) error {
 		"team_id":    teamID.String(),
 		"expires_at": expiresAt.Format(time.RFC3339Nano),
 	})
+}
+
+// signImpersonationToken signs the minted JWT. It is a package-level var so a
+// test can swap in a failing signer to exercise the sign_failed (503) branch —
+// HS256 signing with a []byte key essentially never fails in production, so a
+// seam is the only way to cover that defensive arm without relying on a
+// non-deterministic crypto failure.
+var signImpersonationToken = func(t *jwt.Token, key []byte) (string, error) {
+	return t.SignedString(key)
 }
 
 // errImpersonateNoUsers is returned by resolveTargetUser when the target

@@ -243,7 +243,9 @@ func TestKeyring_Decrypt_LegacyUnversioned(t *testing.T) {
 	keyA := mustKey(t, coverageKeyHexA)
 	legacy, err := crypto.Encrypt(keyA, "pre-rotation-secret")
 	require.NoError(t, err)
-	require.False(t, strings.HasPrefix(legacy, "v"))
+	// A raw Encrypt envelope is base64 (random nonce), so it may coincidentally
+	// begin with "v"; the invariant is that it is NOT a "vN." versioned envelope.
+	require.False(t, len(legacy) >= 3 && legacy[0] == 'v' && legacy[2] == '.' && legacy[1] >= '1' && legacy[1] <= '9')
 
 	kr, err := crypto.NewKeyring('1', map[byte][]byte{'1': keyA})
 	require.NoError(t, err)

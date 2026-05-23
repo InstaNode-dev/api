@@ -19,6 +19,16 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
+// Seams for testing genuinely-unreachable error branches. Production code
+// always uses the real embedded FS + lib/pq driver; tests swap these to
+// drive the embed-read / driver-open failure paths that can't otherwise
+// be reached because the FS is compiled in and lib/pq opens lazily.
+var (
+	readMigrationDir  = func() ([]fs.DirEntry, error) { return fs.ReadDir(migrationsFS, "migrations") }
+	readMigrationFile = func(name string) ([]byte, error) { return fs.ReadFile(migrationsFS, "migrations/"+name) }
+	sqlOpen           = sql.Open
+)
+
 // RunMigrations executes all embedded SQL migration files in alphabetical order.
 // All SQL files use CREATE TABLE IF NOT EXISTS / ALTER TABLE ADD COLUMN IF NOT EXISTS /
 // CREATE INDEX IF NOT EXISTS — safe to re-run on every startup.
@@ -36,7 +46,7 @@ func RunMigrations(db *sql.DB) error {
 	}
 
 	for _, name := range names {
-		content, err := fs.ReadFile(migrationsFS, "migrations/"+name)
+		content, err := readMigrationFile(name)
 		if err != nil {
 			return fmt.Errorf("db.RunMigrations: read %s: %w", name, err)
 		}
@@ -68,7 +78,7 @@ func RunMigrations(db *sql.DB) error {
 // filenames. Exported via MigrationFiles for read-only callers that want
 // to compare the in-binary set against the DB-tracked set.
 func embeddedMigrationFilenames() ([]string, error) {
-	entries, err := fs.ReadDir(migrationsFS, "migrations")
+	entries, err := readMigrationDir()
 	if err != nil {
 		return nil, fmt.Errorf("read dir: %w", err)
 	}
@@ -173,7 +183,7 @@ func envDuration(name string, def time.Duration) time.Duration {
 //	API_PG_CONN_MAX_LIFETIME (default 4m) — Go time.Duration
 //	API_PG_CONN_MAX_IDLE_TIME (default 90s)
 func ConnectPostgres(databaseURL string) *sql.DB {
-	db, err := sql.Open("postgres", databaseURL)
+	db, err := sqlOpen("postgres", databaseURL)
 	if err != nil {
 		panic(&ErrDBConnect{Cause: err})
 	}

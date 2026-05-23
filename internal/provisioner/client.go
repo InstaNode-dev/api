@@ -97,6 +97,29 @@ func NewClient(addr, secret string) (*Client, *grpc.ClientConn, error) {
 	}, conn, nil
 }
 
+// NewClientFromConn builds a Client around an already-dialed gRPC
+// ClientConn. It is the seam used by in-process tests that stand up a
+// fake ProvisionerServiceServer on a bufconn listener and dial it with
+// grpc.WithContextDialer — production always goes through NewClient,
+// which owns the dial.
+//
+// The returned Client carries the same circuit breaker as NewClient so
+// breaker-aware code paths behave identically. The caller owns conn's
+// lifecycle (conn.Close()).
+func NewClientFromConn(conn *grpc.ClientConn, secret string) *Client {
+	br := circuit.NewBreaker(
+		provisionerCircuitName,
+		provisionerCircuitThreshold,
+		provisionerCircuitCooldown,
+	)
+	return &Client{
+		grpc:    provisionerv1.NewProvisionerServiceClient(conn),
+		conn:    conn,
+		secret:  secret,
+		breaker: br,
+	}
+}
+
 // callWithBreaker wraps a single RPC under the shared breaker. Returns
 // circuit.ErrOpen WITHOUT issuing the RPC when the breaker is open.
 // A nil breaker is treated as closed (test paths that build the Client

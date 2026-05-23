@@ -22,7 +22,6 @@ import (
 	"instant.dev/internal/plans"
 	nosqlprovider "instant.dev/internal/providers/nosql"
 	"instant.dev/internal/provisioner"
-	"instant.dev/internal/quota"
 	"instant.dev/internal/safego"
 	"instant.dev/internal/urls"
 )
@@ -269,7 +268,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 	}
 
 	nosqlStorageLimitMB := h.plans.StorageLimitMB("anonymous", "mongodb")
-	_, nosqlStorageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, nosqlStorageLimitMB)
+	_, nosqlStorageExceeded, _ := checkStorageQuota(ctx, h.db, resource.ID, nosqlStorageLimitMB)
 
 	// internal_url omitted on the anonymous path — see internal_url.go.
 	nosqlResp := fiber.Map{
@@ -397,7 +396,7 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 	middleware.RecordProvisionSuccess("mongodb")
 
 	nosqlAuthStorageLimitMB := h.plans.StorageLimitMB(tier, "mongodb")
-	_, nosqlAuthStorageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, nosqlAuthStorageLimitMB)
+	_, nosqlAuthStorageExceeded, _ := checkStorageQuota(ctx, h.db, resource.ID, nosqlAuthStorageLimitMB)
 
 	nosqlAuthResp := fiber.Map{
 		"ok":             true,
@@ -586,7 +585,7 @@ func (h *NoSQLHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 	middleware.RecordProvisionSuccess(models.ResourceTypeMongoDB)
 
 	storageLimitMB := h.plans.StorageLimitMB(in.Tier, models.ResourceTypeMongoDB)
-	_, storageExceeded, _ := quota.CheckStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
+	_, storageExceeded, _ := checkStorageQuota(ctx, h.db, resource.ID, storageLimitMB)
 
 	return TwinProvisionResult{
 		ID:            resource.ID.String(),
