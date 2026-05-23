@@ -173,6 +173,23 @@ jobs:
           psql -h localhost -U postgres -d postgres -c "CREATE DATABASE instant_customers" >/dev/null
           echo "created instant_customers (db-provider admin target)"
 
+      - name: Start NATS with monitoring (queue provider health-checks :8222)
+        # Mirror of ci.yml's NATS step. internal/providers/queue/local.go
+        # Provision() health-checks http://localhost:8222/healthz (NATSHost
+        # defaults to "localhost"), so the TestQueue_* coverage tests need a
+        # real NATS reachable on localhost:8222. Service containers can't pass
+        # the `-m` monitoring flag, so we run nats-server here. NATS-DOWN tests
+        # use the reserved non-resolvable host `nats.test`, so this does not
+        # collide with their 503 expectations. Without this, the unit-test gate
+        # below 503s on TestQueue_* and the deploy aborts before building.
+        run: |
+          docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2.10-alpine -m 8222
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:8222/healthz >/dev/null && { echo "NATS healthy after ${i}s"; break; }
+            echo "waiting for NATS monitoring endpoint (${i}/15)"; sleep 1
+          done
+          curl -sf http://localhost:8222/healthz >/dev/null || { echo "::error::NATS monitoring never came up"; exit 1; }
+
       - name: Run unit tests (short, no integration deps)
         working-directory: api
         env:
