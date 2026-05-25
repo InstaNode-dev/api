@@ -93,7 +93,7 @@ jobs:
       # nosql package contributes to coverage too.
       TEST_MONGO_URI: mongodb://localhost:27017
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: api
           # Full history so diff-cover can resolve origin/<base_ref> for the
@@ -101,20 +101,20 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout proto sibling (for go.mod replace ../proto)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
           path: proto
 
       - name: Checkout common sibling (for go.mod replace ../common)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN }}
           path: common
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: api/go.mod
 
@@ -145,7 +145,7 @@ jobs:
         continue-on-error: true
         run: go test ./... -short -count=1 -p 1 -coverprofile=coverage.out -covermode=atomic
 
-      - uses: codecov/codecov-action@v4
+      - uses: codecov/codecov-action@v6
         with:
           files: api/coverage.out
           flags: api
@@ -159,7 +159,7 @@ jobs:
       # coverage" step above is continue-on-error, so it still produces
       # coverage.out even if a flaky test trips — the gate reads that file.
       # ------------------------------------------------------------------
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         if: github.event_name == 'pull_request'
         with:
           python-version: '3.12'
