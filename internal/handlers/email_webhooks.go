@@ -53,8 +53,19 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 
 	"instant.dev/internal/config"
+	"instant.dev/internal/metrics"
 	"instant.dev/internal/models"
 )
+
+// webhookAuthFailure increments the inbound-webhook auth-failures counter.
+// Centralised so the brevo + ses handlers share one observability surface
+// and a single registry-iterating test guards the label set. webhook is
+// one of {"brevo_hmac","ses_sns","brevo_url_secret"}; reason is one of
+// {"secret_unset","signature_mismatch","missing_signature"}. API-19/96/97/98
+// (QA 2026-05-29).
+func webhookAuthFailure(webhook, reason string) {
+	metrics.WebhookAuthFailuresTotal.WithLabelValues(webhook, reason).Inc()
+}
 
 // EmailWebhookHandler holds the deps for both provider endpoints. db is
 // the platform Postgres; cfg surfaces BrevoWebhookSecret + SESSNSTopicARN;
@@ -158,11 +169,43 @@ var brevoEventTypeMap = map[string]string{
 	"blocked":      models.EmailEventTypeBounce,         // blocked = permanent in practice
 }
 
+// BrevoMethodNotAllowed handles non-POST verbs on /api/v1/email/webhook/brevo.
+//
+// API-98 (QA 2026-05-29): Brevo's dashboard sometimes issues a GET against the
+// configured webhook URL to confirm "the endpoint exists" before saving. The
+// pre-fix path returned a generic 401 (Fiber's app.Use chain hits before any
+// per-handler logic on the non-registered GET verb), and dashboards configured
+// to abandon-on-401 dropped the URL silently. 405 with the explicit code lets
+// the dashboard see "URL exists, only POST accepted" and proceed.
+func (h *EmailWebhookHandler) BrevoMethodNotAllowed(c *fiber.Ctx) error {
+	c.Set("Allow", "POST")
+	return respondError(c, fiber.StatusMethodNotAllowed, "webhook_method_not_allowed",
+		"This webhook URL only accepts POST.")
+}
+
+// SESMethodNotAllowed mirrors BrevoMethodNotAllowed for the SES/SNS endpoint.
+// SNS itself only POSTs, but operators sometimes curl the URL to confirm the
+// configuration. Same 405 + explicit code lets them proceed without thinking
+// they hit an unauthorised route.
+func (h *EmailWebhookHandler) SESMethodNotAllowed(c *fiber.Ctx) error {
+	c.Set("Allow", "POST")
+	return respondError(c, fiber.StatusMethodNotAllowed, "webhook_method_not_allowed",
+		"This webhook URL only accepts POST.")
+}
+
 // Brevo handles POST /api/v1/email/webhook/brevo.
 //
 // Returns 401 on bad signature, 400 on unparseable body, 200 on every
 // other case (including unknown event types — Brevo fires opens/clicks
 // that we silently drop).
+//
+// API-19/96 (QA 2026-05-29): auth runs BEFORE any body inspection so an
+// unauth POST surfaces the actual fault (webhook_signature_mismatch /
+// webhook_secret_mismatch) and triggers the operator-facing agent_action
+// instead of the generic user-auth "log in for a new INSTANODE_TOKEN"
+// envelope. The split between SECRET unset and SIGNATURE mismatch lets
+// observability distinguish "the operator hasn't deployed the secret
+// yet" from "the provider sent a payload with a bad signature".
 func (h *EmailWebhookHandler) Brevo(c *fiber.Ctx) error {
 	ctx, span := otel.Tracer("instant.dev/handlers").Start(c.UserContext(), "email.webhook.brevo")
 	defer span.End()
@@ -173,24 +216,34 @@ func (h *EmailWebhookHandler) Brevo(c *fiber.Ctx) error {
 		sig = c.Get(brevoHeaderSignatureLegacy)
 	}
 
-	if !verifyBrevoSignature(body, sig, h.cfg.BrevoWebhookSecret) {
-		slog.Warn("email.webhook.brevo.signature_failed",
-			"have_secret", h.cfg.BrevoWebhookSecret != "",
+	// Fail-closed split: SECRET unset vs SIGNATURE bad. Both still 401,
+	// but the error CODE + observability label differ. Operators can
+	// alert on `instant_webhook_auth_failures_total{reason="secret_unset"}`
+	// to detect "we forgot to deploy the secret"; the `signature_mismatch`
+	// label detects "the provider rotated their signing key on us".
+	if h.cfg == nil || h.cfg.BrevoWebhookSecret == "" {
+		slog.Warn("email.webhook.brevo.secret_unset",
 			"have_signature", sig != "",
 		)
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"ok":    false,
-			"error": "invalid_signature",
-		})
+		webhookAuthFailure("brevo_hmac", "secret_unset")
+		return respondError(c, fiber.StatusUnauthorized, "webhook_secret_mismatch",
+			"Brevo webhook secret is not configured on this api Deployment.")
+	}
+	if !verifyBrevoSignature(body, sig, h.cfg.BrevoWebhookSecret) {
+		slog.Warn("email.webhook.brevo.signature_failed",
+			"have_secret", true,
+			"have_signature", sig != "",
+		)
+		webhookAuthFailure("brevo_hmac", "signature_mismatch")
+		return respondError(c, fiber.StatusUnauthorized, "webhook_signature_mismatch",
+			"Brevo webhook signature did not verify against the body.")
 	}
 
 	var evt brevoEventPayload
 	if err := json.Unmarshal(body, &evt); err != nil {
 		slog.Warn("email.webhook.brevo.parse_failed", "error", err)
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"ok":    false,
-			"error": "invalid_payload",
-		})
+		return respondError(c, fiber.StatusBadRequest, "invalid_payload",
+			"Brevo webhook body could not be parsed as JSON.")
 	}
 
 	normalized, ok := brevoEventTypeMap[strings.ToLower(evt.Event)]
@@ -294,29 +347,45 @@ type sesMessage struct {
 // must match. Full SNS signature verification (RSA + cert download) is
 // reserved for a follow-up; the ARN check rejects drive-by traffic but
 // not a determined attacker who knows the ARN.
+//
+// API-19/97 (QA 2026-05-29): the SECRET_UNSET branch fires BEFORE envelope
+// parsing so an unauth POST with a junk body returns 401
+// webhook_secret_mismatch (operator config gap) rather than 400
+// invalid_payload (which falsely signals "fix the body"). The envelope
+// parse + TopicArn / RSA checks then surface webhook_signature_mismatch
+// on a bad inbound payload, distinct from the secret-unset path.
 func (h *EmailWebhookHandler) SES(c *fiber.Ctx) error {
 	ctx, span := otel.Tracer("instant.dev/handlers").Start(c.UserContext(), "email.webhook.ses")
 	defer span.End()
+
+	// Fail-closed FIRST: if the operator hasn't deployed SES_SNS_SUBSCRIPTION_ARN
+	// the route can't possibly authenticate anyone, so we reject before
+	// touching the body. This stops a probe from distinguishing
+	// "secret-unset 401" from "bad-body 400" by manipulating the payload.
+	if h.cfg == nil || h.cfg.SESSNSTopicARN == "" {
+		slog.Warn("email.webhook.ses.secret_unset")
+		webhookAuthFailure("ses_sns", "secret_unset")
+		return respondError(c, fiber.StatusUnauthorized, "webhook_secret_mismatch",
+			"SES/SNS subscription ARN is not configured on this api Deployment.")
+	}
 
 	body := c.Body()
 	var env snsEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
 		slog.Warn("email.webhook.ses.parse_envelope_failed", "error", err)
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"ok":    false,
-			"error": "invalid_payload",
-		})
+		// Body shape gate: with the secret configured, an unparseable body
+		// is genuinely a 400. Mirror it through the canonical envelope.
+		return respondError(c, fiber.StatusBadRequest, "invalid_payload",
+			"SES/SNS envelope could not be parsed as JSON.")
 	}
 
-	if h.cfg.SESSNSTopicARN == "" || env.TopicArn == "" || subtle.ConstantTimeCompare([]byte(h.cfg.SESSNSTopicARN), []byte(env.TopicArn)) != 1 {
+	if env.TopicArn == "" || subtle.ConstantTimeCompare([]byte(h.cfg.SESSNSTopicARN), []byte(env.TopicArn)) != 1 {
 		slog.Warn("email.webhook.ses.topic_arn_mismatch",
-			"have_configured_arn", h.cfg.SESSNSTopicARN != "",
 			"have_envelope_arn", env.TopicArn != "",
 		)
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"ok":    false,
-			"error": "invalid_signature",
-		})
+		webhookAuthFailure("ses_sns", "signature_mismatch")
+		return respondError(c, fiber.StatusUnauthorized, "webhook_signature_mismatch",
+			"SES/SNS envelope TopicArn did not match the configured subscription.")
 	}
 
 	// Full SNS RSA signature verification. The TopicArn check above is
@@ -331,10 +400,9 @@ func (h *EmailWebhookHandler) SES(c *fiber.Ctx) error {
 				"signing_cert_url", env.SigningCertURL,
 				"signature_version", env.SignatureVersion,
 			)
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"ok":    false,
-				"error": "invalid_signature",
-			})
+			webhookAuthFailure("ses_sns", "signature_mismatch")
+			return respondError(c, fiber.StatusUnauthorized, "webhook_signature_mismatch",
+				"SES/SNS RSA signature did not verify against the canonical message.")
 		}
 	}
 
@@ -357,10 +425,8 @@ func (h *EmailWebhookHandler) SES(c *fiber.Ctx) error {
 	var msg sesMessage
 	if err := json.Unmarshal([]byte(env.Message), &msg); err != nil {
 		slog.Warn("email.webhook.ses.parse_message_failed", "error", err)
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"ok":    false,
-			"error": "invalid_message",
-		})
+		return respondError(c, fiber.StatusBadRequest, "invalid_message",
+			"SES/SNS inner Message field could not be parsed as JSON.")
 	}
 
 	// Map SES notificationType → our normalized event_type. Multiple

@@ -236,6 +236,34 @@ var (
 		Help: "Inbound Brevo transactional-webhook events by normalized class (delivered/bounced_hard/bounced_soft/rejected/complaint/deferred/unsubscribed/error/unhandled/missing_message_id/unauthorized/invalid_payload/oversized)",
 	}, []string{"event"})
 
+	// WebhookAuthFailuresTotal counts inbound webhook auth failures across
+	// every email-provider webhook surface (Brevo HMAC + SES/SNS RSA).
+	// Distinguishes:
+	//   webhook = "brevo_hmac" | "ses_sns" | "brevo_url_secret"
+	//   reason  = "secret_unset"        — operator hasn't deployed the
+	//                                     corresponding secret env var
+	//             "signature_mismatch"  — secret IS configured, inbound
+	//                                     payload's HMAC / RSA / TopicArn
+	//                                     did not match
+	//             "missing_signature"   — inbound payload carries no
+	//                                     signature header at all
+	//
+	// API-19/96/97/98 (QA 2026-05-29): pre-fix every 401 from these routes
+	// rolled into a single generic "invalid_signature" code, so operators
+	// could not distinguish "we forgot to deploy the secret" from "the
+	// provider rotated their key" from "drive-by traffic" without
+	// hand-grepping log lines. NR alert on
+	// rate(instant_webhook_auth_failures_total{reason="secret_unset"}[5m]) > 0
+	// fires within 5 min of a deploy that drops the env var; signature_mismatch
+	// fires on real attacks or key rotations.
+	//
+	// Cardinality bound: {brevo_hmac, ses_sns, brevo_url_secret} x
+	// {secret_unset, signature_mismatch, missing_signature} = 9 series.
+	WebhookAuthFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_webhook_auth_failures_total",
+		Help: "Inbound webhook auth failures by webhook (brevo_hmac/ses_sns/brevo_url_secret) and reason (secret_unset/signature_mismatch/missing_signature). API-19/96/97/98 (QA 2026-05-29).",
+	}, []string{"webhook", "reason"})
+
 	// MagicLinkEmailRateLimited counts POST /auth/email/start requests
 	// silently absorbed by the per-email rate limiter. B4-F1 (BugBash
 	// 2026-05-20): the per-email limit responds 202 (identical to the

@@ -75,22 +75,36 @@ type internalBackupRefundClaims struct {
 // refunded=false means a prior call already credited the counter for
 // this backup_id (idempotent no-op).
 func (h *InternalBackupRefundHandler) Refund(c *fiber.Ctx) error {
+	// API-28 (QA 2026-05-29): auth-first. Mirror the terminate + resend
+	// handlers — the secret-unset / preauth gate runs BEFORE the path :id
+	// parse so an unauth POST with a junk path returns 401
+	// internal_token_required (the actual fault) instead of 400
+	// invalid_team_id. Pre-fix order let a probe distinguish "path bad"
+	// from "auth bad" by the envelope code — fail-closed inversion.
+	if h.cfg == nil || strings.TrimSpace(h.cfg.WorkerInternalJWTSecret) == "" {
+		slog.Warn("internal.backup_refund.secret_unset",
+			"reason", "WORKER_INTERNAL_JWT_SECRET is empty; rejecting all calls",
+		)
+		return respondError(c, fiber.StatusUnauthorized, "internal_token_required",
+			"Worker internal auth is not configured on this api Deployment.")
+	}
+	if err := preVerifyInternalBackupRefundJWT(c, h.cfg.WorkerInternalJWTSecret); err != nil {
+		return respondError(c, fiber.StatusUnauthorized, "internal_token_required",
+			"Worker internal token is missing or invalid.")
+	}
+
+	// Auth-accepted — now parse path :id. Malformed :id from authenticated
+	// caller is 400 (worker emitted a bad URL).
 	pathID := strings.TrimSpace(c.Params("id"))
 	teamID, err := uuid.Parse(pathID)
 	if err != nil {
 		return respondError(c, fiber.StatusBadRequest, "invalid_team_id", "team_id must be a UUID")
 	}
 
-	// Auth: fail-closed when the worker secret is unset.
-	if h.cfg == nil || strings.TrimSpace(h.cfg.WorkerInternalJWTSecret) == "" {
-		slog.Warn("internal.backup_refund.secret_unset",
-			"path_team_id", pathID,
-			"reason", "WORKER_INTERNAL_JWT_SECRET is empty; rejecting all calls",
-		)
-		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "worker internal auth not configured")
-	}
+	// Second-phase verify: bind the token's team_id claim to the path.
 	if err := verifyInternalBackupRefundJWT(c, h.cfg.WorkerInternalJWTSecret, teamID); err != nil {
-		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "invalid worker token")
+		return respondError(c, fiber.StatusUnauthorized, "internal_token_required",
+			"Worker internal token is missing or invalid.")
 	}
 
 	var body struct {
@@ -177,6 +191,43 @@ func (h *InternalBackupRefundHandler) Refund(c *fiber.Ctx) error {
 		"refunded":  true,
 		"backup_id": backupIDStr,
 	})
+}
+
+// preVerifyInternalBackupRefundJWT is the auth-first gate that runs BEFORE
+// the path :id parse. Mirrors preVerifyInternalTerminateJWT — every JWT
+// structural check that does NOT depend on the path :id runs here; the
+// team_id-claim-binds-to-path check is deferred to
+// verifyInternalBackupRefundJWT after the path parses cleanly.
+// API-28 (QA 2026-05-29).
+func preVerifyInternalBackupRefundJWT(c *fiber.Ctx, secret string) error {
+	authHeader := strings.TrimSpace(c.Get(fiber.HeaderAuthorization))
+	if !strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+		slog.Warn("internal.backup_refund.preauth.missing_bearer")
+		return errors.New("missing bearer token")
+	}
+	tokenStr := strings.TrimSpace(authHeader[len("Bearer "):])
+	claims := &internalBackupRefundClaims{}
+	// WithValidMethods([HS256]) pins alg; non-HS256 short-circuits.
+	_, err := jwt.ParseWithClaims(tokenStr, claims, func(_ *jwt.Token) (interface{}, error) {
+		return []byte(secret), nil
+	}, jwt.WithValidMethods([]string{"HS256"}))
+	if err != nil {
+		slog.Warn("internal.backup_refund.preauth.parse_failed", "error", err)
+		return err
+	}
+	if claims.Purpose != internalBackupRefundPurpose {
+		slog.Warn("internal.backup_refund.preauth.bad_purpose", "purpose", claims.Purpose)
+		return errors.New("purpose claim mismatch")
+	}
+	if claims.IssuedAt == nil {
+		return errors.New("missing iat claim")
+	}
+	now := time.Now()
+	if claims.IssuedAt.Before(now.Add(-internalBackupRefundMaxClockSkew)) ||
+		claims.IssuedAt.After(now.Add(internalBackupRefundMaxClockSkew)) {
+		return errors.New("iat outside clock skew window")
+	}
+	return nil
 }
 
 func verifyInternalBackupRefundJWT(c *fiber.Ctx, secret string, pathTeamID uuid.UUID) error {

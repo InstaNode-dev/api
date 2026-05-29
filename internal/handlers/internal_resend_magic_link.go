@@ -93,9 +93,35 @@ type internalResendMagicLinkRequest struct {
 }
 
 // Resend is the fiber.Handler for POST /internal/email/resend-magic-link.
+//
+// API-27/78 (QA 2026-05-29): the auth check runs FIRST — before any body
+// parsing — so a bogus token paired with a malformed body returns 401
+// internal_token_required (the actual fault) instead of 400 invalid_body.
+// The pre-fix order let an unauthenticated probe distinguish "no body"
+// (400) from "no auth" (401), inverting the fail-closed posture documented
+// for the /internal/* routes.
 func (h *InternalResendMagicLinkHandler) Resend(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
+	// Auth-first. The secret-unset branch must fire before we even look
+	// at the body so a probe can't tell "operator hasn't deployed the
+	// secret" from "operator deployed the secret but caller has wrong
+	// token" by the 401/400 envelope shape.
+	if h.cfg == nil || strings.TrimSpace(h.cfg.WorkerInternalJWTSecret) == "" {
+		slog.Warn("internal.resend_magic_link.secret_unset",
+			"request_id", requestID,
+			"reason", "WORKER_INTERNAL_JWT_SECRET is empty; rejecting all calls",
+		)
+		return respondError(c, fiber.StatusUnauthorized, "internal_token_required",
+			"Worker internal auth is not configured on this api Deployment.")
+	}
+	if err := preVerifyInternalResendMagicLinkJWT(c, h.cfg.WorkerInternalJWTSecret); err != nil {
+		return respondError(c, fiber.StatusUnauthorized, "internal_token_required",
+			"Worker internal token is missing or invalid.")
+	}
+
+	// Auth-accepted. Parse the body. A malformed body from an authenticated
+	// caller is genuinely a 400 (worker emitted a bad payload).
 	var body internalResendMagicLinkRequest
 	if err := c.BodyParser(&body); err != nil {
 		return respondError(c, fiber.StatusBadRequest, "invalid_body", "Request body must be valid JSON")
@@ -105,17 +131,11 @@ func (h *InternalResendMagicLinkHandler) Resend(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "invalid_link_id", "link_id must be a UUID")
 	}
 
-	// Auth: fail-closed when the shared secret is unset.
-	if h.cfg == nil || strings.TrimSpace(h.cfg.WorkerInternalJWTSecret) == "" {
-		slog.Warn("internal.resend_magic_link.secret_unset",
-			"link_id", linkID.String(),
-			"request_id", requestID,
-			"reason", "WORKER_INTERNAL_JWT_SECRET is empty; rejecting all calls",
-		)
-		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "worker internal auth not configured")
-	}
+	// Second-phase verify: bind the token's link_id claim to the body's
+	// link_id. Cross-link replay defence.
 	if err := verifyInternalResendMagicLinkJWT(c, h.cfg.WorkerInternalJWTSecret, linkID); err != nil {
-		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "invalid worker token")
+		return respondError(c, fiber.StatusUnauthorized, "internal_token_required",
+			"Worker internal token is missing or invalid.")
 	}
 
 	ctx := c.Context()
@@ -273,6 +293,47 @@ func readMagicLinkAttempts(ctx context.Context, db *sql.DB, id uuid.UUID) (int, 
 		return 0, err
 	}
 	return n, nil
+}
+
+// preVerifyInternalResendMagicLinkJWT is the auth-first gate that runs
+// BEFORE body parsing. Mirrors preVerifyInternalTerminateJWT — every JWT
+// structural check that does NOT depend on body fields runs here; the
+// link_id-claim-binds-to-body check is deferred to
+// verifyInternalResendMagicLinkJWT after the body parses cleanly.
+// API-27/78 (QA 2026-05-29).
+func preVerifyInternalResendMagicLinkJWT(c *fiber.Ctx, secret string) error {
+	authHeader := strings.TrimSpace(c.Get(fiber.HeaderAuthorization))
+	if !strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+		slog.Warn("internal.resend_magic_link.preauth.missing_bearer")
+		return errors.New("missing bearer token")
+	}
+	tokenStr := strings.TrimSpace(authHeader[len("Bearer "):])
+	claims := &internalResendMagicLinkClaims{}
+	// WithValidMethods([HS256]) pins alg; non-HS256 short-circuits.
+	_, err := jwt.ParseWithClaims(tokenStr, claims, func(_ *jwt.Token) (interface{}, error) {
+		return []byte(secret), nil
+	}, jwt.WithValidMethods([]string{"HS256"}))
+	if err != nil {
+		slog.Warn("internal.resend_magic_link.preauth.parse_failed", "error", err)
+		return err
+	}
+	if claims.Purpose != internalResendMagicLinkPurpose {
+		slog.Warn("internal.resend_magic_link.preauth.bad_purpose",
+			"got", claims.Purpose,
+			"want", internalResendMagicLinkPurpose,
+		)
+		return errors.New("wrong purpose claim")
+	}
+	if claims.IssuedAt == nil {
+		slog.Warn("internal.resend_magic_link.preauth.missing_iat")
+		return errors.New("missing iat claim")
+	}
+	skew := time.Since(claims.IssuedAt.Time)
+	if skew < -60*time.Second || skew > 60*time.Second {
+		slog.Warn("internal.resend_magic_link.preauth.iat_skew", "skew_seconds", skew.Seconds())
+		return errors.New("iat outside skew window")
+	}
+	return nil
 }
 
 // verifyInternalResendMagicLinkJWT parses + validates the bearer token
