@@ -271,6 +271,46 @@ func TestAuth_RenderAuthError_StatusAndContentType(t *testing.T) {
 	assert.Contains(t, body, "Detail")
 }
 
+// SEC-API FINDING-23 regression: renderAuthError must HTML-escape both
+// the headline and detail args so a future caller passing user-influenced
+// input (OAuth profile name, JWT email claim, upstream error) cannot
+// inject script into the api.instanode.dev origin. Closed-form negative
+// — the literal `<script>` and `</script>` payloads MUST NOT appear in
+// the response body; their escaped forms MUST appear.
+func TestAuth_RenderAuthError_HTMLEscapesPayload(t *testing.T) {
+	app := fiber.New()
+	const xssHeadline = `<script>alert("xss-headline")</script>`
+	const xssDetail = `</p><img src=x onerror="alert('xss-detail')">`
+	app.Get("/e", func(c *fiber.Ctx) error {
+		return renderAuthError(c, fiber.StatusBadRequest, xssHeadline, xssDetail)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/e", nil)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	buf := make([]byte, 4096)
+	n, _ := resp.Body.Read(buf)
+	body := string(buf[:n])
+
+	// Negative — raw opening tags must not survive (they would let the
+	// browser parse the payload as live HTML). With `<` and `>` HTML-escaped,
+	// the entire payload becomes inert text inside the surrounding <h2>/<p>
+	// containers — attribute-like sequences (`onerror=...`) inside an inert
+	// run never run.
+	assert.NotContains(t, body, "<script>", "raw <script> must be escaped")
+	assert.NotContains(t, body, "</script>", "raw </script> must be escaped")
+	assert.NotContains(t, body, "<img src=x", "raw <img must be escaped")
+
+	// Positive — escaped forms must be present so the message still
+	// renders as visible text in the browser.
+	assert.Contains(t, body, "&lt;script&gt;", "headline must be HTML-escaped")
+	assert.Contains(t, body, "&lt;/script&gt;", "headline closer must be HTML-escaped")
+	assert.Contains(t, body, "&lt;/p&gt;", "detail prefix must be HTML-escaped")
+	assert.Contains(t, body, "&lt;img src=x", "detail <img must be HTML-escaped")
+}
+
 // TestSignSessionJWT_RoundTrip mints a JWT via signSessionJWT and
 // asserts the resulting token decodes with the expected uid/tid/email.
 func TestAuth_SignSessionJWT_RoundTrip(t *testing.T) {
