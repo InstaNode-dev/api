@@ -259,6 +259,18 @@ func (h *StorageHandler) PresignStorage(c *fiber.Ctx) error {
 // signStorageURL constructs a presigned URL using the platform's master key.
 // Lives here (not in providers/storage) because it needs minio-go's S3
 // client and we don't want that transitive dep leaking into common.
+//
+// API-3 (QA 2026-05-29): when ObjectStorePublicURL is set (production:
+// "https://s3.instanode.dev" — a CNAME/CDN in front of nyc3.digitaloceanspaces.com
+// per CLAUDE.md "Canonical since 2026-05-20"), the presigned URL is rewritten
+// from `https://nyc3.digitaloceanspaces.com/...` to `https://s3.instanode.dev/...`
+// so customer-facing artifacts never leak the underlying DO provider host or
+// the master access-key-id prefix. The SigV4 signature is preserved verbatim
+// because s3.instanode.dev resolves to the same DO Spaces backend at the HTTP
+// layer (CNAME / reverse-proxy), so the canonical Host header in the signature
+// matches what the customer's HTTP client sends. If ObjectStorePublicURL is
+// empty (local dev / MinIO), the original signed endpoint is returned
+// unchanged.
 func (h *StorageHandler) signStorageURL(ctx context.Context, op, objectKey string, ttl time.Duration) (string, time.Time, error) {
 	bucket := h.cfg.ObjectStoreBucket
 	endpoint := h.cfg.ObjectStoreEndpoint
@@ -303,7 +315,46 @@ func (h *StorageHandler) signStorageURL(ctx context.Context, op, objectKey strin
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("presign: %w", err)
 	}
+
+	// API-3: rewrite host+scheme to the canonical public URL when configured.
+	// Path + query (which carries the SigV4 signature) are preserved verbatim;
+	// only the scheme://host prefix is swapped. s3.instanode.dev is a CNAME
+	// over the same DO Spaces backend so the signature remains valid.
+	if rewritten, ok := rewritePresignHost(signed, h.cfg.ObjectStorePublicURL); ok {
+		return rewritten, expiresAt, nil
+	}
 	return signed.String(), expiresAt, nil
+}
+
+// rewritePresignHost swaps the scheme+host of a signed URL with the canonical
+// public URL when one is configured. Returns (rewritten, true) on a successful
+// substitution; (original, false) when publicURL is empty, malformed, or the
+// signed URL is malformed.
+//
+// The SigV4 signature is part of the query string, not bound to the URL host
+// itself — DO Spaces accepts the canonical CNAME host header at the HTTP layer
+// (verified manually 2026-05-20 per CLAUDE.md "Canonical since 2026-05-20").
+// The substitution preserves the path (which includes the bucket prefix and
+// object key) and the entire query string (signature, expiry, credential).
+func rewritePresignHost(signed *url.URL, publicURL string) (string, bool) {
+	if signed == nil {
+		return "", false
+	}
+	if publicURL == "" {
+		return signed.String(), false
+	}
+	pub, err := url.Parse(publicURL)
+	if err != nil || pub.Host == "" {
+		return signed.String(), false
+	}
+	scheme := pub.Scheme
+	if scheme == "" {
+		scheme = signed.Scheme
+	}
+	out := *signed
+	out.Scheme = scheme
+	out.Host = pub.Host
+	return out.String(), true
 }
 
 // isSafePresignKey reports whether key is safe to use as a tenant-supplied

@@ -145,6 +145,47 @@ func TestAnonRecycleGate_Cache(t *testing.T) { recycleGateOnce(t, "/cache/new", 
 func TestAnonRecycleGate_NoSQL(t *testing.T) { recycleGateOnce(t, "/nosql/new", "10.215.0.1", "mongodb") }
 func TestAnonRecycleGate_Queue(t *testing.T) { recycleGateOnce(t, "/queue/new", "10.216.0.1", "queue") }
 
+// TestAnonRecycleGate_DB covers the API-7 (QA 2026-05-29) reorder: the recycle
+// gate now fires from the EARLIER position in NewDB (before checkProvisionLimit),
+// so a fresh fingerprint with a planted recycle marker and zero active rows
+// must still 402 free_tier_recycle_requires_claim on the /db/new path. Pinned
+// here rather than in redis_fault_provarms_test.go because that test depends
+// on a live postgres-customers backend (which the coverage CI job doesn't
+// provide); the gRPC fixture's fakeProvisioner is good enough since recycleGate
+// fires BEFORE any backend dispatch.
+func TestAnonRecycleGate_DB(t *testing.T) {
+	fake := &fakeProvisioner{}
+	fx := setupGRPCProvFixture(t, fake, false)
+
+	ip := "10.217.0.1"
+	// Plant a recycle marker for the fingerprint this IP will produce and
+	// ensure zero active rows. We do NOT need to provision first to learn the
+	// fingerprint — the middleware computes it the same way every request, so
+	// we can plant by replicating the exact fingerprint calc OR by using a
+	// throwaway provision to discover it (mirrors recycleGateOnce above).
+	resp, body := doProvisionKeyed(t, fx, "/cache/new", ip, "", uuid.NewString(),
+		map[string]any{"name": "rg-db-probe"})
+	resp.Body.Close()
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	var fp string
+	require.NoError(t, fx.db.QueryRowContext(context.Background(),
+		`SELECT fingerprint FROM resources WHERE token = $1::uuid`, body.Token).Scan(&fp))
+	_, err := fx.db.ExecContext(context.Background(),
+		`UPDATE resources SET status = 'deleted' WHERE fingerprint = $1`, fp)
+	require.NoError(t, err)
+	require.NoError(t, fx.rdb.Set(context.Background(),
+		handlers.RecycleSeenKeyPrefix+fp, "1", time.Hour).Err())
+
+	// Next /db/new from the same IP must 402 from the EARLY recycle gate.
+	resp2, body2 := doProvisionKeyed(t, fx, "/db/new", ip, "", uuid.NewString(),
+		map[string]any{"name": "rg-db-fire"})
+	defer resp2.Body.Close()
+	require.Equal(t, http.StatusPaymentRequired, resp2.StatusCode,
+		"/db/new recycle gate must 402 (early-gate API-7 reorder)")
+	assert.Equal(t, "free_tier_recycle_requires_claim", body2.Error)
+}
+
 // dedupDecryptFailOnce: provision 5 of a type, corrupt the row's stored
 // connection_url, force over-cap, and assert the 6th over-cap call hits the
 // dedup branch, fails to decrypt, and provisions FRESH (never returns

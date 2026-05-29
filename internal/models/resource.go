@@ -366,7 +366,20 @@ func GetActiveResourceByFingerprint(ctx context.Context, db *sql.DB, fingerprint
 }
 
 // GetAllActiveResourcesByFingerprint returns all active anonymous resources for a fingerprint.
-// Used when issuing an onboarding JWT to include all services provisioned in one session.
+// Used when issuing an onboarding JWT to include all services provisioned in one session
+// AND by the recycle gate (provisionHelper.recycleGate) to decide whether the
+// fingerprint is "still mid-session" (rows present, gate skipped) or "recycle"
+// (zero rows, gate fires).
+//
+// API-4 / CLI-MCP-15R2 (QA 2026-05-29): the gate was leaking expired-but-still-active
+// rows on the queue/storage flow — those handlers' recycleGate call saw a
+// stale row and skipped the gate, so the fingerprint provisioned freely while
+// db/cache/nosql/webhook (which had no stale rows of that type) hit 402.
+// The TTL reaper runs asynchronously, so a row past its 24h TTL can stay
+// status='active' for minutes-to-hours. Adding the expires_at filter at the
+// query layer makes the gate behaviour consistent regardless of reaper lag.
+//
+// NULL expires_at is preserved (authenticated/permanent resources never expire).
 func GetAllActiveResourcesByFingerprint(ctx context.Context, db *sql.DB, fingerprint string) ([]*Resource, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT `+resourceColumns+`
@@ -374,6 +387,7 @@ func GetAllActiveResourcesByFingerprint(ctx context.Context, db *sql.DB, fingerp
 		WHERE fingerprint = $1
 		  AND team_id IS NULL
 		  AND status = 'active'
+		  AND (expires_at IS NULL OR expires_at > NOW())
 		ORDER BY created_at DESC
 	`, fingerprint)
 	if err != nil {

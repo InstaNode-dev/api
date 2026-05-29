@@ -163,6 +163,25 @@ func TestGetAllActiveResourcesByFingerprint_Branches(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestGetAllActiveResourcesByFingerprint_FiltersExpiredRows pins API-4 /
+// CLI-MCP-15R2 (QA 2026-05-29): the recycle gate suppressed itself on
+// queue/storage flows because expired-but-status='active' rows (TTL reaper
+// hadn't run yet) leaked through this query. The fix adds an
+// `expires_at IS NULL OR expires_at > NOW()` clause so the query result is
+// reaper-independent. This test asserts the SQL fragment is present so the
+// guard cannot regress without failing the test.
+func TestGetAllActiveResourcesByFingerprint_FiltersExpiredRows(t *testing.T) {
+	ctx := context.Background()
+	db, mock := newMock(t)
+	// Use a strict regex that asserts the expires_at filter is part of the
+	// WHERE clause. If a future refactor removes it, this test reds.
+	mock.ExpectQuery(`WHERE fingerprint = \$1\s+AND team_id IS NULL\s+AND status = 'active'\s+AND \(expires_at IS NULL OR expires_at > NOW\(\)\)`).
+		WillReturnRows(resourceMockRow())
+	out, err := GetAllActiveResourcesByFingerprint(ctx, db, "fp")
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+}
+
 func TestGetWebhookHMACSecret_Branches(t *testing.T) {
 	ctx := context.Background()
 	db, mock := newMock(t)

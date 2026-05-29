@@ -126,6 +126,17 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 	}
 
 	// ── Anonymous path ─────────────────────────────────────────────────────────
+	// Free-tier recycle gate runs BEFORE the daily-cap check so the 402
+	// `free_tier_recycle_requires_claim` envelope (with claim_url + agent_action
+	// upsell signal) wins over the more generic 429 `provision_limit_reached`
+	// when both apply. API-7 (QA 2026-05-29): an over-cap fingerprint whose
+	// previous resources have aged out used to get the bare daily-cap 429
+	// envelope, losing the recycle-gate upsell entirely. Gate fails open (returns
+	// false on any error) so the early call cannot block an honest first-touch.
+	if h.recycleGate(c, fp, "postgres") {
+		return nil
+	}
+
 	limitExceeded, err := h.checkProvisionLimit(ctx, fp)
 	if err != nil {
 		slog.Error("db.new.provision_limit_check_failed",
@@ -209,15 +220,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 		}
 	}
 
-	// Free-tier recycle gate (Option B / FREE-TIER-RECYCLE-2026-05-12). If
-	// this fingerprint has provisioned anonymously before AND no active row
-	// exists today, require a one-time email claim instead of silently
-	// handing out another 24h free resource. Anonymous-only — the
-	// authenticated path returned above. Fails open on Redis/DB errors so
-	// the magic-first-touch wedge is never collateral damage.
-	if h.recycleGate(c, fp, "postgres") {
-		return nil
-	}
+	// (Recycle gate moved above — see API-7 / QA 2026-05-29 ordering fix.)
 
 	// Provision new anonymous Postgres resource (expires in 24h).
 	expiresAt := time.Now().UTC().Add(24 * time.Hour)

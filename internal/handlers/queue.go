@@ -191,6 +191,11 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 	}
 
 	// ── Anonymous path ─────────────────────────────────────────────────────────
+	// Recycle gate runs BEFORE the daily-cap check — see db.go API-7 fix.
+	if h.recycleGate(c, fp, "queue") {
+		return nil
+	}
+
 	limitExceeded, err := h.checkProvisionLimit(ctx, fp)
 	if err != nil {
 		slog.Error("queue.new.provision_limit_check_failed",
@@ -258,10 +263,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		}
 	}
 
-	// Free-tier recycle gate (see provision_helper.go for rationale).
-	if h.recycleGate(c, fp, "queue") {
-		return nil
-	}
+	// (Recycle gate moved above — see API-7 / QA 2026-05-29 ordering fix.)
 
 	expiresAt := time.Now().UTC().Add(24 * time.Hour)
 	resource, err := models.CreateResource(ctx, h.db, models.CreateResourceParams{

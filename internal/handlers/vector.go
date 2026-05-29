@@ -256,6 +256,11 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 			"isolated resources require an authenticated team. Sign up at "+urls.StartURLPrefix)
 	}
 
+	// Recycle gate runs BEFORE the daily-cap check — see db.go API-7 fix.
+	if h.recycleGate(c, fp, models.ResourceTypeVector) {
+		return nil
+	}
+
 	limitExceeded, err := h.checkProvisionLimit(ctx, fp)
 	if err != nil {
 		slog.Error("vector.new.provision_limit_check_failed",
@@ -322,12 +327,7 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 		}
 	}
 
-	// Free-tier recycle gate — same logic as /db/new, scoped to vector
-	// so a fingerprint that already burned its anonymous Postgres can't
-	// silently get a second wedge via /vector/new.
-	if h.recycleGate(c, fp, models.ResourceTypeVector) {
-		return nil
-	}
+	// (Recycle gate moved above — see API-7 / QA 2026-05-29 ordering fix.)
 
 	// Anonymous: 24h TTL.
 	expiresAt := time.Now().UTC().Add(24 * time.Hour)

@@ -8,6 +8,8 @@ package handlers
 // MinIO being available, and skip when it isn't.
 
 import (
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -67,4 +69,87 @@ func TestSanitisePresignKey(t *testing.T) {
 		got := sanitisePresignKey(in)
 		assert.Equal(t, want, got, "sanitisePresignKey(%q)", in)
 	}
+}
+
+// TestRewritePresignHost_CanonicalHostSubstitution covers API-3 (QA 2026-05-29).
+// The signed URL must be rewritten from the DO-internal host
+// (nyc3.digitaloceanspaces.com) to the canonical public host
+// (s3.instanode.dev) when ObjectStorePublicURL is configured, while the path
+// and entire query string (including the SigV4 signature) are preserved
+// verbatim. When ObjectStorePublicURL is empty, the original URL is returned.
+func TestRewritePresignHost_CanonicalHostSubstitution(t *testing.T) {
+	signedRaw := "https://nyc3.digitaloceanspaces.com/instant-shared/abc12345/test.txt" +
+		"?X-Amz-Algorithm=AWS4-HMAC-SHA256" +
+		"&X-Amz-Credential=DO00CXYXRKNHR6XM77RE%2F20260529%2Fnyc3%2Fs3%2Faws4_request" +
+		"&X-Amz-Date=20260529T120000Z" +
+		"&X-Amz-Expires=600" +
+		"&X-Amz-SignedHeaders=host" +
+		"&X-Amz-Signature=deadbeefcafebabe"
+
+	t.Run("rewrites host+scheme when publicURL configured", func(t *testing.T) {
+		signed, err := url.Parse(signedRaw)
+		assert.NoError(t, err)
+		out, ok := rewritePresignHost(signed, "https://s3.instanode.dev")
+		assert.True(t, ok, "rewrite must succeed when publicURL is non-empty")
+		// Canonical host now visible.
+		assert.True(t, strings.HasPrefix(out, "https://s3.instanode.dev/"),
+			"got %q", out)
+		// DO Spaces host fully removed.
+		assert.NotContains(t, out, "nyc3.digitaloceanspaces.com",
+			"DO Spaces host must not leak through; got %q", out)
+		// Path preserved.
+		assert.Contains(t, out, "/instant-shared/abc12345/test.txt")
+		// SigV4 signature (the load-bearing piece — DO Spaces accepts the
+		// canonical CNAME with the original signature) preserved verbatim.
+		assert.Contains(t, out, "X-Amz-Signature=deadbeefcafebabe")
+		assert.Contains(t, out, "X-Amz-Credential=DO00CXYXRKNHR6XM77RE")
+		assert.Contains(t, out, "X-Amz-Expires=600")
+	})
+
+	t.Run("empty publicURL returns original (local dev fallback)", func(t *testing.T) {
+		signed, err := url.Parse(signedRaw)
+		assert.NoError(t, err)
+		out, ok := rewritePresignHost(signed, "")
+		assert.False(t, ok, "empty publicURL must report no rewrite happened")
+		assert.Equal(t, signedRaw, out,
+			"empty publicURL must return the original URL unchanged")
+	})
+
+	t.Run("malformed publicURL returns original", func(t *testing.T) {
+		signed, err := url.Parse(signedRaw)
+		assert.NoError(t, err)
+		// A URL with no host after parsing — url.Parse is lenient, so we
+		// force the "host is empty" branch by passing a bare scheme.
+		out, ok := rewritePresignHost(signed, "https://")
+		assert.False(t, ok, "publicURL with empty host must not rewrite")
+		assert.Equal(t, signedRaw, out)
+	})
+
+	t.Run("nil signed URL returns empty + false", func(t *testing.T) {
+		out, ok := rewritePresignHost(nil, "https://s3.instanode.dev")
+		assert.False(t, ok)
+		assert.Equal(t, "", out)
+	})
+
+	t.Run("publicURL with explicit scheme overrides signed scheme", func(t *testing.T) {
+		// publicURL with explicit scheme — verify that scheme wins.
+		signed, err := url.Parse(signedRaw)
+		assert.NoError(t, err)
+		out, ok := rewritePresignHost(signed, "http://s3.instanode.dev")
+		assert.True(t, ok)
+		assert.True(t, strings.HasPrefix(out, "http://s3.instanode.dev/"))
+	})
+
+	t.Run("publicURL with no scheme inherits signed scheme", func(t *testing.T) {
+		// Protocol-relative URL: url.Parse on "//host/path" returns
+		// {Scheme:"" Host:"host"}. Exercises the
+		// `if scheme == "" { scheme = signed.Scheme }` branch.
+		signed, err := url.Parse(signedRaw)
+		assert.NoError(t, err)
+		out, ok := rewritePresignHost(signed, "//cdn.instanode.dev")
+		assert.True(t, ok, "protocol-relative publicURL must still rewrite")
+		// signed had scheme "https" — must be preserved on rewrite.
+		assert.True(t, strings.HasPrefix(out, "https://cdn.instanode.dev/"),
+			"scheme must fall back to the signed URL's scheme; got %q", out)
+	})
 }

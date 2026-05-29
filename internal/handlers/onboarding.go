@@ -37,42 +37,38 @@ func NewOnboardingHandler(db *sql.DB, cfg *config.Config, emailClient *email.Cli
 	return &OnboardingHandler{db: db, cfg: cfg, email: emailClient}
 }
 
-// StartLanding handles GET /start?t={jwt}
-// Validates the JWT and redirects to the dashboard ClaimPage.
+// StartLanding handles GET /start?t={jwt}.
+//
+// API-5 (QA 2026-05-29): per CLAUDE.md "Live API surface", /start must ALWAYS
+// 302 to the dashboard `/claim?t=jwt` — the dashboard is the user-facing
+// landing page that renders any token error (expired / unrecognised /
+// already-claimed) in a friendly UI. Previously, an invalid token surfaced
+// the raw `{"ok":false,"error":"invalid_token"}` JSON envelope with HTTP 400,
+// which is what an upgrade link printed in an agent's terminal log lands on
+// when copy-pasted into a browser — the user sees naked JSON, not a recovery
+// flow.
+//
+// The new contract: pass the token through verbatim and let the dashboard's
+// ClaimPage handle validation. Bonus: the platform side avoids a DB lookup on
+// every drive-by /start hit (the JTI lookup now happens once, at /claim time,
+// where it's actually load-bearing).
+//
+// Edge cases:
+//   - Missing `t` query: 302 to /claim (no token) — the dashboard's ClaimPage
+//     renders its "no token" empty state.
+//   - Token shape is preserved (url.QueryEscape on the raw value); no
+//     validation, no decoding — invalidity is the dashboard's concern.
+//
+// The landing-viewed metric still increments so the funnel pivot of
+// "agents that surface /start in their tool output" stays measurable.
 func (h *OnboardingHandler) StartLanding(c *fiber.Ctx) error {
-	ctx := c.UserContext()
-	requestID := middleware.GetRequestID(c)
 	jwtStr := c.Query("t")
-	if jwtStr == "" {
-		return respondError(c, fiber.StatusBadRequest, "missing_token", "Upgrade token is required")
-	}
-
-	claims, err := crypto.VerifyOnboardingJWT([]byte(h.cfg.JWTSecret), jwtStr)
-	if err != nil {
-		slog.Warn("onboarding.start.invalid_jwt",
-			"error", err,
-			"request_id", requestID,
-		)
-		return respondError(c, fiber.StatusBadRequest, "invalid_token", "Upgrade token is invalid or expired")
-	}
-
-	// Verify JTI exists and hasn't been converted.
-	ev, err := models.GetOnboardingByJTI(ctx, h.db, claims.ID)
-	if err != nil {
-		var notFound *models.ErrOnboardingNotFound
-		if errors.As(err, &notFound) {
-			return respondError(c, fiber.StatusBadRequest, "invalid_token", "Upgrade token not recognized")
-		}
-		slog.Error("onboarding.start.db_error", "error", err, "request_id", requestID)
-		return respondError(c, fiber.StatusServiceUnavailable, "lookup_failed", "Failed to verify upgrade token")
-	}
-
-	if ev.ConvertedAt.Valid {
-		return c.Redirect(h.cfg.DashboardBaseURL+"/claim?already_claimed=true", fiber.StatusFound)
-	}
 
 	metrics.ConversionFunnel.WithLabelValues("landing_viewed").Inc()
 
+	if jwtStr == "" {
+		return c.Redirect(h.cfg.DashboardBaseURL+"/claim", fiber.StatusFound)
+	}
 	return c.Redirect(h.cfg.DashboardBaseURL+"/claim?t="+url.QueryEscape(jwtStr), fiber.StatusFound)
 }
 
