@@ -22,6 +22,7 @@ package migrations
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"sync"
 	"time"
 )
@@ -41,6 +42,35 @@ type State struct {
 	Status   string // "ok" or "unknown"
 	Filename string // highest-applied migration filename; "" when unknown
 	Count    int    // total rows in schema_migrations; 0 when unknown
+}
+
+// PublicVersion returns the migration-version string safe to surface on
+// the public /healthz envelope (BUG-API-090/217). The raw Filename leaks
+// the table/feature names embedded in the migration filename ("e.g.
+// 063_forwarder_sent_audit_link.sql" tells an attacker that a
+// forwarder_sent → audit_log FK landed at migration 63), which is
+// recon a reachable-by-anyone health probe should not provide. We strip
+// the filename to its numeric prefix only ("063"), which preserves the
+// canary contract (canaries compare commit_id+migration_count+
+// migration_version to a known-good tuple) without leaking domain
+// knowledge.
+//
+// Empty filename (DB unreachable / pre-migration) returns "" — same
+// shape the pre-fix wire emitted in the unknown branch.
+func (s State) PublicVersion() string {
+	if s.Filename == "" {
+		return ""
+	}
+	// Split on first "_" — migration filenames are `<3-digit>_<name>.sql`.
+	// We tolerate a missing "_" (treat the whole stem as the version) and
+	// a non-numeric prefix (return as-is) so a future renaming scheme
+	// degrades to "leak the prefix only" rather than panicking. The
+	// .sql suffix is stripped if present.
+	stem := strings.TrimSuffix(s.Filename, ".sql")
+	if idx := strings.IndexByte(stem, '_'); idx >= 0 {
+		return stem[:idx]
+	}
+	return stem
 }
 
 // Reader caches one State per process with a TTL. Safe for concurrent use.
