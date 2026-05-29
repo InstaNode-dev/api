@@ -95,61 +95,52 @@ func doGet(t *testing.T, app *fiber.App, path string) *http.Response {
 }
 
 // ── StartLanding ─────────────────────────────────────────────────────────────
+//
+// API-5 (QA 2026-05-29): /start now ALWAYS 302s to the dashboard /claim
+// regardless of token validity — the dashboard ClaimPage renders any token
+// error (expired / unrecognised / already-claimed) in a friendly UI. The
+// platform side no longer validates the JWT at /start; that's the dashboard's
+// job. Per CLAUDE.md "Live API surface" line.
 
-func TestResidualStartLanding_MissingToken_400(t *testing.T) {
+// TestResidualStartLanding_MissingToken_RedirectsToClaim — no token → 302 to
+// /claim (no t=) so the dashboard renders its empty / login state.
+func TestResidualStartLanding_MissingToken_RedirectsToClaim(t *testing.T) {
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
 	app := onboardingResidualApp(t, db)
 	resp := doGet(t, app, "/start")
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+	assert.Contains(t, resp.Header.Get("Location"), "/claim")
+	// No t= query when missing.
+	assert.NotContains(t, resp.Header.Get("Location"), "/claim?t=")
 }
 
-func TestResidualStartLanding_InvalidJWT_400(t *testing.T) {
+// TestResidualStartLanding_GarbageToken_StillRedirects — invalid/garbage tokens
+// must NOT 400 the user with raw JSON. The dashboard renders the error.
+func TestResidualStartLanding_GarbageToken_StillRedirects(t *testing.T) {
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
 	app := onboardingResidualApp(t, db)
 	resp := doGet(t, app, "/start?t=garbage")
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+	assert.Contains(t, resp.Header.Get("Location"), "/claim?t=garbage")
 }
 
-func TestResidualStartLanding_UnknownJTI_400(t *testing.T) {
+// TestResidualStartLanding_UnknownJTI_StillRedirects — a syntactically valid
+// JWT for an unknown JTI must also 302 — the dashboard does the JTI lookup
+// and renders the "expired/unrecognised" message.
+func TestResidualStartLanding_UnknownJTI_StillRedirects(t *testing.T) {
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
 	app := onboardingResidualApp(t, db)
 	signed := mintOnboardingJWT(t, uuid.NewString(), "fp-start-unknown", nil)
 	resp := doGet(t, app, "/start?t="+signed)
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-}
-
-// TestStartLanding_DBError_503 drives the db_error arm (66-67) via a brokenDB:
-// JWT verifies in-process, then GetOnboardingByJTI errors with a non-notfound
-// error → 503 lookup_failed.
-func TestResidualStartLanding_DBError_503(t *testing.T) {
-	app := onboardingResidualApp(t, brokenDB(t))
-	signed := mintOnboardingJWT(t, uuid.NewString(), "fp-start-broken", nil)
-	resp := doGet(t, app, "/start?t="+signed)
-	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
-}
-
-// TestStartLanding_AlreadyClaimed_Redirects drives the converted-redirect arm
-// (70-72): a converted onboarding row → 302 to the dashboard with the flag.
-func TestResidualStartLanding_AlreadyClaimed_Redirects(t *testing.T) {
-	db, clean := testhelpers.SetupTestDB(t)
-	defer clean()
-	app := onboardingResidualApp(t, db)
-	jti := uuid.NewString()
-	_, err := db.ExecContext(context.Background(), `
-		INSERT INTO onboarding_events (jti, fingerprint, converted_at, team_id)
-		VALUES ($1, $2, now(), NULL)
-	`, jti, "fp-start-claimed")
-	require.NoError(t, err)
-	signed := mintOnboardingJWT(t, jti, "fp-start-claimed", nil)
-	resp := doGet(t, app, "/start?t="+signed)
 	assert.Equal(t, http.StatusFound, resp.StatusCode)
-	assert.Contains(t, resp.Header.Get("Location"), "already_claimed=true")
+	assert.Contains(t, resp.Header.Get("Location"), "/claim?t=")
 }
 
-// TestStartLanding_HappyPath_Redirects drives the success redirect (74-76).
+// TestResidualStartLanding_HappyPath_Redirects — happy path is still a 302
+// with t= query intact. Same shape as the always-302 contract.
 func TestResidualStartLanding_HappyPath_Redirects(t *testing.T) {
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()

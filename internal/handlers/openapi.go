@@ -757,17 +757,16 @@ const openAPISpec = `{
     },
     "/start": {
       "get": {
-        "summary": "Onboarding bounce — 302 redirect to the dashboard claim page",
-        "description": "Public bounce endpoint baked into the upgrade_url returned by every anonymous provisioning response. Issues a 302 Location redirect to the dashboard's claim page (DASHBOARD_BASE_URL + '/claim?t=<jwt>') — the dashboard then drives the email-claim flow against POST /claim. Agents that already hold the upgrade_jwt should POST /claim directly instead of following this redirect.",
-        "parameters": [{ "name": "t", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Signed onboarding JWT (the upgrade_jwt field from any anonymous provisioning response, or extracted from the upgrade URL)." }],
+        "summary": "Onboarding bounce — always 302 to the dashboard claim page",
+        "description": "Public bounce endpoint baked into the upgrade_url returned by every anonymous provisioning response. Issues a 302 Location redirect to the dashboard's claim page (DASHBOARD_BASE_URL + '/claim?t=<jwt>') — the dashboard then drives the email-claim flow against POST /claim. ALWAYS 302s regardless of token validity (API-5): an invalid/expired/missing token still redirects to /claim where the dashboard renders a friendly error UI. This is the contract because /start URLs land in agents' terminal logs and users copy-paste them into browsers; a raw JSON 400 is hostile UX. Agents that already hold the upgrade_jwt should POST /claim directly instead of following this redirect.",
+        "parameters": [{ "name": "t", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Signed onboarding JWT (the upgrade_jwt field from any anonymous provisioning response, or extracted from the upgrade URL). Optional — when missing, the bounce still 302s to /claim with no t= query so the dashboard renders its empty / login state." }],
         "responses": {
           "302": {
             "description": "Redirect to the dashboard claim page (e.g. https://instanode.dev/claim?t=<jwt>). Follow the Location header for the human flow, or POST /claim directly with the JWT to skip the dashboard step.",
             "headers": {
-              "Location": { "schema": { "type": "string", "format": "uri" }, "description": "Dashboard claim URL with the JWT echoed in the t= query param" }
+              "Location": { "schema": { "type": "string", "format": "uri" }, "description": "Dashboard claim URL with the JWT echoed in the t= query param (or no t= when omitted by the caller)" }
             }
-          },
-          "400": { "description": "Missing or malformed t= JWT", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+          }
         }
       }
     },

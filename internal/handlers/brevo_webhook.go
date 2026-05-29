@@ -356,10 +356,18 @@ func (h *BrevoTransactionalWebhookHandler) Receive(c *fiber.Ctx) error {
 		// B13-F7 / B18 wave-3: hydrate the canonical ErrorResponse envelope
 		// (ok/error/message/request_id/retry_after_seconds/agent_action) so
 		// schema validators on the wire see the same 4xx shape every other
-		// handler emits. respondError reads the canonical agent_action from
-		// codeToAgentAction["unauthorized"], so we get a consistent UX
-		// surface without a per-call override.
-		return respondError(c, fiber.StatusUnauthorized, "unauthorized",
+		// handler emits.
+		//
+		// API-6 (QA 2026-05-29): use the Brevo-specific error code
+		// `brevo_secret_mismatch` instead of the generic `unauthorized` so
+		// the canonical agent_action correctly tells the OPERATOR to fix
+		// their Brevo dashboard config, instead of telling a USER to log
+		// in for a new INSTANODE_TOKEN (this webhook is unrelated to user
+		// auth). HTTP status stays 401 — only the error CODE + agent_action
+		// copy change, so existing operator alerting that pivots off
+		// `metrics.BrevoWebhookEventsTotal{result="unauthorized"}` is
+		// unaffected.
+		return respondError(c, fiber.StatusUnauthorized, "brevo_secret_mismatch",
 			"Brevo webhook URL secret did not match the configured value.")
 	}
 
