@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
@@ -946,6 +947,15 @@ func (h *AuthHandler) consumeOAuthState(ctx context.Context, state string) bool 
 
 // renderAuthError sends a 400 with a small HTML page so a browser landing on
 // a broken callback URL gets a readable message instead of raw JSON.
+//
+// SEC-API FINDING-23 (2026-05-29): headline + detail are interpolated into HTML
+// via fmt.Sprintf. Every existing caller passes static literals, but the function
+// itself is the only HTML emitter in the api and was unsafe-by-default — any
+// future caller passing a user-influenced value (OAuth profile name, JWT claim,
+// upstream error string) would have introduced reflected XSS on api.instanode.dev
+// (cookies for that host stealable). Both arguments are now html.EscapeString'd
+// at the sink so the helper is safe for every caller without forcing them to
+// remember to escape — defense in depth.
 func renderAuthError(c *fiber.Ctx, status int, headline, detail string) error {
 	c.Set("Content-Type", "text/html; charset=utf-8")
 	body := fmt.Sprintf(`<!DOCTYPE html>
@@ -956,7 +966,7 @@ func renderAuthError(c *fiber.Ctx, status int, headline, detail string) error {
   <p style="color:#444;">%s</p>
   <p><a href="https://instanode.dev/login">Try signing in again &rarr;</a></p>
 </body>
-</html>`, headline, detail)
+</html>`, html.EscapeString(headline), html.EscapeString(detail))
 	return c.Status(status).SendString(body)
 }
 
