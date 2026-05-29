@@ -308,12 +308,8 @@ func preVerifyInternalResendMagicLinkJWT(c *fiber.Ctx, secret string) error {
 		return errors.New("missing bearer token")
 	}
 	tokenStr := strings.TrimSpace(authHeader[len("Bearer "):])
-	if tokenStr == "" {
-		slog.Warn("internal.resend_magic_link.preauth.empty_token")
-		return errors.New("empty bearer token")
-	}
 	claims := &internalResendMagicLinkClaims{}
-	tok, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
+	_, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
@@ -322,10 +318,6 @@ func preVerifyInternalResendMagicLinkJWT(c *fiber.Ctx, secret string) error {
 	if err != nil {
 		slog.Warn("internal.resend_magic_link.preauth.parse_failed", "error", err)
 		return err
-	}
-	if !tok.Valid {
-		slog.Warn("internal.resend_magic_link.preauth.token_invalid")
-		return errors.New("token marked invalid")
 	}
 	if claims.Purpose != internalResendMagicLinkPurpose {
 		slog.Warn("internal.resend_magic_link.preauth.bad_purpose",

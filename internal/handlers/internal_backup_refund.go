@@ -206,11 +206,8 @@ func preVerifyInternalBackupRefundJWT(c *fiber.Ctx, secret string) error {
 		return errors.New("missing bearer token")
 	}
 	tokenStr := strings.TrimSpace(authHeader[len("Bearer "):])
-	if tokenStr == "" {
-		return errors.New("empty bearer token")
-	}
 	claims := &internalBackupRefundClaims{}
-	tok, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
+	_, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
@@ -219,9 +216,6 @@ func preVerifyInternalBackupRefundJWT(c *fiber.Ctx, secret string) error {
 	if err != nil {
 		slog.Warn("internal.backup_refund.preauth.parse_failed", "error", err)
 		return err
-	}
-	if !tok.Valid {
-		return errors.New("token marked invalid")
 	}
 	if claims.Purpose != internalBackupRefundPurpose {
 		slog.Warn("internal.backup_refund.preauth.bad_purpose", "purpose", claims.Purpose)

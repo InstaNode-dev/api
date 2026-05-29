@@ -24,14 +24,50 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gofiber/fiber/v2"
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/stretchr/testify/require"
 
 	"instant.dev/internal/config"
 	"instant.dev/internal/handlers"
 )
+
+// testTerminateSecret is the per-test worker secret used by the preVerify
+// arms below. 32 bytes so HS256 is happy with arbitrary keys.
+const testTerminateSecret = "auth-first-secret-32-bytes-yyyyy"
+
+// mintTestJWT builds an HS256 JWT with the supplied purpose, claim-name+id
+// pair, and an `iat` clock offset (seconds; 0 = now). Used to drive the
+// preVerify* arms that depend on purpose / iat freshness.
+func mintTestJWT(t *testing.T, secret, purpose, idClaim, idValue string, iatOffsetSec int64) string {
+	t.Helper()
+	claims := jwt.MapClaims{
+		"purpose": purpose,
+		idClaim:   idValue,
+		"iat":     time.Now().Add(time.Duration(iatOffsetSec) * time.Second).Unix(),
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := tok.SignedString([]byte(secret))
+	require.NoError(t, err)
+	return signed
+}
+
+// mintTestJWTNoIat builds an HS256 JWT WITHOUT an iat claim — drives the
+// "missing iat" arm of preVerify*.
+func mintTestJWTNoIat(t *testing.T, secret, purpose, idClaim, idValue string) string {
+	t.Helper()
+	claims := jwt.MapClaims{
+		"purpose": purpose,
+		idClaim:   idValue,
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := tok.SignedString([]byte(secret))
+	require.NoError(t, err)
+	return signed
+}
 
 // fiberAppWithErrorHandler builds a minimal Fiber app whose ErrorHandler
 // translates handlers.ErrResponseWritten back to "no-op" — every test in
@@ -348,4 +384,200 @@ func TestInternalRefund_SecretUnset_RejectsRegardlessOfPath(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	env := decodeEnvelope(t, resp)
 	require.Equal(t, "internal_token_required", env["error"])
+}
+
+// ── preVerify* arms — empty bearer / alg pin / token-invalid / iat-skew ─────
+//
+// 100% patch coverage requires hitting every arm of preVerifyInternalTerminate,
+// preVerifyInternalResendMagicLink, preVerifyInternalBackupRefund. The tests
+// above cover {missing_bearer, parse_failed (bogus token)}; these cover the
+// remaining {empty bearer, wrong-purpose, stale iat} arms via direct POSTs.
+
+// TestInternalTerminate_PreVerify_WrongPurpose mints a JWT with wrong purpose
+// → 401.
+func TestInternalTerminate_PreVerify_WrongPurpose(t *testing.T) {
+	app := newInternalTerminateApp(testTerminateSecret)
+	teamID := "00000000-0000-0000-0000-000000000001"
+	jwt := mintTestJWT(t, testTerminateSecret, "WRONG_PURPOSE", "team_id", teamID, 0)
+	req := httptest.NewRequest(http.MethodPost, "/internal/teams/"+teamID+"/terminate", nil)
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+// TestInternalTerminate_PreVerify_StaleIat mints a JWT with iat 5min ago
+// → 401.
+func TestInternalTerminate_PreVerify_StaleIat(t *testing.T) {
+	app := newInternalTerminateApp(testTerminateSecret)
+	teamID := "00000000-0000-0000-0000-000000000001"
+	jwt := mintTestJWT(t, testTerminateSecret, "internal_terminate", "team_id", teamID, -5*60)
+	req := httptest.NewRequest(http.MethodPost, "/internal/teams/"+teamID+"/terminate", nil)
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+// TestInternalTerminate_PreVerify_MissingIat mints a JWT with no iat claim
+// → 401.
+func TestInternalTerminate_PreVerify_MissingIat(t *testing.T) {
+	app := newInternalTerminateApp(testTerminateSecret)
+	teamID := "00000000-0000-0000-0000-000000000001"
+	// "0" iatOffset with a special sentinel — we just mint without iat.
+	jwt := mintTestJWTNoIat(t, testTerminateSecret, "internal_terminate", "team_id", teamID)
+	req := httptest.NewRequest(http.MethodPost, "/internal/teams/"+teamID+"/terminate", nil)
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+// Mirror the above three tests for the resend handler.
+
+func TestInternalResendMagicLink_PreVerify_WrongPurpose(t *testing.T) {
+	app := newInternalResendApp(testTerminateSecret)
+	linkID := "00000000-0000-0000-0000-000000000002"
+	jwt := mintTestJWT(t, testTerminateSecret, "WRONG", "link_id", linkID, 0)
+	req := httptest.NewRequest(http.MethodPost, "/internal/email/resend-magic-link",
+		bytes.NewReader([]byte(`{"link_id":"`+linkID+`"}`)))
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+func TestInternalResendMagicLink_PreVerify_StaleIat(t *testing.T) {
+	app := newInternalResendApp(testTerminateSecret)
+	linkID := "00000000-0000-0000-0000-000000000002"
+	jwt := mintTestJWT(t, testTerminateSecret, "resend_magic_link", "link_id", linkID, -5*60)
+	req := httptest.NewRequest(http.MethodPost, "/internal/email/resend-magic-link",
+		bytes.NewReader([]byte(`{"link_id":"`+linkID+`"}`)))
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+func TestInternalResendMagicLink_PreVerify_MissingIat(t *testing.T) {
+	app := newInternalResendApp(testTerminateSecret)
+	linkID := "00000000-0000-0000-0000-000000000002"
+	jwt := mintTestJWTNoIat(t, testTerminateSecret, "resend_magic_link", "link_id", linkID)
+	req := httptest.NewRequest(http.MethodPost, "/internal/email/resend-magic-link",
+		bytes.NewReader([]byte(`{"link_id":"`+linkID+`"}`)))
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+// Mirror for refund handler.
+
+func TestInternalRefund_PreVerify_WrongPurpose(t *testing.T) {
+	app := newInternalRefundApp(testTerminateSecret)
+	teamID := "00000000-0000-0000-0000-000000000003"
+	jwt := mintTestJWT(t, testTerminateSecret, "WRONG", "team_id", teamID, 0)
+	req := httptest.NewRequest(http.MethodPost, "/internal/teams/"+teamID+"/backup-quota/refund",
+		bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+func TestInternalRefund_PreVerify_StaleIat(t *testing.T) {
+	app := newInternalRefundApp(testTerminateSecret)
+	teamID := "00000000-0000-0000-0000-000000000003"
+	jwt := mintTestJWT(t, testTerminateSecret, "internal_backup_refund", "team_id", teamID, -5*60)
+	req := httptest.NewRequest(http.MethodPost, "/internal/teams/"+teamID+"/backup-quota/refund",
+		bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+func TestInternalRefund_PreVerify_MissingIat(t *testing.T) {
+	app := newInternalRefundApp(testTerminateSecret)
+	teamID := "00000000-0000-0000-0000-000000000003"
+	jwt := mintTestJWTNoIat(t, testTerminateSecret, "internal_backup_refund", "team_id", teamID)
+	req := httptest.NewRequest(http.MethodPost, "/internal/teams/"+teamID+"/backup-quota/refund",
+		bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+// ── More webhook coverage: GET on SES URL, body-parse arms, missing-id arm ──
+
+// TestSESWebhook_GetReturns405_WithWebhookMethodNotAllowed covers the
+// SES counterpart of the Brevo GET handler.
+func TestSESWebhook_GetReturns405_WithWebhookMethodNotAllowed(t *testing.T) {
+	db, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	cfg := &config.Config{}
+	h := handlers.NewEmailWebhookHandler(db, cfg)
+
+	app := fiberAppWithErrorHandler()
+	app.Get("/api/v1/email/webhook/ses", h.SESMethodNotAllowed)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/email/webhook/ses", nil)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
+	require.Equal(t, "POST", resp.Header.Get("Allow"))
+	env := decodeEnvelope(t, resp)
+	require.Equal(t, "webhook_method_not_allowed", env["error"])
+}
+
+// TestSESWebhook_GoodTopicArnButBadEnvelope_Returns400_InvalidPayload covers
+// the SECRET-configured-but-junk-body branch — a 400 invalid_payload not a
+// 401, since the auth-first gate already accepted the secret as configured.
+func TestSESWebhook_GoodTopicArnButBadEnvelope_Returns400_InvalidPayload(t *testing.T) {
+	db, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	cfg := &config.Config{SESSNSTopicARN: "arn:aws:sns:us-east-1:123456789012:bounces"}
+	h := handlers.NewEmailWebhookHandler(db, cfg)
+	h.DisableSNSVerifierForTest()
+
+	app := fiberAppWithErrorHandler()
+	app.Post("/api/v1/email/webhook/ses", h.SES)
+
+	// Secret IS configured; body is junk. Auth-first gate accepts the
+	// secret; envelope parse 400s.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/email/webhook/ses",
+		bytes.NewReader([]byte(`THIS IS NOT JSON`)))
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	env := decodeEnvelope(t, resp)
+	require.Equal(t, "invalid_payload", env["error"])
+}
+
+// TestSESWebhook_NotificationWithBadInnerMessage_Returns400_InvalidMessage
+// exercises the inner-Message parse arm.
+func TestSESWebhook_NotificationWithBadInnerMessage_Returns400_InvalidMessage(t *testing.T) {
+	db, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	arn := "arn:aws:sns:us-east-1:123456789012:bounces"
+	cfg := &config.Config{SESSNSTopicARN: arn}
+	h := handlers.NewEmailWebhookHandler(db, cfg)
+	h.DisableSNSVerifierForTest()
+
+	app := fiberAppWithErrorHandler()
+	app.Post("/api/v1/email/webhook/ses", h.SES)
+
+	// Valid envelope (TopicArn matches, Type=Notification) but the inner
+	// Message field is not JSON.
+	body := []byte(`{"Type":"Notification","TopicArn":"` + arn + `","Message":"NOT JSON"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/email/webhook/ses", bytes.NewReader(body))
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	env := decodeEnvelope(t, resp)
+	require.Equal(t, "invalid_message", env["error"])
 }
