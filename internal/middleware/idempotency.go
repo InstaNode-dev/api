@@ -159,6 +159,85 @@ type idemEntry struct {
 	BodyHash    string `json:"h"` // sha256 hex of the original request body
 }
 
+// mutableErrorCodes lists machine-readable `error` strings whose 4xx
+// resolution can flip BEFORE the explicit-key 24h cache TTL elapses,
+// so caching them silently strands the agent on the stale failure.
+//
+// BUG-API-238 (QA 2026-05-29): the canonical case is
+// `free_tier_recycle_requires_claim`. Sequence:
+//
+//  1. Agent calls POST /db/new with Idempotency-Key K1. The recycle gate
+//     fires → 402 free_tier_recycle_requires_claim cached against K1.
+//  2. User follows the claim_url and successfully claims (POST /claim).
+//     The recycle gate state is now CLEARED — a fresh /db/new without
+//     a key would succeed.
+//  3. Agent retries the original /db/new with Idempotency-Key K1. The
+//     pre-fix path replays the cached 402 verbatim, even though the
+//     gate would now wave the caller through. Agent thinks the claim
+//     failed; user thinks the platform is broken.
+//
+// Excluding these codes from caching restores the Stripe-shape contract
+// ("same key replays the same response") in the spirit it was written:
+// a STABLE outcome is replayed. A 402 that disappears the moment the
+// user takes 30 seconds to claim is not a stable outcome.
+//
+// We do NOT exclude generic `quota_exceeded` / `upgrade_required` /
+// `provision_limit_reached` — those resolve on a calendar boundary
+// (next UTC day) or a payment event, both of which are outside the
+// agent's reach inside the 24h key TTL. The recycle gate is the
+// distinguishing case: a user-initiated action a few seconds later
+// clears it.
+//
+// The list is small on purpose. Adding a code here means "this gate
+// can clear inside 24h without server-side state change" — which is
+// the actual cache-coherence boundary. Any future addition needs a
+// regression test that exercises the same-key-retry-after-resolution
+// path.
+var mutableErrorCodes = map[string]struct{}{
+	"free_tier_recycle_requires_claim": {},
+}
+
+// shouldCacheResponse decides whether a non-5xx response should be
+// written to the idempotency cache. Success (<400) always caches —
+// that's the Stripe contract. 4xx responses cache UNLESS the body's
+// `error` field is in mutableErrorCodes (BUG-API-238).
+//
+// JSON peek is non-strict: any parse error / non-JSON body / missing
+// `error` field falls back to caching (the pre-fix behaviour). Only a
+// well-formed envelope whose `error` is listed gets skipped, so the
+// helper degrades safely on unexpected bodies.
+func shouldCacheResponse(status int, body []byte, contentType string) bool {
+	// Success responses always cache — the Stripe-shape contract guarantees
+	// the agent can replay them. Mutability only matters for failures the
+	// caller might re-resolve.
+	if status < 400 {
+		return true
+	}
+	// Quick rejects: non-JSON bodies (e.g. text/html 4xx) can't carry the
+	// `error` field shape we filter on, so default-cache them.
+	if !strings.Contains(contentType, "json") {
+		return true
+	}
+	if len(body) == 0 {
+		return true
+	}
+	// Peek the `error` field. Use a minimal struct to avoid pulling in the
+	// handlers package's ErrorResponse (which would create a circular
+	// import — handlers depends on middleware).
+	var peek struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &peek); err != nil {
+		// Malformed JSON body — defer to default (cache). The handler
+		// emitted bytes the test suite is responsible for catching.
+		return true
+	}
+	if _, mutable := mutableErrorCodes[peek.Error]; mutable {
+		return false
+	}
+	return true
+}
+
 // Idempotency returns a Fiber handler that dedups duplicate POSTs via two
 // layered mechanisms:
 //
@@ -341,6 +420,20 @@ func idempotencyExplicit(c *fiber.Ctx, rdb *redis.Client, endpoint, scope, rawKe
 	body := append([]byte(nil), c.Response().Body()...)
 	ct := string(c.Response().Header.ContentType())
 
+	// BUG-API-238: bypass the cache for mutable error codes (currently
+	// just free_tier_recycle_requires_claim). A 402 the user resolves
+	// in 30s by clicking claim_url must not get strand-cached against
+	// the agent's 24h Idempotency-Key. Success + stable failures still
+	// cache as before.
+	if !shouldCacheResponse(status, body, ct) {
+		slog.Info("idempotency.skip_cache_mutable_error",
+			"endpoint", endpoint,
+			"status", status,
+			"request_id", GetRequestID(c),
+		)
+		return nextErr
+	}
+
 	entry := idemEntry{
 		StatusCode:  status,
 		Body:        body,
@@ -453,6 +546,20 @@ func idempotencyFingerprint(c *fiber.Ctx, rdb *redis.Client, endpoint, scope str
 
 	body := append([]byte(nil), c.Response().Body()...)
 	ct := string(c.Response().Header.ContentType())
+
+	// BUG-API-238: same mutable-error bypass as the explicit-key path.
+	// The fingerprint TTL is only 120s but the recycle gate still flips
+	// inside that window when a user claims fast — and the fingerprint
+	// path is the no-header default, so the silent strand is even more
+	// likely here.
+	if !shouldCacheResponse(status, body, ct) {
+		slog.Info("idempotency.fingerprint_skip_cache_mutable_error",
+			"endpoint", endpoint,
+			"status", status,
+			"request_id", GetRequestID(c),
+		)
+		return nextErr
+	}
 
 	entry := idemEntry{
 		StatusCode:  status,
