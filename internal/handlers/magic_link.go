@@ -166,11 +166,11 @@ func checkPerIPRateLimit(ctx context.Context, rdb *redis.Client, ip string) (lim
 	if _, execErr := pipe.Exec(ctx); execErr != nil {
 		return false, fmt.Errorf("magic_link.ip_rl: %w", execErr)
 	}
-	count, resultErr := incrCmd.Result()
-	if resultErr != nil {
-		return false, fmt.Errorf("magic_link.ip_rl.result: %w", resultErr)
-	}
-	return count > int64(magicLinkPerIPRateLimit), nil
+	// .Val() returns the cached INCR result. After a successful pipe.Exec,
+	// the cmd's err is guaranteed nil (pipe.Exec is the canonical error
+	// point for pipelined commands), so a separate result-err check would
+	// be dead code per go-redis semantics.
+	return incrCmd.Val() > int64(magicLinkPerIPRateLimit), nil
 }
 
 // magicLinkStartRequest is the body for POST /auth/email/start.
