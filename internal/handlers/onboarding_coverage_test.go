@@ -455,6 +455,13 @@ func TestClaim_HappyPath_FreshTeamAndUser(t *testing.T) {
 	assert.NotEmpty(t, got["session_token"])
 }
 
+// API-5 (QA 2026-05-29): /start ALWAYS 302s to the dashboard /claim, regardless
+// of token validity. The dashboard renders any error UI (expired / unrecognised
+// / already-claimed). Pre-fix, these tests asserted 400 JSON; the new contract
+// is "always-bounce", so they assert 302 to /claim instead. The
+// `already_claimed` flag no longer surfaces in the redirect URL because we no
+// longer look up the JTI at /start time — the dashboard does it.
+
 func TestStartLanding_AlreadyClaimedRedirectsToDashboardWithFlag(t *testing.T) {
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
@@ -489,10 +496,13 @@ func TestStartLanding_AlreadyClaimedRedirectsToDashboardWithFlag(t *testing.T) {
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusFound, resp.StatusCode)
 	loc := resp.Header.Get("Location")
-	assert.Contains(t, loc, "already_claimed=true")
+	// Always-302 contract: the dashboard handles already-claimed in its UI;
+	// the platform side just forwards the token verbatim.
+	assert.Contains(t, loc, "/claim?t=")
 }
 
 func TestStartLanding_MissingTokenReturns400(t *testing.T) {
+	// API-5: kept name for grep; new contract is 302 to /claim with no t= query.
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -504,13 +514,15 @@ func TestStartLanding_MissingTokenReturns400(t *testing.T) {
 	resp, err := app.Test(req, 5000)
 	require.NoError(t, err)
 	defer resp.Body.Close()
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	var body map[string]any
-	testhelpers.DecodeJSON(t, resp, &body)
-	assert.Equal(t, "missing_token", body["error"])
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+	loc := resp.Header.Get("Location")
+	assert.Contains(t, loc, "/claim")
+	assert.NotContains(t, loc, "/claim?t=", "missing token must redirect without t= query")
 }
 
 func TestStartLanding_UnknownJTI_400(t *testing.T) {
+	// API-5: kept name for grep; new contract is 302 to /claim?t=<jwt> — the
+	// dashboard does the JTI lookup and renders any error UI.
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
 	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
@@ -527,7 +539,8 @@ func TestStartLanding_UnknownJTI_400(t *testing.T) {
 	resp, err := app.Test(req, 5000)
 	require.NoError(t, err)
 	defer resp.Body.Close()
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+	assert.Contains(t, resp.Header.Get("Location"), "/claim?t=")
 }
 
 // ===== Email validation helpers =====

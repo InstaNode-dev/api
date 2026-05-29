@@ -209,7 +209,7 @@ func TestBrevoTxWebhook_SecretMismatch_AgentActionMentionsBrevo(t *testing.T) {
 	if strings.Contains(body, "INSTANODE_TOKEN") {
 		t.Errorf("agent_action must NOT mention INSTANODE_TOKEN (unrelated to this webhook); got %s", body)
 	}
-	if strings.Contains(strings.ToLower(body), "have them log in at") {
+	if strings.Contains(body, "log in at https://instanode.dev/login to mint a new one") {
 		t.Errorf("agent_action must NOT carry the user-login recovery script; got %s", body)
 	}
 }
