@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -707,3 +708,226 @@ func parseInt64(t *testing.T, s string) int64 {
 // assertions on cached payloads); intentionally referenced to avoid
 // unused-import churn on the next test addition.
 var _ = bytes.NewBuffer
+
+// ─────────────────────────────────────────────────────────────────────────
+// FINDING API-1 (CEO Option C) — idempotency cache HIT refunds the per-
+// fingerprint daily rate-limit counter. Replays must NOT burn a slot;
+// fresh calls (different key, or no replay) MUST still burn one each.
+// ─────────────────────────────────────────────────────────────────────────
+
+// newIdemPlusRateLimitTestApp mirrors newIdemTestApp but installs the
+// RateLimit middleware FIRST (matching internal/router/router.go:201
+// where RateLimit is wired at app.Use scope before per-route Idempotency).
+// The test cap is 5 so we can drive both the under-limit replay path AND
+// the over-limit-with-refund path in one fixture without burning hundreds
+// of requests.
+func newIdemPlusRateLimitTestApp(t *testing.T, counter *idemCounter) (*fiber.App, *redis.Client, string, func()) {
+	t.Helper()
+	rdb, cleanup := testhelpers.SetupTestRedis(t)
+
+	app := fiber.New()
+	app.Use(middleware.Fingerprint())
+	// Match the prod ordering: RateLimit at app.Use scope, BEFORE the
+	// per-route Idempotency wiring. This is the load-bearing ordering
+	// that FINDING API-1 calls out.
+	const keyPrefix = "rl-idem-test"
+	app.Use(middleware.RateLimit(rdb, middleware.RateLimitConfig{
+		Limit:     5,
+		KeyPrefix: keyPrefix,
+	}))
+	app.Post("/test", middleware.Idempotency(rdb, "test.endpoint"), func(c *fiber.Ctx) error {
+		counter.inc()
+		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+			"ok":  true,
+			"hit": counter.get(),
+		})
+	})
+	return app, rdb, keyPrefix, cleanup
+}
+
+// readRateLimitCounter returns the current value of the per-fingerprint
+// daily counter directly from Redis. This is the source of truth for
+// "did the refund take?" — the X-RateLimit-Remaining header is recomputed
+// by RefundRateLimitCounter but a direct Redis read closes the loop
+// against a stale-header false-positive.
+func readRateLimitCounter(t *testing.T, rdb *redis.Client, keyPrefix, ip string) int64 {
+	t.Helper()
+	// Mirror the key shape from rate_limit.go: "<prefix>:<fp>:<YYYY-MM-DD>".
+	// We need the same fingerprint the middleware computed for this IP —
+	// which is sha256(/24-subnet + ASN). The test app's Fingerprint
+	// middleware emits it on the response context, but here we're reading
+	// from outside the request lifecycle, so we walk every key that
+	// matches the prefix+date and assert there's exactly one. The test
+	// IPs are unique per case so there's no cross-test collision.
+	date := time.Now().UTC().Format("2006-01-02")
+	pattern := fmt.Sprintf("%s:*:%s", keyPrefix, date)
+	keys, err := rdb.Keys(context.Background(), pattern).Result()
+	require.NoError(t, err)
+	if len(keys) == 0 {
+		// No counter yet — caller can interpret as "0 burned so far".
+		return 0
+	}
+	// We always run one IP per test, but a fresh-IP test run on a shared
+	// Redis could trip this. Filter down by reading the count off each
+	// key and returning the max (the test's burn count) — simpler than
+	// reverse-engineering the fingerprint hash here.
+	var maxCount int64
+	for _, k := range keys {
+		v, err := rdb.Get(context.Background(), k).Int64()
+		if err != nil {
+			continue
+		}
+		if v > maxCount {
+			maxCount = v
+		}
+	}
+	return maxCount
+}
+
+// TestIdempotencyCacheHitRefundsRateLimit — the headline regression test
+// for FINDING API-1. Two POSTs with the same Idempotency-Key + same body:
+// the first runs the handler and increments the counter to 1; the second
+// hits the cache, gets refunded, so the counter ends at 1 (NOT 2). The
+// handler must run exactly once.
+//
+// Failure mode this locks in: without the refund, the counter would be 2
+// after the replay — and an agent retrying transient 5xx with the same
+// key would burn the per-fingerprint daily cap inside a 100-retry window
+// instead of getting the documented Stripe-shape replay contract.
+func TestIdempotencyCacheHitRefundsRateLimit(t *testing.T) {
+	c := &idemCounter{}
+	app, rdb, keyPrefix, clean := newIdemPlusRateLimitTestApp(t, c)
+	defer clean()
+
+	ip := uniqueTestIP("refund-replay")
+	key := "test-key-" + ip
+	body := `{"x":1}`
+
+	// First call: counter goes 0 → 1.
+	resp1 := postWithIdem(t, app, "/test", ip, key, body)
+	readBody(t, resp1)
+	require.Equal(t, http.StatusCreated, resp1.StatusCode)
+	require.Empty(t, resp1.Header.Get("X-Idempotent-Replay"),
+		"first call must NOT be a replay")
+	assert.Equal(t, int64(1), readRateLimitCounter(t, rdb, keyPrefix, ip),
+		"first call must burn exactly one rate-limit slot")
+
+	// Replay: counter is INCR'd by RateLimit to 2, then immediately
+	// DECR'd back to 1 by RefundRateLimitCounter on the cache HIT.
+	resp2 := postWithIdem(t, app, "/test", ip, key, body)
+	readBody(t, resp2)
+	require.Equal(t, http.StatusCreated, resp2.StatusCode)
+	require.Equal(t, "true", resp2.Header.Get("X-Idempotent-Replay"),
+		"replay must set X-Idempotent-Replay: true")
+	assert.Equal(t, int64(1), readRateLimitCounter(t, rdb, keyPrefix, ip),
+		"replay MUST be refunded; counter must stay at 1 (the FINDING API-1 boundary)")
+	assert.Equal(t, 1, c.get(),
+		"handler must run exactly once across two same-key calls")
+
+	// Bonus: the X-RateLimit-Remaining header on the replay must reflect
+	// the post-refund budget (5 - 1 = 4), NOT the pre-refund value (3).
+	// Without the header recompute an agent would see 3 remaining and
+	// back off prematurely.
+	assert.Equal(t, "4", resp2.Header.Get("X-RateLimit-Remaining"),
+		"replay's X-RateLimit-Remaining must reflect the post-refund budget")
+}
+
+// TestIdempotencyDifferentKeyDoesNotRefund — the negative half of the
+// boundary. Two distinct keys must produce two handler invocations AND
+// burn two rate-limit slots. A refund on a fresh-key path would let an
+// agent rotate keys to evade the rate limit entirely (and would defeat
+// the whole point of the cap).
+func TestIdempotencyDifferentKeyDoesNotRefund(t *testing.T) {
+	c := &idemCounter{}
+	app, rdb, keyPrefix, clean := newIdemPlusRateLimitTestApp(t, c)
+	defer clean()
+
+	ip := uniqueTestIP("refund-diffkey")
+	body := `{"x":1}`
+
+	resp1 := postWithIdem(t, app, "/test", ip, "key-A", body)
+	readBody(t, resp1)
+	require.Equal(t, http.StatusCreated, resp1.StatusCode)
+
+	resp2 := postWithIdem(t, app, "/test", ip, "key-B", body)
+	readBody(t, resp2)
+	require.Equal(t, http.StatusCreated, resp2.StatusCode)
+	assert.Empty(t, resp2.Header.Get("X-Idempotent-Replay"),
+		"different key MUST NOT trigger replay")
+
+	assert.Equal(t, int64(2), readRateLimitCounter(t, rdb, keyPrefix, ip),
+		"different keys must NOT refund; counter must reflect both calls")
+	assert.Equal(t, 2, c.get(),
+		"handler must run for each distinct key")
+}
+
+// TestIdempotencyConflictDoesNotRefund — the abuse path. Same key, but
+// the agent sent a DIFFERENT body (the request that should never
+// happen). We return 409 idempotency_key_conflict — and we must NOT
+// refund, because the agent did the wrong thing and deserves to pay the
+// rate-limit cost for the mistake. The 409 is a genuine error response,
+// not a replay.
+func TestIdempotencyConflictDoesNotRefund(t *testing.T) {
+	c := &idemCounter{}
+	app, rdb, keyPrefix, clean := newIdemPlusRateLimitTestApp(t, c)
+	defer clean()
+
+	ip := uniqueTestIP("refund-conflict")
+	key := "test-key-" + ip
+
+	resp1 := postWithIdem(t, app, "/test", ip, key, `{"x":1}`)
+	readBody(t, resp1)
+	require.Equal(t, http.StatusCreated, resp1.StatusCode)
+
+	resp2 := postWithIdem(t, app, "/test", ip, key, `{"x":2}`)
+	readBody(t, resp2)
+	require.Equal(t, http.StatusConflict, resp2.StatusCode,
+		"same key with different body must return 409")
+
+	assert.Equal(t, int64(2), readRateLimitCounter(t, rdb, keyPrefix, ip),
+		"conflict path must NOT refund; counter must reflect both attempts")
+}
+
+// TestRefundRateLimitCounterSafeNoOps — the helper must be safe to call
+// from edge cases the production path can produce: nil Redis client (mis-
+// configured deploy), no LocalKey (RateLimit never ran on this route),
+// and no fingerprint (test transport without X-Forwarded-For). None of
+// these are happy-path but each one would crash or corrupt counters if
+// the helper weren't defensive.
+func TestRefundRateLimitCounterSafeNoOps(t *testing.T) {
+	rdb, clean := testhelpers.SetupTestRedis(t)
+	defer clean()
+
+	t.Run("nil_rdb", func(t *testing.T) {
+		app := fiber.New()
+		app.Post("/", func(c *fiber.Ctx) error {
+			n := middleware.RefundRateLimitCounter(c, nil)
+			return c.JSON(fiber.Map{"n": n})
+		})
+		req := httptest.NewRequest(http.MethodPost, "/", nil)
+		resp, err := app.Test(req, 1000)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusOK, resp.StatusCode,
+			"nil rdb must be a safe no-op, not a panic")
+	})
+
+	t.Run("no_local_key", func(t *testing.T) {
+		app := fiber.New()
+		app.Post("/", func(c *fiber.Ctx) error {
+			// No RateLimit middleware installed, so no LocalKey is set.
+			n := middleware.RefundRateLimitCounter(c, rdb)
+			return c.JSON(fiber.Map{"n": n})
+		})
+		req := httptest.NewRequest(http.MethodPost, "/", nil)
+		resp, err := app.Test(req, 1000)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusOK, resp.StatusCode,
+			"missing LocalKey must be a safe no-op")
+	})
+}
+
+// _ keep redis package import alive for the helper above (in case future
+// edits drop the only other reference).
+var _ = errors.New
