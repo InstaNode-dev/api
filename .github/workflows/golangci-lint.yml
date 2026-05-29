@@ -18,26 +18,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: api
       # Sibling checkouts (proto/common) for repos with replace directives.
       # No-op for repos that do not need them.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         if: ${{ hashFiles('api/go.mod') != '' }}
         with:
           repository: InstaNode-dev/common
           path: common
         continue-on-error: true
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: InstaNode-dev/proto
           path: proto
         continue-on-error: true
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: api/go.mod
-      - uses: golangci/golangci-lint-action@v8
+      - uses: golangci/golangci-lint-action@v9
         with:
           version: latest
           working-directory: api
