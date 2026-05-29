@@ -1061,6 +1061,20 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"subscription_cancel_failed": {
 		AgentAction: "Tell the user cancelling the Razorpay subscription failed. The team-delete is paused; email support@instanode.dev so an operator can reconcile — see https://instanode.dev/support.",
 	},
+
+	// ── Auth redirect + PAT trust-boundary walls (AUTH-001/002/016/017/090) ──
+	"invalid_return_to": {
+		AgentAction: "Tell the user the return_to URL is not https:// — javascript: and data: schemes are rejected to prevent open-redirect. Retry with a valid https URL — see https://instanode.dev/docs/auth.",
+	},
+	"invalid_scopes": {
+		AgentAction: "Tell the user the requested PAT scopes are empty or unknown. Pass an explicit non-empty subset of {read,write,admin} — see https://instanode.dev/docs/api-tokens.",
+	},
+	"pat_cannot_mint_pat": {
+		AgentAction: "Tell the user PATs cannot mint child PATs — only session-authenticated requests can create tokens. Sign in at https://instanode.dev/login and re-issue.",
+	},
+	"reauth_required": {
+		AgentAction: "Tell the user this action requires a fresh session (admin-scope PAT mints need re-auth). Sign in again at https://instanode.dev/login — see https://instanode.dev/docs/auth.",
+	},
 }
 
 // ErrorResponse is the canonical JSON shape for every 4xx/5xx response.
