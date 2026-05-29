@@ -1062,6 +1062,12 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user cancelling the Razorpay subscription failed. The team-delete is paused; email support@instanode.dev so an operator can reconcile — see https://instanode.dev/support.",
 	},
 
+	// ── Auth content-type gate (AUTH-163, CSRF). Per-IP rate-limit (AUTH-097/107)
+	// returns 202 silently per CLAUDE.md "silent absorb" policy — no agent_action needed.
+	"invalid_content_type": {
+		AgentAction: "Tell the user the magic-link request must use Content-Type: application/json. Form-urlencoded bodies are rejected to prevent CSRF — retry with JSON. See https://instanode.dev/docs/auth.",
+	},
+
 	// ── Auth redirect + PAT trust-boundary walls (AUTH-001/002/016/017/090) ──
 	"invalid_return_to": {
 		AgentAction: "Tell the user the return_to URL is not https:// — javascript: and data: schemes are rejected to prevent open-redirect. Retry with a valid https URL — see https://instanode.dev/docs/auth.",
