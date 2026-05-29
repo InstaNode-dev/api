@@ -131,16 +131,25 @@ func TestRewritePresignHost_CanonicalHostSubstitution(t *testing.T) {
 		assert.Equal(t, "", out)
 	})
 
-	t.Run("publicURL inherits signed scheme when scheme missing", func(t *testing.T) {
-		// Test the scheme-fallback branch where publicURL is parsed as a
-		// host-only string (no scheme). url.Parse on a bare host returns
-		// {Scheme:"" Host:""} (it lands in Opaque) — so synthesize a
-		// scheme-less URL by passing "//host/path".
+	t.Run("publicURL with explicit scheme overrides signed scheme", func(t *testing.T) {
+		// publicURL with explicit scheme — verify that scheme wins.
 		signed, err := url.Parse(signedRaw)
 		assert.NoError(t, err)
-		// publicURL with scheme but bare host — verify scheme override path.
 		out, ok := rewritePresignHost(signed, "http://s3.instanode.dev")
 		assert.True(t, ok)
 		assert.True(t, strings.HasPrefix(out, "http://s3.instanode.dev/"))
+	})
+
+	t.Run("publicURL with no scheme inherits signed scheme", func(t *testing.T) {
+		// Protocol-relative URL: url.Parse on "//host/path" returns
+		// {Scheme:"" Host:"host"}. Exercises the
+		// `if scheme == "" { scheme = signed.Scheme }` branch.
+		signed, err := url.Parse(signedRaw)
+		assert.NoError(t, err)
+		out, ok := rewritePresignHost(signed, "//cdn.instanode.dev")
+		assert.True(t, ok, "protocol-relative publicURL must still rewrite")
+		// signed had scheme "https" — must be preserved on rewrite.
+		assert.True(t, strings.HasPrefix(out, "https://cdn.instanode.dev/"),
+			"scheme must fall back to the signed URL's scheme; got %q", out)
 	})
 }
