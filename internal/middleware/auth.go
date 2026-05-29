@@ -296,6 +296,15 @@ func rejectAudienceMismatch(c *fiber.Ctx) error {
 // keyword so agents can branch "wrong server" from "bad credentials".
 func RequireAuth(cfg *config.Config) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		// Bearer-only contract (CLAUDE.md "Live API surface"). The
+		// AUTH-004 fix uses a transient `instanode_session_exchange`
+		// cookie scoped to POST /auth/exchange to bridge the callback
+		// redirect into the SPA — RequireAuth deliberately does NOT
+		// honour it. Every CLI/MCP/SDK consumer is Bearer-only, and
+		// extending this middleware to accept the cookie would create
+		// a second auth mechanism that downstream surfaces (CSRF
+		// review, cookie-domain config, route-level auth-mode docs)
+		// would have to reason about. See PR #176 refactor note.
 		header := c.Get("Authorization")
 		if len(header) < 8 || header[:7] != "Bearer " {
 			return respondUnauthorizedWithReason(c, AuthErrorMissingCredentials)

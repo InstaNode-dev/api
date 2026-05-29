@@ -640,6 +640,15 @@ func TestOpenAPI_CoversAllRegisteredRoutes(t *testing.T) {
 		"POST /internal/teams/{id}/backup-quota/refund": true,
 		"GET /api/v1/usage/wall":                        true,
 		"POST /api/v1/experiments/converted":            true,
+		// POST /auth/exchange — browser-only bridge between the magic-link
+		// / OAuth callback and the SPA. The handler reads the transient
+		// instanode_session_exchange cookie (Path=/auth/exchange,
+		// Max-Age=30s) and returns the embedded JWT in the body so the
+		// SPA can swap into Bearer-only mode. Documenting it in the
+		// agent-facing OpenAPI would mislead CLI/MCP/SDK agents into
+		// thinking cookies are a valid auth mechanism — they're not
+		// (CLAUDE.md "Live API surface" + auth_beareronly_authp0_test.go).
+		"POST /auth/exchange": true,
 	}
 
 	var missing []string
