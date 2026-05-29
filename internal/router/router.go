@@ -187,13 +187,23 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	if cfg.Environment == "development" {
 		corsAllowOrigins += ",http://localhost:5173,http://localhost:3000,http://localhost:5174"
 	}
+	const corsAllowMethods = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+	const corsAllowHeaders = "Content-Type,Authorization,X-Request-ID,X-E2E-Test-Token,X-E2E-Source-IP"
+	// BUG-API-066/067: Fiber's CORS middleware sets Access-Control-Allow-*
+	// headers but does NOT validate the inbound preflight request — a
+	// browser asking for TRACE or Cookie still gets a 204 even though
+	// neither is in the allowlist. We pre-empt that by walking the
+	// preflight headers and 403'ing any value not in our allowlist BEFORE
+	// CORS responds. Same allowlist as the CORS Config below so the two
+	// stay in lockstep.
+	app.Use(middleware.PreflightAllowlist(corsAllowMethods, corsAllowHeaders))
 	app.Use(fiberCORS.New(fiberCORS.Config{
 		// Production origin (GitHub Pages serves instanode.dev). Local-dev
 		// ports are appended only in development (see corsAllowOrigins above)
 		// so the prod allowlist stays auditable and localhost-free.
 		AllowOrigins:  corsAllowOrigins,
-		AllowMethods:  "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-		AllowHeaders:  "Content-Type,Authorization,X-Request-ID,X-E2E-Test-Token,X-E2E-Source-IP",
+		AllowMethods:  corsAllowMethods,
+		AllowHeaders:  corsAllowHeaders,
 		ExposeHeaders: "X-Request-ID,X-Instant-Upgrade,X-Instant-Notice",
 	}))
 	app.Use(middleware.GeoEnrich(geoDbs))
