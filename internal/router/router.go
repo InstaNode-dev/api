@@ -703,6 +703,14 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	emailWebhookH := handlers.NewEmailWebhookHandler(db, cfg)
 	app.Post("/api/v1/email/webhook/brevo", emailWebhookH.Brevo)
 	app.Post("/api/v1/email/webhook/ses", emailWebhookH.SES)
+	// API-98 (QA 2026-05-29): explicit 405 + Allow: POST on the GET verb so
+	// a provider dashboard pre-flight that GETs the configured webhook URL
+	// sees "endpoint exists, method wrong" rather than the catch-all 404 /
+	// 401 envelope (which some dashboards interpret as "URL invalid" and
+	// silently drop). Registered BEFORE the /api/v1 RequireAuth group so the
+	// group middleware doesn't catch the GET and 401 it.
+	app.Get("/api/v1/email/webhook/brevo", emailWebhookH.BrevoMethodNotAllowed)
+	app.Get("/api/v1/email/webhook/ses", emailWebhookH.SESMethodNotAllowed)
 
 	// Brevo transactional-delivery receiver — closes the "201 ≠ delivered"
 	// gap. Brevo's transactional API returns 201 on accept but actual
