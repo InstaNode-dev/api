@@ -1,0 +1,31 @@
+{
+  "name": "instant-api — webhook auth failures (Brevo/SES — secret unset or signature mismatch)",
+  "policyName": "instant-api alerts",
+  "description": "P1 operator signal. Fires when inbound email-provider webhooks (Brevo HMAC, SES/SNS RSA) authenticate-fail at the api boundary. Two distinct reasons are emitted: (a) reason='secret_unset' — the operator has not deployed BREVO_WEBHOOK_SECRET / SES_SNS_SUBSCRIPTION_ARN to the api Deployment. This means EVERY inbound provider event is rejected and forwarder_sent.classification is never updated. Rule 12 (email truth surface) is broken until the operator deploys the secret. CRITICAL within 5 min — fix is one kubectl set env. (b) reason='signature_mismatch' — secret IS configured but the inbound signature does not verify. Real causes: (1) provider rotated their signing key, (2) drive-by probe traffic, (3) man-in-the-middle on the webhook URL. WARN at >10/h — operator should rotate the secret in the dashboard if the provider confirms a key rotation. Source: api/internal/handlers/email_webhooks.go webhookAuthFailure() helper; counter instant_webhook_auth_failures_total. API-19/96/97/98 (QA 2026-05-29).",
+  "enabled": true,
+  "nrql": {
+    "query": "SELECT count(*) FROM Metric WHERE metricName = 'instant_webhook_auth_failures_total' AND reason = 'secret_unset' FACET webhook"
+  },
+  "terms": [
+    {
+      "priority": "CRITICAL",
+      "operator": "ABOVE",
+      "threshold": 0,
+      "thresholdDuration": 300,
+      "thresholdOccurrences": "ALL"
+    }
+  ],
+  "signal": {
+    "aggregationWindow": 60,
+    "aggregationMethod": "EVENT_FLOW",
+    "aggregationDelay": 120,
+    "fillOption": "STATIC",
+    "fillValue": 0
+  },
+  "expiration": {
+    "expirationDuration": 3600,
+    "openViolationOnExpiration": false,
+    "closeViolationsOnExpiration": true
+  },
+  "violationTimeLimitSeconds": 86400
+}

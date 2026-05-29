@@ -98,28 +98,49 @@ func NewInternalTerminateHandler(db *sql.DB, cfg *config.Config, cancelFn func(s
 //  8. Emit one `payment.grace_terminated` audit row.
 //  9. Return 200 JSON.
 func (h *InternalTerminateHandler) Terminate(c *fiber.Ctx) error {
+	// API-26/77 (QA 2026-05-29): the auth check runs FIRST — before any
+	// path-param / body parsing — so a bogus token paired with a malformed
+	// path returns 401 internal_token_required (the actual fault) instead
+	// of 400 invalid_team_id. The pre-fix order let an unauthenticated
+	// probe distinguish "path malformed" (400) from "auth missing" (401),
+	// which itself leaked the route's shape (the existence of a :id path
+	// param) to anyone who could send a request. Auth-first closes that
+	// channel and matches the canonical fail-closed posture documented on
+	// the /internal/* routes in router.go.
+	//
+	// We accept the bearer's structural shape + signature + purpose claim
+	// here without binding to the path :id; the team_id-claim-binds-to-path
+	// check happens AFTER we parse the path, in the second-phase verify.
+	if h.cfg == nil || strings.TrimSpace(h.cfg.WorkerInternalJWTSecret) == "" {
+		slog.Warn("internal.terminate.secret_unset",
+			"reason", "WORKER_INTERNAL_JWT_SECRET is empty; rejecting all calls",
+		)
+		return respondError(c, fiber.StatusUnauthorized, "internal_token_required",
+			"Worker internal auth is not configured on this api Deployment.")
+	}
+	if err := preVerifyInternalTerminateJWT(c, h.cfg.WorkerInternalJWTSecret); err != nil {
+		return respondError(c, fiber.StatusUnauthorized, "internal_token_required",
+			"Worker internal token is missing or invalid.")
+	}
+
+	// Auth-accepted — now parse the path :id. A malformed :id from an
+	// authenticated caller is genuinely a 400 (the worker emitted a bad
+	// URL; operator-debuggable from the worker side).
 	pathID := strings.TrimSpace(c.Params("id"))
 	teamID, err := uuid.Parse(pathID)
 	if err != nil {
 		return respondError(c, fiber.StatusBadRequest, "invalid_team_id", "team_id must be a UUID")
 	}
 
-	// Auth: HS256 JWT bound to the configured worker secret. When the
-	// secret is unset, EVERY call 401s — operators must wire
-	// WORKER_INTERNAL_JWT_SECRET into the api's k8s Secret to enable
-	// the route. This is the fail-closed default.
-	if h.cfg == nil || strings.TrimSpace(h.cfg.WorkerInternalJWTSecret) == "" {
-		slog.Warn("internal.terminate.secret_unset",
-			"path_team_id", pathID,
-			"reason", "WORKER_INTERNAL_JWT_SECRET is empty; rejecting all calls",
-		)
-		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "worker internal auth not configured")
-	}
+	// Bind the token's team_id claim to the path :id. Cross-team-rewrite
+	// defence: a worker that minted a token for team A and POSTed to
+	// /teams/B/terminate must 401.
 	if err := verifyInternalTerminateJWT(c, h.cfg.WorkerInternalJWTSecret, teamID); err != nil {
 		// verifyInternalTerminateJWT logs the structured reason; the
 		// caller only ever sees a generic 401 so this route emits no
 		// signal a probe could use to refine an attack.
-		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "invalid worker token")
+		return respondError(c, fiber.StatusUnauthorized, "internal_token_required",
+			"Worker internal token is missing or invalid.")
 	}
 
 	ctx := c.Context()
@@ -270,6 +291,62 @@ type internalTerminateAuditMetadata struct {
 	PreviousPlanTier      string `json:"previous_plan_tier"`
 	RazorpayCanceled      bool   `json:"razorpay_canceled"`
 	RazorpayError         string `json:"razorpay_error,omitempty"`
+}
+
+// preVerifyInternalTerminateJWT is the auth-first gate that runs BEFORE the
+// path-param parse. It enforces every JWT structural check that does NOT
+// depend on the path :id — signature, alg pin, purpose claim, iat freshness.
+// The team_id-claim-binds-to-path check is deferred to verifyInternalTerminateJWT
+// after the path parses cleanly.
+//
+// API-26/77 (QA 2026-05-29): split into two passes so the 401 fires on
+// every unauth POST regardless of path shape. A pre-fix probe could
+// distinguish "no path-id" (400 invalid_team_id) from "no auth" (401), a
+// fail-closed inversion. Post-fix the 401 fires first for ALL unauth calls.
+func preVerifyInternalTerminateJWT(c *fiber.Ctx, secret string) error {
+	authHeader := strings.TrimSpace(c.Get(fiber.HeaderAuthorization))
+	if !strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+		slog.Warn("internal.terminate.preauth.missing_bearer")
+		return errors.New("missing bearer token")
+	}
+	tokenStr := strings.TrimSpace(authHeader[len("Bearer "):])
+	if tokenStr == "" {
+		slog.Warn("internal.terminate.preauth.empty_token")
+		return errors.New("empty bearer token")
+	}
+	claims := &internalTerminateClaims{}
+	tok, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return []byte(secret), nil
+	}, jwt.WithValidMethods([]string{"HS256"}))
+	if err != nil {
+		slog.Warn("internal.terminate.preauth.parse_failed", "error", err)
+		return err
+	}
+	if !tok.Valid {
+		slog.Warn("internal.terminate.preauth.token_invalid")
+		return errors.New("token marked invalid")
+	}
+	if claims.Purpose != internalTerminatePurpose {
+		slog.Warn("internal.terminate.preauth.bad_purpose",
+			"purpose", claims.Purpose,
+			"expected", internalTerminatePurpose,
+		)
+		return errors.New("purpose claim mismatch")
+	}
+	if claims.IssuedAt == nil {
+		slog.Warn("internal.terminate.preauth.missing_iat")
+		return errors.New("missing iat claim")
+	}
+	iat := claims.IssuedAt.Time
+	now := time.Now()
+	if iat.Before(now.Add(-internalTerminateMaxClockSkew)) || iat.After(now.Add(internalTerminateMaxClockSkew)) {
+		slog.Warn("internal.terminate.preauth.iat_skew", "iat", iat, "now", now)
+		return errors.New("iat outside clock skew window")
+	}
+	return nil
 }
 
 // verifyInternalTerminateJWT parses + validates the bearer token
