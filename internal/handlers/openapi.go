@@ -1278,12 +1278,12 @@ const openAPISpec = `{
     "/api/v1/billing/checkout": {
       "post": {
         "summary": "Create a Razorpay subscription and return its hosted-page URL",
-        "description": "Mints a Razorpay subscription for the requested plan (hobby, hobby_plus, or pro) tied to the authenticated team. The dashboard redirects the user to the returned short_url to complete payment; on success Razorpay fires subscription.activated AND subscription.charged to /razorpay/webhook — both trigger the same idempotent tier-elevation path so the team is upgraded as soon as the mandate is authorised, even before the first invoice is collected. The Team tier currently returns 400 tier_unavailable — only ops can set it via /internal/set-tier. plan_frequency selects monthly (default) vs yearly billing — yearly returns 503 billing_not_configured until the operator creates the yearly Razorpay plan and sets RAZORPAY_PLAN_ID_*_YEARLY. promotion_code: admin-issued codes are bookmarked in the subscription notes for future discount wiring (no Razorpay Offer is applied yet — codes are not consumed until a real discount is confirmed). IDEMPOTENT: the endpoint never mints a second subscription for a team that already has a live one — if the team already holds the requested tier (or higher) it returns 400 already_on_plan, and if a prior checkout's subscription is still payable at Razorpay (status created/authenticated/pending) it returns that subscription's short_url with reused:true instead of creating a new one. This prevents a confused re-click from producing two parallel subscriptions that both charge the card.",
+        "description": "Mints a Razorpay subscription for the requested plan (hobby, hobby_plus, pro, or team) tied to the authenticated team. The dashboard redirects the user to the returned short_url to complete payment; on success Razorpay fires subscription.activated AND subscription.charged to /razorpay/webhook — both trigger the same idempotent tier-elevation path so the team is upgraded as soon as the mandate is authorised, even before the first invoice is collected. Team-tier checkout was enabled 2026-05-29 (CEO BIZ-1) — if RAZORPAY_PLAN_ID_TEAM / _TEAM_ANNUAL is unset on the environment the request returns 503 billing_not_configured (operator signal), not 400 tier_unavailable. plan_frequency selects monthly (default) vs yearly billing — yearly returns 503 billing_not_configured until the operator creates the yearly Razorpay plan and sets RAZORPAY_PLAN_ID_*_YEARLY. promotion_code: admin-issued codes are bookmarked in the subscription notes for future discount wiring (no Razorpay Offer is applied yet — codes are not consumed until a real discount is confirmed). IDEMPOTENT: the endpoint never mints a second subscription for a team that already has a live one — if the team already holds the requested tier (or higher) it returns 400 already_on_plan, and if a prior checkout's subscription is still payable at Razorpay (status created/authenticated/pending) it returns that subscription's short_url with reused:true instead of creating a new one. This prevents a confused re-click from producing two parallel subscriptions that both charge the card.",
         "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] }, "plan_frequency": { "type": "string", "enum": ["monthly", "yearly"], "default": "monthly", "description": "Billing cycle. Empty = monthly. Yearly variants follow the same canonical-tier mapping on the webhook side — teams.plan_tier still stores the bare tier name." } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro", "team"] }, "plan_frequency": { "type": "string", "enum": ["monthly", "yearly"], "default": "monthly", "description": "Billing cycle. Empty = monthly. Yearly variants follow the same canonical-tier mapping on the webhook side — teams.plan_tier still stores the bare tier name." } } } } } },
         "responses": {
           "200": { "description": "Subscription created (or an existing live one reused) — redirect user to short_url. reused:true means the short_url belongs to a checkout the team started earlier and no new subscription was minted.", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "short_url": { "type": "string", "format": "uri" }, "subscription_id": { "type": "string" }, "reused": { "type": "boolean", "description": "Present and true only when an existing still-payable subscription was returned instead of minting a new one." } } } } } },
-          "400": { "description": "Invalid plan, invalid plan_frequency, tier_unavailable, or already_on_plan (the team already holds the requested tier or higher)" },
+          "400": { "description": "Invalid plan, invalid plan_frequency, or already_on_plan (the team already holds the requested tier or higher)" },
           "401": { "description": "Missing or invalid session token" },
           "502": { "description": "Razorpay rejected the create-subscription call" },
           "503": { "description": "Razorpay not configured on this environment (incl. yearly plan_id unset)" }
@@ -1317,12 +1317,12 @@ const openAPISpec = `{
     "/api/v1/billing/change-plan": {
       "post": {
         "summary": "Switch the team's subscription to a different tier",
-        "description": "Hobby ↔ Hobby Plus ↔ Pro on the same Razorpay subscription. Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. Team tier is currently not customer-changeable — returns 400 tier_unavailable.",
+        "description": "Hobby ↔ Hobby Plus ↔ Pro ↔ Team on the same Razorpay subscription. Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. Team-tier ChangePlan was enabled 2026-05-29 (CEO BIZ-1) alongside Team checkout.",
         "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro", "team"] } } } } } },
         "responses": {
           "200": { "description": "Plan change accepted by Razorpay" },
-          "400": { "description": "Invalid plan or tier_unavailable" },
+          "400": { "description": "Invalid plan" },
           "401": { "description": "Missing or invalid session token" },
           "404": { "description": "No active subscription" },
           "503": { "description": "Razorpay not configured" }
@@ -1645,10 +1645,10 @@ const openAPISpec = `{
         "summary": "Legacy alias for POST /api/v1/billing/checkout",
         "description": "Kept for backward compatibility with older dashboard/SDK clients. Identical contract to POST /api/v1/billing/checkout. New callers should use the /api/v1 path.",
         "security": [{ "bearerAuth": [] }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro"] } } } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["plan"], "properties": { "plan": { "type": "string", "enum": ["hobby", "hobby_plus", "pro", "team"] } } } } } },
         "responses": {
           "200": { "description": "Subscription created — redirect user to short_url", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "short_url": { "type": "string", "format": "uri" }, "subscription_id": { "type": "string" } } } } } },
-          "400": { "description": "Invalid plan or tier_unavailable" },
+          "400": { "description": "Invalid plan" },
           "401": { "description": "Missing or invalid session token" },
           "502": { "description": "Razorpay rejected the create-subscription call" },
           "503": { "description": "Razorpay not configured on this environment" }

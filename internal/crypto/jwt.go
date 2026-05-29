@@ -16,7 +16,15 @@ type OnboardingClaims struct {
 	OrgName       string   `json:"org"`
 	Tokens        []string `json:"tok"`
 	ResourceTypes []string `json:"rt"`
-	SuggestedPlan string   `json:"plan"`
+	// SuggestedPlan is an advisory upsell hint computed at provisioning
+	// time. It is NOT a tier grant: every server-side tier decision flows
+	// through teams.plan_tier (hardcoded 'free' on claim) and the
+	// Razorpay subscription.charged webhook — never through this field.
+	// Renamed 2026-05-29 from json:"plan" -> json:"suggested_plan"
+	// (API FINDING-2, P1 hygiene) to keep a future engineer from
+	// trusting a JWT-supplied tier. See onboarding.go — `claims.SuggestedPlan`
+	// has zero call sites in production code.
+	SuggestedPlan string `json:"suggested_plan"`
 	jwt.RegisteredClaims
 }
 

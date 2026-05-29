@@ -129,10 +129,13 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user this feature requires the Pro plan or higher. Upgrade at https://instanode.dev/pricing — takes 30 seconds.",
 		UpgradeURL:  "https://instanode.dev/pricing",
 	},
-	"tier_unavailable": {
-		AgentAction: "Tell the user this resource type isn't available on their plan. Upgrade to Pro at https://instanode.dev/pricing to unlock it.",
-		UpgradeURL:  "https://instanode.dev/pricing",
-	},
+	// "tier_unavailable" was removed 2026-05-29 along with the Team-tier
+	// checkout/change-plan guards (CEO BIZ-1). The only emitters of this
+	// code lived in those two billing branches; with both gone, the
+	// codeToAgentAction entry was orphan-flagged by
+	// TestCodeToAgentAction_NoOrphans. If a future feature reintroduces
+	// a "tier is genuinely unavailable" surface, re-add the entry here
+	// and emit it from the new site in the same PR.
 	"rate_limit_exceeded": {
 		AgentAction: "Tell the user they've sent too many requests in a short window. Wait 60 seconds and retry — or upgrade to Pro at https://instanode.dev/pricing for higher limits.",
 		UpgradeURL:  "https://instanode.dev/pricing",
