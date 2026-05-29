@@ -628,9 +628,16 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// SetRevocationDB wires the Redis client into the middleware package once
 	// so every RequireAuth call can query it without threading rdb through
 	// every handler constructor.
+	//
+	// BUG-AUTH-005: per the OpenAPI contract, POST /auth/logout is
+	// idempotent — "safe to call without a valid token." We therefore do
+	// NOT gate it on RequireAuth; the handler itself returns 200 {ok:true}
+	// for missing/malformed/expired credentials (the local token is already
+	// useless, so the dashboard's logout-on-expiry hitting this surface
+	// must not 401). Tokens that DO parse cleanly are revoked normally.
 	middleware.SetRevocationDB(rdb)
 	logoutH := handlers.NewLogoutHandler(cfg, rdb)
-	app.Post("/auth/logout", middleware.RequireAuth(cfg), logoutH.Logout)
+	app.Post("/auth/logout", logoutH.Logout)
 
 	// Billing
 	billing := handlers.NewBillingHandler(db, cfg, breakingMailer)
