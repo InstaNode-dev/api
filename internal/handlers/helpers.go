@@ -155,6 +155,57 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"brevo_secret_mismatch": {
 		AgentAction: "Tell the user this is a Brevo-webhook config mismatch, not their auth. Operators must verify the Brevo dashboard webhook URL matches the configured BREVO_WEBHOOK_SECRET — see https://instanode.dev/docs/email.",
 	},
+	// webhook_secret_mismatch is the generic per-provider webhook URL-path-token
+	// or shared-secret mismatch surface. API-19/96/97/98 (QA 2026-05-29): the
+	// pre-fix path returned generic 401 envelopes for /api/v1/email/webhook/brevo
+	// and /api/v1/email/webhook/ses unauth POSTs, which sent the canonical
+	// "log in for new INSTANODE_TOKEN" agent_action to operators chasing a
+	// webhook-config incident. Same shape as brevo_secret_mismatch but
+	// distinguishes the secret-not-configured branch from the signature-mismatch
+	// branch below. Operator must wire the corresponding env var
+	// (BREVO_WEBHOOK_SECRET / SES_SNS_SUBSCRIPTION_ARN) before the route accepts.
+	"webhook_secret_mismatch": {
+		AgentAction: "Tell the user this is an email-webhook secret-config mismatch, not their auth. Operators must set the corresponding webhook secret env var in the api Deployment — see https://instanode.dev/docs/email.",
+	},
+	// webhook_signature_mismatch is the per-provider signature-verification
+	// failure surface — the secret IS configured, the inbound payload's HMAC /
+	// SNS signature did NOT verify against the body. Distinct from
+	// webhook_secret_mismatch so observability can split "we haven't deployed
+	// the secret yet" from "someone is sending bad signatures (or the provider
+	// rotated keys)" without an operator hand-grepping log lines. Used by
+	// /api/v1/email/webhook/brevo + /api/v1/email/webhook/ses.
+	"webhook_signature_mismatch": {
+		AgentAction: "Tell the user the inbound email-webhook signature did not verify. Operators must confirm the dashboard webhook secret matches the api Deployment's env var and that the provider hasn't rotated signing keys — see https://instanode.dev/docs/email.",
+	},
+	// webhook_method_not_allowed surfaces the GET-on-a-POST-only webhook URL
+	// path (BUG-API-098). Brevo's dashboard sometimes sends a GET pre-flight to
+	// the configured webhook URL; the pre-fix path returned generic 401 which
+	// could make the dashboard abandon the config. 405 with this code surfaces
+	// the actual situation (the URL exists, but only accepts POST).
+	"webhook_method_not_allowed": {
+		AgentAction: "Tell the user this webhook URL only accepts POST. Provider dashboards confirming a webhook URL via GET should treat 405 as 'URL exists' — see https://instanode.dev/docs/email.",
+	},
+	// internal_token_required is the worker-to-api auth-failure surface for
+	// the /internal/* routes (terminate, resend-magic-link, backup-quota refund).
+	// API-26/27/28/77/78 (QA 2026-05-29): pre-fix these handlers parsed the
+	// path :id / request body BEFORE checking the secret, so a bogus token
+	// with a malformed path returned 400 invalid_team_id / 400 invalid_body
+	// instead of 401 — inverting the fail-closed posture (a probe could
+	// distinguish "secret unset" from "secret wrong" by the 400/401 envelope).
+	// Post-fix: the auth check runs first; any missing / malformed worker
+	// JWT returns 401 internal_token_required, surfacing the actual fault to
+	// operators without leaking shape information about the path or body to
+	// unauthenticated probes.
+	"internal_token_required": {
+		AgentAction: "Tell the user this is an internal worker-to-api route. The caller must present a valid worker JWT signed with WORKER_INTERNAL_JWT_SECRET — see https://instanode.dev/docs/internal.",
+	},
+	// invalid_message is the SES/SNS-inner-Message-not-JSON arm. Distinct
+	// from invalid_payload (the envelope parse) so a debugging operator can
+	// tell "AWS gave us a malformed envelope" from "AWS gave us a malformed
+	// inner Message" without re-reading the response message string.
+	"invalid_message": {
+		AgentAction: "Tell the user the inner Message field of the SES/SNS envelope could not be parsed as JSON. Provider-side bug; operators must inspect the raw payload in audit — see https://instanode.dev/docs/email.",
+	},
 	"auth_required": {
 		AgentAction: "Tell the user this action requires an authenticated session. Have them log in or sign up at https://instanode.dev/login — both flows mint a token.",
 	},

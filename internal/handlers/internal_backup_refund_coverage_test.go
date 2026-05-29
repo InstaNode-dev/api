@@ -96,7 +96,13 @@ func TestBackupRefund_AuthArms(t *testing.T) {
 	backupID := uuid.NewString()
 
 	t.Run("invalid_team_id", func(t *testing.T) {
-		resp := backupRefundPost(t, app, "", "not-a-uuid", `{"backup_id":"`+backupID+`"}`)
+		// API-28 (QA 2026-05-29): auth-first ordering means an unauth
+		// caller with a malformed :id 401s on the auth check before the
+		// path parse. The invalid_team_id arm is only reachable by an
+		// authenticated caller (worker emitted a bad URL) — we exercise
+		// it with a valid JWT here so the path-parse arm stays covered.
+		validJWT := mintBackupRefundJWT(t, testBackupRefundSecret, "internal_backup_refund", uuid.NewString(), 0)
+		resp := backupRefundPost(t, app, validJWT, "not-a-uuid", `{"backup_id":"`+backupID+`"}`)
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		resp.Body.Close()
 	})

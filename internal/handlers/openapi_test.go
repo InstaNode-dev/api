@@ -618,8 +618,14 @@ func TestOpenAPI_CoversAllRegisteredRoutes(t *testing.T) {
 	//      (A/B click sink). Agents shouldn't drive these and adding them
 	//      to the agent-facing spec would muddy the contract.
 	intentionallyHidden := map[string]bool{
-		"POST /api/v1/email/webhook/brevo":    true,
-		"POST /api/v1/email/webhook/ses":      true,
+		"POST /api/v1/email/webhook/brevo": true,
+		"POST /api/v1/email/webhook/ses":   true,
+		// API-98 (QA 2026-05-29): provider-dashboard pre-flight GET on the
+		// webhook URL — returns 405 + Allow: POST so a dashboard sees
+		// "URL exists, method wrong" rather than silently abandoning a
+		// 401. Not an agent-facing surface; stays out of OpenAPI.
+		"GET /api/v1/email/webhook/brevo": true,
+		"GET /api/v1/email/webhook/ses":   true,
 		"POST /internal/teams/{id}/terminate": true,
 		// Worker-only resend driver. Auth is the shared
 		// WORKER_INTERNAL_JWT_SECRET HS256 token; agents must never call
