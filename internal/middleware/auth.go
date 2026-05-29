@@ -96,6 +96,46 @@ const unauthorizedMessage = "Authentication required: missing, malformed, or exp
 // claims, invalid PAT). Kept as a single helper so adding RFC 6750
 // WWW-Authenticate headers in a future PR happens in one place.
 func respondUnauthorized(c *fiber.Ctx) error {
+	return respondUnauthorizedWithReason(c, AuthErrorMissingCredentials)
+}
+
+// AuthErrorReason names the specific 401 sub-classification an agent or
+// dashboard can branch on. The top-level `error` keyword stays `unauthorized`
+// for back-compat (any client matching on `error=="unauthorized"` continues
+// to work); the sub-code lands in a new `error_code` field. Without this an
+// agent inspecting a 401 from `/auth/me`, `/api/v1/whoami`, or any protected
+// route had no way to distinguish "I never sent credentials" from "my JWT
+// expired 30s ago" from "the signature is wrong" — they all rendered the
+// same envelope (BUG-API-035/051).
+type AuthErrorReason string
+
+const (
+	// AuthErrorMissingCredentials — no `Authorization: Bearer ...` header.
+	// Remediation: log in to mint a session token.
+	AuthErrorMissingCredentials AuthErrorReason = "missing_credentials"
+	// AuthErrorMalformedToken — header present but the value is not a
+	// well-formed JWT/PAT (parse failure, wrong shape, signature mismatch).
+	// Remediation: log in to mint a fresh token; the existing one is
+	// corrupted, not just stale.
+	AuthErrorMalformedToken AuthErrorReason = "malformed_token"
+	// AuthErrorExpiredToken — JWT parsed, signature valid, but `exp` is in
+	// the past. Remediation: log in to mint a fresh token.
+	AuthErrorExpiredToken AuthErrorReason = "expired_token"
+	// AuthErrorInvalidClaims — JWT parsed and signature valid, but a
+	// required claim (uid/tid) is empty. Remediation: log in to mint a
+	// fresh, fully-populated token.
+	AuthErrorInvalidClaims AuthErrorReason = "invalid_claims"
+	// AuthErrorRevokedSession — token's jti is in the session-revocation
+	// set (the user explicitly logged out). Remediation: log in to mint a
+	// new session.
+	AuthErrorRevokedSession AuthErrorReason = "revoked_session"
+)
+
+// respondUnauthorizedWithReason writes the canonical 401 envelope with an
+// additional `error_code` sub-field carrying the AuthErrorReason. The
+// top-level `error` keyword stays `unauthorized` so existing clients matching
+// on it keep working unchanged.
+func respondUnauthorizedWithReason(c *fiber.Ctx, reason AuthErrorReason) error {
 	// B10 P2-4 (BugBash 2026-05-20): RFC 6750 §3 requires `WWW-Authenticate:
 	// Bearer realm=...` on every 401 from a Bearer-protected resource.
 	// Pre-fix only the audience-mismatch path set the header — every other
@@ -108,6 +148,7 @@ func respondUnauthorized(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 		"ok":                  false,
 		"error":               "unauthorized",
+		"error_code":          string(reason),
 		"message":             unauthorizedMessage,
 		"request_id":          GetRequestID(c),
 		"retry_after_seconds": nil,
@@ -266,7 +307,7 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 		// would have to reason about. See PR #176 refactor note.
 		header := c.Get("Authorization")
 		if len(header) < 8 || header[:7] != "Bearer " {
-			return respondUnauthorized(c)
+			return respondUnauthorizedWithReason(c, AuthErrorMissingCredentials)
 		}
 		tokenStr := header[7:]
 
@@ -276,7 +317,7 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 		if IsAPIKey(tokenStr) {
 			ok, err := AuthenticateAPIKey(c, tokenStr)
 			if err != nil || !ok {
-				return respondUnauthorized(c)
+				return respondUnauthorizedWithReason(c, AuthErrorMalformedToken)
 			}
 			return c.Next()
 		}
@@ -296,11 +337,21 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 			return []byte(cfg.JWTSecret), nil
 		}, jwt.WithValidMethods([]string{"HS256"}))
 		if err != nil || !parsed.Valid {
-			return respondUnauthorized(c)
+			// BUG-API-051: differentiate expired-vs-malformed so an agent
+			// can branch "refresh the session" from "ask the user to log
+			// in again." jwt/v4 returns *jwt.ValidationError whose Is()
+			// implementation matches the public ErrTokenExpired /
+			// ErrTokenNotValidYet sentinels; everything else is "the
+			// signature, alg, or shape was wrong" — that's malformed.
+			reason := AuthErrorMalformedToken
+			if errors.Is(err, jwt.ErrTokenExpired) || errors.Is(err, jwt.ErrTokenNotValidYet) {
+				reason = AuthErrorExpiredToken
+			}
+			return respondUnauthorizedWithReason(c, reason)
 		}
 
 		if claims.UserID == "" || claims.TeamID == "" {
-			return respondUnauthorized(c)
+			return respondUnauthorizedWithReason(c, AuthErrorInvalidClaims)
 		}
 
 		// RFC 8707 audience check — only enforced when the token actually
@@ -323,7 +374,7 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 				// Logged inside IsJTIRevoked; no additional log here to avoid duplication.
 				_ = err
 			} else if revoked {
-				return respondUnauthorized(c)
+				return respondUnauthorizedWithReason(c, AuthErrorRevokedSession)
 			}
 		}
 
@@ -443,7 +494,7 @@ func optionalAuthImpl(cfg *config.Config, strict bool) fiber.Handler {
 		}
 		if len(header) < 8 || header[:7] != "Bearer " {
 			if strict {
-				return respondUnauthorized(c)
+				return respondUnauthorizedWithReason(c, AuthErrorMalformedToken)
 			}
 			return c.Next()
 		}
@@ -470,7 +521,13 @@ func optionalAuthImpl(cfg *config.Config, strict bool) fiber.Handler {
 				// Header present but JWT is bad — reject so the caller
 				// learns their token is the problem instead of silently
 				// downgrading to anonymous. T19 P1-7.
-				return respondUnauthorized(c)
+				reason := AuthErrorMalformedToken
+				if errors.Is(err, jwt.ErrTokenExpired) || errors.Is(err, jwt.ErrTokenNotValidYet) {
+					reason = AuthErrorExpiredToken
+				} else if err == nil && parsed != nil && parsed.Valid {
+					reason = AuthErrorInvalidClaims
+				}
+				return respondUnauthorizedWithReason(c, reason)
 			}
 			return c.Next()
 		}

@@ -94,12 +94,16 @@ func NewLogoutHandler(cfg *config.Config, rdb *redis.Client) *LogoutHandler {
 func (h *LogoutHandler) Logout(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
-	// RequireAuth already validated the token — but we need the raw JWT to
-	// extract the jti and exp claims. Re-parse without secret validation is
-	// wrong; re-parse with the secret is the correct approach.
+	// BUG-AUTH-005: /auth/logout is idempotent per the OpenAPI contract
+	// ("safe to call without a valid token"). Missing / malformed /
+	// expired credentials therefore return 200 {ok:true} with no
+	// revocation work — the local token is already useless, so the
+	// dashboard's logout-on-expiry path must not surface a confusing 401
+	// here. Tokens that DO parse cleanly carry a jti to revoke (the path
+	// below handles them).
 	header := c.Get("Authorization")
 	if len(header) < 8 || !strings.EqualFold(header[:7], "Bearer ") {
-		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Authorization header required")
+		return c.JSON(fiber.Map{"ok": true})
 	}
 	tokenStr := header[7:]
 
@@ -117,7 +121,8 @@ func (h *LogoutHandler) Logout(c *fiber.Ctx) error {
 		return []byte(h.cfg.JWTSecret), nil
 	}, jwt.WithValidMethods([]string{"HS256"}))
 	if err != nil || !parsed.Valid {
-		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Token invalid or expired")
+		// BUG-AUTH-005: idempotent — token won't parse, nothing to revoke.
+		return c.JSON(fiber.Map{"ok": true})
 	}
 
 	jti := claims.ID

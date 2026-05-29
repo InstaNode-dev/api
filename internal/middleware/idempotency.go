@@ -297,10 +297,23 @@ func idempotencyExplicit(c *fiber.Ctx, rdb *redis.Client, endpoint, scope, rawKe
 				// refund the rate-limit counter here. The agent did the
 				// wrong thing (reused a key for a different body) and
 				// should still pay the cost of that mistake.
+				//
+				// BUG-API-013/406: every 4xx must carry the canonical
+				// envelope — request_id + agent_action — so an agent
+				// inspecting this 409 gets the same shape as the
+				// handler-emitted 400/402/etc. branches. The agent_action
+				// tells the agent to mint a NEW Idempotency-Key for the
+				// new body, not retry the same key (which would keep
+				// returning 409). retry_after_seconds is null: the
+				// conflict is permanent for this (key, body) pair — only
+				// re-keying resolves it.
 				return c.Status(fiber.StatusConflict).JSON(fiber.Map{
-					"ok":      false,
-					"error":   "idempotency_key_conflict",
-					"message": "Idempotency-Key already used with a different body",
+					"ok":                  false,
+					"error":               "idempotency_key_conflict",
+					"message":             "Idempotency-Key already used with a different body",
+					"request_id":          GetRequestID(c),
+					"retry_after_seconds": nil,
+					"agent_action":        "Tell the user this Idempotency-Key is already bound to a different request body. Mint a NEW Idempotency-Key (any RFC 4122 UUID) for the new body and retry — see https://instanode.dev/docs/idempotency.",
 				})
 			}
 			// Cache HIT — refund the rate-limit slot RateLimit burned on

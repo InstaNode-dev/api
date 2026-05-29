@@ -72,6 +72,11 @@ func mintLogoutJWT(t *testing.T, jti string, expDelta time.Duration) string {
 	return s
 }
 
+// BUG-AUTH-005: /auth/logout is idempotent per the OpenAPI contract —
+// "safe to call without a valid token." Missing / non-Bearer / wrong-secret
+// credentials must return 200 {ok:true} (the local token is already
+// useless, so the dashboard's logout-on-expiry path can't surface a
+// confusing 401). Pre-fix all three returned 401.
 func TestLogout_MissingAuthorizationHeader(t *testing.T) {
 	rdb, clean := setupCoverageRedis(t)
 	defer clean()
@@ -81,7 +86,7 @@ func TestLogout_MissingAuthorizationHeader(t *testing.T) {
 	resp, err := app.Test(req, 5000)
 	require.NoError(t, err)
 	defer resp.Body.Close()
-	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "BUG-AUTH-005: idempotent on missing auth")
 }
 
 func TestLogout_NonBearerAuthorization(t *testing.T) {
@@ -94,7 +99,7 @@ func TestLogout_NonBearerAuthorization(t *testing.T) {
 	resp, err := app.Test(req, 5000)
 	require.NoError(t, err)
 	defer resp.Body.Close()
-	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "BUG-AUTH-005: idempotent on non-Bearer scheme")
 }
 
 func TestLogout_WrongSecretJWT(t *testing.T) {
@@ -117,7 +122,7 @@ func TestLogout_WrongSecretJWT(t *testing.T) {
 	resp, err := app.Test(req, 5000)
 	require.NoError(t, err)
 	defer resp.Body.Close()
-	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "BUG-AUTH-005: idempotent on wrong-secret JWT (parse fail)")
 }
 
 func TestLogout_NoJTIIsNoOp(t *testing.T) {
@@ -165,19 +170,24 @@ func TestLogout_HappyPath_WritesRedisRevocationKey(t *testing.T) {
 	assert.LessOrEqual(t, ttl, 2*time.Hour+time.Second)
 }
 
-func TestLogout_ExpiredButValidlySignedTokenStillRejectedByJWTParse(t *testing.T) {
+// BUG-AUTH-005: an expired-but-validly-signed token is a no-op. The
+// underlying jwt library refuses to parse it (exp in the past), so the
+// handler treats it as "nothing to revoke" and returns 200 {ok:true}.
+// Pre-fix this returned 401 — which broke the dashboard's
+// logout-on-expiry path because the local token was already useless.
+func TestLogout_ExpiredButValidlySignedTokenIsIdempotent(t *testing.T) {
 	rdb, clean := setupCoverageRedis(t)
 	defer clean()
 	app := newLogoutApp(t, rdb)
 
-	// jwt library rejects expired tokens; the handler returns 401.
 	tokenStr := mintLogoutJWT(t, uuid.New().String(), -time.Minute)
 	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
 	req.Header.Set("Authorization", "Bearer "+tokenStr)
 	resp, err := app.Test(req, 5000)
 	require.NoError(t, err)
 	defer resp.Body.Close()
-	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Equal(t, http.StatusOK, resp.StatusCode,
+		"BUG-AUTH-005: expired token = no-op, returns 200 (idempotent)")
 }
 
 func TestLogout_RedisFailureReturns503(t *testing.T) {
@@ -235,7 +245,12 @@ func TestLogout_TokenWithoutExpDefaultsTo24h(t *testing.T) {
 	assert.LessOrEqual(t, ttl, 24*time.Hour+time.Second)
 }
 
-func TestLogout_HS384RejectedAsUnexpectedSigningMethod(t *testing.T) {
+// BUG-AUTH-005 + T10 P2-1: an HS384-signed token still fails the
+// jwt.WithValidMethods(["HS256"]) gate at parse-time, so the handler
+// treats it as "nothing to revoke" and returns 200 (idempotent contract).
+// The alg pin is still enforced — a wrong-alg JWT never lands in the
+// revocation set. Pre-AUTH-005 fix this returned 401.
+func TestLogout_HS384TokenIsIdempotent(t *testing.T) {
 	rdb, clean := setupCoverageRedis(t)
 	defer clean()
 	app := newLogoutApp(t, rdb)
@@ -255,6 +270,13 @@ func TestLogout_HS384RejectedAsUnexpectedSigningMethod(t *testing.T) {
 	resp, err := app.Test(req, 5000)
 	require.NoError(t, err)
 	defer resp.Body.Close()
-	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode,
-		"HS384 must be rejected; only HS256 is accepted")
+	assert.Equal(t, http.StatusOK, resp.StatusCode,
+		"BUG-AUTH-005: HS384 won't parse → idempotent 200, jti never revoked")
+
+	// Verify the alg-pin still bars the jti from landing in Redis.
+	key := RevokedJTIKey(rc.ID)
+	exists, err := rdb.Exists(context.Background(), key).Result()
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), exists,
+		"HS384 token must NOT result in a Redis revocation row (alg pin honoured)")
 }

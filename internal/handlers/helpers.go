@@ -441,7 +441,12 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the confirm_slug field is required to confirm this destructive action — supply the slug exactly as shown in the prompt and retry — see https://instanode.dev/docs.",
 	},
 	"name_too_long": {
-		AgentAction: "Tell the user the 'name' field exceeds 64 characters. Shorten it to a short human label (1-64 chars) and retry — see https://instanode.dev/docs.",
+		// BUG-AUTH-006: do NOT bake a numeric cap into this sentence —
+		// the cap varies per endpoint (resource names 1-64; PAT names
+		// up to 120; team names up to 200). Each handler's `message`
+		// field carries the endpoint-specific limit; agent_action just
+		// tells the agent to read that and shorten.
+		AgentAction: "Tell the user the 'name' field is too long. Read the exact limit from `message`, shorten the value to fit, and retry — see https://instanode.dev/docs.",
 	},
 	"body_too_long": {
 		AgentAction: "Tell the user the request body exceeded the per-endpoint cap. Shrink the payload — see https://instanode.dev/docs for per-endpoint limits.",
