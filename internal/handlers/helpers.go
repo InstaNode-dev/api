@@ -1054,6 +1054,12 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"subscription_cancel_failed": {
 		AgentAction: "Tell the user cancelling the Razorpay subscription failed. The team-delete is paused; email support@instanode.dev so an operator can reconcile — see https://instanode.dev/support.",
 	},
+
+	// ── Auth content-type gate (AUTH-163, CSRF). Per-IP rate-limit (AUTH-097/107)
+	// returns 202 silently per CLAUDE.md "silent absorb" policy — no agent_action needed.
+	"invalid_content_type": {
+		AgentAction: "Tell the user the magic-link request must use Content-Type: application/json. Form-urlencoded bodies are rejected to prevent CSRF — retry with JSON.",
+	},
 }
 
 // ErrorResponse is the canonical JSON shape for every 4xx/5xx response.
