@@ -926,6 +926,82 @@ func TestRefundRateLimitCounterSafeNoOps(t *testing.T) {
 		assert.Equal(t, http.StatusOK, resp.StatusCode,
 			"missing LocalKey must be a safe no-op")
 	})
+
+	t.Run("redis_decr_error_fails_open", func(t *testing.T) {
+		// Cover rate_limit.go:190-197 (the DECR error WARN-log + RedisErrors
+		// metric path). We can't poison rdb mid-request, so we stash a
+		// LocalKey but then point the helper at a closed client. The fail-
+		// open posture means the cached response keeps flowing — only the
+		// counter stays slightly elevated.
+		dead := redis.NewClient(&redis.Options{
+			Addr:        "127.0.0.1:1", // closed port
+			DialTimeout: 100 * time.Millisecond,
+			ReadTimeout: 100 * time.Millisecond,
+		})
+		defer dead.Close()
+
+		app := fiber.New()
+		app.Post("/", func(c *fiber.Ctx) error {
+			c.Locals(middleware.LocalKeyRateLimitKey, "rl-test:fp:2026-05-29")
+			c.Locals(middleware.LocalKeyRateLimitConfiguredLimit, int64(5))
+			n := middleware.RefundRateLimitCounter(c, dead)
+			return c.JSON(fiber.Map{"n": n})
+		})
+		req := httptest.NewRequest(http.MethodPost, "/", nil)
+		resp, err := app.Test(req, 3000)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusOK, resp.StatusCode,
+			"Redis DECR error must be fail-open, not propagate")
+	})
+
+	t.Run("decr_below_zero_clamps", func(t *testing.T) {
+		// Cover rate_limit.go:203-204 (newCount < 0 clamp) AND
+		// :213-214 (remaining < 0 clamp). When the helper is called on a
+		// fresh key (DECR with no prior INCR produces -1), the clamp must
+		// floor at 0 and the published X-RateLimit-Remaining must equal
+		// the configured limit (no negative budget visible to the agent).
+		// Bonus: configured limit < 0 (newCount) drives the remaining<0
+		// clamp branch — we set limit=0 so remaining = 0 - 0 = 0, which
+		// covers the post-clamp path; then we set limit=-1 via Locals
+		// directly so remaining = -1 - 0 = -1 trips the clamp.
+		app := fiber.New()
+		app.Post("/clamp-newcount", func(c *fiber.Ctx) error {
+			c.Locals(middleware.LocalKeyRateLimitKey, "rl-test-clamp:fp:2026-05-29")
+			c.Locals(middleware.LocalKeyRateLimitConfiguredLimit, int64(5))
+			// DECR on a non-existent key returns -1; helper must clamp to 0.
+			n := middleware.RefundRateLimitCounter(c, rdb)
+			return c.JSON(fiber.Map{"n": n})
+		})
+		req := httptest.NewRequest(http.MethodPost, "/clamp-newcount", nil)
+		resp, err := app.Test(req, 1000)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		// After clamp: newCount=0, remaining=5-0=5.
+		assert.Equal(t, "5", resp.Header.Get("X-RateLimit-Remaining"),
+			"newCount<0 must clamp to 0 so remaining = limit - 0")
+
+		// Now drive the remaining<0 clamp: pre-seed the counter to a value
+		// greater than the (small) configured limit so DECR returns a
+		// positive newCount that still exceeds the limit.
+		key := "rl-test-clamp-remain:fp:2026-05-29"
+		require.NoError(t, rdb.Set(context.Background(), key, "10", time.Hour).Err())
+
+		app.Post("/clamp-remaining", func(c *fiber.Ctx) error {
+			c.Locals(middleware.LocalKeyRateLimitKey, key)
+			c.Locals(middleware.LocalKeyRateLimitConfiguredLimit, int64(3))
+			n := middleware.RefundRateLimitCounter(c, rdb)
+			return c.JSON(fiber.Map{"n": n})
+		})
+		req2 := httptest.NewRequest(http.MethodPost, "/clamp-remaining", nil)
+		resp2, err := app.Test(req2, 1000)
+		require.NoError(t, err)
+		defer resp2.Body.Close()
+		// After DECR: newCount=9, remaining=3-9=-6, clamped to 0.
+		assert.Equal(t, "0", resp2.Header.Get("X-RateLimit-Remaining"),
+			"remaining<0 must clamp to 0 (never show negative budget)")
+	})
 }
 
 // _ keep redis package import alive for the helper above (in case future
