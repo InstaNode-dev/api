@@ -46,16 +46,22 @@ import (
 // Middleware ordering (see internal/router/router.go for the per-route
 // wiring): RateLimit runs at app.Use scope (global, before OptionalAuth),
 // so by the time this middleware runs the per-fingerprint daily counter
-// has already incremented. THIS IS DELIBERATE: a malicious agent must NOT
-// be able to bypass rate limiting via Idempotency-Key reuse, so replays
-// still consume rate budget. The original-call cost is borne by the
-// counter on the FIRST request; replays add an extra increment, which is
-// the conservative choice — the customer paid for the first call (in
-// quota terms) but a key-reuse attacker doesn't get free attempts.
-// Quota-walls inside handlers (CheckAndIncrementToken) similarly continue
-// to fire on replay paths, but the replay short-circuits BEFORE the
-// handler so the quota counter is unaffected — the cached response simply
-// goes out the wire. Net effect: rate-limit budget = abuse-protected;
+// has already incremented. To honor the published Stripe-shape replay
+// contract — same Idempotency-Key replays the cached response without
+// burning a fresh rate-limit slot — every cache HIT path below calls
+// RefundRateLimitCounter (single Redis DECR) BEFORE sending the cached
+// response. The FIRST call still pays the cost (the original INCR), so
+// an attacker reusing one key 100× gets amortised-cheaper attempts, NOT
+// free attempts (FINDING API-1, CEO Option C, 2026-05-29). The handler-
+// internal per-fingerprint provision-dedup cap (5/day, CLAUDE.md rule 6)
+// is NOT touched by the refund — that abuse signal lives in handler
+// code and is independent of the request-rate-limit counter.
+//
+// Quota-walls inside handlers (CheckAndIncrementToken) continue to fire
+// on replay paths, but the replay short-circuits BEFORE the handler so
+// the quota counter is unaffected — the cached response simply goes out
+// the wire. Net effect: rate-limit budget = refunded on replay (Stripe
+// contract); fingerprint provision-dedup = abuse-protected (unchanged);
 // quota budget = customer-friendly (no double-charge for retries).
 //
 // Cache key shape: idem:<scope>:<endpoint>:<sha256(key)> where <scope> is
@@ -287,12 +293,20 @@ func idempotencyExplicit(c *fiber.Ctx, rdb *redis.Client, endpoint, scope, rawKe
 				"error", jerr, "endpoint", endpoint)
 		} else {
 			if entry.BodyHash != reqBodyHash {
+				// 409 is a genuine error response, not a replay — DO NOT
+				// refund the rate-limit counter here. The agent did the
+				// wrong thing (reused a key for a different body) and
+				// should still pay the cost of that mistake.
 				return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 					"ok":      false,
 					"error":   "idempotency_key_conflict",
 					"message": "Idempotency-Key already used with a different body",
 				})
 			}
+			// Cache HIT — refund the rate-limit slot RateLimit burned on
+			// the way in (FINDING API-1, Option C). Fail-open: a refund
+			// error logs WARN but never blocks the cached response.
+			RefundRateLimitCounter(c, rdb)
 			c.Set(idempotencyReplayHeader, "true")
 			if entry.ContentType != "" {
 				c.Set(fiber.HeaderContentType, entry.ContentType)
@@ -397,6 +411,12 @@ func idempotencyFingerprint(c *fiber.Ctx, rdb *redis.Client, endpoint, scope str
 				"error", jerr, "endpoint", endpoint)
 			// Corrupt — fall through to handler and overwrite below.
 		} else {
+			// Cache HIT on the body-fingerprint fallback path. Same
+			// refund semantics as the explicit-key branch: the
+			// rate-limit slot RateLimit burned on the way in is
+			// returned because we're serving a cached response, not
+			// re-running the handler (FINDING API-1, Option C).
+			RefundRateLimitCounter(c, rdb)
 			c.Set(idempotencySourceHeader, idempotencySourceFingerprint)
 			c.Set(idempotencyReplayHeader, "true")
 			if entry.ContentType != "" {

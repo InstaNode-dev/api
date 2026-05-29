@@ -57,6 +57,27 @@ var (
 		Help: "Requests blocked by fingerprint rate limiting",
 	})
 
+	// IdempotencyReplayRefunded counts the rate-limit counter refunds the
+	// Idempotency middleware issues on a cache HIT — one increment per
+	// replayed response that successfully DECR'd the per-fingerprint
+	// daily counter (CLAUDE.md FINDING API-1, fix Option C).
+	//
+	// Labelled by route_path so on-call can see which endpoints absorb the
+	// most retry-storm traffic. A steady non-zero rate is healthy (agents
+	// are retrying transient 5xx and we're honoring the published Stripe-
+	// shape replay contract). A sudden spike on one route correlates with
+	// upstream brownouts; flip to NR and check the corresponding 5xx rate
+	// for the same route.
+	//
+	// Companion alert (infra repo): "idempotency replay refund spike (1h)"
+	// fires when rate(idempotency_replay_refunded_total[1h]) > 5×7d
+	// baseline — points the operator at a brownout in the underlying
+	// provisioner before agents start abandoning.
+	IdempotencyReplayRefunded = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_idempotency_replay_refunded_total",
+		Help: "Rate-limit counter refunds issued by Idempotency middleware on cache hit",
+	}, []string{"route"})
+
 	// RecycleGateBlocked counts anonymous provision attempts blocked by the
 	// free-tier recycle gate (Option B from FREE-TIER-RECYCLE-2026-05-12).
 	// Labelled by resource_type so we can see which services see the most
