@@ -251,6 +251,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
+					"claim_url":      upgradeURL, // DOG-21: see db.go
 				}
 				setInternalURL(dedupResp, existing.Tier, connectionURL, "queue")
 				return respondOK(c, dedupResp)
@@ -382,6 +383,7 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		"note":           upgradeNote(upgradeURL),
 		"upgrade":        upgradeURL,
 		"upgrade_jwt":    jwtToken,
+		"claim_url":      upgradeURL, // DOG-21: see dedup branch above
 	}
 	// MR-P0-5: when isolated creds are minted, surface them. Tenant clients
 	// pass nats_jwt + nats_nkey to nats.UserJWTAndSeed(), or write the

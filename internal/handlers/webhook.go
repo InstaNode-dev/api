@@ -289,6 +289,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 				"note":        limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 				"upgrade":     upgradeURL,
 				"upgrade_jwt": jwtToken,
+				"claim_url":   upgradeURL, // DOG-21: see db.go
 			}
 			if existing.ExpiresAt.Valid {
 				// P2-03: emit RFC3339 (not the default RFC3339Nano of a raw
@@ -390,6 +391,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 		"note":        upgradeNote(upgradeURL),
 		"upgrade":     upgradeURL,
 		"upgrade_jwt": jwtToken,
+		"claim_url":   upgradeURL, // DOG-21: see dedup branch above
 		// P2-03: RFC3339 to match storage.go and the webhook dedup branch —
 		// one wire shape for expires_at across all provisioning endpoints.
 		"expires_at": expiresAt.Format(time.RFC3339),
