@@ -232,6 +232,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
+					"claim_url":      upgradeURL, // DOG-21: see db.go
 					"expires_at":     existing.ExpiresAt.Time.Format(time.RFC3339),
 				}
 				// P2-05: the S3 prefix is recoverable from the persisted
@@ -389,6 +390,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 	resp["note"] = upgradeNote(upgradeURL)
 	resp["upgrade"] = upgradeURL
 	resp["upgrade_jwt"] = jwtToken
+	resp["claim_url"] = upgradeURL // DOG-21: see dedup branch above
 	resp["expires_at"] = expiresAt.Format(time.RFC3339)
 	resp["limits"] = h.storageAnonymousLimits()
 	return respondCreated(c, resp)

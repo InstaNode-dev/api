@@ -172,6 +172,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
+					"claim_url":      upgradeURL, // DOG-21: see db.go
 				}
 				setInternalURL(dedupResp, existing.Tier, connectionURL, "redis")
 				if existing.KeyPrefix.String != "" {
@@ -289,6 +290,7 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 		"note":           upgradeNote(upgradeURL),
 		"upgrade":        upgradeURL,
 		"upgrade_jwt":    jwtToken,
+		"claim_url":      upgradeURL, // DOG-21: see dedup branch above
 	}
 	// T19 P0-2 (BugHunt 2026-05-20): emit top-level expires_at for
 	// shape parity with storage/webhook responses; see db.go for rationale.

@@ -208,6 +208,12 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 					"note":           limitExceededNote(upgradeURL, existing.ExpiresAt.Time),
 					"upgrade":        upgradeURL,
 					"upgrade_jwt":    jwtToken,
+					// DOG-21 (QA 2026-05-29): emit claim_url alongside upgrade
+					// so agents have a labelled link for the email-claim flow.
+					// Same URL (the /start?t=<jwt> page handles both claim and
+					// upgrade); distinct field signals intent to the calling
+					// agent, matching the documented OpenAPI response schema.
+					"claim_url":      upgradeURL,
 				}
 				setInternalURL(dedupResp, existing.Tier, connectionURL, "postgres")
 				return respondOK(c, dedupResp)
@@ -331,6 +337,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 		"note":           upgradeNote(upgradeURL),
 		"upgrade":        upgradeURL,
 		"upgrade_jwt":    jwtToken,
+		"claim_url":      upgradeURL, // DOG-21: see dedup branch above
 	}
 	// T19 P0-2 (BugHunt 2026-05-20): unify the TTL contract across all
 	// provisioning endpoints — storage/webhook already emit a top-level

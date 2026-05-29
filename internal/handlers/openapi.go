@@ -2644,7 +2644,8 @@ const openAPISpec = `{
           "warning": { "type": "string", "description": "Present only when the resource is already over its storage limit at provision time — accompanied by the X-Instant-Notice: storage_limit_reached response header." },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email to convert the anonymous resource into a claimed (authenticated) one — no need to string-parse the upgrade URL. Absent on authenticated provisions." },
-          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL the agent can hand to the user to drive the dashboard claim flow." }
+          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL the agent can hand to the user to drive the dashboard claim flow." },
+          "claim_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. DOG-21: same URL as 'upgrade', but distinct field signals the email-claim flow to the calling agent (vs upgrade-to-paid). Agents can render this as a claim CTA directly without constructing the URL from upgrade_jwt." }
         }
       },
       "VectorProvisionRequest": {
@@ -2677,7 +2678,8 @@ const openAPISpec = `{
           "warning": { "type": "string", "description": "Present only when the resource is already over its storage limit at provision time — accompanied by the X-Instant-Notice: storage_limit_reached response header." },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
-          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
+          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." },
+          "claim_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. DOG-21: same URL as 'upgrade', but distinct field signals the email-claim flow to the calling agent (vs upgrade-to-paid). Agents can render this as a claim CTA directly without constructing the URL from upgrade_jwt." }
         }
       },
       "CacheProvisionResponse": {
@@ -2699,7 +2701,8 @@ const openAPISpec = `{
           "warning": { "type": "string", "description": "Present only when the resource is already over its storage limit at provision time — accompanied by the X-Instant-Notice: storage_limit_reached response header." },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
-          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
+          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." },
+          "claim_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. DOG-21: same URL as 'upgrade', but distinct field signals the email-claim flow to the calling agent (vs upgrade-to-paid). Agents can render this as a claim CTA directly without constructing the URL from upgrade_jwt." }
         }
       },
       "NoSQLProvisionResponse": {
@@ -2720,7 +2723,8 @@ const openAPISpec = `{
           "warning": { "type": "string", "description": "Present only when the resource is already over its storage limit at provision time — accompanied by the X-Instant-Notice: storage_limit_reached response header." },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
-          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
+          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." },
+          "claim_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. DOG-21: same URL as 'upgrade', but distinct field signals the email-claim flow to the calling agent (vs upgrade-to-paid). Agents can render this as a claim CTA directly without constructing the URL from upgrade_jwt." }
         }
       },
       "QueueProvisionResponse": {
@@ -2754,7 +2758,8 @@ const openAPISpec = `{
           "dedicated": { "type": "boolean", "description": "True when the resource was provisioned on dedicated (single-tenant) infrastructure rather than the shared pool." },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
-          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
+          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." },
+          "claim_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. DOG-21: same URL as 'upgrade', but distinct field signals the email-claim flow to the calling agent (vs upgrade-to-paid). Agents can render this as a claim CTA directly without constructing the URL from upgrade_jwt." }
         }
       },
       "WebhookProvisionResponse": {
@@ -2772,7 +2777,8 @@ const openAPISpec = `{
           "expires_at": { "type": "string", "format": "date-time" },
           "note": { "type": "string" },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
-          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
+          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." },
+          "claim_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. DOG-21: same URL as 'upgrade', but distinct field signals the email-claim flow to the calling agent (vs upgrade-to-paid). Agents can render this as a claim CTA directly without constructing the URL from upgrade_jwt." }
         }
       },
       "StorageProvisionResponse": {
@@ -2802,7 +2808,8 @@ const openAPISpec = `{
           "note": { "type": "string", "description": "Anonymous-tier upgrade hint emitted on the 201 happy path (T19 P1-5, BugHunt 2026-05-20). Was previously undocumented; the schema only listed credentials_note which only appears on the dedup path." },
           "credentials_note": { "type": "string", "description": "Present only on the rate-limited anonymous dedup response, where access_key_id/secret_access_key are NOT re-emitted (the secret is minted once at provision time and never stored)." },
           "upgrade_jwt": { "type": "string", "description": "Anonymous-tier only. Signed JWT the agent can POST to /claim with an email. Absent on authenticated provisions." },
-          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." }
+          "upgrade": { "type": "string", "format": "uri", "description": "Anonymous-tier only. Pre-baked GET /start?t=<upgrade_jwt> URL for the dashboard claim flow." },
+          "claim_url": { "type": "string", "format": "uri", "description": "Anonymous-tier only. DOG-21: same URL as 'upgrade', but distinct field signals the email-claim flow to the calling agent (vs upgrade-to-paid). Agents can render this as a claim CTA directly without constructing the URL from upgrade_jwt." }
         }
       },
       "DeployItem": {
@@ -3193,7 +3200,7 @@ const openAPISpec = `{
           "retry_after_seconds": { "type": ["integer", "null"], "description": "Seconds the agent should wait before retrying. null on 4xx (no retry — fix the request). int on transient 5xx: 30 for 503, 60 for 429, 10 for 502/504. For 429/502/503/504 the same value is also set in the Retry-After HTTP header." },
           "agent_action": { "type": "string", "description": "Optional. A sentence the calling agent should surface verbatim to the human user — e.g. 'Tell the user they've hit the hobby tier storage limit (500MB). Have them upgrade at https://instanode.dev/pricing to provision more storage.' Present on quota walls, invalid-token errors, permission-denied errors, expired-resource errors, tier-gate errors, AND on plumbing 5xx (where it falls back to a generic 'email support with this request_id' sentence)." },
           "upgrade_url": { "type": "string", "format": "uri", "description": "Optional. Where the user can resolve the error — typically the pricing/upgrade page for quota walls and the login page for token errors. Present whenever following the URL would clear the error." },
-          "claim_url": { "type": "string", "format": "uri", "description": "Optional. Present specifically on error='free_tier_recycle_requires_claim' (402 from /db/new, /cache/new, /nosql/new, /queue/new, /storage/new, /webhook/new): the URL the anonymous caller should visit to claim their existing resources with email before they can provision again. Distinct from upgrade_url — claim_url is about identity (anonymous → claimed), upgrade_url is about tier (claimed → paid). Both may be present on the same envelope." }
+          "claim_url": { "type": "string", "format": "uri", "description": "Optional. Present on error='free_tier_recycle_requires_claim' (402 from /db/new, /cache/new, /nosql/new, /queue/new, /storage/new, /webhook/new, /vector/new): the URL the anonymous caller should visit to claim their existing resources with email before they can provision again. DOG-21 (QA 2026-05-29): ALSO emitted on every successful 201 anonymous provision response under each service's response schema — agents can surface a claim CTA on first provision instead of waiting for the recycle gate. Distinct from upgrade_url — claim_url is about identity (anonymous → claimed), upgrade_url is about tier (claimed → paid). Both may be present on the same envelope." }
         },
         "required": ["ok", "error", "message", "retry_after_seconds"]
       },
