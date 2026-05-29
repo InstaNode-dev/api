@@ -690,17 +690,19 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	}
 
 	switch plan {
-	case "hobby", "hobby_plus", "pro":
+	case "hobby", "hobby_plus", "pro", "team":
 		// fall through — plan_id is resolved by razorpayPlanIDFor below.
-	case "team":
-		// Team tier is under development — block customer-initiated
-		// subscribe via the public API. The internal /internal/set-tier
-		// endpoint still works for ops use. Drop this guard when team
-		// launches (and revert the public pricing UI).
-		return respondError(c, fiber.StatusBadRequest, "tier_unavailable",
-			"Team tier is under active development. Email support@instanode.dev to join the early access list.")
+		// Team enabled 2026-05-29 (CEO BIZ-1 ship call): marketing,
+		// dashboard PricingGrid, and llms.txt all sell Team @ $199/mo,
+		// but this handler used to return 400 tier_unavailable on every
+		// team checkout — turning away the highest-AOV prospect mid-funnel.
+		// If RAZORPAY_PLAN_ID_TEAM (or RAZORPAY_PLAN_ID_TEAM_ANNUAL) is
+		// unset in this environment the request now falls through to the
+		// shared 503 billing_not_configured branch below (a clear
+		// operator signal), not 400 tier_unavailable (a customer signal
+		// that the tier itself doesn't exist).
 	default:
-		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "plan must be 'hobby', 'hobby_plus', or 'pro'")
+		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "plan must be 'hobby', 'hobby_plus', 'pro', or 'team'")
 	}
 	planID := h.razorpayPlanIDFor(plan, frequency)
 
@@ -2994,13 +2996,13 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 			"Tell the user that downgrading to a lower plan is support-assisted. Have them email support@instanode.dev with their team and the target plan.",
 			"mailto:support@instanode.dev")
 	}
-	// Team tier is under development — block customer-initiated upgrades to
-	// team via the public API. The internal /internal/set-tier endpoint
-	// still works for ops use. Drop this guard when team launches.
-	if strings.EqualFold(target, "team") {
-		return respondError(c, fiber.StatusBadRequest, "tier_unavailable",
-			"Team tier is under active development. Email support@instanode.dev to join the early access list.")
-	}
+	// Team-tier ChangePlan is now allowed for the same reason Team
+	// checkout is: marketing + dashboard + llms.txt sell Team @ $199/mo
+	// as a self-serve upgrade path. If the operator hasn't created the
+	// Razorpay plan_id yet, razorpayPlanIDFor / portal.ChangePlan
+	// surfaces the configuration error downstream — never 400
+	// tier_unavailable from this layer. (Enabled 2026-05-29 alongside
+	// the checkout-creation team guard removal.)
 	portal := h.billingPortal()
 	if _, err := portal.SubscriptionID(c.Context(), teamID); err != nil {
 		return respondError(c, fiber.StatusBadRequest, "no_subscription", "no active subscription to change")

@@ -102,8 +102,13 @@ func TestResidualChangePlan_Downgrade_400(t *testing.T) {
 	assert.Equal(t, "downgrade_not_self_serve", body["error"])
 }
 
-// TestResidualChangePlan_TeamTier_400 hits tier_unavailable (team is dev-locked).
-func TestResidualChangePlan_TeamTier_400(t *testing.T) {
+// TestResidualChangePlan_TeamTier_Accepted locks the 2026-05-29 BIZ-1
+// fix at the change-plan surface: a Pro team requesting target_plan=team
+// no longer 400s with tier_unavailable. The dev-lock branch was removed
+// alongside the matching checkout branch, so the request flows to the
+// downstream no_subscription guard (this team has no Razorpay
+// subscription_id on file).
+func TestResidualChangePlan_TeamTier_Accepted(t *testing.T) {
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
 	teamID := mkVerifiedTeam(t, db, "pro")
@@ -112,7 +117,10 @@ func TestResidualChangePlan_TeamTier_400(t *testing.T) {
 	app := billingAppNoAuth(t, db, cfg, teamID)
 	status, body := changePlanPost(t, app, `{"target_plan":"team"}`)
 	assert.Equal(t, http.StatusBadRequest, status)
-	assert.Equal(t, "tier_unavailable", body["error"])
+	assert.NotEqual(t, "tier_unavailable", body["error"],
+		"target_plan=team must no longer return tier_unavailable")
+	assert.Equal(t, "no_subscription", body["error"],
+		"pro team with no Razorpay sub id → expect the downstream no_subscription guard")
 }
 
 // TestResidualChangePlan_NoSubscription_400 hits no_subscription: a valid

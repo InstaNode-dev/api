@@ -215,7 +215,12 @@ func TestAgentActionContract_RegistryCoverage(t *testing.T) {
 		// Quota walls.
 		"quota_exceeded", "storage_limit_reached", "vault_quota_exceeded",
 		"vault_not_available", "vault_env_not_allowed", "member_limit",
-		"upgrade_required", "tier_unavailable", "rate_limit_exceeded",
+		// "tier_unavailable" was dropped 2026-05-29 alongside the Team-tier
+		// checkout/change-plan guards (CEO BIZ-1). It was the only code in
+		// this registry that no handler emitted; the orphan-coverage gate
+		// flagged it. If a future feature reintroduces a "tier is genuinely
+		// unavailable" surface, re-add the code + its emitter in one PR.
+		"upgrade_required", "rate_limit_exceeded",
 		// Auth.
 		"unauthorized", "auth_required", "invalid_token", "missing_token",
 		"vault_requires_auth", "invitation_invalid", "already_accepted",
