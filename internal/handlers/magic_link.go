@@ -295,9 +295,18 @@ func logMagicLinkSendResult(sendErr error, requestID string) {
 func (h *MagicLinkHandler) Callback(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
+	// BUG-API-011: accept `?token=` as a fallback for `?t=` so a user who
+	// hand-typed (or an MCP tool that guessed) the longer param name still
+	// lands on the validation branch instead of "missing its token." The
+	// canonical magic-link URL we emit always uses `?t=` (15-char-long
+	// plaintext kept short for SMS-style copy-paste); `token` is purely a
+	// recovery alias and is never advertised.
 	plaintext := strings.TrimSpace(c.Query("t"))
 	if plaintext == "" {
-		return renderAuthError(c, fiber.StatusBadRequest, "Sign-in link is missing its token", "Open the link from your email exactly as we sent it.")
+		plaintext = strings.TrimSpace(c.Query("token"))
+	}
+	if plaintext == "" {
+		return renderAuthError(c, fiber.StatusBadRequest, "Sign-in link is missing its token", "Open the link from your email exactly as we sent it — the URL should include `?t=...`.")
 	}
 
 	hash := models.HashMagicLink(plaintext)
