@@ -138,6 +138,13 @@ func generateOAuthState() (string, error) {
 
 // appendSessionToken returns returnTo with ?session_token=<jwt> (or &) appended.
 // Preserves any existing query string on returnTo.
+//
+// AUTH-004 (2026-05-29): no longer used by the magic-link / OAuth callback
+// paths — the JWT now rides in a Secure HttpOnly cookie and only a
+// `signed_in=1` marker lands in the redirect URL. Retained for
+// backwards-compatibility with the JSON OAuth handlers (POST /auth/github,
+// POST /auth/google) which return the session token in the response body,
+// not a redirect.
 func appendSessionToken(returnTo, sessionToken string) string {
 	u, err := url.Parse(returnTo)
 	if err != nil {
@@ -149,6 +156,153 @@ func appendSessionToken(returnTo, sessionToken string) string {
 	q.Set("session_token", sessionToken)
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+// appendSignedInMarker adds ?signed_in=1 to returnTo. AUTH-004: replaces
+// the JWT-in-URL pattern. The marker tells the dashboard SPA that the
+// session cookie has been set and it should call /auth/me to pick up the
+// user/team, without leaking any secret material into URL logs / Referer.
+func appendSignedInMarker(returnTo string) string {
+	u, err := url.Parse(returnTo)
+	if err != nil {
+		return defaultReturnTo + "?signed_in=1"
+	}
+	q := u.Query()
+	q.Set("signed_in", "1")
+	// Be explicit that the old key is gone — if any code path ever set it
+	// upstream, strip it here so we don't accidentally pass through a
+	// leaked token.
+	q.Del("session_token")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// exchangeCookieName is the transient cookie that bridges the magic-link
+// / OAuth browser callback into the SPA. It carries the session JWT for
+// at most 30 seconds and is scoped to POST /auth/exchange so the only
+// surface that ever reads it is the exchange handler — RequireAuth is
+// strictly Bearer-only (CLAUDE.md "Live API surface").
+//
+// AUTH-004 flow:
+//
+//  1. /auth/email/callback (or github/google browser callback) mints the
+//     session JWT, sets it in this cookie, 302s to the dashboard with
+//     ?signed_in=1 (no token in URL).
+//  2. SPA loads, sees signed_in=1, POSTs /auth/exchange with credentials.
+//  3. Exchange handler reads the cookie, deletes it (Max-Age=0), returns
+//     {token: <jwt>} in the body. SPA stores it in memory and from then
+//     on uses Authorization: Bearer like every other client.
+const exchangeCookieName = "instanode_session_exchange"
+
+// exchangeCookieMaxAge — 30s ceiling on the bridge window. Long enough
+// for the SPA to load and POST /auth/exchange after the 302, short
+// enough that an attacker with momentary cookie-jar access can't extract
+// the JWT later. Cookie expiry is enforced by the browser; the handler
+// additionally rejects an absent / empty cookie with 400.
+const exchangeCookieMaxAge = 30
+
+// exchangeCookiePath confines the cookie's send scope to the exchange
+// endpoint. Browsers will NOT attach it to /api/v1/* or any other path,
+// which is what keeps the cookie out of the API contract.
+const exchangeCookiePath = "/auth/exchange"
+
+// setExchangeCookie writes the session JWT into a transient
+// Secure; HttpOnly; SameSite=Lax cookie scoped to Path=/auth/exchange
+// with Max-Age=30. HttpOnly blocks the XSS exfil path (AUTH-003);
+// Secure forces TLS in prod; SameSite=Lax preserves the top-level
+// navigation flow from the 302 redirect while blocking third-party
+// POST CSRF. No Domain attribute — the cookie stays on the api host
+// where /auth/exchange lives; the SPA fetches it cross-origin with
+// credentials:'include'.
+func setExchangeCookie(c *fiber.Ctx, jwt string, prod bool) {
+	c.Cookie(&fiber.Cookie{
+		Name:     exchangeCookieName,
+		Value:    jwt,
+		Path:     exchangeCookiePath,
+		MaxAge:   exchangeCookieMaxAge,
+		Secure:   prod,
+		HTTPOnly: true,
+		SameSite: "Lax",
+	})
+}
+
+// clearExchangeCookie writes a cookie with the same name/path but an
+// expired Expires attribute so the browser drops the bridge cookie
+// immediately after the SPA consumes it. Single-use semantics: even if
+// the response body is lost to a network hiccup, the cookie is gone and
+// the SPA has to restart the sign-in flow rather than retry from a
+// still-live cookie.
+//
+// Fiber's cookie codec lower-cases Path and does NOT emit Max-Age=0 for
+// MaxAge<=0 — it omits the attribute entirely. Use a fixed-past Expires
+// instead, which both Fiber and the browser treat as "drop immediately".
+func clearExchangeCookie(c *fiber.Ctx, prod bool) {
+	c.Cookie(&fiber.Cookie{
+		Name:     exchangeCookieName,
+		Value:    "",
+		Path:     exchangeCookiePath,
+		Expires:  time.Unix(0, 0).UTC(),
+		Secure:   prod,
+		HTTPOnly: true,
+		SameSite: "Lax",
+	})
+}
+
+// Exchange handles POST /auth/exchange: reads the transient
+// instanode_session_exchange cookie set by the magic-link / OAuth
+// browser callback, clears it (Max-Age=0), and returns the embedded
+// session JWT in the response body. Browser-only path — the SPA is the
+// sole consumer.
+//
+// On any failure (no cookie, empty cookie, expired-by-browser) the
+// handler returns 400 cookie_missing_or_expired so the SPA can surface
+// "please sign in again" rather than wedge with an infinite spinner.
+//
+// The cookie is cleared on BOTH the success and failure paths to
+// prevent a partial-failure leak (e.g. the SPA crashed before reading
+// the body but the cookie is still alive). The single-use guarantee
+// is what keeps this path's blast radius bounded to the 30-second
+// transient window.
+func (h *AuthHandler) Exchange(c *fiber.Ctx) error {
+	prod := h.cfg.Environment == "production"
+	token := c.Cookies(exchangeCookieName)
+	if token == "" {
+		clearExchangeCookie(c, prod)
+		return respondError(c, fiber.StatusBadRequest, "cookie_missing_or_expired",
+			"No session-exchange cookie present. Start the sign-in flow again.")
+	}
+	clearExchangeCookie(c, prod)
+	return c.JSON(fiber.Map{"ok": true, "token": token})
+}
+
+// returnToSchemeIsAllowed reports whether the URL's scheme is in the
+// per-environment allow-list:
+//
+//	prod:  {https}
+//	dev:   {https, http} (http only via the host gate downstream — we
+//	       reject javascript:/data:/file: etc. regardless of environment)
+//
+// AUTH-016 / AUTH-017: javascript: and data: were previously silently
+// downgraded to the default by validateReturnTo. The new gate rejects
+// up-front with a clear 400 instead. Callers with no return_to (empty
+// string) still get the default behaviour.
+func returnToSchemeIsAllowed(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return true
+	case "http":
+		// HTTP only for the localhost-dev allowlist. The host check still
+		// runs in validateReturnTo downstream, so http://evil.com falls
+		// to the default — but javascript:/data:/file: are rejected
+		// outright at this gate, which is the user-visible win.
+		return returnToAllowsLocalhost
+	default:
+		return false
+	}
 }
 
 // AuthHandler handles OAuth login flows.
@@ -979,6 +1133,18 @@ func (h *AuthHandler) GitHubStart(c *fiber.Ctx) error {
 		return renderAuthError(c, fiber.StatusServiceUnavailable, "GitHub sign-in is not configured", "Ask the operator to set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET.")
 	}
 
+	// AUTH-016 / AUTH-017: fail-closed on hostile return_to schemes.
+	// Previously validateReturnTo silently downgraded javascript:/data:/
+	// file:/ etc. to the default — we now reject with 400 invalid_return_to
+	// up-front so the contract is explicit and abuse leaves a clean signal.
+	// Empty / missing return_to is permitted and collapses to the default.
+	if rawReturnTo := strings.TrimSpace(c.Query("return_to")); rawReturnTo != "" {
+		if !returnToSchemeIsAllowed(rawReturnTo) {
+			return respondError(c, fiber.StatusBadRequest, "invalid_return_to",
+				"Query 'return_to' must use https:// (or http://localhost for dev). javascript:, data:, file: and other schemes are rejected.")
+		}
+	}
+
 	state, err := generateOAuthState()
 	if err != nil {
 		return renderAuthError(c, fiber.StatusInternalServerError, "Could not start sign-in", "Random source unavailable.")
@@ -1057,13 +1223,24 @@ func (h *AuthHandler) GitHubCallback(c *fiber.Ctx) error {
 
 	emitAuthLoginAudit(h.db, team.ID, user.ID, user.Email, "github", c.IP(), c.Get("User-Agent"))
 
-	return c.Redirect(appendSessionToken(returnTo, sessionToken), fiber.StatusFound)
+	// AUTH-004: do NOT put the session JWT in the Location header.
+	// See comment on the magic-link callback for the full rationale.
+	setExchangeCookie(c, sessionToken, h.cfg.Environment == "production")
+	return c.Redirect(appendSignedInMarker(returnTo), fiber.StatusFound)
 }
 
 // GoogleStart handles GET /auth/google/start?return_to=<url>.
 func (h *AuthHandler) GoogleStart(c *fiber.Ctx) error {
 	if h.cfg.GoogleClientID == "" {
 		return renderAuthError(c, fiber.StatusServiceUnavailable, "Google sign-in is not configured", "Ask the operator to set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.")
+	}
+
+	// AUTH-016 / AUTH-017: mirror the GitHubStart fail-closed gate.
+	if rawReturnTo := strings.TrimSpace(c.Query("return_to")); rawReturnTo != "" {
+		if !returnToSchemeIsAllowed(rawReturnTo) {
+			return respondError(c, fiber.StatusBadRequest, "invalid_return_to",
+				"Query 'return_to' must use https:// (or http://localhost for dev). javascript:, data:, file: and other schemes are rejected.")
+		}
 	}
 
 	state, err := generateOAuthState()
@@ -1149,7 +1326,9 @@ func (h *AuthHandler) GoogleCallbackBrowser(c *fiber.Ctx) error {
 
 	emitAuthLoginAudit(h.db, team.ID, user.ID, user.Email, "google", c.IP(), c.Get("User-Agent"))
 
-	return c.Redirect(appendSessionToken(returnTo, sessionToken), fiber.StatusFound)
+	// AUTH-004: session cookie + signed_in marker (no JWT in Location).
+	setExchangeCookie(c, sessionToken, h.cfg.Environment == "production")
+	return c.Redirect(appendSignedInMarker(returnTo), fiber.StatusFound)
 }
 
 func (h *AuthHandler) findOrCreateUserGoogle(ctx context.Context, g *googleUser) (*models.User, *models.Team, error) {

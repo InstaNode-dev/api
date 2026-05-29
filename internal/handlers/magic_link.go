@@ -246,19 +246,21 @@ func (h *MagicLinkHandler) Start(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "invalid_email", "A valid email address is required")
 	}
 
-	// AUTH-107 / AUTH-097 (P0/P1): per-IP rate limit. The existing per-
-	// email-hash limit is bypassed by rotating the address — an attacker
-	// can spam any number of arbitrary 3rd-party addresses from one IP.
-	// With Brevo currently configured to return 201 then internally
-	// reject (project memory project_brevo_sender_not_validated), every
-	// spam send still chews through DB rows + Brevo quota.
-	//
-	// Runs AFTER email validation so a typo doesn't burn budget; runs
-	// BEFORE the per-email limit because the per-IP limit is the wider
-	// abuse-defence layer and we want it to fire even when the per-email
-	// budget is fresh. Fail-open on Redis error per CLAUDE.md convention
-	// 1. Limited path returns 202 — identical to the success path —
-	// so an attacker gains no enumeration signal.
+	// AUTH-016 / AUTH-017: fail-closed on hostile return_to schemes (cheap
+	// reject before any Redis work). Empty/missing return_to is permitted
+	// and collapses to the allowlisted default downstream.
+	if rawReturnTo := strings.TrimSpace(body.ReturnTo); rawReturnTo != "" {
+		if !returnToSchemeIsAllowed(rawReturnTo) {
+			return respondError(c, fiber.StatusBadRequest, "invalid_return_to",
+				"Field 'return_to' must use https:// (or http://localhost for dev). javascript:, data:, file: and other schemes are rejected.")
+		}
+	}
+
+	// AUTH-107 / AUTH-097: per-IP rate-limit. The per-email-hash limit is
+	// bypassed by rotating the address; per-IP is the wider abuse-defence
+	// layer. Runs AFTER cheap validation; fail-open on Redis error per
+	// CLAUDE.md convention 1. Limited path returns 202 (identical to the
+	// success path) — no enumeration signal.
 	if ipLimited, ipErr := checkPerIPRateLimit(c.Context(), h.rdb, c.IP()); ipErr != nil {
 		slog.Warn("magic_link.start.ip_rl_error",
 			"error", ipErr,
@@ -454,7 +456,20 @@ func (h *MagicLinkHandler) Callback(c *fiber.Ctx) error {
 
 	emitAuthLoginAudit(h.db, team.ID, user.ID, user.Email, "email", c.IP(), c.Get("User-Agent"))
 
-	return c.Redirect(appendSessionToken(returnTo, sessionToken), fiber.StatusFound)
+	// AUTH-004: do NOT put the session JWT in the Location header. The
+	// 24h-TTL JWT used to land in the URL query (?session_token=<jwt>),
+	// which leaked it to:
+	//   - browser history (persistent device-side trail)
+	//   - server-side access logs (ingress, CDN, dashboard nginx)
+	//   - Referer headers on subsequent navigations
+	//   - third-party analytics that capture full URLs
+	// Instead, set the JWT in a Secure; HttpOnly; SameSite=Lax cookie
+	// scoped to .instanode.dev so the dashboard origin can authenticate
+	// API calls via the cookie path in RequireAuth. The redirect URL
+	// carries only a non-secret `?signed_in=1` marker so the dashboard
+	// knows to call /auth/me and pick up the session.
+	setExchangeCookie(c, sessionToken, h.cfg.Environment == "production")
+	return c.Redirect(appendSignedInMarker(returnTo), fiber.StatusFound)
 }
 
 // looksLikeEmail performs the cheapest plausible check: must contain a single

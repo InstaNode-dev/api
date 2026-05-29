@@ -150,7 +150,11 @@ func TestAPIKeys_Create_ValidationArms(t *testing.T) {
 		{"missing_name", `{"name":""}`, http.StatusBadRequest},
 		{"name_too_long", `{"name":"` + strings.Repeat("x", 121) + `"}`, http.StatusBadRequest},
 		{"invalid_scope", `{"name":"k","scopes":["delete"]}`, http.StatusBadRequest},
-		{"valid_admin_scope", `{"name":"k","scopes":["admin"]}`, http.StatusCreated},
+		// 2026-05-29 AUTH-090: minting admin-scope PATs from a session JWT
+		// now requires the X-Confirm-Reauth header. Without it → 403
+		// reauth_required. The header-bearing happy path is covered in
+		// TestPAT_SessionJWTCannotMintAdminScope_RequiresReauth.
+		{"valid_admin_scope_without_reauth", `{"name":"k","scopes":["admin"]}`, http.StatusForbidden},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
