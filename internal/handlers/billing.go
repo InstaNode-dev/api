@@ -98,6 +98,95 @@ var reusableSubscriptionStatuses = map[string]struct{}{
 // from buying a plan they already pay for.
 const errCheckoutAlreadyOnTier = "already_on_plan"
 
+// ── BUG-P112 traffic_env derivation + live-key-in-dev guard ─────────────────
+//
+// Razorpay's API-key convention encodes the environment in the prefix:
+//
+//   rzp_live_*  →  LIVE mode (real card mandates, real money)
+//   rzp_test_*  →  TEST mode (sandbox card-mandate fixtures, no money moves)
+//
+// Surface this derived field on every checkout response (rule 22 — agents and
+// the SPA must be able to read the mode WITHOUT seeing the actual key value).
+// CRITICAL: the actual `RazorpayKeyID` value MUST NEVER leak in any response
+// — only the boolean derivation `traffic_env: "production" | "test"`. Tests
+// pin this constraint.
+//
+// In addition to surfacing the derivation, the handler short-circuits with
+// 503 billing_misconfigured when ENVIRONMENT≠"production" but the key is
+// LIVE. Real money flowing through a staging/dev deployment is the BUG-P111
+// failure mode (anonymous /app/checkout reaching a LIVE subscription page).
+// Fail fast at the API instead of minting the subscription.
+
+// razorpayLiveKeyPrefix / razorpayTestKeyPrefix match the documented Razorpay
+// key-ID convention. https://razorpay.com/docs/api/authentication/#api-keys.
+// Lowercase comparison via strings.HasPrefix(strings.ToLower(...)) so a stray
+// uppercase key does not bypass the guard.
+const (
+	razorpayLiveKeyPrefix = "rzp_live_"
+	razorpayTestKeyPrefix = "rzp_test_"
+)
+
+// trafficEnv classifies a Razorpay key ID as "production" (LIVE) or "test".
+// Returns ("test", false) for empty/unrecognised input — the safer default
+// is "test" because callers branching on the field then treat the deployment
+// as non-prod, and the missing-config branch (billing_not_configured) catches
+// the empty case before this is ever surfaced.
+//
+// recognised=true means the key carried a known prefix — the live/test
+// distinction is authoritative. recognised=false means the key was empty
+// or didn't match the convention; do not draw deployment conclusions.
+func trafficEnv(razorpayKeyID string) (env string, recognised bool) {
+	k := strings.ToLower(strings.TrimSpace(razorpayKeyID))
+	if k == "" {
+		return "test", false
+	}
+	if strings.HasPrefix(k, razorpayLiveKeyPrefix) {
+		return "production", true
+	}
+	if strings.HasPrefix(k, razorpayTestKeyPrefix) {
+		return "test", true
+	}
+	return "test", false
+}
+
+// deploymentEnv normalises the configured ENVIRONMENT value for comparison
+// against the Razorpay key class. "production" is the only value that
+// permits a LIVE key; everything else (development, test, staging,
+// preview-*, "") rejects.
+func deploymentEnv(cfgEnvironment string) string {
+	return strings.ToLower(strings.TrimSpace(cfgEnvironment))
+}
+
+// detectBillingMisconfiguration returns ("", "") when the (deployment, key)
+// pairing is valid, or (code, message) when it is dangerous and the request
+// must be short-circuited with 503 before any Razorpay call.
+//
+// The single failure mode this catches: ENVIRONMENT="development" (or any
+// non-prod value) paired with a LIVE Razorpay key. That combination created
+// BUG-P111 — a staging or dev deployment minted a real LIVE subscription
+// against the prod Razorpay account. Tests pin every variant explicitly.
+//
+// Note: a production deployment with a TEST key is NOT caught here — that's
+// a different class of operator bug (test cards in prod) which the existing
+// billing_not_configured + plan_id-missing guards already cover and which
+// surfaces honest test-card behaviour to the user anyway. Adding a third
+// failure mode here would risk false-positiving every staging deploy that
+// uses a sandbox key by design.
+func detectBillingMisconfiguration(cfgEnvironment, razorpayKeyID string) (code, message string) {
+	env, recognised := trafficEnv(razorpayKeyID)
+	if !recognised {
+		// Key is empty or has an unknown prefix — the billing_not_configured
+		// branch below handles this. Don't double-classify.
+		return "", ""
+	}
+	dep := deploymentEnv(cfgEnvironment)
+	if env == "production" && dep != "production" {
+		return "billing_misconfigured",
+			"Razorpay LIVE key configured on a non-production deployment (ENVIRONMENT=" + dep + "). Refusing to mint a real subscription. Operator: rotate to a test key (rzp_test_*) or set ENVIRONMENT=production. See https://instanode.dev/docs/operator/billing-modes."
+	}
+	return "", ""
+}
+
 // BillingHandler handles billing and Razorpay webhook endpoints.
 type BillingHandler struct {
 	db    *sql.DB
@@ -706,6 +795,34 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	}
 	planID := h.razorpayPlanIDFor(plan, frequency)
 
+	// ── BUG-P112 live-key-in-dev guard ─────────────────────────────────────
+	// A LIVE Razorpay key pointed at a non-prod deployment is the
+	// BUG-P111/P112 root cause: anyone (even unauth, via the BUG-P111 SPA
+	// regression) reaching this handler would have minted a REAL Razorpay
+	// subscription on the prod Razorpay account. Fast-fail with a clear
+	// operator agent_action BEFORE the create-subscription call so the
+	// Razorpay dashboard is not polluted with phantom test subscriptions.
+	//
+	// Run BEFORE the billing_not_configured check: a live-key-in-dev
+	// deployment is dangerous EVEN IF the operator forgot to set
+	// RAZORPAY_PLAN_ID_TEAM — the underlying configuration drift is the
+	// signal we must surface first.
+	if code, message := detectBillingMisconfiguration(h.cfg.Environment, h.cfg.RazorpayKeyID); code != "" {
+		// Derive (but DO NOT log) the key class. Logging the actual key value
+		// is a hard no — only the boolean derivation is safe.
+		derivedTrafficEnv, _ := trafficEnv(h.cfg.RazorpayKeyID)
+		slog.Error("billing.checkout.misconfigured_live_key_in_nonprod",
+			"team_id", teamID,
+			"plan", plan,
+			"deployment_environment", h.cfg.Environment,
+			"traffic_env", derivedTrafficEnv,
+			"request_id", requestID,
+		)
+		return respondErrorWithAgentAction(c, fiber.StatusServiceUnavailable, code, message,
+			"Operator: a LIVE Razorpay key is configured on a non-production deployment. Either rotate to a test key (rzp_test_*) or set ENVIRONMENT=production. Real subscriptions cannot be minted against this deployment until that is fixed.",
+			"https://instanode.dev/docs/operator/billing-modes")
+	}
+
 	if h.cfg.RazorpayKeyID == "" || h.cfg.RazorpayKeySecret == "" || planID == "" {
 		slog.Warn("billing.checkout.not_configured",
 			"team_id", teamID,
@@ -762,11 +879,16 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	// subscription_id the first checkout produced — same response shape as a
 	// fresh create below.
 	if reuseSubID, reuseURL, reuse := h.reusablePendingCheckout(c.Context(), teamID, requestID); reuse {
+		// BUG-P112: include traffic_env on the reuse path too — same
+		// derivation, same NEVER-leak-the-key contract. SPA branches on
+		// this field regardless of whether the sub was freshly minted.
+		derivedTrafficEnv, _ := trafficEnv(h.cfg.RazorpayKeyID)
 		return c.JSON(fiber.Map{
 			"ok":              true,
 			"short_url":       reuseURL,
 			"subscription_id": reuseSubID,
 			"reused":          true,
+			"traffic_env":     derivedTrafficEnv,
 		})
 	}
 	// ────────────────────────────────────────────────────────────────────────
@@ -935,10 +1057,15 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 		"request_id", requestID,
 	)
 
+	// BUG-P112: surface the derived `traffic_env` so clients (the SPA, MCP
+	// agents, curl users) can detect production-vs-test mode without ever
+	// seeing the actual RAZORPAY_KEY_ID. NEVER include the key value here.
+	derivedTrafficEnv, _ := trafficEnv(h.cfg.RazorpayKeyID)
 	return c.JSON(fiber.Map{
 		"ok":              true,
 		"short_url":       shortURL,
 		"subscription_id": subID,
+		"traffic_env":     derivedTrafficEnv,
 	})
 }
 

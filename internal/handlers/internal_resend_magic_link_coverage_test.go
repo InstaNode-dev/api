@@ -116,8 +116,15 @@ func TestResendMagicLink_AuthArms(t *testing.T) {
 	linkID := seedMagicLink(t, db, time.Now().Add(10*time.Minute), 0)
 
 	t.Run("invalid_body", func(t *testing.T) {
+		// API-27/78 (QA 2026-05-29): auth-first ordering means a junk body
+		// from an AUTHENTICATED caller still 400s (worker emitted a bad
+		// payload); unauthenticated callers 401 on the auth check before
+		// the body parse. We test the authenticated-bad-body path here so
+		// the body-parse arm stays covered.
+		validJWT := mintResendMLJWT(t, testResendMagicLinkSecret, "resend_magic_link", linkID, 0)
 		req := httptest.NewRequest(http.MethodPost, "/internal/email/resend-magic-link", strings.NewReader(`{bad`))
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+validJWT)
 		resp, err := app.Test(req, 5000)
 		require.NoError(t, err)
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -125,7 +132,14 @@ func TestResendMagicLink_AuthArms(t *testing.T) {
 	})
 
 	t.Run("invalid_link_id", func(t *testing.T) {
-		resp := resendMLPost(t, app, "", "not-a-uuid")
+		// API-27/78: same auth-first reasoning as invalid_body above —
+		// the body-link_id parse only fires for authenticated callers.
+		// We mint a fresh JWT whose link_id claim matches the bogus body
+		// link_id so the structural verify accepts the token; the body
+		// parse then surfaces 400 invalid_link_id (since "not-a-uuid"
+		// fails uuid.Parse).
+		validJWT := mintResendMLJWT(t, testResendMagicLinkSecret, "resend_magic_link", "not-a-uuid", 0)
+		resp := resendMLPost(t, app, validJWT, "not-a-uuid")
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		resp.Body.Close()
 	})
