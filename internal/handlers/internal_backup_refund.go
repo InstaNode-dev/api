@@ -207,10 +207,8 @@ func preVerifyInternalBackupRefundJWT(c *fiber.Ctx, secret string) error {
 	}
 	tokenStr := strings.TrimSpace(authHeader[len("Bearer "):])
 	claims := &internalBackupRefundClaims{}
-	_, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-		}
+	// WithValidMethods([HS256]) pins alg; non-HS256 short-circuits.
+	_, err := jwt.ParseWithClaims(tokenStr, claims, func(_ *jwt.Token) (interface{}, error) {
 		return []byte(secret), nil
 	}, jwt.WithValidMethods([]string{"HS256"}))
 	if err != nil {
