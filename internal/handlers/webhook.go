@@ -233,6 +233,11 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 	}
 
 	// ── Anonymous path ───────────────────────────────────────────────────────────
+	// Recycle gate runs BEFORE the daily-cap check — see db.go API-7 fix.
+	if h.recycleGate(c, fp, "webhook") {
+		return nil
+	}
+
 	limitExceeded, err := h.checkProvisionLimit(ctx, fp)
 	if err != nil {
 		slog.Error("webhook.new.provision_limit_check_failed",
@@ -295,10 +300,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 		}
 	}
 
-	// Free-tier recycle gate (see provision_helper.go for rationale).
-	if h.recycleGate(c, fp, "webhook") {
-		return nil
-	}
+	// (Recycle gate moved above — see API-7 / QA 2026-05-29 ordering fix.)
 
 	expiresAt := time.Now().UTC().Add(24 * time.Hour)
 	tokenStr := ""

@@ -130,6 +130,56 @@ func TestPresign_Success_HEAD(t *testing.T) {
 	assert.Equal(t, "HEAD", body.Method)
 }
 
+// TestPresign_CanonicalHostSubstitution — API-3 (QA 2026-05-29) end-to-end.
+// When ObjectStorePublicURL is configured (production: https://s3.instanode.dev),
+// the returned URL must point at the canonical host, NEVER at
+// nyc3.digitaloceanspaces.com — leaking the DO provider host + master access-key-id
+// prefix is the leak QA flagged.
+func TestPresign_CanonicalHostSubstitution(t *testing.T) {
+	fx := setupStorageProvFixture(t, newDOSpacesProvider(t), false)
+	// Patch the config in-place — the handler reads through h.cfg, so a
+	// post-construction tweak is honoured. Mirrors what production does:
+	// OBJECT_STORE_PUBLIC_URL=https://s3.instanode.dev.
+	fx.cfg.ObjectStorePublicURL = "https://s3.instanode.dev"
+
+	token := seedStorageResource(t, fx.db, "", "canon-prefix")
+
+	resp, body := doPresign(t, fx, token, "",
+		map[string]any{"operation": "GET", "key": "subdir/obj.bin"})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.True(t, body.OK)
+
+	// Canonical host present, DO Spaces host MUST be absent.
+	assert.True(t, strings.HasPrefix(body.URL, "https://s3.instanode.dev/"),
+		"signed URL must start with the canonical host; got %q", body.URL)
+	assert.NotContains(t, body.URL, "digitaloceanspaces.com",
+		"DO Spaces vendor host must not leak in signed URLs; got %q", body.URL)
+	// Path + signature query still intact.
+	assert.Contains(t, body.URL, "canon-prefix/subdir/obj.bin")
+	assert.Contains(t, body.URL, "X-Amz-Signature=")
+	assert.Contains(t, body.URL, "X-Amz-Credential=")
+}
+
+// TestPresign_NoCanonicalHost_PassesThrough — local-dev / MinIO fallback: when
+// ObjectStorePublicURL is empty (no canonical CNAME configured), the raw signed
+// URL is returned unchanged.
+func TestPresign_NoCanonicalHost_PassesThrough(t *testing.T) {
+	fx := setupStorageProvFixture(t, newDOSpacesProvider(t), false)
+	// Default fixture cfg has ObjectStorePublicURL == "".
+	assert.Empty(t, fx.cfg.ObjectStorePublicURL)
+
+	token := seedStorageResource(t, fx.db, "", "nopub")
+	resp, body := doPresign(t, fx, token, "",
+		map[string]any{"operation": "GET", "key": "x"})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	// With no public URL, the original signed host (configured endpoint) is
+	// returned. Asserts the no-rewrite branch behaves as a pass-through.
+	assert.Contains(t, body.URL, "nyc3.test.local")
+	assert.NotContains(t, body.URL, "s3.instanode.dev")
+}
+
 // ── TTL cap: requesting > 1h is silently capped to 3600s ───────────────────
 
 func TestPresign_TTLCapped(t *testing.T) {
