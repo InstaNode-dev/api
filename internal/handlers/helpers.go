@@ -1058,7 +1058,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	// ── Auth content-type gate (AUTH-163, CSRF). Per-IP rate-limit (AUTH-097/107)
 	// returns 202 silently per CLAUDE.md "silent absorb" policy — no agent_action needed.
 	"invalid_content_type": {
-		AgentAction: "Tell the user the magic-link request must use Content-Type: application/json. Form-urlencoded bodies are rejected to prevent CSRF — retry with JSON.",
+		AgentAction: "Tell the user the magic-link request must use Content-Type: application/json. Form-urlencoded bodies are rejected to prevent CSRF — retry with JSON. See https://instanode.dev/docs/auth.",
 	},
 }
 
