@@ -124,9 +124,17 @@ func e2eTokenAccepted(c *fiber.Ctx) bool {
 	if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1 {
 		return true
 	}
+	// SEC-API FINDING-26 (2026-05-29): previously logged `expected_len` +
+	// `got_prefix` on every mismatch. Both are info-disclosure: expected_len
+	// hands an attacker who can read the api logs the byte-length of
+	// E2E_TEST_TOKEN (narrows brute-force search), and got_prefix is the
+	// attacker's own guess being echoed back into long-term log storage
+	// (correlation-grep risk, plus attests the env var is configured in
+	// prod). Keep only `got_len` — the attacker already knows the length of
+	// their own input, so this leaks nothing new while still letting an SRE
+	// distinguish "malformed/missing" from "wrong-content" failures.
 	slog.Warn("e2e_bypass.token_mismatch",
-		"got_len", len(got), "expected_len", len(expected),
-		"got_prefix", got[:min(8, len(got))])
+		"got_len", len(got))
 	return false
 }
 
