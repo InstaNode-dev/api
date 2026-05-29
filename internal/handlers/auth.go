@@ -138,6 +138,13 @@ func generateOAuthState() (string, error) {
 
 // appendSessionToken returns returnTo with ?session_token=<jwt> (or &) appended.
 // Preserves any existing query string on returnTo.
+//
+// AUTH-004 (2026-05-29): no longer used by the magic-link / OAuth callback
+// paths — the JWT now rides in a Secure HttpOnly cookie and only a
+// `signed_in=1` marker lands in the redirect URL. Retained for
+// backwards-compatibility with the JSON OAuth handlers (POST /auth/github,
+// POST /auth/google) which return the session token in the response body,
+// not a redirect.
 func appendSessionToken(returnTo, sessionToken string) string {
 	u, err := url.Parse(returnTo)
 	if err != nil {
@@ -149,6 +156,100 @@ func appendSessionToken(returnTo, sessionToken string) string {
 	q.Set("session_token", sessionToken)
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+// appendSignedInMarker adds ?signed_in=1 to returnTo. AUTH-004: replaces
+// the JWT-in-URL pattern. The marker tells the dashboard SPA that the
+// session cookie has been set and it should call /auth/me to pick up the
+// user/team, without leaking any secret material into URL logs / Referer.
+func appendSignedInMarker(returnTo string) string {
+	u, err := url.Parse(returnTo)
+	if err != nil {
+		return defaultReturnTo + "?signed_in=1"
+	}
+	q := u.Query()
+	q.Set("signed_in", "1")
+	// Be explicit that the old key is gone — if any code path ever set it
+	// upstream, strip it here so we don't accidentally pass through a
+	// leaked token.
+	q.Del("session_token")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// sessionCookieName is the cross-host session cookie set by the magic-link
+// and OAuth callback paths after a successful sign-in (AUTH-004). The
+// RequireAuth middleware accepts it as a fallback when no
+// Authorization: Bearer header is present, so the dashboard at
+// instanode.dev can authenticate API calls to api.instanode.dev via the
+// cookie alone — no JWT in URLs, history, or logs.
+const sessionCookieName = "instanode_session"
+
+// sessionCookieDomain is the parent Domain attribute for the session
+// cookie. Setting it explicitly to .instanode.dev makes the cookie
+// readable on api.instanode.dev (where it's set) AND on instanode.dev
+// (where the dashboard runs) so the SPA picks up the session without
+// any token-in-URL gymnastics. In non-production environments the Domain
+// attribute is omitted (defaults to current host) so local dev / tests
+// with httptest hosts don't get rejected by the browser cookie store.
+const sessionCookieDomain = ".instanode.dev"
+
+// sessionCookieMaxAge mirrors the JWT lifetime so the cookie expires no
+// later than the embedded JWT exp claim. Keeping the JWT TTL as the
+// source of truth (see issueSessionJWT) and the cookie as the carrier.
+const sessionCookieMaxAge = 24 * 60 * 60 // 24h, matches JWT TTL
+
+// setSessionCookie writes the session JWT into a Secure; HttpOnly;
+// SameSite=Lax cookie scoped to .instanode.dev (prod) or current host
+// (dev). HttpOnly blocks the XSS exfil path that AUTH-003 documented;
+// Secure forces TLS so the cookie never rides a cleartext fallback;
+// SameSite=Lax preserves the top-level navigation flow (the user lands
+// on the dashboard via 302 from the callback) while blocking
+// third-party-origin POST CSRF.
+func setSessionCookie(c *fiber.Ctx, jwt string, prod bool) {
+	cookie := &fiber.Cookie{
+		Name:     sessionCookieName,
+		Value:    jwt,
+		Path:     "/",
+		MaxAge:   sessionCookieMaxAge,
+		Secure:   prod,
+		HTTPOnly: true,
+		SameSite: "Lax",
+	}
+	if prod {
+		cookie.Domain = sessionCookieDomain
+	}
+	c.Cookie(cookie)
+}
+
+// returnToSchemeIsAllowed reports whether the URL's scheme is in the
+// per-environment allow-list:
+//
+//	prod:  {https}
+//	dev:   {https, http} (http only via the host gate downstream — we
+//	       reject javascript:/data:/file: etc. regardless of environment)
+//
+// AUTH-016 / AUTH-017: javascript: and data: were previously silently
+// downgraded to the default by validateReturnTo. The new gate rejects
+// up-front with a clear 400 instead. Callers with no return_to (empty
+// string) still get the default behaviour.
+func returnToSchemeIsAllowed(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return true
+	case "http":
+		// HTTP only for the localhost-dev allowlist. The host check still
+		// runs in validateReturnTo downstream, so http://evil.com falls
+		// to the default — but javascript:/data:/file: are rejected
+		// outright at this gate, which is the user-visible win.
+		return returnToAllowsLocalhost
+	default:
+		return false
+	}
 }
 
 // AuthHandler handles OAuth login flows.
@@ -979,6 +1080,18 @@ func (h *AuthHandler) GitHubStart(c *fiber.Ctx) error {
 		return renderAuthError(c, fiber.StatusServiceUnavailable, "GitHub sign-in is not configured", "Ask the operator to set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET.")
 	}
 
+	// AUTH-016 / AUTH-017: fail-closed on hostile return_to schemes.
+	// Previously validateReturnTo silently downgraded javascript:/data:/
+	// file:/ etc. to the default — we now reject with 400 invalid_return_to
+	// up-front so the contract is explicit and abuse leaves a clean signal.
+	// Empty / missing return_to is permitted and collapses to the default.
+	if rawReturnTo := strings.TrimSpace(c.Query("return_to")); rawReturnTo != "" {
+		if !returnToSchemeIsAllowed(rawReturnTo) {
+			return respondError(c, fiber.StatusBadRequest, "invalid_return_to",
+				"Query 'return_to' must use https:// (or http://localhost for dev). javascript:, data:, file: and other schemes are rejected.")
+		}
+	}
+
 	state, err := generateOAuthState()
 	if err != nil {
 		return renderAuthError(c, fiber.StatusInternalServerError, "Could not start sign-in", "Random source unavailable.")
@@ -1057,13 +1170,24 @@ func (h *AuthHandler) GitHubCallback(c *fiber.Ctx) error {
 
 	emitAuthLoginAudit(h.db, team.ID, user.ID, user.Email, "github", c.IP(), c.Get("User-Agent"))
 
-	return c.Redirect(appendSessionToken(returnTo, sessionToken), fiber.StatusFound)
+	// AUTH-004: do NOT put the session JWT in the Location header.
+	// See comment on the magic-link callback for the full rationale.
+	setSessionCookie(c, sessionToken, h.cfg.Environment == "production")
+	return c.Redirect(appendSignedInMarker(returnTo), fiber.StatusFound)
 }
 
 // GoogleStart handles GET /auth/google/start?return_to=<url>.
 func (h *AuthHandler) GoogleStart(c *fiber.Ctx) error {
 	if h.cfg.GoogleClientID == "" {
 		return renderAuthError(c, fiber.StatusServiceUnavailable, "Google sign-in is not configured", "Ask the operator to set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.")
+	}
+
+	// AUTH-016 / AUTH-017: mirror the GitHubStart fail-closed gate.
+	if rawReturnTo := strings.TrimSpace(c.Query("return_to")); rawReturnTo != "" {
+		if !returnToSchemeIsAllowed(rawReturnTo) {
+			return respondError(c, fiber.StatusBadRequest, "invalid_return_to",
+				"Query 'return_to' must use https:// (or http://localhost for dev). javascript:, data:, file: and other schemes are rejected.")
+		}
 	}
 
 	state, err := generateOAuthState()
@@ -1149,7 +1273,9 @@ func (h *AuthHandler) GoogleCallbackBrowser(c *fiber.Ctx) error {
 
 	emitAuthLoginAudit(h.db, team.ID, user.ID, user.Email, "google", c.IP(), c.Get("User-Agent"))
 
-	return c.Redirect(appendSessionToken(returnTo, sessionToken), fiber.StatusFound)
+	// AUTH-004: session cookie + signed_in marker (no JWT in Location).
+	setSessionCookie(c, sessionToken, h.cfg.Environment == "production")
+	return c.Redirect(appendSignedInMarker(returnTo), fiber.StatusFound)
 }
 
 func (h *AuthHandler) findOrCreateUserGoogle(ctx context.Context, g *googleUser) (*models.User, *models.Team, error) {

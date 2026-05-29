@@ -601,7 +601,12 @@ func TestAuth_GitHubCallback_FullSuccess(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusFound, resp.StatusCode)
-	assert.Contains(t, resp.Header.Get("Location"), "session_token=")
+	// AUTH-004 (2026-05-29): JWT in cookie, NOT in Location URL.
+	loc2 := resp.Header.Get("Location")
+	assert.NotContains(t, loc2, "session_token=", "AUTH-004: JWT must not appear in Location")
+	assert.Contains(t, loc2, "signed_in=1")
+	assert.Contains(t, strings.Join(resp.Header.Values("Set-Cookie"), "\n"), "instanode_session=",
+		"AUTH-004: session JWT must be set as the instanode_session cookie")
 }
 
 func TestAuth_GoogleCallbackBrowser_StateAndErrorBranches(t *testing.T) {
@@ -644,7 +649,12 @@ func TestAuth_GoogleCallbackBrowser_FullSuccess(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusFound, resp.StatusCode)
-	assert.Contains(t, resp.Header.Get("Location"), "session_token=")
+	// AUTH-004 (2026-05-29): JWT in cookie, NOT in Location URL.
+	loc2 := resp.Header.Get("Location")
+	assert.NotContains(t, loc2, "session_token=", "AUTH-004: JWT must not appear in Location")
+	assert.Contains(t, loc2, "signed_in=1")
+	assert.Contains(t, strings.Join(resp.Header.Values("Set-Cookie"), "\n"), "instanode_session=",
+		"AUTH-004: session JWT must be set as the instanode_session cookie")
 }
 
 // extractQueryParam pulls a single (already-unescaped for our hex value) query

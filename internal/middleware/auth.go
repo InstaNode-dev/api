@@ -11,6 +11,14 @@ import (
 	"instant.dev/internal/urls"
 )
 
+// SessionCookieName is the cookie name carrying the session JWT after a
+// successful magic-link / OAuth callback (AUTH-004, 2026-05-29). It MUST
+// match the constant of the same name in handlers/auth.go — they're kept
+// separate to avoid a middleware → handlers import cycle. The two
+// constants are tested for equality in middleware/auth_test.go to catch
+// drift.
+const SessionCookieName = "instanode_session"
+
 const (
 	// LocalKeyUserID is the fiber.Locals key for the authenticated user ID.
 	LocalKeyUserID = "auth_user_id"
@@ -255,11 +263,21 @@ func rejectAudienceMismatch(c *fiber.Ctx) error {
 // keyword so agents can branch "wrong server" from "bad credentials".
 func RequireAuth(cfg *config.Config) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		// AUTH-004: prefer Authorization: Bearer when present; fall back
+		// to the instanode_session cookie set by the magic-link / OAuth
+		// callbacks. Without this fallback the dashboard couldn't
+		// authenticate API calls after the callback path stopped
+		// embedding the session JWT in the redirect URL — the dashboard
+		// has the cookie but no Bearer header.
+		var tokenStr string
 		header := c.Get("Authorization")
-		if len(header) < 8 || header[:7] != "Bearer " {
+		if len(header) >= 8 && header[:7] == "Bearer " {
+			tokenStr = header[7:]
+		} else if cookieJWT := c.Cookies(SessionCookieName); cookieJWT != "" {
+			tokenStr = cookieJWT
+		} else {
 			return respondUnauthorized(c)
 		}
-		tokenStr := header[7:]
 
 		// Dispatch on token shape. PATs (ink_<base64>) hit the api_keys
 		// table; JWTs go through HMAC validation. Both populate the same

@@ -342,7 +342,16 @@ func TestMagicLink_Callback_AlreadyVerifiedUser(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusFound, resp.StatusCode)
-	assert.Contains(t, resp.Header.Get("Location"), "session_token=")
+	// 2026-05-29 AUTH-004: the session JWT is now set in a Secure
+	// HttpOnly SameSite=Lax cookie; the Location header carries only a
+	// non-secret ?signed_in=1 marker so the dashboard SPA knows to call
+	// /auth/me. The full session-leak rationale lives on the AUTH-004
+	// regression test in auth_callback_nojwt_authp0_test.go.
+	loc := resp.Header.Get("Location")
+	assert.NotContains(t, loc, "session_token=", "AUTH-004: JWT must not appear in Location")
+	assert.Contains(t, loc, "signed_in=1")
+	assert.Contains(t, strings.Join(resp.Header.Values("Set-Cookie"), "\n"), "instanode_session=",
+		"AUTH-004: session JWT must be set as the instanode_session cookie")
 }
 
 // capturingMailer records the magic link so the callback test can replay it.

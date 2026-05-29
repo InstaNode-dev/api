@@ -177,7 +177,10 @@ func TestMagicLinkCallback_InvalidTokenReturns400HTML(t *testing.T) {
 // TestMagicLinkCallback_HappyPath_ConsumesAndRedirects walks the full
 // success flow: Start inserts a row, we extract the plaintext from the
 // stub mailer's recorded link, hit Callback, expect a 302 to
-// <return_to>?session_token=...
+// <return_to>?signed_in=1 plus a Secure HttpOnly session cookie. The
+// previous "session_token=<jwt>" Location pattern was retired in
+// AUTH-004 (2026-05-29) — see auth_callback_nojwt_authp0_test.go for
+// the standalone regression test.
 func TestMagicLinkCallback_HappyPath_ConsumesAndRedirects(t *testing.T) {
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
@@ -208,7 +211,12 @@ func TestMagicLinkCallback_HappyPath_ConsumesAndRedirects(t *testing.T) {
 	defer resp2.Body.Close()
 	assert.Equal(t, fiber.StatusFound, resp2.StatusCode)
 	loc := resp2.Header.Get("Location")
-	assert.Contains(t, loc, "session_token=")
+	// AUTH-004: JWT in cookie, NOT in Location. The dashboard SPA gets
+	// a signed_in=1 marker and reads the cookie via /auth/me.
+	assert.NotContains(t, loc, "session_token=", "AUTH-004: JWT must not appear in Location")
+	assert.Contains(t, loc, "signed_in=1")
+	assert.Contains(t, strings.Join(resp2.Header.Values("Set-Cookie"), "\n"), "instanode_session=",
+		"AUTH-004: session JWT must be set as the instanode_session cookie")
 
 	// Replay must fail — the row has been consumed.
 	req3 := httptest.NewRequest(http.MethodGet, "/auth/email/callback?t="+plaintext, nil)
