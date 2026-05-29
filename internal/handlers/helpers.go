@@ -145,6 +145,15 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"unauthorized": {
 		AgentAction: "Tell the user their INSTANODE_TOKEN is missing or invalid. Have them log in at https://instanode.dev/login to mint a new one — takes 30 seconds.",
 	},
+	// brevo_secret_mismatch is a Brevo webhook URL-path-token mismatch — NOT a
+	// user-auth failure. The generic "unauthorized" agent_action ("log in to mint
+	// a new INSTANODE_TOKEN") sent an unrelated recovery script that's
+	// uselessly wrong for the actual incident (operator must verify their Brevo
+	// dashboard webhook URL contains the configured BREVO_WEBHOOK_SECRET).
+	// API-6 (QA 2026-05-29): give this error its own copy.
+	"brevo_secret_mismatch": {
+		AgentAction: "Operator action: the URL path segment of the Brevo webhook call does not match the configured BREVO_WEBHOOK_SECRET. Verify the webhook URL in Brevo dashboard → Transactional → Settings → Webhook URL matches https://api.instanode.dev/webhooks/brevo/<SECRET>, where SECRET is the value of the BREVO_WEBHOOK_SECRET env var.",
+	},
 	"auth_required": {
 		AgentAction: "Tell the user this action requires an authenticated session. Have them log in or sign up at https://instanode.dev/login — both flows mint a token.",
 	},

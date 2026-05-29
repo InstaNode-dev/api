@@ -30,8 +30,10 @@ package handlers_test
 import (
 	"bytes"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
@@ -168,6 +170,47 @@ func TestBrevoTxWebhook_SecretMismatch_Returns401(t *testing.T) {
 	resp := postBrevoTx(t, app, "wrong-secret-value-32-byte-padding-extra", `{"event":"delivered","message-id":"x"}`)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d; want 401", resp.StatusCode)
+	}
+}
+
+// TestBrevoTxWebhook_SecretMismatch_AgentActionMentionsBrevo pins API-6 (QA
+// 2026-05-29): the 401 envelope must carry an OPERATOR-targeted agent_action
+// telling whoever called this endpoint to verify their Brevo webhook URL,
+// NOT the generic "tell the user to log in for a new INSTANODE_TOKEN" copy
+// that ships on the canonical `unauthorized` error class. The Brevo webhook
+// is unrelated to user auth.
+func TestBrevoTxWebhook_SecretMismatch_AgentActionMentionsBrevo(t *testing.T) {
+	db, _, _ := sqlmock.New()
+	defer db.Close()
+	h := handlers.NewBrevoTransactionalWebhookHandler(db, &config.Config{BrevoWebhookSecret: testBrevoTxSecret})
+	app := brevoTxApp(t, h)
+
+	resp := postBrevoTx(t, app, "bogus-secret", `{"event":"delivered","message-id":"x"}`)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d; want 401", resp.StatusCode)
+	}
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	body := string(raw)
+
+	// Error CODE must be the Brevo-specific one — not the generic
+	// "unauthorized" that ships with the user-login agent_action.
+	if !strings.Contains(body, `"error":"brevo_secret_mismatch"`) {
+		t.Errorf("body must carry error=brevo_secret_mismatch; got %s", body)
+	}
+	// Agent action must mention Brevo / BREVO_WEBHOOK_SECRET — NOT
+	// "INSTANODE_TOKEN" or the generic login-recovery script.
+	if !strings.Contains(strings.ToLower(body), "brevo") {
+		t.Errorf("agent_action must mention Brevo; got %s", body)
+	}
+	if strings.Contains(body, "INSTANODE_TOKEN") {
+		t.Errorf("agent_action must NOT mention INSTANODE_TOKEN (unrelated to this webhook); got %s", body)
+	}
+	if strings.Contains(strings.ToLower(body), "have them log in at") {
+		t.Errorf("agent_action must NOT carry the user-login recovery script; got %s", body)
 	}
 }
 
