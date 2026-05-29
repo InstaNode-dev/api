@@ -201,8 +201,8 @@ func TestBrevoTxWebhook_SecretMismatch_AgentActionMentionsBrevo(t *testing.T) {
 	if !strings.Contains(body, `"error":"brevo_secret_mismatch"`) {
 		t.Errorf("body must carry error=brevo_secret_mismatch; got %s", body)
 	}
-	// Agent action must mention Brevo / BREVO_WEBHOOK_SECRET — NOT
-	// "INSTANODE_TOKEN" or the generic login-recovery script.
+	// Agent action must mention Brevo — NOT "INSTANODE_TOKEN" or the
+	// generic login-recovery script.
 	if !strings.Contains(strings.ToLower(body), "brevo") {
 		t.Errorf("agent_action must mention Brevo; got %s", body)
 	}
@@ -211,6 +211,17 @@ func TestBrevoTxWebhook_SecretMismatch_AgentActionMentionsBrevo(t *testing.T) {
 	}
 	if strings.Contains(body, "log in at https://instanode.dev/login to mint a new one") {
 		t.Errorf("agent_action must NOT carry the user-login recovery script; got %s", body)
+	}
+	// BUG-API-021 (QA 2026-05-29): the 401 envelope is reachable by any
+	// brute-forcer probing /webhooks/brevo/<guess>. The pre-fix copy
+	// literally named the BREVO_WEBHOOK_SECRET env var — recon a public
+	// 401 must not provide. Assert the env-var name (and BREVO_ prefix
+	// generally) never reaches the wire.
+	if strings.Contains(body, "BREVO_WEBHOOK_SECRET") {
+		t.Errorf("BUG-API-021: agent_action must NOT name BREVO_WEBHOOK_SECRET env var on a public 401; got %s", body)
+	}
+	if strings.Contains(body, "BREVO_") {
+		t.Errorf("BUG-API-021: agent_action must NOT carry any BREVO_-prefixed env-var name; got %s", body)
 	}
 }
 

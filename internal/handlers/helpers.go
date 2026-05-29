@@ -152,8 +152,18 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	// dashboard webhook URL contains the configured BREVO_WEBHOOK_SECRET).
 	// API-6 (QA 2026-05-29): give this error its own copy. Follows the U3
 	// contract — "Tell the user" opening, https://instanode.dev/ URL, < 280 chars.
+	// BUG-API-021 (QA 2026-05-29): the pre-fix agent_action literally
+	// named the BREVO_WEBHOOK_SECRET env var, which (a) is informational
+	// disclosure to a brute-forcer probing the public 401 surface — they
+	// learn the exact env-var name the operator must rotate — and (b)
+	// targets the operator using internal vocab the calling agent has no
+	// business surfacing to the end-user. The new copy drops the env-var
+	// name and points at the public docs page (which documents the
+	// rotation procedure for an operator that follows the link). Wire
+	// contract preserved: error code, status, message all unchanged —
+	// only the agent_action sentence is softened.
 	"brevo_secret_mismatch": {
-		AgentAction: "Tell the user this is a Brevo-webhook config mismatch, not their auth. Operators must verify the Brevo dashboard webhook URL matches the configured BREVO_WEBHOOK_SECRET — see https://instanode.dev/docs/email.",
+		AgentAction: "Tell the user this is a Brevo-webhook configuration mismatch, not their auth — they have no action. Operators: rotate the Brevo webhook secret and update the api Deployment — see https://instanode.dev/docs/email.",
 	},
 	// webhook_secret_mismatch is the generic per-provider webhook URL-path-token
 	// or shared-secret mismatch surface. API-19/96/97/98 (QA 2026-05-29): the
@@ -164,8 +174,12 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	// distinguishes the secret-not-configured branch from the signature-mismatch
 	// branch below. Operator must wire the corresponding env var
 	// (BREVO_WEBHOOK_SECRET / SES_SNS_SUBSCRIPTION_ARN) before the route accepts.
+	// BUG-API-021 sibling: "set the corresponding webhook secret env var"
+	// pointed at an internal env-var by name. Same softening as
+	// brevo_secret_mismatch above — drop env-var vocab from the public
+	// 401 surface; the docs page covers operator-side wiring.
 	"webhook_secret_mismatch": {
-		AgentAction: "Tell the user this is an email-webhook secret-config mismatch, not their auth. Operators must set the corresponding webhook secret env var in the api Deployment — see https://instanode.dev/docs/email.",
+		AgentAction: "Tell the user this is an email-webhook configuration mismatch, not their auth — they have no action. Operators: configure the webhook secret in the api Deployment — see https://instanode.dev/docs/email.",
 	},
 	// webhook_signature_mismatch is the per-provider signature-verification
 	// failure surface — the secret IS configured, the inbound payload's HMAC /
@@ -174,8 +188,11 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	// the secret yet" from "someone is sending bad signatures (or the provider
 	// rotated keys)" without an operator hand-grepping log lines. Used by
 	// /api/v1/email/webhook/brevo + /api/v1/email/webhook/ses.
+	// BUG-API-021 sibling: "the api Deployment's env var" leaked the
+	// internal wiring; soften to "the configured webhook secret" so the
+	// 401 stays self-explanatory without naming env-var keys.
 	"webhook_signature_mismatch": {
-		AgentAction: "Tell the user the inbound email-webhook signature did not verify. Operators must confirm the dashboard webhook secret matches the api Deployment's env var and that the provider hasn't rotated signing keys — see https://instanode.dev/docs/email.",
+		AgentAction: "Tell the user the inbound email-webhook signature did not verify. Operators: confirm the dashboard webhook secret matches the configured value and the provider hasn't rotated signing keys — see https://instanode.dev/docs/email.",
 	},
 	// webhook_method_not_allowed surfaces the GET-on-a-POST-only webhook URL
 	// path (BUG-API-098). Brevo's dashboard sometimes sends a GET pre-flight to

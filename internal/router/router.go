@@ -349,13 +349,21 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	migrationReader := migrations.NewReader(db, 0, nil)
 	app.Get("/healthz", func(c *fiber.Ctx) error {
 		mstate := migrationReader.Get(c.UserContext())
+		// BUG-API-090 / BUG-API-217 (QA 2026-05-29): /healthz is a
+		// public probe (no auth, no rate-limit by token). Emitting the
+		// raw migration filename leaked the table/feature names embedded
+		// in it ("063_forwarder_sent_audit_link.sql" tells an attacker a
+		// forwarder_sent→audit_log FK landed at migration 63). Strip to
+		// the numeric prefix only via State.PublicVersion so canaries
+		// keep their commit_id+count+version tuple but no domain
+		// knowledge leaks. migration_count + migration_status unchanged.
 		return c.JSON(fiber.Map{
 			"ok":                true,
 			"service":           "instant.dev",
 			"commit_id":         buildinfo.GitSHA,
 			"build_time":        buildinfo.BuildTime,
 			"version":           buildinfo.Version,
-			"migration_version": mstate.Filename,
+			"migration_version": mstate.PublicVersion(),
 			"migration_count":   mstate.Count,
 			"migration_status":  mstate.Status,
 		})
