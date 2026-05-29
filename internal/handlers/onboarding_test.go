@@ -43,6 +43,9 @@ func TestOnboarding_GetStart_ValidJWT_Returns302WithClaimRedirect(t *testing.T) 
 	assert.Contains(t, loc, "t=", "redirect must include JWT parameter")
 }
 
+// API-5 (QA 2026-05-29): /start ALWAYS 302s — invalid/expired/tampered tokens
+// still bounce to /claim where the dashboard renders any error UI.
+
 func TestOnboarding_GetStart_ExpiredJWT_Returns400LinkExpired(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
@@ -61,13 +64,9 @@ func TestOnboarding_GetStart_ExpiredJWT_Returns400LinkExpired(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
-		"expired JWT must return 400")
-
-	var body map[string]any
-	testhelpers.DecodeJSON(t, resp, &body)
-	msg, _ := body["error"].(string)
-	assert.NotEmpty(t, msg)
+	assert.Equal(t, http.StatusFound, resp.StatusCode,
+		"expired JWT must still 302 to /claim — dashboard renders the error")
+	assert.Contains(t, resp.Header.Get("Location"), "/claim?t=")
 }
 
 func TestOnboarding_GetStart_TamperedJWT_Returns400InvalidLink(t *testing.T) {
@@ -86,13 +85,9 @@ func TestOnboarding_GetStart_TamperedJWT_Returns400InvalidLink(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
-		"tampered JWT must return 400")
-
-	var body map[string]any
-	testhelpers.DecodeJSON(t, resp, &body)
-	msg, _ := body["error"].(string)
-	assert.NotEmpty(t, msg, "error field must be present")
+	assert.Equal(t, http.StatusFound, resp.StatusCode,
+		"tampered JWT must still 302 to /claim — dashboard renders the error")
+	assert.Contains(t, resp.Header.Get("Location"), "/claim?t=")
 }
 
 func TestOnboarding_GetStart_ExpiredResources_ShownGracefully(t *testing.T) {
@@ -318,6 +313,9 @@ func TestOnboarding_PostClaim_Atomic_ConcurrentClaims_OnlyOneSucceeds(t *testing
 // TestStartLanding_* — HTML landing page tests
 // ---------------------------------------------------------------------------
 
+// API-5 (QA 2026-05-29): /start ALWAYS 302s. Names kept for grep stability;
+// assertions updated to the always-bounce contract.
+
 func TestStartLanding_NoToken_Returns400(t *testing.T) {
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
@@ -332,8 +330,11 @@ func TestStartLanding_NoToken_Returns400(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
-		"GET /start without ?t must return 400")
+	assert.Equal(t, http.StatusFound, resp.StatusCode,
+		"GET /start without ?t must 302 to /claim — dashboard renders empty state")
+	loc := resp.Header.Get("Location")
+	assert.Contains(t, loc, "/claim")
+	assert.NotContains(t, loc, "/claim?t=", "no t= when token missing")
 }
 
 func TestStartLanding_TamperedJWT_Returns400(t *testing.T) {
@@ -351,8 +352,9 @@ func TestStartLanding_TamperedJWT_Returns400(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
-		"tampered JWT must return 400")
+	assert.Equal(t, http.StatusFound, resp.StatusCode,
+		"tampered JWT must still 302 to /claim — dashboard renders the error")
+	assert.Contains(t, resp.Header.Get("Location"), "/claim?t=")
 }
 
 func TestStartLanding_ValidJWT_Returns302Redirect(t *testing.T) {
@@ -413,8 +415,9 @@ func TestStartLanding_AlreadyClaimed_Returns302(t *testing.T) {
 	assert.Equal(t, http.StatusFound, resp.StatusCode,
 		"already-claimed must redirect")
 	loc := resp.Header.Get("Location")
-	assert.Contains(t, loc, "already_claimed=true",
-		"redirect must indicate already-claimed")
+	// API-5: dashboard now renders the already-claimed UI. The platform no
+	// longer surfaces an already_claimed=true flag in the redirect URL.
+	assert.Contains(t, loc, "/claim?t=", "redirect must forward to /claim with the token")
 }
 
 func TestOnboarding_JWTWithFutureIssuedAt_Returns400(t *testing.T) {
@@ -440,8 +443,10 @@ func TestOnboarding_JWTWithFutureIssuedAt_Returns400(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
-		"token with future IssuedAt must be rejected with 400")
+	// API-5: future-IssuedAt tokens also 302 — dashboard renders the error.
+	assert.Equal(t, http.StatusFound, resp.StatusCode,
+		"future-IssuedAt token still 302s — dashboard handles the validation")
+	assert.Contains(t, resp.Header.Get("Location"), "/claim?t=")
 }
 
 // TestOnboarding_PostClaim_EmitsAuditLogRow verifies that a successful POST
