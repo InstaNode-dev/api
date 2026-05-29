@@ -178,6 +178,21 @@ func (h *MagicLinkHandler) Start(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "invalid_email", "A valid email address is required")
 	}
 
+	// AUTH-016 / AUTH-017: fail-closed on hostile return_to schemes.
+	// Previously validateReturnTo silently downgraded javascript:/data:/
+	// file:/ etc. to the default — the resulting magic-link still landed
+	// (in the default origin) and the operator-side signal was lost. The
+	// fail-closed gate rejects with 400 invalid_return_to so callers
+	// learn the contract immediately and we get a clean abuse counter.
+	// An empty/missing return_to is still permitted and collapses to the
+	// allowlisted default downstream (the legitimate dashboard flow).
+	if rawReturnTo := strings.TrimSpace(body.ReturnTo); rawReturnTo != "" {
+		if !returnToSchemeIsAllowed(rawReturnTo) {
+			return respondError(c, fiber.StatusBadRequest, "invalid_return_to",
+				"Field 'return_to' must use https:// (or http://localhost for dev). javascript:, data:, file: and other schemes are rejected.")
+		}
+	}
+
 	// Per-email rate limit (A04). Fail-open on Redis error so a cache
 	// outage never blocks sign-in. The 202 response on the limited path is
 	// identical to the success path — the attacker gains no signal.
@@ -358,7 +373,20 @@ func (h *MagicLinkHandler) Callback(c *fiber.Ctx) error {
 
 	emitAuthLoginAudit(h.db, team.ID, user.ID, user.Email, "email", c.IP(), c.Get("User-Agent"))
 
-	return c.Redirect(appendSessionToken(returnTo, sessionToken), fiber.StatusFound)
+	// AUTH-004: do NOT put the session JWT in the Location header. The
+	// 24h-TTL JWT used to land in the URL query (?session_token=<jwt>),
+	// which leaked it to:
+	//   - browser history (persistent device-side trail)
+	//   - server-side access logs (ingress, CDN, dashboard nginx)
+	//   - Referer headers on subsequent navigations
+	//   - third-party analytics that capture full URLs
+	// Instead, set the JWT in a Secure; HttpOnly; SameSite=Lax cookie
+	// scoped to .instanode.dev so the dashboard origin can authenticate
+	// API calls via the cookie path in RequireAuth. The redirect URL
+	// carries only a non-secret `?signed_in=1` marker so the dashboard
+	// knows to call /auth/me and pick up the session.
+	setExchangeCookie(c, sessionToken, h.cfg.Environment == "production")
+	return c.Redirect(appendSignedInMarker(returnTo), fiber.StatusFound)
 }
 
 // looksLikeEmail performs the cheapest plausible check: must contain a single
