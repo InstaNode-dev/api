@@ -385,7 +385,7 @@ func (h *MagicLinkHandler) Callback(c *fiber.Ctx) error {
 	// API calls via the cookie path in RequireAuth. The redirect URL
 	// carries only a non-secret `?signed_in=1` marker so the dashboard
 	// knows to call /auth/me and pick up the session.
-	setSessionCookie(c, sessionToken, h.cfg.Environment == "production")
+	setExchangeCookie(c, sessionToken, h.cfg.Environment == "production")
 	return c.Redirect(appendSignedInMarker(returnTo), fiber.StatusFound)
 }
 

@@ -215,7 +215,7 @@ func TestMagicLinkCallback_HappyPath_ConsumesAndRedirects(t *testing.T) {
 	// a signed_in=1 marker and reads the cookie via /auth/me.
 	assert.NotContains(t, loc, "session_token=", "AUTH-004: JWT must not appear in Location")
 	assert.Contains(t, loc, "signed_in=1")
-	assert.Contains(t, strings.Join(resp2.Header.Values("Set-Cookie"), "\n"), "instanode_session=",
+	assert.Contains(t, strings.Join(resp2.Header.Values("Set-Cookie"), "\n"), "instanode_session_exchange=",
 		"AUTH-004: session JWT must be set as the instanode_session cookie")
 
 	// Replay must fail — the row has been consumed.

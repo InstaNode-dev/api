@@ -164,6 +164,13 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"missing_token": {
 		AgentAction: "Tell the user no INSTANODE_TOKEN was provided. Have them log in at https://instanode.dev/login and pass it via Authorization: Bearer <token>.",
 	},
+	// cookie_missing_or_expired — POST /auth/exchange (browser-only bridge
+	// from the magic-link / OAuth callback into the SPA) saw no bridge
+	// cookie. The 30-second transient window closed or the cookie was
+	// dropped. The remediation is to restart the sign-in flow.
+	"cookie_missing_or_expired": {
+		AgentAction: "Tell the user the sign-in handoff window expired. Have them start the login flow again at https://instanode.dev/login — the bridge cookie lives for 30 seconds.",
+	},
 	"vault_requires_auth": {
 		AgentAction: "Tell the user vault access requires an authenticated session. Have them log in at https://instanode.dev/login to mint a token.",
 	},

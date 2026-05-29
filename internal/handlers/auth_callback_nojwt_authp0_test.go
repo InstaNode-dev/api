@@ -41,7 +41,7 @@ import (
 // Assertions:
 //   - Location header MUST NOT contain "session_token" or a JWT-shape token
 //     (any string starting with "eyJ" is a base64url JOSE header).
-//   - Set-Cookie header MUST carry instanode_session=<jwt>; HttpOnly; SameSite=Lax.
+//   - Set-Cookie header MUST carry instanode_session_exchange=<jwt>; HttpOnly; SameSite=Lax.
 func TestAuthCallback_DoesNotPutJWTInLocation(t *testing.T) {
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
@@ -88,7 +88,7 @@ func TestAuthCallback_DoesNotPutJWTInLocation(t *testing.T) {
 	// clear + the new session cookie) and Header.Get returns only the first.
 	setCookies := strings.Join(resp.Header.Values("Set-Cookie"), "\n")
 	require.NotEmpty(t, setCookies, "callback must set a session cookie")
-	assert.Contains(t, setCookies, "instanode_session=",
+	assert.Contains(t, setCookies, "instanode_session_exchange=",
 		"the session cookie name must be set")
 	setCookie := setCookies // alias for downstream attribute checks
 	assert.True(t,

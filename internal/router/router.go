@@ -612,6 +612,16 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	app.Get("/auth/cli/:id", cliAuthH.PollCLISession)
 	app.Get("/auth/me", middleware.RequireAuth(cfg), cliAuthH.GetCurrentUser)
 
+	// AUTH-004: browser-only bridge between the magic-link / OAuth callback
+	// and the SPA. The callback sets a 30-second, Path=/auth/exchange cookie
+	// (instanode_session_exchange) carrying the session JWT and redirects
+	// with ?signed_in=1. The SPA POSTs /auth/exchange with credentials, the
+	// handler reads the cookie, clears it (Max-Age=0), and returns the JWT
+	// in the body. RequireAuth deliberately does NOT honour the cookie —
+	// every subsequent API call is Bearer-only, preserving the contract
+	// every CLI/MCP/SDK consumer already implements.
+	app.Post("/auth/exchange", authH.Exchange)
+
 	// A03 (P1): server-side session invalidation. POST /auth/logout stores the
 	// JWT's jti in Redis so subsequent requests with the same token are rejected
 	// by RequireAuth. RequireAuth checks the revocation set via IsJTIRevoked.

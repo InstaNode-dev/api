@@ -177,49 +177,102 @@ func appendSignedInMarker(returnTo string) string {
 	return u.String()
 }
 
-// sessionCookieName is the cross-host session cookie set by the magic-link
-// and OAuth callback paths after a successful sign-in (AUTH-004). The
-// RequireAuth middleware accepts it as a fallback when no
-// Authorization: Bearer header is present, so the dashboard at
-// instanode.dev can authenticate API calls to api.instanode.dev via the
-// cookie alone — no JWT in URLs, history, or logs.
-const sessionCookieName = "instanode_session"
+// exchangeCookieName is the transient cookie that bridges the magic-link
+// / OAuth browser callback into the SPA. It carries the session JWT for
+// at most 30 seconds and is scoped to POST /auth/exchange so the only
+// surface that ever reads it is the exchange handler — RequireAuth is
+// strictly Bearer-only (CLAUDE.md "Live API surface").
+//
+// AUTH-004 flow:
+//
+//  1. /auth/email/callback (or github/google browser callback) mints the
+//     session JWT, sets it in this cookie, 302s to the dashboard with
+//     ?signed_in=1 (no token in URL).
+//  2. SPA loads, sees signed_in=1, POSTs /auth/exchange with credentials.
+//  3. Exchange handler reads the cookie, deletes it (Max-Age=0), returns
+//     {token: <jwt>} in the body. SPA stores it in memory and from then
+//     on uses Authorization: Bearer like every other client.
+const exchangeCookieName = "instanode_session_exchange"
 
-// sessionCookieDomain is the parent Domain attribute for the session
-// cookie. Setting it explicitly to .instanode.dev makes the cookie
-// readable on api.instanode.dev (where it's set) AND on instanode.dev
-// (where the dashboard runs) so the SPA picks up the session without
-// any token-in-URL gymnastics. In non-production environments the Domain
-// attribute is omitted (defaults to current host) so local dev / tests
-// with httptest hosts don't get rejected by the browser cookie store.
-const sessionCookieDomain = ".instanode.dev"
+// exchangeCookieMaxAge — 30s ceiling on the bridge window. Long enough
+// for the SPA to load and POST /auth/exchange after the 302, short
+// enough that an attacker with momentary cookie-jar access can't extract
+// the JWT later. Cookie expiry is enforced by the browser; the handler
+// additionally rejects an absent / empty cookie with 400.
+const exchangeCookieMaxAge = 30
 
-// sessionCookieMaxAge mirrors the JWT lifetime so the cookie expires no
-// later than the embedded JWT exp claim. Keeping the JWT TTL as the
-// source of truth (see issueSessionJWT) and the cookie as the carrier.
-const sessionCookieMaxAge = 24 * 60 * 60 // 24h, matches JWT TTL
+// exchangeCookiePath confines the cookie's send scope to the exchange
+// endpoint. Browsers will NOT attach it to /api/v1/* or any other path,
+// which is what keeps the cookie out of the API contract.
+const exchangeCookiePath = "/auth/exchange"
 
-// setSessionCookie writes the session JWT into a Secure; HttpOnly;
-// SameSite=Lax cookie scoped to .instanode.dev (prod) or current host
-// (dev). HttpOnly blocks the XSS exfil path that AUTH-003 documented;
-// Secure forces TLS so the cookie never rides a cleartext fallback;
-// SameSite=Lax preserves the top-level navigation flow (the user lands
-// on the dashboard via 302 from the callback) while blocking
-// third-party-origin POST CSRF.
-func setSessionCookie(c *fiber.Ctx, jwt string, prod bool) {
-	cookie := &fiber.Cookie{
-		Name:     sessionCookieName,
+// setExchangeCookie writes the session JWT into a transient
+// Secure; HttpOnly; SameSite=Lax cookie scoped to Path=/auth/exchange
+// with Max-Age=30. HttpOnly blocks the XSS exfil path (AUTH-003);
+// Secure forces TLS in prod; SameSite=Lax preserves the top-level
+// navigation flow from the 302 redirect while blocking third-party
+// POST CSRF. No Domain attribute — the cookie stays on the api host
+// where /auth/exchange lives; the SPA fetches it cross-origin with
+// credentials:'include'.
+func setExchangeCookie(c *fiber.Ctx, jwt string, prod bool) {
+	c.Cookie(&fiber.Cookie{
+		Name:     exchangeCookieName,
 		Value:    jwt,
-		Path:     "/",
-		MaxAge:   sessionCookieMaxAge,
+		Path:     exchangeCookiePath,
+		MaxAge:   exchangeCookieMaxAge,
 		Secure:   prod,
 		HTTPOnly: true,
 		SameSite: "Lax",
+	})
+}
+
+// clearExchangeCookie writes a cookie with the same name/path but an
+// expired Expires attribute so the browser drops the bridge cookie
+// immediately after the SPA consumes it. Single-use semantics: even if
+// the response body is lost to a network hiccup, the cookie is gone and
+// the SPA has to restart the sign-in flow rather than retry from a
+// still-live cookie.
+//
+// Fiber's cookie codec lower-cases Path and does NOT emit Max-Age=0 for
+// MaxAge<=0 — it omits the attribute entirely. Use a fixed-past Expires
+// instead, which both Fiber and the browser treat as "drop immediately".
+func clearExchangeCookie(c *fiber.Ctx, prod bool) {
+	c.Cookie(&fiber.Cookie{
+		Name:     exchangeCookieName,
+		Value:    "",
+		Path:     exchangeCookiePath,
+		Expires:  time.Unix(0, 0).UTC(),
+		Secure:   prod,
+		HTTPOnly: true,
+		SameSite: "Lax",
+	})
+}
+
+// Exchange handles POST /auth/exchange: reads the transient
+// instanode_session_exchange cookie set by the magic-link / OAuth
+// browser callback, clears it (Max-Age=0), and returns the embedded
+// session JWT in the response body. Browser-only path — the SPA is the
+// sole consumer.
+//
+// On any failure (no cookie, empty cookie, expired-by-browser) the
+// handler returns 400 cookie_missing_or_expired so the SPA can surface
+// "please sign in again" rather than wedge with an infinite spinner.
+//
+// The cookie is cleared on BOTH the success and failure paths to
+// prevent a partial-failure leak (e.g. the SPA crashed before reading
+// the body but the cookie is still alive). The single-use guarantee
+// is what keeps this path's blast radius bounded to the 30-second
+// transient window.
+func (h *AuthHandler) Exchange(c *fiber.Ctx) error {
+	prod := h.cfg.Environment == "production"
+	token := c.Cookies(exchangeCookieName)
+	if token == "" {
+		clearExchangeCookie(c, prod)
+		return respondError(c, fiber.StatusBadRequest, "cookie_missing_or_expired",
+			"No session-exchange cookie present. Start the sign-in flow again.")
 	}
-	if prod {
-		cookie.Domain = sessionCookieDomain
-	}
-	c.Cookie(cookie)
+	clearExchangeCookie(c, prod)
+	return c.JSON(fiber.Map{"ok": true, "token": token})
 }
 
 // returnToSchemeIsAllowed reports whether the URL's scheme is in the
@@ -1172,7 +1225,7 @@ func (h *AuthHandler) GitHubCallback(c *fiber.Ctx) error {
 
 	// AUTH-004: do NOT put the session JWT in the Location header.
 	// See comment on the magic-link callback for the full rationale.
-	setSessionCookie(c, sessionToken, h.cfg.Environment == "production")
+	setExchangeCookie(c, sessionToken, h.cfg.Environment == "production")
 	return c.Redirect(appendSignedInMarker(returnTo), fiber.StatusFound)
 }
 
@@ -1274,7 +1327,7 @@ func (h *AuthHandler) GoogleCallbackBrowser(c *fiber.Ctx) error {
 	emitAuthLoginAudit(h.db, team.ID, user.ID, user.Email, "google", c.IP(), c.Get("User-Agent"))
 
 	// AUTH-004: session cookie + signed_in marker (no JWT in Location).
-	setSessionCookie(c, sessionToken, h.cfg.Environment == "production")
+	setExchangeCookie(c, sessionToken, h.cfg.Environment == "production")
 	return c.Redirect(appendSignedInMarker(returnTo), fiber.StatusFound)
 }
 
