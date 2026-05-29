@@ -38,6 +38,19 @@ const magicLinkEmailRateLimitWindow = time.Hour
 // coupling to a string literal buried in a format string.
 const magicLinkEmailRLKeyPrefix = "ml:email:rl"
 
+// magicLinkPerIPRateLimit caps magic-link Start calls per source IP per
+// magicLinkPerIPRateLimitWindow (AUTH-097 / AUTH-107). The existing
+// per-email limit is bypassed by rotating the address; this is the
+// per-IP backstop. 5/hr matches the per-email cap so the two limits
+// behave symmetrically from an operator-monitoring perspective.
+const magicLinkPerIPRateLimit = 5
+const magicLinkPerIPRateLimitWindow = time.Hour
+
+// magicLinkPerIPRLKeyPrefix is the Redis key prefix for per-IP rate
+// limits. Distinct from magicLinkEmailRLKeyPrefix so the two budgets
+// can be observed and tuned independently in NR / Prom.
+const magicLinkPerIPRLKeyPrefix = "ml:ip:rl"
+
 // magicLinkStartMaxBodyBytes caps the inbound POST /auth/email/start JSON
 // body. Real bodies are ~80 bytes (email + return_to); 1 KiB is comfortable
 // for a future field without inviting megabyte-sized abuse payloads. The
@@ -129,6 +142,37 @@ func checkEmailRateLimit(ctx context.Context, rdb *redis.Client, emailAddr strin
 	return count > int64(magicLinkEmailRateLimit), nil
 }
 
+// perIPRateLimitKey returns the Redis key for a given source IP. IP is
+// hashed (SHA-256) so raw IPs never appear in Redis MONITOR output / key
+// dumps / logs — same PII-hygiene pattern emailRateLimitKey uses.
+func perIPRateLimitKey(ip string) string {
+	h := sha256.Sum256([]byte(ip))
+	return fmt.Sprintf("%s:%x", magicLinkPerIPRLKeyPrefix, h[:])
+}
+
+// checkPerIPRateLimit increments the per-IP Redis counter and returns
+// (limited, err). Same fail-open semantics as checkEmailRateLimit — a
+// Redis outage must never block legitimate sign-in. The 202 response on
+// the limited path is identical to the success path (no enumeration
+// signal). AUTH-097 / AUTH-107.
+func checkPerIPRateLimit(ctx context.Context, rdb *redis.Client, ip string) (limited bool, err error) {
+	if rdb == nil || ip == "" {
+		return false, nil
+	}
+	key := perIPRateLimitKey(ip)
+	pipe := rdb.Pipeline()
+	incrCmd := pipe.Incr(ctx, key)
+	pipe.Expire(ctx, key, magicLinkPerIPRateLimitWindow)
+	if _, execErr := pipe.Exec(ctx); execErr != nil {
+		return false, fmt.Errorf("magic_link.ip_rl: %w", execErr)
+	}
+	count, resultErr := incrCmd.Result()
+	if resultErr != nil {
+		return false, fmt.Errorf("magic_link.ip_rl.result: %w", resultErr)
+	}
+	return count > int64(magicLinkPerIPRateLimit), nil
+}
+
 // magicLinkStartRequest is the body for POST /auth/email/start.
 type magicLinkStartRequest struct {
 	Email    string `json:"email"`
@@ -155,6 +199,30 @@ type magicLinkStartRequest struct {
 func (h *MagicLinkHandler) Start(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
+	// AUTH-163 (P0): the server previously accepted
+	// Content-Type: application/x-www-form-urlencoded on this endpoint
+	// (Fiber's BodyParser autodetects the content-type and merrily
+	// decoded `email=qa@x.com&return_to=...` form bodies). Combined with
+	// no Origin/Referer enforcement that was a textbook CSRF primitive:
+	// any malicious site could <form action="https://api.instanode.dev/
+	// auth/email/start" method="POST"> to spam any arbitrary email with
+	// magic-links from the victim's IP.
+	//
+	// Fail-closed: require Content-Type to start with application/json.
+	// The legitimate dashboard / CLI / agent flows all set
+	// application/json; the only callers that send urlencoded bodies are
+	// browser <form> POSTs from third-party origins — which is exactly
+	// the attack surface we want to close.
+	ct := strings.ToLower(strings.TrimSpace(c.Get("Content-Type")))
+	// Strip any "; charset=..." suffix before comparing.
+	if semi := strings.IndexByte(ct, ';'); semi >= 0 {
+		ct = strings.TrimSpace(ct[:semi])
+	}
+	if ct != "application/json" {
+		return respondError(c, fiber.StatusBadRequest, "invalid_content_type",
+			"POST /auth/email/start requires Content-Type: application/json. Form-encoded bodies are rejected to close the CSRF primitive.")
+	}
+
 	// B4-F5 (BugBash 2026-05-20): the global Fiber BodyLimit is 50MiB to
 	// accommodate /deploy/new tarballs — that's far too generous for a
 	// 2-field JSON envelope. A 10MB JSON body on /auth/email/start passed
@@ -176,6 +244,34 @@ func (h *MagicLinkHandler) Start(c *fiber.Ctx) error {
 	emailAddr := strings.ToLower(strings.TrimSpace(body.Email))
 	if !looksLikeEmail(emailAddr) {
 		return respondError(c, fiber.StatusBadRequest, "invalid_email", "A valid email address is required")
+	}
+
+	// AUTH-107 / AUTH-097 (P0/P1): per-IP rate limit. The existing per-
+	// email-hash limit is bypassed by rotating the address — an attacker
+	// can spam any number of arbitrary 3rd-party addresses from one IP.
+	// With Brevo currently configured to return 201 then internally
+	// reject (project memory project_brevo_sender_not_validated), every
+	// spam send still chews through DB rows + Brevo quota.
+	//
+	// Runs AFTER email validation so a typo doesn't burn budget; runs
+	// BEFORE the per-email limit because the per-IP limit is the wider
+	// abuse-defence layer and we want it to fire even when the per-email
+	// budget is fresh. Fail-open on Redis error per CLAUDE.md convention
+	// 1. Limited path returns 202 — identical to the success path —
+	// so an attacker gains no enumeration signal.
+	if ipLimited, ipErr := checkPerIPRateLimit(c.Context(), h.rdb, c.IP()); ipErr != nil {
+		slog.Warn("magic_link.start.ip_rl_error",
+			"error", ipErr,
+			"request_id", requestID,
+		)
+		// fail-open
+	} else if ipLimited {
+		metrics.MagicLinkEmailRateLimited.Inc()
+		slog.Warn("magic_link.start.ip_rate_limited",
+			"request_id", requestID,
+			"ip", c.IP(),
+		)
+		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"ok": true})
 	}
 
 	// Per-email rate limit (A04). Fail-open on Redis error so a cache
