@@ -998,10 +998,19 @@ func TestCheckout_PlanFrequency_MonthlyDefault_NoFrequency(t *testing.T) {
 	assert.Equal(t, "billing_not_configured", body["error"])
 }
 
-// TestCheckout_PlanFrequency_TeamGuard_StillFires verifies the team-tier
-// guard runs before frequency resolution — team is unavailable on either
-// cycle while the multi-seat surface is in development.
-func TestCheckout_PlanFrequency_TeamGuard_StillFires(t *testing.T) {
+// Note: the full positive-path Team-tier checkout regression lives in
+// billing_coverage2_test.go (TestCov2_Checkout_TeamTierAccepted /
+// _TeamTierYearlyAccepted / _TeamTierNotConfigured) — those need a
+// real test DB to clear the post-validation email-verify gate, so they
+// can't run in the no-DB harness this file uses for input-validation
+// branches. The no-DB-friendly negative case (typo'd plan still 400s)
+// stays here.
+
+// TestCheckout_RejectsUnknownPlan locks the negative side of the
+// 2026-05-29 BIZ-1 fix: a typo'd plan name still returns 400
+// invalid_plan, and the error message now lists team as an accepted
+// plan since the dedicated tier_unavailable branch is gone.
+func TestCheckout_RejectsUnknownPlan(t *testing.T) {
 	cfg := &config.Config{
 		JWTSecret:                "test-secret-that-is-at-least-32-bytes-long!!",
 		RazorpayKeyID:            "rzp_test_key",
@@ -1010,15 +1019,12 @@ func TestCheckout_PlanFrequency_TeamGuard_StillFires(t *testing.T) {
 		RazorpayPlanIDTeamYearly: "plan_yearly_team",
 	}
 	app := checkoutAppNoDB(t, cfg)
-	for _, freq := range []string{"monthly", "yearly", ""} {
-		body := map[string]any{"plan": "team"}
-		if freq != "" {
-			body["plan_frequency"] = freq
-		}
-		status, resp := postCheckout(t, app, body)
-		assert.Equal(t, http.StatusBadRequest, status,
-			"team is locked regardless of frequency=%q", freq)
-		assert.Equal(t, "tier_unavailable", resp["error"])
+	status, resp := postCheckout(t, app, map[string]any{"plan": "teamz"})
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, "invalid_plan", resp["error"])
+	if msg, ok := resp["message"].(string); ok {
+		assert.Contains(t, msg, "team",
+			"invalid_plan message should list team as an accepted plan now that the guard is gone")
 	}
 }
 

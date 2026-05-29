@@ -747,7 +747,15 @@ func TestCov2_ChangePlan_DowngradeNotSelfServe(t *testing.T) {
 	assert.Equal(t, "downgrade_not_self_serve", body["error"])
 }
 
-func TestCov2_ChangePlan_TeamTierUnavailable(t *testing.T) {
+// TestCov2_ChangePlan_TeamTierAccepted locks in the 2026-05-29 BIZ-1 fix:
+// ChangePlan no longer 400-rejects upgrades targeting the Team tier. A
+// hobby team with no active Razorpay subscription now flows past the
+// (deleted) tier_unavailable guard and is stopped by the downstream
+// no_subscription check instead — confirming the team-tier path is
+// reachable end-to-end and only fails on a real per-request condition.
+// Regression guard: if a future engineer reintroduces the tier_unavailable
+// branch on the team tier, this test flips back to RED.
+func TestCov2_ChangePlan_TeamTierAccepted(t *testing.T) {
 	cov2NeedsDB(t)
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
@@ -757,7 +765,10 @@ func TestCov2_ChangePlan_TeamTierUnavailable(t *testing.T) {
 	app := changePlanAppReal(t, db, cfg, teamID)
 	code, body := changePlanReq(t, app, map[string]any{"target_plan": "team"})
 	assert.Equal(t, http.StatusBadRequest, code)
-	assert.Equal(t, "tier_unavailable", body["error"])
+	assert.NotEqual(t, "tier_unavailable", body["error"],
+		"team must no longer be tier_unavailable — marketing+dashboard+llms.txt sell Team @ $199/mo")
+	assert.Equal(t, "no_subscription", body["error"],
+		"hobby team has no active subscription → expect the downstream guard, not tier_unavailable")
 }
 
 func TestCov2_ChangePlan_NoSubscription(t *testing.T) {
@@ -1288,16 +1299,68 @@ func TestCov2_Checkout_PromoCode_ExpiredSkipsBookkeeping(t *testing.T) {
 	assert.False(t, present, "an expired admin promo code must not stamp the notes")
 }
 
-func TestCov2_Checkout_TeamTierUnavailable(t *testing.T) {
+// TestCov2_Checkout_TeamTierAccepted locks in the 2026-05-29 BIZ-1 fix:
+// Team checkout no longer 400s with tier_unavailable. With Razorpay
+// credentials + RAZORPAY_PLAN_ID_TEAM configured, the team plan reaches
+// the CreateSubscription codepath and returns a short_url like every
+// other paid tier. CEO BIZ-1: marketing/dashboard/llms.txt all sell
+// Team @ $199/mo; the API now matches that story.
+func TestCov2_Checkout_TeamTierAccepted(t *testing.T) {
 	cov2NeedsDB(t)
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
 	cfg := &config.Config{JWTSecret: "test-secret-that-is-at-least-32-bytes-long!!", RazorpayKeyID: "k", RazorpayKeySecret: "s", RazorpayPlanIDTeam: "plan_team"}
 	teamID, userID := seedVerifiedTeamUser(t, db, "free")
+	app, bh := cov2CheckoutApp(t, db, cfg, teamID, userID)
+	freshSub := "sub_team_" + uuid.NewString()
+	bh.CreateSubscription = func(_ map[string]any) (map[string]any, error) {
+		return map[string]any{"id": freshSub, "short_url": "https://rzp.io/team"}, nil
+	}
+	code, body := postCheckoutReq(t, app, map[string]any{"plan": "team"})
+	require.Equal(t, http.StatusOK, code, "body=%v", body)
+	assert.Equal(t, freshSub, body["subscription_id"])
+	assert.Equal(t, "https://rzp.io/team", body["short_url"])
+	assert.NotEqual(t, "tier_unavailable", body["error"],
+		"Team must no longer return tier_unavailable — see CEO memo 2026-05-29 BIZ-1.")
+}
+
+// TestCov2_Checkout_TeamTierYearlyAccepted mirrors the monthly accept
+// for plan_frequency=yearly. RAZORPAY_PLAN_ID_TEAM_ANNUAL configured →
+// the yearly Team subscription is created. Regression guard against a
+// future engineer wiring yearly behind a separate tier_unavailable check.
+func TestCov2_Checkout_TeamTierYearlyAccepted(t *testing.T) {
+	cov2NeedsDB(t)
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	cfg := &config.Config{JWTSecret: "test-secret-that-is-at-least-32-bytes-long!!", RazorpayKeyID: "k", RazorpayKeySecret: "s", RazorpayPlanIDTeamYearly: "plan_team_y"}
+	teamID, userID := seedVerifiedTeamUser(t, db, "free")
+	app, bh := cov2CheckoutApp(t, db, cfg, teamID, userID)
+	freshSub := "sub_team_y_" + uuid.NewString()
+	bh.CreateSubscription = func(_ map[string]any) (map[string]any, error) {
+		return map[string]any{"id": freshSub, "short_url": "https://rzp.io/team_y"}, nil
+	}
+	code, body := postCheckoutReq(t, app, map[string]any{"plan": "team", "plan_frequency": "yearly"})
+	require.Equal(t, http.StatusOK, code, "body=%v", body)
+	assert.Equal(t, freshSub, body["subscription_id"])
+}
+
+// TestCov2_Checkout_TeamTierNotConfigured covers the operator-config
+// gap surfaced by memory `project_razorpay_recurring_not_enabled.md`:
+// when RAZORPAY_PLAN_ID_TEAM is unset the request now falls through to
+// the shared 503 billing_not_configured branch (clear operator signal)
+// rather than 400 tier_unavailable (a customer signal that the tier
+// itself doesn't exist).
+func TestCov2_Checkout_TeamTierNotConfigured(t *testing.T) {
+	cov2NeedsDB(t)
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	cfg := &config.Config{JWTSecret: "test-secret-that-is-at-least-32-bytes-long!!", RazorpayKeyID: "k", RazorpayKeySecret: "s"}
+	teamID, userID := seedVerifiedTeamUser(t, db, "free")
 	app, _ := cov2CheckoutApp(t, db, cfg, teamID, userID)
 	code, body := postCheckoutReq(t, app, map[string]any{"plan": "team"})
-	assert.Equal(t, http.StatusBadRequest, code)
-	assert.Equal(t, "tier_unavailable", body["error"])
+	assert.Equal(t, http.StatusServiceUnavailable, code)
+	assert.Equal(t, "billing_not_configured", body["error"])
+	assert.NotEqual(t, "tier_unavailable", body["error"])
 }
 
 func TestCov2_Checkout_InvalidPlan(t *testing.T) {
