@@ -465,7 +465,11 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the object key is invalid. Use a non-empty UTF-8 path without traversal (../) — see https://instanode.dev/docs/storage.",
 	},
 	"invalid_operation": {
-		AgentAction: "Tell the user the operation value is invalid. Use GET or PUT for /storage/:token/presign — see https://instanode.dev/docs/storage.",
+		// API-8 (QA 2026-05-29): agent_action enum must match the error message
+		// enum exactly. Error message lists GET, PUT, HEAD as accepted — so
+		// must this. Drift surfaces as agent advice that contradicts the
+		// actual contract.
+		AgentAction: "Tell the user the operation value is invalid. Use GET, PUT, or HEAD for /storage/:token/presign — see https://instanode.dev/docs/storage.",
 	},
 	"path_unsafe": {
 		AgentAction: "Tell the user the object path contains unsafe characters. Use a clean UTF-8 path with no '..', leading slash, or empty segments — see https://instanode.dev/docs/storage.",

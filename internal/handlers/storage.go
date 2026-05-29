@@ -167,6 +167,11 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 	}
 
 	// ── Anonymous path ─────────────────────────────────────────────────────────
+	// Recycle gate runs BEFORE the daily-cap check — see db.go API-7 fix.
+	if h.recycleGate(c, fp, "storage") {
+		return nil
+	}
+
 	limitExceeded, err := h.checkProvisionLimit(ctx, fp)
 	if err != nil {
 		slog.Error("storage.new.provision_limit_check_failed",
@@ -264,10 +269,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 		}
 	}
 
-	// Free-tier recycle gate (see provision_helper.go for rationale).
-	if h.recycleGate(c, fp, "storage") {
-		return nil
-	}
+	// (Recycle gate moved above — see API-7 / QA 2026-05-29 ordering fix.)
 
 	// P1-B: enforce the anonymous-tier storage byte cap. The authenticated path
 	// (newStorageAuthenticated) sums SumStorageBytesByTeamAndType vs the tier
