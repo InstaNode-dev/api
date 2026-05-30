@@ -1,0 +1,138 @@
+---
+# api/.github/workflows/preview-dispatch.yml — Phase 1a (scaffolding only).
+#
+# Fires a repository_dispatch on the infra repo on every PR open/sync to
+# request a preview env, and on PR close to request teardown. The infra
+# repo's preview-create.yml + preview-teardown.yml workflows pick up the
+# matching `preview-{create,teardown}-from-api` event types.
+#
+# Phase 1a behaviour: dispatch fires, infra logs what it WOULD do, posts a
+# `neutral` check-run back here. No real namespace is created.
+#
+# Auth: REPO_ACCESS_TOKEN already exists as a secret on this repo (used
+# for the auth-contract-e2e cross-repo dispatch in ci.yml). Same fine-
+# grained PAT, `repo` scope on the infra repo for the
+# /repos/.../dispatches endpoint.
+#
+# SECURITY: only repo-controlled identifiers (github.sha, github.event
+# .pull_request.number, github.event_name) are placed in the dispatch
+# payload. No PR title / branch name / commit message is forwarded —
+# those are attacker-controlled and irrelevant to the preview lifecycle.
+# Even so, every value is assigned via env: and shape-validated before
+# the dispatch curl runs.
+
+name: preview-dispatch
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-dispatch-${{ github.event.pull_request.number }}-${{ github.event.action }}
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    name: Dispatch preview-env event to infra repo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine event kind
+        id: kind
+        env:
+          ACTION: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+          case "${ACTION}" in
+            opened|synchronize|reopened) kind="create" ;;
+            closed)                      kind="teardown" ;;
+            *)
+              echo "::warning::unexpected pull_request action='${ACTION}', skipping dispatch"
+              kind="skip"
+              ;;
+          esac
+          echo "kind=${kind}" >> "$GITHUB_OUTPUT"
+          echo "dispatch kind: ${kind}"
+
+      - name: Fire preview-create-from-api on infra
+        if: steps.kind.outputs.kind == 'create'
+        env:
+          DISPATCH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TRIGGER: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DISPATCH_TOKEN:-}" ]; then
+            echo "::warning::REPO_ACCESS_TOKEN not set on api repo — skipping preview-env dispatch. " \
+              "Phase 1a is warn-only so this is fine; provision the secret before Phase 1c."
+            exit 0
+          fi
+          # PR number: github-assigned integer, never user-controlled, but defense-in-depth.
+          case "${PR_NUMBER}" in
+            [1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9]) ;;
+            *) echo "::error::unexpected PR_NUMBER value: ${PR_NUMBER}"; exit 1 ;;
+          esac
+          # SHA: 40-char hex from github.event.pull_request.head.sha — repo-controlled.
+          case "${SHA}" in
+            [0-9a-f]*) ;;
+            *) echo "::error::unexpected SHA shape: ${SHA}"; exit 1 ;;
+          esac
+          payload=$(printf '{"event_type":"preview-create-from-api","client_payload":{"api_pr":"%s","api_sha":"%s","trigger":"%s"}}' \
+            "${PR_NUMBER}" "${SHA}" "${TRIGGER}")
+          echo "Dispatching preview-create to InstaNode-dev/infra: pr=${PR_NUMBER} sha=${SHA}"
+          http_code=$(curl -sS -o /tmp/dispatch.out -w '%{http_code}' \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/InstaNode-dev/infra/dispatches \
+            -d "$payload")
+          echo "dispatch response: HTTP $http_code"
+          cat /tmp/dispatch.out || true
+          if [ "$http_code" != "204" ]; then
+            echo "::warning::preview-create dispatch returned $http_code (expected 204). " \
+              "Phase 1a is warn-only end-to-end — not failing the api PR."
+          fi
+
+      - name: Fire preview-teardown-from-api on infra
+        if: steps.kind.outputs.kind == 'teardown'
+        env:
+          DISPATCH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          ACTION: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DISPATCH_TOKEN:-}" ]; then
+            echo "::warning::REPO_ACCESS_TOKEN not set — skipping preview-env teardown dispatch. " \
+              "The TTL CronJob in preview-system will sweep the namespace within 72h."
+            exit 0
+          fi
+          case "${PR_NUMBER}" in
+            [1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9]) ;;
+            *) echo "::error::unexpected PR_NUMBER value: ${PR_NUMBER}"; exit 1 ;;
+          esac
+          # PR_MERGED is a github-supplied bool (true/false). Normalise.
+          case "${PR_MERGED}" in
+            true|false) ;;
+            *) echo "::warning::unexpected PR_MERGED value: ${PR_MERGED} — defaulting to 'unknown'"; PR_MERGED="unknown" ;;
+          esac
+          payload=$(printf '{"event_type":"preview-teardown-from-api","client_payload":{"api_pr":"%s","action":"%s","merged":"%s"}}' \
+            "${PR_NUMBER}" "${ACTION}" "${PR_MERGED}")
+          echo "Dispatching preview-teardown to InstaNode-dev/infra: pr=${PR_NUMBER} merged=${PR_MERGED}"
+          http_code=$(curl -sS -o /tmp/dispatch.out -w '%{http_code}' \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/InstaNode-dev/infra/dispatches \
+            -d "$payload")
+          echo "dispatch response: HTTP $http_code"
+          cat /tmp/dispatch.out || true
+          if [ "$http_code" != "204" ]; then
+            echo "::warning::preview-teardown dispatch returned $http_code (expected 204). " \
+              "TTL CronJob is the safety net — not failing the api PR."
+          fi
