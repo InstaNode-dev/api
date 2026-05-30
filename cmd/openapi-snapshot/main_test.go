@@ -44,7 +44,11 @@ func TestCanonicalise_DoesNotEscapeHTML(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.Contains(string(got), `&`) {
-		t.Errorf("expected '&' preserved (HTML escaping disabled), got:\n%s", got)
+	s := string(got)
+	if !strings.Contains(s, `&plan=hobby`) {
+		t.Errorf("expected literal '&' preserved (HTML escaping disabled), got:\n%s", s)
+	}
+	if strings.Contains(s, `&`) {
+		t.Errorf("expected '&' not to be escaped as \\u0026, got:\n%s", s)
 	}
 }
