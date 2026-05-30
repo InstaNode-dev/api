@@ -61,11 +61,20 @@ func (h *DeployHandler) MakePermanent(c *fiber.Ctx) error {
 	}
 
 	if team.PlanTier == "anonymous" {
+		// B7-P1-7 (BugBash 2026-05-20): the wall used to emit
+		// `upgrade_required`, which an agent that branches on error code
+		// alone routes to https://instanode.dev/pricing (paid checkout) —
+		// but the actual remediation is a FREE claim, not a paid upgrade.
+		// The agent_action sentence said "claim" correctly, but a strict
+		// code-switching agent never reads it. `claim_required` is the
+		// honest code for "free signup needed, not money." Wire shape
+		// (402 status, message, agent_action) preserved; only the `error`
+		// keyword and the upgrade_url destination change.
 		return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired,
-			"upgrade_required",
-			"Anonymous deploys cannot be made permanent — they always expire in 24h. Claim the account to keep deploys.",
+			"claim_required",
+			"Anonymous deploys cannot be made permanent — they always expire in 24h. Claim the account (free) to keep deploys.",
 			AgentActionDeployMakePermanentAnonymous,
-			"https://api.instanode.dev/start")
+			"https://instanode.dev/claim")
 	}
 
 	previousPolicy := d.TTLPolicy
@@ -135,11 +144,15 @@ func (h *DeployHandler) SetTTL(c *fiber.Ctx) error {
 	}
 
 	if team.PlanTier == "anonymous" {
+		// B7-P1-7 (see MakePermanent above): emit `claim_required` so an
+		// agent branching on error code routes the user to the free claim
+		// flow, not the paid pricing page. The `agent_action` sentence
+		// already said "claim"; this aligns the machine-readable code.
 		return respondErrorWithAgentAction(c, fiber.StatusPaymentRequired,
-			"upgrade_required",
-			"Anonymous deploys have a fixed 24h TTL — custom TTL requires a claimed account.",
+			"claim_required",
+			"Anonymous deploys have a fixed 24h TTL — custom TTL requires a claimed account (free).",
 			AgentActionDeployMakePermanentAnonymous,
-			"https://api.instanode.dev/start")
+			"https://instanode.dev/claim")
 	}
 
 	var body SetTTLRequest
