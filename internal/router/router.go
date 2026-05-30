@@ -136,8 +136,12 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// GET /livez — "the process is alive." NO database check, NO migration
 	// check, NO auth, NO rate-limit, NO logging context. Pure process-up
 	// signal so a k8s liveness probe can distinguish "process alive" from
-	// "process ready" (the readiness signal lives at /healthz, which checks
-	// DB + migration state).
+	// "process ready" (the deep readiness matrix lives at /readyz — see
+	// handlers/readyz.go; /healthz is the shallow build-SHA + migration
+	// stamp surface that canaries hit post-deploy). BUG-API-202: an
+	// earlier copy of this block said "readiness signal lives at /healthz"
+	// which was wrong — /healthz is the shallow probe, /readyz is the
+	// per-component readiness matrix wired to the k8s readinessProbe.
 	//
 	// Wired here BEFORE the app.Use(...) chain so the kubelet's probe
 	// traffic (~6/min/pod from livenessProbe + readinessProbe split, per
@@ -367,9 +371,17 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 		// of the pod's local TZ. build_time is the immutable image stamp;
 		// `now` is the live read — keeping both lets a probe compute the
 		// pod's uptime as a sanity check too.
+		// BUG-API-146/148/309 (QA 2026-05-29): the `service` field used to
+		// emit "instant.dev" — the legacy brand name. Now emits "instanode-api"
+		// so /healthz aligns with the runtime brand (instanode.dev) and the
+		// log-line serviceName ("api" / "instant-api"). Canaries that key on
+		// `service` to disambiguate api vs worker vs provisioner /healthz
+		// stamps benefit from the new value too — see handlers/readyz.go
+		// where worker/provisioner probes report "instanode-worker" and
+		// "instanode-provisioner" in sibling repos.
 		return c.JSON(fiber.Map{
 			"ok":                true,
-			"service":           "instant.dev",
+			"service":           "instanode-api",
 			"commit_id":         buildinfo.GitSHA,
 			"build_time":        buildinfo.BuildTime,
 			"version":           buildinfo.Version,

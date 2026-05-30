@@ -28,8 +28,10 @@ func TestE2E_Healthz_ReturnsOK(t *testing.T) {
 	if body["ok"] != true {
 		t.Errorf("GET /healthz: want ok=true, got %v", body)
 	}
-	if body["service"] != "instant.dev" {
-		t.Errorf("GET /healthz: want service=instant.dev, got %v", body["service"])
+	// BUG-API-146/148/309: `service` is "instanode-api" — the legacy
+	// "instant.dev" value is the brand drift this assertion catches.
+	if body["service"] != "instanode-api" {
+		t.Errorf("GET /healthz: want service=instanode-api, got %v", body["service"])
 	}
 }
 
