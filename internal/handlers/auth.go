@@ -1131,8 +1131,26 @@ func (h *AuthHandler) consumeOAuthState(ctx context.Context, state string) bool 
 // remember to escape — defense in depth.
 func renderAuthError(c *fiber.Ctx, status int, headline, detail string) error {
 	c.Set("Content-Type", "text/html; charset=utf-8")
+	// BUG-API-404 (QA 2026-05-29): the OAuth / magic-link callback HTML
+	// is a per-request rendering of session-bound state — a back-button,
+	// browser-history-restore, or service-worker re-fetch must NOT replay
+	// it (the underlying token has been consumed or expired). Without
+	// Cache-Control, the body could be re-served by the browser fetch
+	// cache or any intermediary, which both leaks the "you tried this
+	// link" UX state across sessions AND, in the success-redirect cousin
+	// of this surface, would re-set the exchange cookie. `no-store`
+	// (RFC 9111 §5.2.2.5) is the strongest stop-cache directive and
+	// matches the contract every other auth-result surface in the api
+	// already follows.
+	c.Set(fiber.HeaderCacheControl, "no-store")
+	// BUG-API-257 (QA 2026-05-29): the <html> element used to ship with
+	// no `lang` attribute. WCAG 3.1.1 "Language of Page" requires a
+	// programmatically determinable primary language; assistive tech
+	// (VoiceOver, NVDA) falls back to the OS locale otherwise, mis-
+	// pronouncing English copy in non-English locales. `lang="en"` is
+	// the correct value for the static English-only copy below.
 	body := fmt.Sprintf(`<!DOCTYPE html>
-<html>
+<html lang="en">
 <head><meta charset="UTF-8"><title>Sign-in error</title></head>
 <body style="font-family:sans-serif;max-width:480px;margin:48px auto;padding:24px;color:#111;">
   <h2>%s</h2>

@@ -263,12 +263,24 @@ func TestAuth_RenderAuthError_StatusAndContentType(t *testing.T) {
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	assert.Contains(t, resp.Header.Get("Content-Type"), "text/html")
+	// BUG-API-404 (QA 2026-05-29): the OAuth / magic-link callback HTML
+	// is per-request session-bound state — back-button or service-worker
+	// re-fetch must NOT replay it. Pin Cache-Control: no-store so a
+	// future regression that drops the c.Set call fails before merge.
+	assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"),
+		"BUG-API-404: renderAuthError must stamp Cache-Control: no-store on every callback HTML response")
 	buf := make([]byte, 1024)
 	n, _ := resp.Body.Read(buf)
 	body := string(buf[:n])
 	assert.Contains(t, body, "<title>Sign-in error")
 	assert.Contains(t, body, "Hello")
 	assert.Contains(t, body, "Detail")
+	// BUG-API-257 (QA 2026-05-29): WCAG 3.1.1 — the <html> element MUST
+	// carry a lang attribute so assistive tech (VoiceOver, NVDA) doesn't
+	// fall back to the OS locale and mispronounce English copy. Pin the
+	// value here so a future revert to the bare <html> fails before merge.
+	assert.Contains(t, body, `<html lang="en">`,
+		"BUG-API-257: renderAuthError HTML must include lang=\"en\" on the <html> element (WCAG 3.1.1)")
 }
 
 // SEC-API FINDING-23 regression: renderAuthError must HTML-escape both
