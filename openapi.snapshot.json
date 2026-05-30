@@ -839,7 +839,7 @@
           },
           "redeploy": {
             "default": false,
-            "description": "When true with a matching 'name', replace the existing deployment in place (same app_id + URL, same provider_id) instead of minting a fresh one. The platform looks up the team's most-recent non-terminal deployment whose env_vars._name matches the supplied 'name' (scoped to the resolved 'env'), then routes through the same compute path as POST /deploy/:id/redeploy. Closes the agent-UX gap (2026-05-30): multiple /deploy/new calls for the same logical app used to fan out into N distinct URLs because there was no way to upsert by name. Truthy values: 'true', '1', 'yes' (case-insensitive); anything else is false. Errors: 400 redeploy_requires_name when 'name' is empty; 404 no_existing_deployment_to_redeploy when no live row matches (omit 'redeploy' to create a new deployment, or call GET /api/v1/deployments first to discover the id); 409 not_ready when the matching row exists but has no provider_id yet (initial build still running). Default false: leaving the field absent keeps the legacy fan-out behaviour.",
+            "description": "When true with a matching 'name', replace the existing deployment in place (same app_id + URL, same provider_id) instead of minting a fresh one. The platform looks up the team's most-recent non-terminal deployment whose env_vars._name matches the supplied 'name' (scoped to the resolved 'env'), then routes through the same compute path as POST /deploy/:id/redeploy. Closes the agent-UX gap (2026-05-30): multiple /deploy/new calls for the same logical app used to fan out into N distinct URLs because there was no way to upsert by name. Truthy values: 'true', '1', 'yes' (case-insensitive); anything else is false. Errors: 404 no_existing_deployment_to_redeploy when no live row matches (note: an empty 'name' is rejected upstream by the standard name_required check, before this flag is even consulted) (omit 'redeploy' to create a new deployment, or call GET /api/v1/deployments first to discover the id); 409 not_ready when the matching row exists but has no provider_id yet (initial build still running). Default false: leaving the field absent keeps the legacy fan-out behaviour.",
             "type": "boolean"
           },
           "resource_bindings": {
@@ -8082,6 +8082,50 @@
           }
         },
         "summary": "Send a passwordless magic-link sign-in email"
+      }
+    },
+    "/auth/exchange": {
+      "post": {
+        "description": "Final leg of the AUTH-004 cross-origin sign-in handshake. The /auth/email/callback and /auth/github/callback handlers set a short-lived HttpOnly auth_exchange_cookie and 302 to https://instanode.dev/login/callback?signed_in=1. The dashboard then makes a credentials:include POST to this endpoint. CORS contract: response MUST include Access-Control-Allow-Origin: https://instanode.dev AND Access-Control-Allow-Credentials: true — the browser blocks the read otherwise. Request MUST be a CORS-simple POST (no custom headers like Accept: application/json), since adding one forces a preflight that PreflightAllowlist may reject. Returns 200 + the bearer JWT (24h, HS256, aud=https://api.instanode.dev) on success. The 2026-05-29 to 2026-05-30 prod-login outage chained three failures along this exact endpoint — documenting it here so any future regression is catchable by the cross-stack contract gate (api PR #202).",
+        "requestBody": {
+          "description": "No body. The bridge cookie travels in the Cookie header via credentials:include.",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "token": {
+                      "description": "Session JWT — store in localStorage and send as Authorization: Bearer for /api/v1/* calls",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "token"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Cookie verified; JWT minted"
+          },
+          "400": {
+            "description": "Bridge cookie missing / expired (canonical envelope with error code cookie_missing_or_expired)"
+          },
+          "401": {
+            "description": "Cookie present but signature invalid or aud mismatch"
+          },
+          "503": {
+            "description": "JWT signing failed (downstream)"
+          }
+        },
+        "summary": "Exchange the AUTH-004 bridge cookie for a session JWT"
       }
     },
     "/auth/github": {
