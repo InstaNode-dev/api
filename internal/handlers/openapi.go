@@ -3246,9 +3246,10 @@ const openAPISpec = `{
           "rpo_minutes":             { "type": "integer", "description": "Recovery Point Objective in minutes — the maximum window of data loss a restore can incur. 0 means no backup/RPO guarantee for the tier." },
           "rto_minutes":             { "type": "integer", "description": "Recovery Time Objective in minutes — the target time to restore service after an incident. 0 means no RTO guarantee for the tier." },
           "annual_discount_percent": { "type": "integer", "description": "Discount percent of the {tier}_yearly variant vs 12x the monthly. 0 when no yearly variant exists." },
-          "upgrade_url":             { "type": "string", "format": "uri" }
+          "upgrade_url":             { "type": ["string", "null"], "format": "uri", "description": "Pricing/upgrade URL for non-terminal tiers. null for the terminal tier (Team today) — there is nothing to upgrade to. Pairs with is_terminal_tier; SDKs/dashboards rendering an Upgrade CTA should suppress when null. DOG-26 (QA 2026-05-29)." },
+          "is_terminal_tier":        { "type": "boolean", "description": "True for the top tier in the rank ladder (Team today). When true, upgrade_url is null. Lets clients render an Upgrade CTA conditionally without string-matching tier names. DOG-26." }
         },
-        "required": ["tier", "display_name", "price_usd_monthly", "paid_from_day_one", "storage_limit_mb", "connections_limit", "deployments_apps", "upgrade_url"]
+        "required": ["tier", "display_name", "price_usd_monthly", "paid_from_day_one", "storage_limit_mb", "connections_limit", "deployments_apps", "upgrade_url", "is_terminal_tier"]
       },
       "CapabilitiesResponse": {
         "type": "object",

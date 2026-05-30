@@ -49,7 +49,19 @@ type tierCapabilities struct {
 	RPOMinutes            int            `json:"rpo_minutes"`
 	RTOMinutes            int            `json:"rto_minutes"`
 	AnnualDiscountPercent int            `json:"annual_discount_percent"`
-	UpgradeURL            string         `json:"upgrade_url"`
+	// UpgradeURL — pointer so the terminal tier (Team — there is nothing
+	// to upgrade to) emits an explicit JSON `null` instead of the pricing
+	// URL. DOG-26 (QA 2026-05-29): every tier including Team used to
+	// return the pricing page, which would have SDKs / dashboards
+	// rendering an "Upgrade" CTA on the Team plan with no destination.
+	// `null` is the contract-stable terminal-tier marker; a non-null
+	// string is the "click here to upgrade" signal.
+	UpgradeURL            *string        `json:"upgrade_url"`
+	// IsTerminalTier — explicit boolean so clients don't have to encode
+	// the "is upgrade_url null" check at every render site. True for the
+	// top tier (Team today), false for everything below. Pairs with
+	// UpgradeURL — when IsTerminalTier=true, UpgradeURL is null.
+	IsTerminalTier        bool           `json:"is_terminal_tier"`
 }
 
 // capabilityResourceTypes is the list of service types the /capabilities
@@ -128,6 +140,20 @@ func (h *CapabilitiesHandler) Get(c *fiber.Ctx) error {
 		return entries[i].name < entries[j].name
 	})
 
+	// terminalRank — the highest rank in the entries slice. Used to mark
+	// the top tier as terminal (upgrade_url=null, is_terminal_tier=true).
+	// Computed after the rank-sort so we don't have to re-walk the slice;
+	// entries[len-1] has the highest rank by construction.
+	terminalRank := -1
+	if len(entries) > 0 {
+		terminalRank = entries[len(entries)-1].rank
+	}
+
+	// upgradeURLStr — pointer-to-string so we can emit explicit null for
+	// the terminal tier. Hoisted to a local so we don't take the address
+	// of a package-level const (Go doesn't allow that).
+	upgradeURLStr := upgradeURL
+
 	out := make([]tierCapabilities, 0, len(entries))
 	for _, e := range entries {
 		storage := map[string]int{}
@@ -137,6 +163,15 @@ func (h *CapabilitiesHandler) Get(c *fiber.Ctx) error {
 			conns[rt] = h.plans.ConnectionsLimit(e.name, rt)
 		}
 		priceUSD := e.plan.PriceMonthly / 100 // cents → dollars
+		// DOG-26: terminal tier marker — top of the rank ladder has
+		// nothing to upgrade to. upgrade_url is null + is_terminal_tier
+		// is true so SDKs/dashboards rendering an "Upgrade" CTA can
+		// suppress it without string-matching "team".
+		isTerminal := e.rank == terminalRank
+		var upgrade *string
+		if !isTerminal {
+			upgrade = &upgradeURLStr
+		}
 		out = append(out, tierCapabilities{
 			Tier:                  e.name,
 			DisplayName:           e.plan.DisplayName,
@@ -151,7 +186,8 @@ func (h *CapabilitiesHandler) Get(c *fiber.Ctx) error {
 			RPOMinutes:            h.plans.RPOMinutes(e.name),
 			RTOMinutes:            h.plans.RTOMinutes(e.name),
 			AnnualDiscountPercent: annualDiscountPercent(all, e.name),
-			UpgradeURL:            upgradeURL,
+			UpgradeURL:            upgrade,
+			IsTerminalTier:        isTerminal,
 		})
 	}
 
