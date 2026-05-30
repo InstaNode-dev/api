@@ -54,23 +54,23 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	canonical, err := canonicalise(handlers.OpenAPISpecProduction())
 	if err != nil {
-		fmt.Fprintf(stderr, "openapi-snapshot: canonicalise: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "openapi-snapshot: canonicalise: %v\n", err)
 		return 2
 	}
 
 	if *toStdout {
 		if _, err := stdout.Write(canonical); err != nil {
-			fmt.Fprintf(stderr, "openapi-snapshot: stdout: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "openapi-snapshot: stdout: %v\n", err)
 			return 2
 		}
 		return 0
 	}
 
 	if err := os.WriteFile(*out, canonical, 0o644); err != nil {
-		fmt.Fprintf(stderr, "openapi-snapshot: write %s: %v\n", *out, err)
+		_, _ = fmt.Fprintf(stderr, "openapi-snapshot: write %s: %v\n", *out, err)
 		return 2
 	}
-	fmt.Fprintf(stderr, "openapi-snapshot: wrote %d bytes to %s\n", len(canonical), *out)
+	_, _ = fmt.Fprintf(stderr, "openapi-snapshot: wrote %d bytes to %s\n", len(canonical), *out)
 	return 0
 }
 
