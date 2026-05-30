@@ -51,6 +51,43 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	return app
 }
 
+// processStart is captured once per process so /healthz can report
+// `uptime_seconds` for liveness diagnostics without an external clock.
+// Sampled via time.Now() at package-load time — there is no production
+// reason to mutate it after first read. Tests that want to assert a
+// specific uptime override it via processStartFunc.
+//
+// BUG-P272 (QA 2026-05-29): `/healthz` previously did not expose
+// uptime, leaving canaries / agents unable to distinguish "freshly
+// rolled pod" from "pod that's been alive for hours" without a
+// separate metrics scrape. The new `uptime_seconds` field plus the
+// existing `build_time` give a self-contained "when did this pod
+// start and how long has it been up" signal on every shallow probe.
+var processStart = time.Now()
+
+// processStartFunc is the seam that lets tests pin the uptime value.
+// Production code reads processStart directly; test code can swap
+// processStartFunc to a fixed instant to assert the JSON field.
+var processStartFunc = func() time.Time { return processStart }
+
+// probeOptionsHandler returns a Fiber handler that responds 204 + an
+// Allow header to bare `OPTIONS /<probe>` calls. Without it Fiber's
+// "no route for verb" path returns 405 — fine for browser preflight
+// (the CORS middleware lower in the chain handles Origin-bearing
+// requests) but surprising for curl / uptime-checker / SDK probes
+// that do not set Origin. Used by the shallow probe surfaces
+// (/livez, /healthz, /readyz, /openapi.json) per BUG-API-024 /
+// BUG-API-025. The Allow header mirrors the verbs the routed
+// handlers expose so an HTTP-conformant client sees the same allow
+// set whether it reads it from a 405 envelope or a 204 OPTIONS
+// response.
+func probeOptionsHandler(allow string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		c.Set("Allow", allow)
+		return c.SendStatus(fiber.StatusNoContent)
+	}
+}
+
 // NewWithHooks is the production entrypoint — returns both the Fiber
 // app and the ShutdownHooks needed for graceful shutdown.
 func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.GeoDBs, emailClient *email.Client, planRegistry *plans.Registry, provClient *provisioner.Client, nrApp *newrelic.Application) (*fiber.App, ShutdownHooks) {
@@ -152,6 +189,15 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	app.Get("/livez", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"alive": true})
 	})
+	// BUG-API-025 (QA 2026-05-29): bare `OPTIONS /livez` (no Origin
+	// header, e.g. curl/uptime-checker style probes) used to fall
+	// through to Fiber's "no route" handler and return 405 because
+	// the CORS middleware (which is the usual OPTIONS responder)
+	// skips when Origin is unset. Browser preflight (Origin present)
+	// still flows through fiberCORS below — this OPTIONS shim only
+	// covers the no-Origin probe lane and returns 204 with the same
+	// Allow header set Fiber would have emitted on a routed 405.
+	app.Options("/livez", probeOptionsHandler("GET, HEAD, OPTIONS"))
 
 	// ── Middleware chain (order matters) ─────────────────────────────────────
 	// SecurityHeaders runs BEFORE RequestID so the static defense-in-depth
@@ -392,6 +438,13 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 		// stamps benefit from the new value too — see handlers/readyz.go
 		// where worker/provisioner probes report "instanode-worker" and
 		// "instanode-provisioner" in sibling repos.
+		// BUG-P272 (QA 2026-05-29): expose `uptime_seconds` (int64) so
+		// canaries / agents can answer "how long has this pod been up?"
+		// without a separate metrics scrape. Computed from processStartFunc()
+		// (a test-overridable seam) and rounded to seconds — sub-second
+		// jitter has no diagnostic value at this surface and would defeat
+		// HTTP-cache deduplication if anyone proxies the response.
+		uptimeSeconds := int64(time.Since(processStartFunc()).Seconds())
 		return c.JSON(fiber.Map{
 			"ok":                true,
 			"service":           "instanode-api",
@@ -402,8 +455,15 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 			"migration_count":   mstate.Count,
 			"migration_status":  mstate.Status,
 			"now":               time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+			"uptime_seconds":    uptimeSeconds,
 		})
 	})
+	// BUG-API-025 (QA 2026-05-29): mirror the /livez OPTIONS shim on
+	// /healthz so curl/uptime-checker style probes that send a bare
+	// `OPTIONS /healthz` (no Origin) get a 204 instead of the 405 Fiber
+	// returns when no route matches the verb. Browser CORS preflight
+	// (Origin present) still flows through fiberCORS below.
+	app.Options("/healthz", probeOptionsHandler("GET, HEAD, OPTIONS"))
 
 	// /readyz — deep, component-by-component readiness probe wired to
 	// the k8s readinessProbe (NOT livenessProbe — see /healthz above
@@ -414,6 +474,8 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// motivation (RETRO 2026-05-20).
 	readyzH := handlers.NewReadyzHandler(cfg, db, rdb, provClient)
 	app.Get("/readyz", readyzH.Get)
+	// BUG-API-025 (QA 2026-05-29): same OPTIONS shim as /healthz/livez.
+	app.Options("/readyz", probeOptionsHandler("GET, HEAD, OPTIONS"))
 
 	// OpenAPI spec — machine-readable description of the agent-facing API.
 	// T19 P0-1 (BugHunt 2026-05-20): pass ENVIRONMENT so the served spec
@@ -427,6 +489,14 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// the session_token redirected there.
 	handlers.SetReturnToAllowsLocalhost(cfg.Environment != "production")
 	app.Get("/openapi.json", handlers.ServeOpenAPI)
+	// BUG-API-024 (QA 2026-05-29): bare `OPTIONS /openapi.json` (no
+	// Origin header — e.g. an SDK doing a preflight probe before a
+	// custom-header GET) used to return 405 because no route matched
+	// the verb. The CORS middleware below only responds when Origin
+	// is set. Register an explicit OPTIONS handler so the no-Origin
+	// probe lane returns 204 + the Allow header set the browser CORS
+	// preflight would otherwise see via fiberCORS.
+	app.Options("/openapi.json", probeOptionsHandler("GET, HEAD, OPTIONS"))
 
 	// /llms.txt — agent discovery doc, 302 to marketing where it's the
 	// source of truth. Agents that hit api.instanode.dev first land here

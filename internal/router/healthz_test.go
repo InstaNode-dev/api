@@ -43,8 +43,15 @@ func TestHealthzShape(t *testing.T) {
 	reader := migrations.NewReader(sqlDB, 0, nil)
 
 	app := fiber.New()
+	// Pin the process-start instant 42 seconds in the past so the
+	// uptime_seconds assertion below has a stable expected value.
+	// router.go reads processStartFunc() per request — production
+	// captures it at package load via time.Now(), the test fixture
+	// here mirrors the same code shape with a fixed offset.
+	fixedStart := time.Now().Add(-42 * time.Second)
 	app.Get("/healthz", func(c *fiber.Ctx) error {
 		m := reader.Get(c.UserContext())
+		uptimeSeconds := int64(time.Since(fixedStart).Seconds())
 		return c.JSON(fiber.Map{
 			"ok":                true,
 			"service":           "instanode-api",
@@ -59,6 +66,9 @@ func TestHealthzShape(t *testing.T) {
 			// fixture aligned with prod so a future deletion of the
 			// router.go emit also fails here.
 			"now": time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+			// BUG-P272 (QA 2026-05-29): mirror the router.go addition of
+			// uptime_seconds so the wire-shape contract is pinned here too.
+			"uptime_seconds": uptimeSeconds,
 		})
 	})
 
@@ -117,6 +127,23 @@ func TestHealthzShape(t *testing.T) {
 		"BUG-API-090: migration_version must not leak filename suffix to anon /healthz callers")
 	require.Equal(t, float64(22), got["migration_count"]) // JSON numbers decode as float64
 	require.Equal(t, "ok", got["migration_status"])
+
+	// BUG-P272 (QA 2026-05-29): `uptime_seconds` is the new pod-liveness
+	// field. Must be a non-negative integer-valued JSON number. The
+	// fixture pinned the start instant to ~42s ago, so 41-44s is the
+	// tolerant range (in-process fiber.Test takes <50ms; ±2s is room
+	// to spare for slow CI runners). Drift outside that window is
+	// either a clock bug or a regression that swapped the offset.
+	require.NotNil(t, got["uptime_seconds"], "BUG-P272: /healthz must emit uptime_seconds (int64)")
+	uptimeRaw, ok := got["uptime_seconds"].(float64)
+	require.True(t, ok, "BUG-P272: uptime_seconds must be a JSON number (decoded as float64)")
+	require.GreaterOrEqual(t, uptimeRaw, 40.0, "BUG-P272: uptime_seconds floor — fixture pinned start 42s ago")
+	require.LessOrEqual(t, uptimeRaw, 45.0, "BUG-P272: uptime_seconds ceiling — fixture pinned start 42s ago")
+	// JSON-number must round-trip to an integer (no fractional seconds —
+	// sub-second jitter has no diagnostic value at this surface and
+	// would defeat HTTP-cache dedup for any proxy in front).
+	require.Equal(t, float64(int64(uptimeRaw)), uptimeRaw,
+		"BUG-P272: uptime_seconds must round to an integer; got %f", uptimeRaw)
 
 	require.NoError(t, mock.ExpectationsWereMet())
 }
