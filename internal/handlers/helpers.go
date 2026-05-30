@@ -141,7 +141,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		UpgradeURL:  "",
 	},
 	"no_existing_deployment_to_redeploy": {
-		AgentAction: "No deployment with that name exists on this team. Omit redeploy=true to create a fresh deployment, or call GET /api/v1/deployments to discover the existing app_id and use POST /deploy/{id}/redeploy.",
+		AgentAction: "Tell the user no deployment with that name exists on this team. Omit redeploy=true to create one fresh, or list https://instanode.dev/api/v1/deployments to find the app_id and call POST /deploy/{id}/redeploy.",
 		UpgradeURL:  "",
 	},
 	"rate_limit_exceeded": {
