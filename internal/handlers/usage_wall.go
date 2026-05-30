@@ -36,6 +36,7 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -57,6 +58,29 @@ const usageWallKind = "near_quota_wall"
 // quotaWallDedupeWindow — a row outside this window is stale and we
 // return near_wall=false even if it exists.
 const usageWallFreshness = 24 * time.Hour
+
+// usageWallCacheMaxAge is the Cache-Control: max-age value emitted on
+// every GET /api/v1/usage/wall response. BUG-API-420 (QA 2026-05-29):
+// the dashboard fetches this endpoint on every navigation (Overview
+// page on mount + every 5-min poll); without a cache hint the browser
+// re-fetches on every back/forward / SPA route change, generating
+// redundant DB scans on the busiest team-scoped table (audit_log).
+//
+// 30s is the consistency tradeoff (memory rule
+// feedback_caching_and_consistency_tradeoffs):
+//   - The worker writes at most one near_quota_wall row per team per
+//     24h (quotaWallDedupeWindow = usageWallFreshness above), so a
+//     30s staleness window can miss a brand-new wall event by ≤30s.
+//   - The wall banner is a soft upgrade-nudge, not a hard quota
+//     enforcement — the hard 402 still fires synchronously on the
+//     next provision regardless of banner state.
+//   - 30s < the 5-min dashboard poll interval, so the cache flushes
+//     well within one polling round and walls are visible within
+//     5min + 30s in the worst case.
+//
+// `Vary: Authorization` is added alongside so per-team caching at a
+// CDN never serves team A's banner state to team B.
+const usageWallCacheMaxAge = 30
 
 // UsageWallHandler serves GET /api/v1/usage/wall.
 type UsageWallHandler struct {
@@ -81,6 +105,23 @@ type wallMetadata struct {
 	PercentUsed int    `json:"percent_used"`
 }
 
+// setUsageWallCacheHeaders stamps the per-team cache hint on every 200
+// response from GetWall. Lives on the handler struct so a future
+// per-team max-age override (e.g. shorter for hobby_plus walls) has a
+// single edit site. BUG-API-420.
+func (h *UsageWallHandler) setUsageWallCacheHeaders(c *fiber.Ctx) {
+	// Sprintf instead of a literal so the constant above (with its
+	// consistency-tradeoff comment) is the single source of truth and
+	// can't drift from the wire value. golangci-lint's `unused` check
+	// blocks anyone deleting the constant without also touching this
+	// fmt format string.
+	c.Set("Cache-Control", fmt.Sprintf("private, max-age=%d", usageWallCacheMaxAge))
+	// Vary: Authorization is the per-team boundary — without it a
+	// shared cache (CDN, browser back-cache after re-auth) could
+	// serve team A's banner state to team B.
+	c.Set("Vary", "Authorization")
+}
+
 // GetWall handles GET /api/v1/usage/wall.
 func (h *UsageWallHandler) GetWall(c *fiber.Ctx) error {
 	teamID, err := uuid.Parse(middleware.GetTeamID(c))
@@ -92,6 +133,7 @@ func (h *UsageWallHandler) GetWall(c *fiber.Ctx) error {
 	// Fail-open: if team lookup errors, fall through to the audit
 	// query rather than refusing to serve.
 	if team, terr := models.GetTeamByID(c.Context(), h.db, teamID); terr == nil && team != nil && team.PlanTier == "team" {
+		h.setUsageWallCacheHeaders(c)
 		return c.JSON(fiber.Map{"ok": true, "near_wall": false})
 	}
 
@@ -113,6 +155,7 @@ func (h *UsageWallHandler) GetWall(c *fiber.Ctx) error {
 	)
 	if scanErr := row.Scan(&metadataRaw, &createdAt); scanErr != nil {
 		if scanErr == sql.ErrNoRows {
+			h.setUsageWallCacheHeaders(c)
 			return c.JSON(fiber.Map{"ok": true, "near_wall": false})
 		}
 		slog.Error("usage.wall.query_failed",
@@ -143,5 +186,6 @@ func (h *UsageWallHandler) GetWall(c *fiber.Ctx) error {
 			resp["percent_used"] = meta.PercentUsed
 		}
 	}
+	h.setUsageWallCacheHeaders(c)
 	return c.JSON(resp)
 }
