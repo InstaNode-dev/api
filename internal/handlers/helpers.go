@@ -137,7 +137,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	// a "tier is genuinely unavailable" surface, re-add the entry here
 	// and emit it from the new site in the same PR.
 	"events_query_failed": {
-		AgentAction: "Tell the user the deployment-events read is temporarily unavailable. Retry in 30 seconds; the deploy itself isn't affected.",
+		AgentAction: "Tell the user the deployment-events read is temporarily unavailable. Retry in 30 seconds; the deploy itself isn't affected. Status: https://instanode.dev/status",
 		UpgradeURL:  "",
 	},
 	"rate_limit_exceeded": {
