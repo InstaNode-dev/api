@@ -194,6 +194,10 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	}
 	const corsAllowMethods = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
 	const corsAllowHeaders = "Content-Type,Authorization,X-Request-ID,X-E2E-Test-Token,X-E2E-Source-IP"
+	// corsMaxAgeSeconds — 24h preflight cache (Firefox/Safari upper bound;
+	// Chrome will clamp to 2h regardless). BUG-API-303 (QA 2026-05-29):
+	// without this value the browser re-preflights every CORS request.
+	const corsMaxAgeSeconds = 86400
 	// BUG-API-066/067: Fiber's CORS middleware sets Access-Control-Allow-*
 	// headers but does NOT validate the inbound preflight request — a
 	// browser asking for TRACE or Cookie still gets a 204 even though
@@ -210,6 +214,15 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 		AllowMethods:  corsAllowMethods,
 		AllowHeaders:  corsAllowHeaders,
 		ExposeHeaders: "X-Request-ID,X-Instant-Upgrade,X-Instant-Notice",
+		// BUG-API-303 (QA 2026-05-29): without Access-Control-Max-Age the
+		// browser re-issues an OPTIONS preflight before every CORS request.
+		// 24h (corsMaxAgeSeconds) is the modern browsers' clamp ceiling —
+		// Chrome caps at 2h, Firefox 24h, Safari 7d, so the practical
+		// effect is per-browser but we ask for the maximum standard value
+		// so cooperative agents (and reverse proxies) cache for the longest
+		// period. Pairs with the Vary: Origin header already emitted to
+		// keep per-origin caches safe.
+		MaxAge: corsMaxAgeSeconds,
 	}))
 	app.Use(middleware.GeoEnrich(geoDbs))
 	app.Use(middleware.Fingerprint())
