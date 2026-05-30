@@ -343,7 +343,14 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	// StatusNotFound / StatusMethodNotAllowed / StatusRequestEntityTooLarge
 	// / StatusUnsupportedMediaType.
 	"not_found": {
-		AgentAction: "Tell the user the URL is wrong or the resource no longer exists. Have them check the path against https://instanode.dev/docs — anon resources also auto-expire after 24h, so re-provision if needed.",
+		// BUG-API-105 (QA 2026-05-29): the agent_action used to tack on
+		// "anon resources also auto-expire after 24h" — irrelevant when
+		// the 404 is a typo'd internal path or unknown route, and
+		// actively misleading on authenticated misroutes. Hint kept
+		// behind a "see /docs" pointer; the auto-expire footnote now
+		// only fires when the surface-specific 404 (resource_not_found
+		// / webhook_not_found / etc.) emits it.
+		AgentAction: "Tell the user the URL is wrong or the resource no longer exists. Have them check the path against https://instanode.dev/docs — if they were calling a token-keyed URL the token may have expired or been mistyped.",
 	},
 	"method_not_allowed": {
 		AgentAction: "Tell the user the HTTP method is wrong for this URL. Have them check the Allow response header (or https://instanode.dev/docs) for the supported methods.",
