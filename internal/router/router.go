@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/gofiber/contrib/otelfiber/v2"
 	"github.com/gofiber/fiber/v2"
@@ -357,6 +358,15 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 		// the numeric prefix only via State.PublicVersion so canaries
 		// keep their commit_id+count+version tuple but no domain
 		// knowledge leaks. migration_count + migration_status unchanged.
+		// BUG-API-417 (QA 2026-05-29): include the server's current wall
+		// clock in /healthz so canaries / SDKs / agents can detect clock
+		// skew between their host and the api pod without an extra round
+		// trip. RFC 3339 with millisecond precision matches the format
+		// used in audit-log and forwarder_sent rows; `now` is sourced
+		// from time.Now().UTC() so the value is unambiguous regardless
+		// of the pod's local TZ. build_time is the immutable image stamp;
+		// `now` is the live read — keeping both lets a probe compute the
+		// pod's uptime as a sanity check too.
 		return c.JSON(fiber.Map{
 			"ok":                true,
 			"service":           "instant.dev",
@@ -366,6 +376,7 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 			"migration_version": mstate.PublicVersion(),
 			"migration_count":   mstate.Count,
 			"migration_status":  mstate.Status,
+			"now":               time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 		})
 	})
 

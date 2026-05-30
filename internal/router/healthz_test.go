@@ -54,6 +54,11 @@ func TestHealthzShape(t *testing.T) {
 			"migration_version": m.PublicVersion(),
 			"migration_count":   m.Count,
 			"migration_status":  m.Status,
+			// BUG-API-417 (QA 2026-05-29): mirror the router.go addition
+			// of the live `now` server timestamp. Keeps the in-process
+			// fixture aligned with prod so a future deletion of the
+			// router.go emit also fails here.
+			"now": time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 		})
 	})
 
@@ -80,6 +85,22 @@ func TestHealthzShape(t *testing.T) {
 	require.Equal(t, buildinfo.GitSHA, got["commit_id"])
 	require.Equal(t, buildinfo.BuildTime, got["build_time"])
 	require.Equal(t, buildinfo.Version, got["version"])
+
+	// BUG-API-417: `now` is the wall-clock the server emits so canaries
+	// can detect clock skew between their host and the api pod without
+	// an extra round trip. Format pinned to RFC 3339 with millisecond
+	// precision (matches audit-log + forwarder_sent rows) and the value
+	// must parse back to a time within a generous 5-second window of
+	// the test's own clock (sqlmock + fiber.Test is in-process so the
+	// drift is microseconds in practice).
+	require.NotEmpty(t, got["now"], "BUG-API-417: /healthz must emit a server `now` timestamp so clients can detect clock skew")
+	nowStr, ok := got["now"].(string)
+	require.True(t, ok, "BUG-API-417: `now` must be a JSON string (RFC 3339)")
+	parsedNow, parseErr := time.Parse("2006-01-02T15:04:05.000Z", nowStr)
+	require.NoError(t, parseErr, "BUG-API-417: `now` must parse as `2006-01-02T15:04:05.000Z` (RFC 3339 with ms); got %q", nowStr)
+	drift := time.Since(parsedNow)
+	require.Less(t, drift.Abs(), 5*time.Second,
+		"BUG-API-417: `now` must be within 5s of the test's wall clock (UTC); got drift=%s", drift)
 
 	// Migration contract — new fields the canary reads to detect drift
 	// between binary commit and DB schema state. BUG-API-090/217: the
