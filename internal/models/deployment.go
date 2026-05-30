@@ -406,6 +406,51 @@ func GetDeploymentsByTeamAndEnv(ctx context.Context, db *sql.DB, teamID uuid.UUI
 	return results, nil
 }
 
+// FindActiveDeploymentByTeamEnvName looks up the most recent non-terminal
+// deployment for (team, env, name) — the lookup key for the POST /deploy/new
+// `redeploy=true` in-place-update path.
+//
+// Selection rules:
+//   - status filter: includes 'building', 'deploying', 'healthy', 'failed'
+//     (the rows a caller can legitimately redeploy in place). 'deleted' and
+//     'expired' (the terminal set per terminalDeploymentStatusesSQL) are
+//     excluded so a redeploy never resurrects a reaped row. 'stopped' is
+//     also excluded: a paused deploy must be explicitly restarted via its
+//     own flow, not silently replaced.
+//   - the human-readable name is stored in env_vars.JSONB under the
+//     "_name" key (see handlers.deployNameEnvKey). We compare the JSONB
+//     extraction (env_vars->>'_name') directly so the lookup matches what
+//     the dashboard / list endpoint surfaces as `name`.
+//   - ORDER BY created_at DESC LIMIT 1: when a name has been reused across
+//     multiple deploy rows (e.g. a failed build then a healthy retry), we
+//     target the most recent one — same heuristic an operator would apply.
+//
+// Returns (nil, sql.ErrNoRows) when no matching row exists. The handler
+// translates that to a 404 with the canonical agent_action envelope.
+func FindActiveDeploymentByTeamEnvName(ctx context.Context, db *sql.DB, teamID uuid.UUID, env, name string) (*Deployment, error) {
+	if env == "" {
+		env = EnvDefault
+	}
+	row := db.QueryRowContext(ctx, `
+		SELECT `+deploymentColumns+`
+		FROM deployments
+		WHERE team_id = $1
+		  AND env = $2
+		  AND env_vars->>'_name' = $3
+		  AND status IN ('building', 'deploying', 'healthy', 'failed')
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, teamID, env, name)
+	d, err := scanDeployment(row)
+	if err == sql.ErrNoRows {
+		return nil, sql.ErrNoRows
+	}
+	if err != nil {
+		return nil, fmt.Errorf("models.FindActiveDeploymentByTeamEnvName: %w", err)
+	}
+	return d, nil
+}
+
 // UpdateDeploymentStatus updates the status and optional error_message for a deployment.
 // updated_at is set to now() by the database.
 func UpdateDeploymentStatus(ctx context.Context, db *sql.DB, id uuid.UUID, status, errorMessage string) error {

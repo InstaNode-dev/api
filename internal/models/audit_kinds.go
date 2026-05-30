@@ -124,6 +124,15 @@ const (
 	// message — full error stays in the deployments.error_message column).
 	AuditKindDeployFailed = "deploy.failed"
 
+	// AuditKindDeployRedeployRequested fires the moment a redeploy compute
+	// path is accepted (after status is flipped to 'building' and BEFORE
+	// the async rebuild runs). Emitted on both POST /deploy/:id/redeploy
+	// AND POST /deploy/new with redeploy=true. Metadata: {deploy_id,
+	// team_id, app_id, env, source: "redeploy_endpoint" |
+	// "deploy_new_in_place"}. Distinct from deploy.created so the activity
+	// feed can distinguish "new app shipped" from "existing app rebuilt".
+	AuditKindDeployRedeployRequested = "deploy.redeploy.requested"
+
 	// Deploy TTL lifecycle (Wave FIX-J — migration 045). Each kind names one
 	// inflection point in the auto-24h-TTL-with-reminders flow so on-call,
 	// the dashboard's Recent Activity feed, and the Loops/Brevo event

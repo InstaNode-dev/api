@@ -211,6 +211,27 @@ var (
 		Help: "GET /api/v1/deployments/:id/events calls by result (ok|not_found|invalid|error)",
 	}, []string{"result"})
 
+	// DeployRedeployInPlaceTotal counts the POST /deploy/new in-place
+	// redeploy outcomes (redeploy=true form field). Labels:
+	//
+	//   outcome = "success"      — match found, redeploy compute path invoked
+	//             "not_found"    — no live deployment for (team, env, name)
+	//             "wrong_team"   — name exists on a different team (404 is
+	//                              still returned — we never confirm existence)
+	//             "missing_name" — caller set redeploy=true but omitted name
+	//
+	// Closes the agent-UX gap surfaced 2026-05-30 (duplicate-URL incident):
+	// agents previously called /deploy/new repeatedly, minting a fresh
+	// app_id per call. A rising `outcome="not_found"` rate means agents
+	// are guessing names — pair with the MCP `list_deployments` tool to
+	// teach them the discovery path. `outcome="success"` is the healthy
+	// state — the platform served an in-place update instead of fanning
+	// out a new URL.
+	DeployRedeployInPlaceTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_deploy_redeploy_total",
+		Help: "POST /deploy/new redeploy=true outcomes (success/not_found/wrong_team/missing_name). Closes the duplicate-URL agent-UX gap (2026-05-30).",
+	}, []string{"outcome"})
+
 	// NatsAuthFailures counts NATS credential-issuance failures from the
 	// common/queueprovider abstraction. MR-P0-5 (NATS per-tenant isolation,
 	// 2026-05-20). A non-zero rate is almost always one of:
