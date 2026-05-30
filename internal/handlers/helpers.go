@@ -136,6 +136,10 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	// TestCodeToAgentAction_NoOrphans. If a future feature reintroduces
 	// a "tier is genuinely unavailable" surface, re-add the entry here
 	// and emit it from the new site in the same PR.
+	"events_query_failed": {
+		AgentAction: "Tell the user the deployment-events read is temporarily unavailable. Retry in 30 seconds; the deploy itself isn't affected. Status: https://instanode.dev/status",
+		UpgradeURL:  "",
+	},
 	"rate_limit_exceeded": {
 		AgentAction: "Tell the user they've sent too many requests in a short window. Wait 60 seconds and retry — or upgrade to Pro at https://instanode.dev/pricing for higher limits.",
 		UpgradeURL:  "https://instanode.dev/pricing",
