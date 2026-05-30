@@ -29,6 +29,33 @@ export default defineConfig({
       name: 'chromium',
       use: { ...devices['Desktop Chrome'] },
     },
+    {
+      // Layer-2 docker-compose auth-contract gate
+      // (tests/auth-contract-local.spec.ts) — needs Chromium's Local /
+      // Private Network Access checks disabled because both the document
+      // origin (http://localhost:5173, stubbed) and the api (http://localhost
+      // :8080) live in the loopback address space, and Chromium blocks
+      // even loopback→loopback fetches as a CORS pre-PNA "permission denied"
+      // when there is no Access-Control-Allow-Private-Network header.
+      // PROD does not hit this case (instanode.dev → api.instanode.dev are
+      // both public addresses), so the PNA disable is strictly a localhost
+      // shim — it does NOT weaken the contract under test, which is the
+      // CORS allow-origin + allow-credentials response from the api.
+      name: 'chromium-compose-pna',
+      testMatch: /auth-contract-local\.spec\.ts/,
+      use: {
+        ...devices['Desktop Chrome'],
+        launchOptions: {
+          args: [
+            // Disable the full family of PNA / LNA blocking features. Names
+            // have shifted across Chromium versions (PrivateNetworkAccess*
+            // → LocalNetworkAccessChecks) so we list both — unknown names
+            // are silently ignored by Chromium, so over-listing is safe.
+            '--disable-features=LocalNetworkAccessChecks,PrivateNetworkAccessSendPreflights,PrivateNetworkAccessRespectPreflightResults,BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessPermissionPrompt',
+          ],
+        },
+      },
+    },
   ],
   // No webServer — the k8s API is already running.
 });

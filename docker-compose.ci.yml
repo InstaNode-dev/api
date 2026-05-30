@@ -1,0 +1,128 @@
+# docker-compose.ci.yml — Layer-2 PR-gate harness.
+#
+# Purpose
+# -------
+# The Layer-1 auth-contract Playwright spec
+# (instanode-web/e2e/auth-contract.spec.ts + this repo's PR-time dispatch in
+# ci.yml::dispatch-auth-contract-e2e) drives Chromium against PRODUCTION api.
+# It catches the AUTH-004-class regression AFTER an api PR merges + deploys.
+#
+# This compose stack is the Layer-2 gate: spin up a minimal real-binary api
+# built from the PR's branch, run the SAME contract assertions against it
+# locally inside the GH Actions runner, fail the PR BEFORE merge if the
+# preflight loses ACAO / ACAC or /auth/email/start stops returning 202.
+#
+# Anti-goals (deliberately not in here)
+# -------------------------------------
+#   - worker + provisioner. The auth surface does not need them. Magic-link
+#     /auth/email/start writes a row and returns 202 even if the downstream
+#     email backend is missing — that's deliberate enumeration defence (see
+#     handlers/magic_link.go::Start) and exactly what makes this stack
+#     viable without a worker.
+#   - object storage, NATS, mongo. None on the auth path.
+#   - shipping this to prod. This file is CI-only. infra/docker-compose.yml
+#     remains the local-dev stack; this file is a peer not a replacement.
+#
+# Build context
+# -------------
+# Built from the REPO PARENT (the workspace that holds proto/, common/, api/
+# as siblings) because the Dockerfile expects all three. In CI the workflow
+# checks out proto+common as siblings of api/ and runs
+#   docker compose -f api/docker-compose.ci.yml --project-directory .. up -d --build
+# so the build context resolves the COPY proto/, COPY common/, COPY api/
+# lines exactly as deploy.yml does.
+#
+# Resources
+# ---------
+# postgres:17-alpine + redis:7-alpine. The api auto-runs migrations on boot
+# (main.go::runMigrations) so no separate migrator container is needed.
+#
+# CORS contract
+# -------------
+# The router (internal/router/router.go ~L237) appends
+# http://localhost:5173,3000,5174 to the CORS allowlist when ENVIRONMENT=
+# development. The Playwright spec stubs out http://localhost:5173 as the
+# document origin so the cross-origin fetch to http://localhost:8080 is
+# genuinely cross-origin and exercises the same code path that ships to
+# prod.
+
+services:
+  postgres:
+    # Postgres 17 — newer than CI's :16-alpine but compatible with every
+    # migration in internal/db/migrations/. Pinning to a recent major catches
+    # any forward-compat breakage at PR time rather than at infra-bump time.
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: instant_platform
+    healthcheck:
+      # `pg_isready` is the standard probe — accepting connections == ready
+      # for the api's RunMigrations call.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d instant_platform"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    # Build from repo PARENT so the multi-stage Dockerfile can COPY proto/
+    # + common/ + api/ as siblings. The CI workflow runs `docker compose
+    # ... --project-directory ..` to set the build context root accordingly.
+    build:
+      context: ..
+      dockerfile: api/Dockerfile
+      args:
+        # Deterministic stamp so /healthz commit_id is comparable across runs
+        # (we want it to equal $GITHUB_SHA in CI; falls back to "ci-local"
+        # for laptop runs).
+        GIT_SHA: ${GIT_SHA:-ci-local}
+        BUILD_TIME: ${BUILD_TIME:-ci-local}
+        VERSION: ${VERSION:-ci-local}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      # Required by config.Load (see internal/config/config.go::Load).
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/instant_platform?sslmode=disable
+      # 64-hex = 32 raw bytes — matches AES-256-GCM key requirement. Public
+      # test value, never reused outside this compose stack.
+      AES_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      JWT_SECRET: ci-test-jwt-secret-not-used-in-prod
+      # ENVIRONMENT=development is what unlocks the http://localhost:5173,
+      # :3000, :5174 origins in the CORS allowlist (router.go ~L237). Without
+      # this, the Playwright spec's cross-origin POST would be blocked by
+      # CORS and silently pass the wrong contract.
+      ENVIRONMENT: development
+      REDIS_URL: redis://redis:6379
+      # Disable expensive optional providers. None of these are on the auth
+      # surface so we set them to "noop"/empty equivalents.
+      INSTANT_ENABLED_SERVICES: redis,postgres
+      # PostgresCustomersURL is required by config.Load (default points at a
+      # k8s DNS name that doesn't resolve here). Point at the same Postgres
+      # — the auth contract doesn't exercise customer-DB provisioning so
+      # whether the URL works is irrelevant; we just need config.Load to
+      # accept it.
+      POSTGRES_CUSTOMERS_URL: postgres://postgres:postgres@postgres:5432/instant_platform?sslmode=disable
+      # Skip the geo-IP DB lookup (no MMDB volume in this stack). middleware
+      # GeoEnrich no-ops when the DB pointer is nil.
+      GEOLITE2_DB_PATH: /tmp/no-such-geolite2.mmdb
+    healthcheck:
+      # /healthz returns 200 once migrations + DB ping succeed. The wget is
+      # alpine-bundled so no extra package install.
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8080/healthz | grep -q ok || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 10s

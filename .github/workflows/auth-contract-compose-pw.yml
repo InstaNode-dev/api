@@ -1,0 +1,212 @@
+# Layer-2 auth-contract PR gate. Spins up a docker-compose stack with
+# postgres + redis + the api binary BUILT FROM THIS PR'S SOURCE, then runs
+# the same Playwright contract assertions that the Layer-1 prod-target
+# spec runs (instanode-web/e2e/auth-contract.spec.ts + this repo's
+# e2e/browser/tests/auth-contract-local.spec.ts). Difference: this fires
+# on every PR and reds the PR if the contract regresses — Layer-1 catches
+# regressions ~5 minutes POST-deploy, this catches them PRE-merge.
+#
+# Cost ceiling: ~5 min wall clock per PR (compose build dominates ~3 min).
+# No path filter — the auth surface is implicit (a router change, a CORS
+# config tweak, a magic-link handler tweak, a config.Load default flip
+# could all break it without touching obvious "auth" paths).
+#
+# What this does NOT cover:
+#   - email delivery (worker + Brevo; covered by post-deploy auth-probe).
+#   - dashboard SPA cookie exchange round-trip (covered by Layer-1 prod
+#     spec — needs a real web origin DNS record).
+#   - rate-limit / abuse-defence paths (covered by unit tests).
+# What this DOES cover that nothing else does:
+#   - the literal CORS preflight headers from the PR's api binary, against
+#     a real Chromium fetch — closes the 2026-05-29 / 2026-05-30 outage
+#     class at PR time.
+
+name: Auth Contract (Layer-2 compose Playwright)
+
+on:
+  pull_request:
+    branches: [master]
+    # NO paths-ignore. The auth surface is the union of:
+    #   internal/router/router.go (CORS config)
+    #   internal/handlers/auth*.go (Exchange / Email)
+    #   internal/handlers/magic_link.go
+    #   internal/middleware/preflight_allowlist.go
+    #   internal/config/config.go (Environment default)
+    #   internal/db/migrations/*  (magic_link table shape)
+    # Any of these can regress the contract — the only honest filter is
+    # "every PR". The 5-min wall-clock budget makes this affordable.
+  workflow_dispatch:
+
+concurrency:
+  group: auth-contract-compose-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  auth-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout api
+        uses: actions/checkout@v6
+        with:
+          path: api
+
+      # The Dockerfile multi-stage build does `COPY proto/`, `COPY common/`,
+      # `COPY api/` — so the build context needs all three as siblings.
+      # Identical pattern to ci.yml / deploy.yml.
+      - name: Checkout proto sibling (for go.mod replace ../proto)
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
+          path: proto
+
+      - name: Checkout common sibling (for go.mod replace ../common)
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
+          path: common
+
+      - name: Set up Node (for Playwright)
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: api/e2e/browser/package-lock.json
+
+      - name: Install Playwright + Chromium
+        working-directory: api/e2e/browser
+        # `npm ci` keeps lockfile drift out of CI; --with-deps installs the
+        # system libs Chromium needs on a fresh ubuntu-latest runner.
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Build + start docker-compose stack
+        # Compose resolves `context: ..` (in api/docker-compose.ci.yml)
+        # RELATIVE TO THE COMPOSE FILE'S DIRECTORY by default, which lands
+        # on the GitHub workspace root holding proto/, common/, api/ — exactly
+        # the path the multi-stage Dockerfile expects for its three COPY
+        # lines. Build args stamp /healthz commit_id with the real PR SHA
+        # so the artifact emitted below is comparable to $GITHUB_SHA.
+        env:
+          GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BUILD_TIME: ${{ github.event.repository.updated_at }}
+          VERSION: pr-${{ github.event.pull_request.number || 'manual' }}
+        run: |
+          set -euo pipefail
+          docker compose \
+            -f api/docker-compose.ci.yml \
+            up -d --build
+
+      - name: Wait for api /healthz to return 200
+        # 90s ceiling — postgres pull + start + api migration apply +
+        # listener bind. If we ever blow past this, the api isn't healthy
+        # and the test would fail downstream anyway; failing here gives a
+        # cleaner diagnostic.
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 45); do
+            if curl -sf http://localhost:8080/healthz | tee /tmp/healthz.json | grep -q '"ok":true'; then
+              echo "api healthy after ${i} attempts ($((i*2))s)"
+              break
+            fi
+            echo "waiting for api (${i}/45)"
+            sleep 2
+          done
+          if ! curl -sf http://localhost:8080/healthz >/dev/null; then
+            echo "::error::api never became healthy in 90s"
+            docker compose -f api/docker-compose.ci.yml ps
+            docker compose -f api/docker-compose.ci.yml logs --tail=200 api
+            exit 1
+          fi
+          echo "── /healthz ────────────────────────────────"
+          cat /tmp/healthz.json
+          echo
+
+      - name: Run Layer-2 Playwright spec
+        working-directory: api/e2e/browser
+        env:
+          E2E_API_URL: http://localhost:8080
+          E2E_WEB_ORIGIN: http://localhost:5173
+          CI: 'true'
+        # Use the chromium-compose-pna project so Chromium's Local /
+        # Private Network Access checks are disabled (see playwright.config.ts
+        # — both origin and api live in loopback under this stack, which
+        # PNA blocks even though it never trips in prod's public→public flow).
+        run: npx playwright test tests/auth-contract-local.spec.ts --project=chromium-compose-pna --reporter=list
+
+      - name: Emit gate-fired signal (rule 25 — observability)
+        # Compose runs are a CI-internal signal, not a prod metric (so they
+        # don't need an NR alert+dashboard per rule 25's literal text). But
+        # we DO want to be able to answer "did the gate fire on the last
+        # N PRs?" without scraping job logs. A 1-line newline-delimited
+        # JSON artifact does that — downloadable per-run, greppable by
+        # date, no infrastructure required.
+        if: always()
+        # SECURITY: route every GitHub-context interpolation through env:
+        # rather than splicing into the shell, even though all four values
+        # here are GitHub-controlled enums/integers/hashes (no user-author
+        # input). Keeps the surface uniformly safe — same pattern as the
+        # ci.yml::dispatch-auth-contract-e2e step.
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || 'manual' }}
+          PR_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          # Defensive shape checks — PR_NUMBER is an integer or "manual",
+          # SHA is hex. Cheap to enforce, blocks the (theoretical) command
+          # injection vector if a future GitHub bug ever lets these leak.
+          case "$PR_NUMBER" in
+            manual|[0-9]*) ;;
+            *) echo "::error::unexpected PR_NUMBER shape"; exit 1 ;;
+          esac
+          case "$PR_SHA" in
+            [0-9a-f]*) ;;
+            *) echo "::error::unexpected SHA shape"; exit 1 ;;
+          esac
+          case "$JOB_STATUS" in
+            success|failure|cancelled) ;;
+            *) echo "::error::unexpected JOB_STATUS"; exit 1 ;;
+          esac
+          mkdir -p /tmp/gate-signal
+          printf '{"gate":"auth-contract-compose-pw","pr":"%s","sha":"%s","status":"%s","ts":"%s"}\n' \
+            "$PR_NUMBER" \
+            "$PR_SHA" \
+            "$JOB_STATUS" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > /tmp/gate-signal/auth-contract-compose.jsonl
+          cat /tmp/gate-signal/auth-contract-compose.jsonl
+
+      - name: Upload gate-fired signal artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-contract-gate-signal
+          path: /tmp/gate-signal/auth-contract-compose.jsonl
+          retention-days: 30
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-auth-contract-layer2
+          path: api/e2e/browser/playwright-report/
+          retention-days: 14
+
+      - name: Dump api logs on failure
+        if: failure()
+        run: |
+          echo "── docker compose ps ───────────────────────"
+          docker compose -f api/docker-compose.ci.yml ps || true
+          echo "── api logs (tail 500) ─────────────────────"
+          docker compose -f api/docker-compose.ci.yml logs --tail=500 api || true
+          echo "── postgres logs (tail 200) ────────────────"
+          docker compose -f api/docker-compose.ci.yml logs --tail=200 postgres || true
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose -f api/docker-compose.ci.yml down -v || true
