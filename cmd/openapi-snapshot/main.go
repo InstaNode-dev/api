@@ -36,7 +36,11 @@ import (
 
 const defaultOutPath = "openapi.snapshot.json"
 
-func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, handlers.OpenAPISpecProduction)) }
+// exitFn is os.Exit at runtime; tests swap it so the main() body becomes
+// a measurable statement instead of an irreducible coverage hole.
+var exitFn = os.Exit
+
+func main() { exitFn(run(os.Args[1:], os.Stdout, os.Stderr, handlers.OpenAPISpecProduction)) }
 
 // run is the testable body of main. Returns the exit code. specSource is
 // injected so the test suite can drive both the happy path (real production

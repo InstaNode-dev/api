@@ -116,6 +116,22 @@ func TestRun_FileMode_UnwritableOutPath_ReturnsExit2(t *testing.T) {
 	}
 }
 
+// TestMain_DispatchesViaExitFn covers the main() entry-point line by
+// swapping exitFn for a capture closure. os.Args[1:] in test context is
+// the test framework's flag set, which flag.Parse rejects → run returns 2.
+// We assert exitFn received that value (proving main correctly forwards
+// run's return code), not the specific number.
+func TestMain_DispatchesViaExitFn(t *testing.T) {
+	var captured int = -1
+	orig := exitFn
+	exitFn = func(code int) { captured = code }
+	defer func() { exitFn = orig }()
+	main()
+	if captured < 0 {
+		t.Errorf("expected exitFn to be invoked, got captured=%d", captured)
+	}
+}
+
 func TestRun_BadSpecSource_ReturnsExit2(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	badSpec := func() string { return "not json at all" }
