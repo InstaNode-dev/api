@@ -408,7 +408,18 @@ func (h *AuthHandler) GitHub(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "invalid_body", "Request body must be valid JSON")
 	}
 	if body.Code == "" {
-		return respondError(c, fiber.StatusBadRequest, "missing_code", "code field is required")
+		// BUG-API-184 (QA 2026-05-29): the error message used to read
+		// "code field is required" — accurate but agent-unhelpful. An
+		// LLM agent that 4xx'd here needed to either know the GitHub
+		// OAuth code-exchange contract already or open /openapi.json to
+		// learn what to send. Stamp the full required-fields list inline
+		// (the request body has only one field today, but the contract
+		// shape is what the agent needs — `{ "code": "<github_oauth_code>" }`)
+		// so the message is a self-contained instruction. Keep the
+		// `missing_code` error code stable for back-compat (agents
+		// branching on .error stay green).
+		return respondError(c, fiber.StatusBadRequest, "missing_code",
+			"Request body is missing the required `code` field. POST `{\"code\": \"<github_oauth_code>\"}` after exchanging your OAuth authorization code at GitHub.")
 	}
 
 	if h.cfg.GitHubClientID == "" || h.cfg.GitHubClientSecret == "" {
@@ -514,10 +525,18 @@ func (h *AuthHandler) GoogleCallback(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "invalid_body", "Request body must be valid JSON")
 	}
 	if body.Code == "" {
-		return respondError(c, fiber.StatusBadRequest, "missing_code", "code field is required")
+		// BUG-API-184 (QA 2026-05-29): mirror the GitHub surface so the
+		// agent-actionable message names BOTH fields the Google callback
+		// expects (code + redirect_uri). Same code stays for back-compat;
+		// only the human/agent-facing message gains the shape hint.
+		return respondError(c, fiber.StatusBadRequest, "missing_code",
+			"Request body is missing the required `code` field. POST `{\"code\": \"<google_oauth_code>\", \"redirect_uri\": \"<uri>\"}` after exchanging your OAuth authorization code at Google.")
 	}
 	if body.RedirectURI == "" {
-		return respondError(c, fiber.StatusBadRequest, "missing_redirect_uri", "redirect_uri field is required")
+		// BUG-API-184: same treatment — name the field and the body shape
+		// so an LLM hitting this 4xx has everything it needs to retry.
+		return respondError(c, fiber.StatusBadRequest, "missing_redirect_uri",
+			"Request body is missing the required `redirect_uri` field. POST `{\"code\": \"<google_oauth_code>\", \"redirect_uri\": \"<uri>\"}` matching the redirect_uri you registered with Google.")
 	}
 
 	accessToken, err := exchangeGoogleAuthorizationCode(c.Context(), h.cfg.GoogleClientID, h.cfg.GoogleClientSecret, body.Code, body.RedirectURI)

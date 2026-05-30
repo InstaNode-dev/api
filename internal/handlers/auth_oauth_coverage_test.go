@@ -248,7 +248,23 @@ func TestAuth_GitHub_MissingCodeAndBadBody(t *testing.T) {
 
 	r2 := oauthPostJSON(t, app, "/auth/github", `{}`)
 	assert.Equal(t, http.StatusBadRequest, r2.StatusCode)
+	// BUG-API-184 (QA 2026-05-29): the missing-code message used to read
+	// "code field is required" — accurate but agent-unhelpful. Pin the
+	// agent-actionable copy: the message MUST name the field AND the
+	// expected request body shape so an LLM hitting this 4xx has
+	// everything it needs to retry without opening the OpenAPI spec.
+	var env struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, json.NewDecoder(r2.Body).Decode(&env))
 	r2.Body.Close()
+	assert.Equal(t, "missing_code", env.Error,
+		"BUG-API-184: error code MUST stay missing_code for back-compat")
+	assert.Contains(t, env.Message, "`code`",
+		"BUG-API-184: message must name the required field (`code`); got %q", env.Message)
+	assert.Contains(t, env.Message, `{"code":`,
+		"BUG-API-184: message must show the request body shape `{\"code\": \"<...>\"}`; got %q", env.Message)
 }
 
 func TestAuth_GitHub_NotConfigured(t *testing.T) {
