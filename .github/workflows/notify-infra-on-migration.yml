@@ -1,0 +1,68 @@
+---
+# instant.dev/api — notify infra repo when migrations change.
+#
+# The CF Containers staging pg-platform image bakes
+# api/internal/db/migrations/*.sql into /docker-entrypoint-initdb.d/.
+# Daily cron rebuilds the image, but that's a 24h lag for migration
+# changes. This workflow sends a repository_dispatch to infra as soon
+# as a migration lands on master, triggering an immediate rebuild
+# (cutting the lag from ≤24h to ≤2min).
+#
+# This is a no-op if INFRA_DISPATCH_TOKEN is unset — the workflow logs
+# a notice and exits 0 so the api repo isn't blocked on infra-side
+# secret rotation. Daily cron remains the fallback.
+#
+# Security: no user-controllable input is consumed in run: blocks.
+
+name: notify-infra-on-migration
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'internal/db/migrations/**'
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    name: dispatch migrations-changed to infra
+    runs-on: ubuntu-latest
+    env:
+      # INFRA_DISPATCH_TOKEN is a fine-grained PAT with Contents:read +
+      # repository_dispatch:write on instanode-dev/infra. Set via
+      #   gh secret set INFRA_DISPATCH_TOKEN -R instanode-dev/api
+      INFRA_DISPATCH_TOKEN: ${{ secrets.INFRA_DISPATCH_TOKEN }}
+      # Commit SHA is provided by GHA and is always a 40-char hex —
+      # safe to embed but we use env-passing for consistency.
+      HEAD_SHA: ${{ github.sha }}
+    steps:
+      - name: Skip if token unset
+        id: gate
+        run: |
+          if [ -z "${INFRA_DISPATCH_TOKEN}" ]; then
+            echo "::notice::INFRA_DISPATCH_TOKEN unset; relying on infra daily cron rebuild"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Dispatch event to infra repo
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ env.INFRA_DISPATCH_TOKEN }}
+          INFRA_REPO: ${{ vars.INFRA_REPO || format('{0}/infra', github.repository_owner) }}
+        run: |
+          # repository_dispatch event arrives at infra's
+          # wrangler-build-staging-images.yml with types=[migrations-changed]
+          # which triggers an immediate rebuild of the pg-platform staging
+          # image with the latest migrations baked in.
+          gh api \
+            "repos/${INFRA_REPO}/dispatches" \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -f "event_type=migrations-changed" \
+            -f "client_payload[source_sha]=${HEAD_SHA}" \
+            -f "client_payload[source_repo]=${GITHUB_REPOSITORY}"
+          echo "::notice::Dispatched migrations-changed to ${INFRA_REPO} (source SHA ${HEAD_SHA:0:7})"
