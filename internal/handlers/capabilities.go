@@ -191,6 +191,23 @@ func (h *CapabilitiesHandler) Get(c *fiber.Ctx) error {
 		})
 	}
 
+	// BUG-API-039 / BUG-API-311 (QA 2026-05-29): /api/v1/capabilities
+	// is dashboard-hit on every nav (sidebar tile counts, billing card,
+	// settings page render). The response only changes when
+	// api/plans.yaml is edited and the binary is redeployed — so the
+	// tier matrix is *immutable for the life of the running pod*.
+	// Without a Cache-Control hint each dashboard nav re-fetched the
+	// full ~4 KB matrix; sidebar fanout meant 4-6 redundant fetches per
+	// nav (BUG-DASH-016 noise). A `max-age=60` directive lets the
+	// browser fetch cache + intermediaries serve the response from the
+	// edge for a minute, cutting tile-render latency without hiding a
+	// real tier change for longer than one rule-23 deploy cycle (the
+	// build-SHA flip invalidates the proxy cache via /healthz polling).
+	// `public` because the tier matrix is the same for every caller
+	// (no per-user discrimination); `must-revalidate` so stale-while-
+	// revalidate proxies still re-fetch on expiry rather than serving
+	// indefinitely-stale rows after an extended offline period.
+	c.Set(fiber.HeaderCacheControl, "public, max-age=60, must-revalidate")
 	return c.JSON(fiber.Map{
 		"ok":      true,
 		"tiers":   out,
