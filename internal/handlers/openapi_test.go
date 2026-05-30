@@ -138,6 +138,50 @@ func TestOpenAPI_StacksEndpointsDocumented(t *testing.T) {
 	}
 }
 
+// TestOpenAPI_StackRequestUsesAdditionalProperties pins DOG-30 (QA 2026-05-29):
+// the dynamic per-service multipart field used to be modeled with a literal
+// "<service-name>" property in the StackRequest schema, which codegen clients
+// (Postman, OpenAPI-generator, etc.) would interpret as "a property literally
+// named <service-name>", emitting broken upload code. The contract is now
+// expressed with additionalProperties — the OpenAPI-3 idiom for "any
+// additional field with this shape".
+func TestOpenAPI_StackRequestUsesAdditionalProperties(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	schema, ok := digMap(v, "components", "schemas", "StackRequest")
+	if !ok {
+		t.Fatal("DOG-30: StackRequest schema missing entirely")
+	}
+
+	// The literal placeholder must NOT appear as a property — it's the
+	// regression marker for the original bug. Codegen clients emitted a
+	// real field literally named "<service-name>" when this was present.
+	props, _ := schema["properties"].(map[string]any)
+	if _, has := props["<service-name>"]; has {
+		t.Error("DOG-30: StackRequest.properties still contains the literal '<service-name>' placeholder — codegen clients will emit a broken field with that literal name. Use additionalProperties to express the dynamic per-service shape instead.")
+	}
+
+	// additionalProperties must be present with the binary-upload shape so
+	// codegen clients understand "for every service in manifest.services,
+	// emit one upload field named after the service".
+	ap, has := schema["additionalProperties"]
+	if !has {
+		t.Fatal("DOG-30: StackRequest schema missing additionalProperties — the dynamic per-service multipart field has no machine-readable contract")
+	}
+	apMap, ok := ap.(map[string]any)
+	if !ok {
+		t.Fatalf("DOG-30: StackRequest.additionalProperties must be an object schema, got %T", ap)
+	}
+	if apMap["type"] != "string" {
+		t.Errorf("DOG-30: StackRequest.additionalProperties.type must be 'string' (multipart upload), got %v", apMap["type"])
+	}
+	if apMap["format"] != "binary" {
+		t.Errorf("DOG-30: StackRequest.additionalProperties.format must be 'binary' (multipart binary upload), got %v", apMap["format"])
+	}
+}
+
 // TestOpenAPI_MultiEnvEndpointsDocumented guards RETRO-2026-05-12 §10.17:
 // the env-promotion endpoints (POST /api/v1/stacks/:slug/promote and
 // POST /api/v1/vault/copy) must be discoverable in the spec, and both must
