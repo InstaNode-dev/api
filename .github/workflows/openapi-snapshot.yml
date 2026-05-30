@@ -1,0 +1,110 @@
+# Cross-stack OpenAPI contract snapshot check.
+#
+# Why this exists: today's prod login broke for ~24h because /auth/exchange
+# (AUTH-004) shipped server-side without the dashboard's client being updated.
+# Per-repo unit tests on both sides stayed green because each repo only saw
+# its own half of the contract. This workflow makes the contract a committed
+# artifact (api/openapi.snapshot.json) that the dashboard + instanode-web
+# repos consume to generate typed clients. A drift here at PR time forces
+# the engineer to address client-side regeneration in the same change.
+#
+# Gate logic (small + cheap, < 30s):
+#   1. Build the openapi-snapshot tool.
+#   2. Regenerate openapi.snapshot.json from internal/handlers/openapi.go.
+#   3. Diff against the committed file. If different → fail with the exact
+#      `make openapi-snapshot` command the engineer must run.
+#
+# Observability (rule 25): a single structured log line per run so we can
+# query CI artifacts for the rate at which contract drift is being caught:
+#   {"event":"cross_stack_contract_drift","detected":true|false,"repo":"api"}
+# Captured by the GitHub Actions log forwarder into NR (instanode-reliability
+# dashboard tile: "Contract drift caught at PR time, 30d").
+
+name: openapi-snapshot
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'internal/handlers/openapi.go'
+      - 'cmd/openapi-snapshot/**'
+      - 'openapi.snapshot.json'
+      - '.github/workflows/openapi-snapshot.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'internal/handlers/openapi.go'
+      - 'cmd/openapi-snapshot/**'
+      - 'openapi.snapshot.json'
+      - '.github/workflows/openapi-snapshot.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: openapi-snapshot-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  snapshot-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Checkout proto sibling (for go.mod replace ../proto)
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
+          path: _proto_ci
+
+      - name: Place ../proto for Go replace directive
+        run: mv _proto_ci ../proto
+
+      - name: Checkout common sibling (for go.mod replace ../common)
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
+          path: _common_ci
+
+      - name: Place ../common for Go replace directive
+        run: mv _common_ci ../common
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+
+      - name: Regenerate openapi.snapshot.json
+        id: regen
+        run: |
+          go run ./cmd/openapi-snapshot/ -out /tmp/openapi.snapshot.regenerated.json
+          if diff -q openapi.snapshot.json /tmp/openapi.snapshot.regenerated.json >/dev/null; then
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Emit observability line (rule 25)
+        # Single structured line so NR log forwarder can chart drift rate.
+        # Runs regardless of drift status so the absence of drift is also
+        # a data point ("we ran, we passed").
+        run: |
+          printf '{"event":"cross_stack_contract_drift","detected":%s,"repo":"api","pr":"%s","sha":"%s"}\n' \
+            "${{ steps.regen.outputs.drift }}" \
+            "${{ github.event.pull_request.number || 'none' }}" \
+            "${GITHUB_SHA:0:7}"
+
+      - name: Fail if snapshot is out of date
+        if: steps.regen.outputs.drift == 'true'
+        run: |
+          echo "::error::openapi.snapshot.json is out of date."
+          echo "::error::An edit to internal/handlers/openapi.go changed the production OpenAPI surface but the snapshot was not regenerated."
+          echo "::error::Run \`make openapi-snapshot\` and commit the updated file in this PR."
+          echo "::error::This is rule 22 (contract surface checklist): dashboard + instanode-web depend on this snapshot to generate typed clients."
+          echo ""
+          echo "Drift (committed → regenerated, first 200 lines):"
+          diff -u openapi.snapshot.json /tmp/openapi.snapshot.regenerated.json | head -200 || true
+          exit 1
+
+      - name: Snapshot is current
+        if: steps.regen.outputs.drift == 'false'
+        run: echo "openapi.snapshot.json matches handlers.OpenAPISpecProduction() — dashboards can regenerate clients deterministically."
