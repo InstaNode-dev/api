@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -50,5 +53,60 @@ func TestCanonicalise_DoesNotEscapeHTML(t *testing.T) {
 	}
 	if strings.Contains(s, "\\u0026") {
 		t.Errorf("expected '&' not to be escaped as backslash-u0026, got:\n%s", s)
+	}
+}
+
+func TestRun_StdoutMode_WritesCanonicalSpec(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-stdout"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %s)", code, stderr.String())
+	}
+	if stdout.Len() == 0 {
+		t.Fatal("expected non-empty stdout")
+	}
+	if !strings.HasPrefix(stdout.String(), "{") {
+		t.Errorf("expected JSON object on stdout, got prefix: %q", stdout.String()[:min(40, stdout.Len())])
+	}
+}
+
+func TestRun_FileMode_WritesToCustomOutPath(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "snap.json")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-out", target}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %s)", code, stderr.String())
+	}
+	stat, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("expected file at %s, got error: %v", target, err)
+	}
+	if stat.Size() == 0 {
+		t.Errorf("expected non-empty file, got 0 bytes")
+	}
+	if !strings.Contains(stderr.String(), "wrote") {
+		t.Errorf("expected stderr breadcrumb 'wrote N bytes to ...', got: %q", stderr.String())
+	}
+}
+
+func TestRun_BadFlag_ReturnsExit2(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--no-such-flag"}, &stdout, &stderr)
+	if code != 2 {
+		t.Errorf("expected exit 2 for unknown flag, got %d", code)
+	}
+}
+
+func TestRun_FileMode_UnwritableOutPath_ReturnsExit2(t *testing.T) {
+	// /dev/full is a Linux-only sink that always returns ENOSPC. Skip on
+	// platforms without it (CI runs Linux, local dev may be macOS).
+	if _, err := os.Stat("/dev/full"); err != nil {
+		t.Skip("/dev/full not available on this platform")
+	}
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-out", "/dev/full"}, &stdout, &stderr)
+	if code != 2 {
+		t.Errorf("expected exit 2 for unwritable -out, got %d (stderr: %s)", code, stderr.String())
 	}
 }

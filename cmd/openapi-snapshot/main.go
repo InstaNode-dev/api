@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
 	"instant.dev/internal/handlers"
@@ -36,34 +37,50 @@ import (
 const defaultOutPath = "openapi.snapshot.json"
 
 func main() {
-	out := flag.String("out", defaultOutPath, "destination file for the canonical snapshot")
-	toStdout := flag.Bool("stdout", false, "write to stdout instead of -out (CI diff mode)")
-	flag.Parse()
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// run is the testable body of main. Returns the exit code. Splitting main
+// from run lets the test suite invoke the binary's behaviour without
+// shelling out to a subprocess.
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("openapi-snapshot", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	out := fs.String("out", defaultOutPath, "destination file for the canonical snapshot")
+	toStdout := fs.Bool("stdout", false, "write to stdout instead of -out (CI diff mode)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 
 	canonical, err := canonicalise(handlers.OpenAPISpecProduction())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "openapi-snapshot: canonicalise: %v\n", err)
-		os.Exit(2)
+		fmt.Fprintf(stderr, "openapi-snapshot: canonicalise: %v\n", err)
+		return 2
 	}
 
 	if *toStdout {
-		if _, err := os.Stdout.Write(canonical); err != nil {
-			fmt.Fprintf(os.Stderr, "openapi-snapshot: stdout: %v\n", err)
-			os.Exit(2)
+		if _, err := stdout.Write(canonical); err != nil {
+			fmt.Fprintf(stderr, "openapi-snapshot: stdout: %v\n", err)
+			return 2
 		}
-		return
+		return 0
 	}
 
 	if err := os.WriteFile(*out, canonical, 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "openapi-snapshot: write %s: %v\n", *out, err)
-		os.Exit(2)
+		fmt.Fprintf(stderr, "openapi-snapshot: write %s: %v\n", *out, err)
+		return 2
 	}
-	fmt.Fprintf(os.Stderr, "openapi-snapshot: wrote %d bytes to %s\n", len(canonical), *out)
+	fmt.Fprintf(stderr, "openapi-snapshot: wrote %d bytes to %s\n", len(canonical), *out)
+	return 0
 }
 
 // canonicalise parses the spec as JSON and re-emits it with sorted keys and
 // 2-space indent so that the on-disk snapshot is deterministic and friendly
 // to diff. encoding/json sorts map keys alphabetically by default.
+//
+// Re-encoding a value produced by json.Unmarshal cannot fail (bytes.Buffer
+// writes never error, and json.Marshal on interface{} produced from valid
+// JSON is always defined), so we only surface the parse error.
 func canonicalise(spec string) ([]byte, error) {
 	var v any
 	if err := json.Unmarshal([]byte(spec), &v); err != nil {
@@ -73,8 +90,6 @@ func canonicalise(spec string) ([]byte, error) {
 	enc := json.NewEncoder(&buf)
 	enc.SetIndent("", "  ")
 	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, fmt.Errorf("re-emit spec: %w", err)
-	}
+	_ = enc.Encode(v) // see godoc: re-encoding a valid-JSON-derived value cannot fail
 	return buf.Bytes(), nil
 }
