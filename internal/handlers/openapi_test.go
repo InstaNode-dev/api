@@ -649,6 +649,15 @@ func TestOpenAPI_CoversAllRegisteredRoutes(t *testing.T) {
 		// thinking cookies are a valid auth mechanism — they're not
 		// (CLAUDE.md "Live API surface" + auth_beareronly_authp0_test.go).
 		"POST /auth/exchange": true,
+		// BUG-API-411 (QA 2026-05-29): RFC 9116 security.txt is a
+		// security-researcher disclosure surface, not an agent-facing
+		// API. The body is hand-crafted text/plain matching RFC §2.3,
+		// not JSON, so it has no OpenAPI schema. Both the canonical
+		// .well-known path and the apex fallback are excluded from the
+		// public spec on the same rationale. See security_txt.go for
+		// the builder and security_txt_test.go for the wire contract.
+		"GET /.well-known/security.txt": true,
+		"GET /security.txt":             true,
 	}
 
 	var missing []string
