@@ -1,0 +1,159 @@
+---
+# api/.github/workflows/preview-image-build.yml — Phase 1b companion.
+#
+# Builds + pushes a `:pr-<N>-<sha>` GHCR tag of the api image on every PR
+# open / sync / reopen. The infra repo's preview-create workflow (also
+# Phase 1b) pulls this exact tag when it provisions the per-PR namespace.
+#
+# Why a sibling workflow rather than a tag-add on deploy.yml: deploy.yml
+# only fires on push to master. PR builds need a parallel pipeline.
+#
+# Scope:
+#   - Mirrors deploy.yml's image-build step (sibling repo checkout for
+#     common/ + proto/, same Dockerfile, same buildx invocation) but
+#     SKIPS the test gate (CI's ci.yml already runs the test suite on
+#     PRs; the preview-image build is purely "package the binary so a
+#     preview env can pull it"). Faster turnaround, no duplicated load
+#     on the test runner.
+#   - Tags ONLY `:pr-<N>-<sha>`. Never touches `:latest` or `:master-*`
+#     (production tag namespace is reserved for deploy.yml). Per
+#     IMAGE-RETENTION-POLICY.md the pin-prod-images workflow only
+#     protects `master-*` + semver tags; `pr-*` tags are free to be
+#     reaped by GHCR retention.
+#   - Soft-fails if GHCR_PUSH_TOKEN is unset (matches deploy.yml's
+#     auth posture — GHCR_PUSH_TOKEN is a classic PAT with write:packages
+#     for the InstaNode-dev org; per-job GITHUB_TOKEN cannot push to
+#     the org-owned package, see deploy.yml line 230 comment).
+#   - Does NOT deploy. The infra repo's preview-create workflow handles
+#     the `kubectl set image` equivalent (applies a fresh Deployment).
+#
+# Concurrency: a rapid push that fires this workflow twice for the same
+# PR will cancel the older run — the latest SHA is what the preview env
+# wants.
+
+name: preview-image-build
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    # Same docs-only path skip as deploy.yml: preview images for a
+    # markdown-only PR are useless and burn CI minutes.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'CLAUDE.md'
+      - '.gitignore'
+      - 'LICENSE'
+      - 'BUGBASH-*/**'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: preview-image-build-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_REPO: ghcr.io/instanode-dev/instant-api
+
+jobs:
+  build:
+    name: Build + push :pr-<N>-<sha> image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Soft-check GHCR_PUSH_TOKEN
+        id: prereq
+        env:
+          GHCR_PUSH_TOKEN: ${{ secrets.GHCR_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GHCR_PUSH_TOKEN:-}" ]; then
+            echo "::warning::GHCR_PUSH_TOKEN not set on api repo — skipping preview image build."
+            echo "::warning::infra preview-create will soft-fail with 'image not yet pushed' on rollout."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout api (this repo) into ./api
+        if: steps.prereq.outputs.skip == 'false'
+        uses: actions/checkout@v6
+        with:
+          path: api
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Checkout common sibling into ./common
+        if: steps.prereq.outputs.skip == 'false'
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
+          path: common
+
+      - name: Checkout proto sibling into ./proto
+        if: steps.prereq.outputs.skip == 'false'
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
+          path: proto
+
+      - name: Compute build metadata
+        if: steps.prereq.outputs.skip == 'false'
+        id: meta
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Defensive: github.event.pull_request.number is always numeric +
+          # github-controlled, but match deploy.yml's shape discipline.
+          case "${PR_NUMBER}" in
+            [1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9]) ;;
+            *) echo "::error::unexpected PR_NUMBER: ${PR_NUMBER}"; exit 1 ;;
+          esac
+          case "${PR_HEAD_SHA}" in
+            [0-9a-f]*) ;;
+            *) echo "::error::unexpected SHA shape: ${PR_HEAD_SHA}"; exit 1 ;;
+          esac
+          SHORT_SHA="${PR_HEAD_SHA:0:7}"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # Tag matches the pattern preview-create expects.
+          VERSION="pr-${PR_NUMBER}-${SHORT_SHA}"
+          echo "short_sha=${SHORT_SHA}"  >> "$GITHUB_OUTPUT"
+          echo "build_time=${BUILD_TIME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}"       >> "$GITHUB_OUTPUT"
+          echo "Building ${VERSION} (${BUILD_TIME})"
+
+      - name: Set up Docker Buildx
+        if: steps.prereq.outputs.skip == 'false'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: steps.prereq.outputs.skip == 'false'
+        # Same PAT posture as deploy.yml: GHCR_PUSH_TOKEN is a classic PAT
+        # with write:packages for the InstaNode-dev org. The per-job
+        # GITHUB_TOKEN, even with `packages: write`, is scoped to THIS
+        # repo and cannot push to the org-owned package — see deploy.yml
+        # for the full rationale.
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_PUSH_TOKEN }}
+
+      - name: Build and push :pr-<N>-<sha> image
+        if: steps.prereq.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/amd64 \
+            -f api/Dockerfile \
+            --build-arg GIT_SHA="${{ steps.meta.outputs.short_sha }}" \
+            --build-arg BUILD_TIME="${{ steps.meta.outputs.build_time }}" \
+            --build-arg VERSION="${{ steps.meta.outputs.version }}" \
+            -t "${IMAGE_REPO}:${{ steps.meta.outputs.version }}" \
+            --push \
+            .
+          echo "pushed ${IMAGE_REPO}:${{ steps.meta.outputs.version }}"
