@@ -36,6 +36,7 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -109,7 +110,12 @@ type wallMetadata struct {
 // per-team max-age override (e.g. shorter for hobby_plus walls) has a
 // single edit site. BUG-API-420.
 func (h *UsageWallHandler) setUsageWallCacheHeaders(c *fiber.Ctx) {
-	c.Set("Cache-Control", "private, max-age=30")
+	// Sprintf instead of a literal so the constant above (with its
+	// consistency-tradeoff comment) is the single source of truth and
+	// can't drift from the wire value. golangci-lint's `unused` check
+	// blocks anyone deleting the constant without also touching this
+	// fmt format string.
+	c.Set("Cache-Control", fmt.Sprintf("private, max-age=%d", usageWallCacheMaxAge))
 	// Vary: Authorization is the per-team boundary — without it a
 	// shared cache (CDN, browser back-cache after re-auth) could
 	// serve team A's banner state to team B.
