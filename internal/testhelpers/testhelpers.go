@@ -1066,9 +1066,13 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	// B17-P0 (BugBash 2026-05-20): broker-mode presign with the production
 	// middleware chain so handler-level tests see the same guarantees as
 	// production callers. See internal/router/router.go for the wiring
-	// rationale (OptionalAuth → PresignTokenRateLimit → Idempotency).
+	// rationale (OptionalAuthStrict → PresignTokenRateLimit → Idempotency).
+	// 2026-05-30: switched to OptionalAuthStrict to mirror production after
+	// the H46 F1 fix landed in router.go (the comment had said strict but
+	// the chain was bare). Handler-level tests need the strict variant or
+	// they would falsely pass while prod rejects a bad bearer.
 	app.Post("/storage/:token/presign",
-		middleware.OptionalAuth(cfg),
+		middleware.OptionalAuthStrict(cfg),
 		middleware.PresignTokenRateLimit(rdb),
 		middleware.Idempotency(rdb, "storage.presign"),
 		storageH.PresignStorage,
