@@ -107,11 +107,18 @@ func (h *OnboardingHandler) ClaimPreview(c *fiber.Ctx) error {
 	}
 
 	if ev.ConvertedAt.Valid {
+		// `items` is the canonical envelope field for every list endpoint on
+		// the platform (`/api/v1/resources`, `/api/v1/deployments`, audit,
+		// backups). `/claim/preview` originally shipped with `resources` —
+		// kept as a legacy alias so the dashboard / sdk-go don't break; new
+		// callers should read `items`. B5-P1-3 (BugBash 2026-05-20).
+		empty := []fiber.Map{}
 		return c.JSON(fiber.Map{
 			"ok":              true,
 			"token_valid":     false,
 			"already_claimed": true,
-			"resources":       []fiber.Map{},
+			"items":           empty,
+			"resources":       empty,
 		})
 	}
 
@@ -172,9 +179,13 @@ func (h *OnboardingHandler) ClaimPreview(c *fiber.Ctx) error {
 		expiresAt = claims.ExpiresAt.Time.UTC().Format(time.RFC3339)
 	}
 
+	// Emit BOTH `items` (canonical) and `resources` (legacy alias). Both
+	// point at the same slice — no allocation overhead. See B5-P1-3
+	// note on the already_claimed branch above for rationale.
 	return c.JSON(fiber.Map{
 		"ok":          true,
 		"token_valid": true,
+		"items":       resources,
 		"resources":   resources,
 		"expires_at":  expiresAt,
 	})
