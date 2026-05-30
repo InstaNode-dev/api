@@ -283,6 +283,30 @@ func TestCapabilities_TerminalTierUpgradeURLIsNull(t *testing.T) {
 	}
 }
 
+// TestCapabilities_CacheControlPublicMaxAge60 pins BUG-API-039 /
+// BUG-API-311: /api/v1/capabilities is dashboard-hit on every nav
+// (sidebar tiles, billing card, settings) and the tier matrix is
+// immutable for the life of the running pod (only changes on a
+// plans.yaml edit + redeploy). Without a Cache-Control hint each nav
+// re-fetched the full ~4 KB matrix; sidebar fanout meant 4-6 redundant
+// fetches per nav (BUG-DASH-016).
+//
+// Pin `public, max-age=60, must-revalidate` so the browser/edge cache
+// serves the matrix for a minute while still re-validating on expiry.
+// A future deletion of the c.Set call fails this assertion before merge.
+func TestCapabilities_CacheControlPublicMaxAge60(t *testing.T) {
+	reg := plans.Default()
+	app := newCapabilitiesApp(t, reg)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/capabilities", nil)
+	resp, err := app.Test(req, -1)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "public, max-age=60, must-revalidate",
+		resp.Header.Get("Cache-Control"),
+		"BUG-API-039/311: /api/v1/capabilities must stamp Cache-Control: public, max-age=60, must-revalidate so dashboard nav fanout doesn't re-fetch the same immutable matrix every navigation")
+}
+
 // TestCapabilities_AnnualDiscountFromYAML — when a {tier}_yearly variant
 // exists in the registry, the canonical tier reports a non-zero
 // annual_discount_percent computed from (1 - yearly/(monthly*12)).
