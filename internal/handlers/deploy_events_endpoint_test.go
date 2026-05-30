@@ -24,6 +24,7 @@ package handlers_test
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,10 +32,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"instant.dev/internal/config"
+	"instant.dev/internal/handlers"
+	"instant.dev/internal/middleware"
+	"instant.dev/internal/plans"
 	"instant.dev/internal/testhelpers"
 )
 
@@ -398,4 +404,128 @@ func TestDeployEvents_InvalidLimit_FallsBackToDefault(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 	assert.Equal(t, 50, body.Count, "invalid limit must fall back to default (50)")
 	assert.Len(t, body.Events, 50)
+}
+
+// TestDeployEvents_MidHandler503_FetchFailed: GetDeploymentByAppID returns a
+// non-not-found error (DB fault injected) so the handler's "fetch_failed" 503
+// arm (deploy.go ~L945-947) fires. Mirrors TestDeployGet_MidHandler503.
+func TestDeployEvents_MidHandler503_FetchFailed(t *testing.T) {
+	daDeployNeedsDB(t)
+	seedDB, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, seedDB, "pro"))
+	jwt := testhelpers.MustSignSessionJWT(t, uuid.NewString(), teamID.String(), "deg@example.com")
+	d := seedInternalDeploy(t, seedDB, teamID, "healthy", map[string]string{})
+
+	got := daTryDeployFaultStatus(t, "/api/v1/deployments/"+d.AppID+"/events",
+		http.MethodGet, "", jwt, http.StatusServiceUnavailable)
+	assert.True(t, got, "expected Events 503 within failAfter sweep "+
+		"(covers the GetDeploymentByAppID non-not-found error arm)")
+}
+
+// TestDeployEvents_EventsQueryFailed_ExactErrorCode: the fault-DB sweep above
+// (TestDeployEvents_MidHandler503_FetchFailed) accepts any 503 — it can't
+// distinguish the `fetch_failed` arm (GetDeploymentByAppID) from the
+// `events_query_failed` arm (GetDeploymentEvents). This test pins the LATTER
+// by asserting the exact response envelope error code, so the slog.Error +
+// respondError at deploy.go ~L970-975 is exercised AND verified.
+//
+// Strategy: seed a real deployment into the shared test DB so the
+// deployments-table SELECT succeeds, then drive the same request through a
+// fault-DB sweep — at the failAfter value where the deployments lookup
+// passes but the deployment_events lookup fails, the envelope's error field
+// must equal "events_query_failed".
+func TestDeployEvents_EventsQueryFailed_ExactErrorCode(t *testing.T) {
+	daDeployNeedsDB(t)
+	seedDB, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, seedDB, "pro"))
+	jwt := testhelpers.MustSignSessionJWT(t, uuid.NewString(), teamID.String(),
+		"eq503@example.com")
+	d := seedInternalDeploy(t, seedDB, teamID, "healthy", map[string]string{})
+
+	gotExactCode := false
+	for failAfter := int64(1); failAfter <= 8 && !gotExactCode; failAfter++ {
+		fdb := openFaultDB(t, failAfter)
+		fApp := newDeployTestApp(t, fdb)
+		req := httptest.NewRequest(http.MethodGet,
+			"/api/v1/deployments/"+d.AppID+"/events", nil)
+		req.Header.Set("Authorization", "Bearer "+jwt)
+		req.Header.Set("X-Forwarded-For", "10.99.0.8")
+		resp, err := fApp.Test(req, 5000)
+		require.NoError(t, err)
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			continue
+		}
+		var envelope struct {
+			OK    bool   `json:"ok"`
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(body, &envelope) == nil &&
+			envelope.Error == "events_query_failed" {
+			gotExactCode = true
+		}
+	}
+	assert.True(t, gotExactCode,
+		"events_query_failed envelope must surface for at least one failAfter "+
+			"value (covers slog.Error + respondError at deploy.go ~L970-975)")
+}
+
+// TestDeployEvents_EmptyAppID_Returns400: the handler defends against an
+// empty :id (deploy.go ~L933-936). The router can't produce an empty :id
+// directly (Fiber 404s on `/deployments//events`), so this test mounts the
+// same handler on a route that has NO :id segment — `c.Params("id")`
+// returns "" and the 400 arm fires.
+//
+// Why we still ship the defensive 400: a future refactor that adds an
+// alternate mount (an alias, a sub-mount, an internal call) must not be
+// allowed to silently fall through to the DB lookup with an empty key.
+func TestDeployEvents_EmptyAppID_Returns400(t *testing.T) {
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
+	sessionJWT := testhelpers.MustSignSessionJWT(t,
+		"88888888-8888-8888-8888-888888888888", teamID, "events-empty-id@example.com")
+
+	cfg := &config.Config{
+		JWTSecret: testhelpers.TestJWTSecret,
+		AESKey:    testhelpers.TestAESKeyHex,
+	}
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, e error) error {
+			if errors.Is(e, handlers.ErrResponseWritten) {
+				return nil
+			}
+			code := fiber.StatusInternalServerError
+			if fe, ok := e.(*fiber.Error); ok {
+				code = fe.Code
+			}
+			return c.Status(code).JSON(fiber.Map{"ok": false, "error": e.Error()})
+		},
+	})
+	dh := handlers.NewDeployHandler(db, nil, cfg, plans.Default())
+	// Mount Events at a route with NO :id parameter so c.Params("id") == "".
+	// Production routes always supply :id; this exists purely to exercise
+	// the handler's defensive empty-id arm.
+	app.Get("/test-empty-id/events", middleware.RequireAuth(cfg), dh.Events)
+
+	req := httptest.NewRequest(http.MethodGet, "/test-empty-id/events", nil)
+	req.Header.Set("Authorization", "Bearer "+sessionJWT)
+	req.Header.Set("X-Forwarded-For", "10.99.0.9")
+
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	var envelope struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&envelope))
+	assert.False(t, envelope.OK)
+	assert.Equal(t, "invalid_id", envelope.Error)
 }

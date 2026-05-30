@@ -218,6 +218,7 @@ func newDeployTestApp(t *testing.T, db *sql.DB) *fiber.App {
 	app.Get("/deploy/:id", middleware.RequireAuth(cfg), dh.Get)
 	app.Get("/deploy/:id/logs", middleware.RequireAuth(cfg), dh.Logs)
 	app.Get("/api/v1/deployments", middleware.RequireAuth(cfg), dh.List)
+	app.Get("/api/v1/deployments/:id/events", middleware.RequireAuth(cfg), dh.Events)
 	app.Patch("/deploy/:id/env", middleware.RequireAuth(cfg), dh.UpdateEnv)
 	app.Delete("/deploy/:id", middleware.RequireAuth(cfg), dh.Delete)
 	app.Post("/deploy/:id/redeploy", middleware.RequireAuth(cfg), dh.Redeploy)
@@ -276,6 +277,7 @@ func TestDeploy_RequireTeamError_AllRoutes(t *testing.T) {
 		{app2, http.MethodGet, "/deploy/x", ""},
 		{app2, http.MethodGet, "/deploy/x/logs", ""},
 		{app2, http.MethodGet, "/api/v1/deployments", ""},
+		{app2, http.MethodGet, "/api/v1/deployments/x/events", ""},
 		{app2, http.MethodPatch, "/deploy/x/env", `{"env":{"A":"b"}}`},
 		{app2, http.MethodDelete, "/deploy/x", ""},
 		{app2, http.MethodPost, "/deploy/x/redeploy", `{"x":1}`},
