@@ -248,6 +248,7 @@ jobs:
             --build-arg VERSION="${{ steps.meta.outputs.version }}" \
             -t "${IMAGE_REPO}:${{ steps.meta.outputs.version }}" \
             -t "${IMAGE_REPO}:latest" \
+            -t "${IMAGE_REPO}:staging" \
             --push \
             .
 
