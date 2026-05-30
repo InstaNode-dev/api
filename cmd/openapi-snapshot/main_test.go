@@ -122,7 +122,7 @@ func TestRun_FileMode_UnwritableOutPath_ReturnsExit2(t *testing.T) {
 // We assert exitFn received that value (proving main correctly forwards
 // run's return code), not the specific number.
 func TestMain_DispatchesViaExitFn(t *testing.T) {
-	var captured int = -1
+	captured := -1
 	orig := exitFn
 	exitFn = func(code int) { captured = code }
 	defer func() { exitFn = orig }()
