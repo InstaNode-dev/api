@@ -445,6 +445,17 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 		// jitter has no diagnostic value at this surface and would defeat
 		// HTTP-cache deduplication if anyone proxies the response.
 		uptimeSeconds := int64(time.Since(processStartFunc()).Seconds())
+		// BUG-API-300 (QA 2026-05-29): /healthz is the canonical surface
+		// the rule-14 build-SHA gate reads after every deploy. Without a
+		// Cache-Control hint, any intermediary (Cloudflare edge, browser
+		// fetch cache, kubectl-port-forward'd browser tab, NR synthetic
+		// monitor) may return a stale commit_id read for seconds-to-minutes
+		// after a rollout — silently breaking the "did the new image
+		// actually land" verification. Stamp `no-store` so probes always
+		// hit the live pod. Cost: a few hundred bytes of header per probe;
+		// upside: zero stale build-SHA reads, matching the contract canaries
+		// already assume. Pairs with the OPTIONS shim above.
+		c.Set(fiber.HeaderCacheControl, "no-store")
 		return c.JSON(fiber.Map{
 			"ok":                true,
 			"service":           "instanode-api",

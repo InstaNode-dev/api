@@ -52,6 +52,10 @@ func TestHealthzShape(t *testing.T) {
 	app.Get("/healthz", func(c *fiber.Ctx) error {
 		m := reader.Get(c.UserContext())
 		uptimeSeconds := int64(time.Since(fixedStart).Seconds())
+		// BUG-API-300: mirror the router.go stamp of
+		// Cache-Control: no-store so the wire-contract assertion
+		// below catches a future regression that drops the header.
+		c.Set(fiber.HeaderCacheControl, "no-store")
 		return c.JSON(fiber.Map{
 			"ok":                true,
 			"service":           "instanode-api",
@@ -144,6 +148,16 @@ func TestHealthzShape(t *testing.T) {
 	// would defeat HTTP-cache dedup for any proxy in front).
 	require.Equal(t, float64(int64(uptimeRaw)), uptimeRaw,
 		"BUG-P272: uptime_seconds must round to an integer; got %f", uptimeRaw)
+
+	// BUG-API-300 (QA 2026-05-29): /healthz is the rule-14 build-SHA
+	// gate surface. Without a Cache-Control directive every intermediary
+	// (CF edge, browser fetch cache, NR synthetic) may return a stale
+	// commit_id for seconds-to-minutes after a rollout, silently breaking
+	// the "did the new image actually land" verification. Pin
+	// `no-store` here so any future deletion of the header on the
+	// router.go path fails this assertion before merge.
+	require.Equal(t, "no-store", resp.Header.Get("Cache-Control"),
+		"BUG-API-300: /healthz must stamp Cache-Control: no-store so build-SHA reads never come from a cached layer")
 
 	require.NoError(t, mock.ExpectationsWereMet())
 }
