@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"instant.dev/internal/handlers"
 )
 
 func TestCanonicalise_SortsKeysAnd2SpaceIndent(t *testing.T) {
@@ -58,7 +61,7 @@ func TestCanonicalise_DoesNotEscapeHTML(t *testing.T) {
 
 func TestRun_StdoutMode_WritesCanonicalSpec(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"-stdout"}, &stdout, &stderr)
+	code := run([]string{"-stdout"}, &stdout, &stderr, handlers.OpenAPISpecProduction)
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d (stderr: %s)", code, stderr.String())
 	}
@@ -74,7 +77,7 @@ func TestRun_FileMode_WritesToCustomOutPath(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "snap.json")
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"-out", target}, &stdout, &stderr)
+	code := run([]string{"-out", target}, &stdout, &stderr, handlers.OpenAPISpecProduction)
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d (stderr: %s)", code, stderr.String())
 	}
@@ -92,21 +95,53 @@ func TestRun_FileMode_WritesToCustomOutPath(t *testing.T) {
 
 func TestRun_BadFlag_ReturnsExit2(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"--no-such-flag"}, &stdout, &stderr)
+	code := run([]string{"--no-such-flag"}, &stdout, &stderr, handlers.OpenAPISpecProduction)
 	if code != 2 {
 		t.Errorf("expected exit 2 for unknown flag, got %d", code)
 	}
 }
 
 func TestRun_FileMode_UnwritableOutPath_ReturnsExit2(t *testing.T) {
-	// /dev/full is a Linux-only sink that always returns ENOSPC. Skip on
-	// platforms without it (CI runs Linux, local dev may be macOS).
-	if _, err := os.Stat("/dev/full"); err != nil {
-		t.Skip("/dev/full not available on this platform")
-	}
+	// Portable: write into a path whose parent directory doesn't exist.
+	// os.WriteFile returns ENOENT on both macOS + Linux for this.
+	dir := t.TempDir()
+	target := filepath.Join(dir, "does", "not", "exist", "snap.json")
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"-out", "/dev/full"}, &stdout, &stderr)
+	code := run([]string{"-out", target}, &stdout, &stderr, handlers.OpenAPISpecProduction)
 	if code != 2 {
 		t.Errorf("expected exit 2 for unwritable -out, got %d (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "openapi-snapshot: write") {
+		t.Errorf("expected stderr to mention the write failure, got: %q", stderr.String())
+	}
+}
+
+func TestRun_BadSpecSource_ReturnsExit2(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	badSpec := func() string { return "not json at all" }
+	code := run([]string{"-stdout"}, &stdout, &stderr, badSpec)
+	if code != 2 {
+		t.Errorf("expected exit 2 when specSource is malformed, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "not valid JSON") {
+		t.Errorf("expected stderr to mention 'not valid JSON', got: %q", stderr.String())
+	}
+}
+
+// failingWriter implements io.Writer and always returns an error. Used to
+// drive the stdout-write-error branch of run().
+type failingWriter struct{ err error }
+
+func (w failingWriter) Write(_ []byte) (int, error) { return 0, w.err }
+
+func TestRun_StdoutMode_WriteError_ReturnsExit2(t *testing.T) {
+	stdout := failingWriter{err: errors.New("simulated stdout write failure")}
+	var stderr bytes.Buffer
+	code := run([]string{"-stdout"}, stdout, &stderr, handlers.OpenAPISpecProduction)
+	if code != 2 {
+		t.Errorf("expected exit 2 for stdout write failure, got %d (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "simulated stdout write failure") {
+		t.Errorf("expected stderr to wrap the write error, got: %q", stderr.String())
 	}
 }

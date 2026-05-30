@@ -36,14 +36,12 @@ import (
 
 const defaultOutPath = "openapi.snapshot.json"
 
-func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
-}
+func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, handlers.OpenAPISpecProduction)) }
 
-// run is the testable body of main. Returns the exit code. Splitting main
-// from run lets the test suite invoke the binary's behaviour without
-// shelling out to a subprocess.
-func run(args []string, stdout, stderr io.Writer) int {
+// run is the testable body of main. Returns the exit code. specSource is
+// injected so the test suite can drive both the happy path (real production
+// spec) and the canonicalise-error path (a deliberately-malformed source).
+func run(args []string, stdout, stderr io.Writer, specSource func() string) int {
 	fs := flag.NewFlagSet("openapi-snapshot", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	out := fs.String("out", defaultOutPath, "destination file for the canonical snapshot")
@@ -52,9 +50,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	canonical, err := canonicalise(handlers.OpenAPISpecProduction())
+	canonical, err := canonicalise(specSource())
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "openapi-snapshot: canonicalise: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "openapi-snapshot: built-in spec is not valid JSON: %v\n", err)
 		return 2
 	}
 
