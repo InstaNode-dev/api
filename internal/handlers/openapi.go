@@ -2957,9 +2957,15 @@ const openAPISpec = `{
           "ok": { "type": "boolean" },
           "token_valid": { "type": "boolean", "description": "True when the onboarding JWT is well-formed, unexpired, and not yet claimed." },
           "expires_at": { "type": "string", "format": "date-time", "description": "When the onboarding JWT itself expires (typically 7 days from issue). Unrelated to per-resource 24h TTL." },
+          "items": {
+            "type": "array",
+            "description": "All anonymous resources that this JWT would attach to the new team if /claim were posted. Canonical envelope field — matches /api/v1/resources, /api/v1/deployments, /api/v1/audit, and every other list endpoint on the platform.",
+            "items": { "$ref": "#/components/schemas/ResourceItem" }
+          },
           "resources": {
             "type": "array",
-            "description": "All anonymous resources that this JWT would attach to the new team if /claim were posted.",
+            "deprecated": true,
+            "description": "DEPRECATED — legacy alias of items. Kept populated for back-compat with the dashboard and existing curl recipes; new clients should read items. B5-P1-3 (BugBash 2026-05-20).",
             "items": { "$ref": "#/components/schemas/ResourceItem" }
           }
         }
