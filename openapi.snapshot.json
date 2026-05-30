@@ -837,6 +837,11 @@
             "description": "Optional flag (\"true\" / \"1\" / \"yes\") that turns this into a private deploy. When set, the resulting Ingress carries an nginx whitelist-source-range annotation built from allowed_ips. Pro / Team / Growth only — hobby/anonymous/free return 402 with agent_action: \"Tell the user private deploys require Pro tier. Upgrade at https://instanode.dev/pricing — takes 30 seconds.\"",
             "type": "string"
           },
+          "redeploy": {
+            "default": false,
+            "description": "When true with a matching 'name', replace the existing deployment in place (same app_id + URL, same provider_id) instead of minting a fresh one. The platform looks up the team's most-recent non-terminal deployment whose env_vars._name matches the supplied 'name' (scoped to the resolved 'env'), then routes through the same compute path as POST /deploy/:id/redeploy. Closes the agent-UX gap (2026-05-30): multiple /deploy/new calls for the same logical app used to fan out into N distinct URLs because there was no way to upsert by name. Truthy values: 'true', '1', 'yes' (case-insensitive); anything else is false. Errors: 400 redeploy_requires_name when 'name' is empty; 404 no_existing_deployment_to_redeploy when no live row matches (omit 'redeploy' to create a new deployment, or call GET /api/v1/deployments first to discover the id); 409 not_ready when the matching row exists but has no provider_id yet (initial build still running). Default false: leaving the field absent keeps the legacy fan-out behaviour.",
+            "type": "boolean"
+          },
           "resource_bindings": {
             "description": "Optional JSON object mapping env-var-name to a resource reference. Values can be either 'family:<family_root_id>' (resolved at submit time to the family member matching the deploy's env — one manifest works across all envs) or a raw resource-token UUID (legacy path; resolves to that specific resource regardless of env). Resolved values are merged into env_vars, with explicit env_vars taking precedence on key collision. Example: '{\"DATABASE_URL\":\"family:7a3f2c91-...\",\"REDIS_URL\":\"family:9bd5f3e0-...\"}'.",
             "type": "string"
@@ -941,6 +946,10 @@
                 "description": "True when the Ingress is locked down via nginx whitelist-source-range. Pro / Team / Growth feature.",
                 "type": "boolean"
               },
+              "redeployed": {
+                "description": "Mirror of the top-level 'redeployed' flag — included inside item so a client that reads only item still sees the in-place-vs-fresh branch indicator. True when this row was reused via POST /deploy/new redeploy=true, false on the fresh-deploy path.",
+                "type": "boolean"
+              },
               "reminders_sent": {
                 "description": "Wave FIX-J. Count of reminder emails dispatched (0..6). Present when ttl_policy != 'permanent'.",
                 "type": "integer"
@@ -983,6 +992,10 @@
             "type": "string"
           },
           "ok": {
+            "type": "boolean"
+          },
+          "redeployed": {
+            "description": "True when this response served an in-place redeploy (POST /deploy/new redeploy=true matched an existing deployment), false on the fresh-deploy path. Always present so agents have a single response shape across both branches.",
             "type": "boolean"
           }
         },

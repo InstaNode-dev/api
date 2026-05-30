@@ -108,6 +108,11 @@ var auditConsumerSpec = map[string]auditConsumerExpectation{
 	"deploy.created":        {IntentionallyNoConsumer: true},
 	"deploy.healthy":        {IntentionallyNoConsumer: true},
 	"deploy.failed":         {Emails: true, Forwards: true},
+	// In-place redeploy (POST /deploy/new with redeploy=true) emits this
+	// audit row so the activity feed / dashboard see a non-create write,
+	// but no email is sent (the deploy.healthy event the rebuild emits is
+	// the user-facing success signal). No downstream consumer required.
+	"deploy.redeploy.requested": {IntentionallyNoConsumer: true},
 
 	// Deploy deletion lifecycle (email-confirmed)
 	"deploy.deletion_requested":   {Emails: true, Forwards: true},

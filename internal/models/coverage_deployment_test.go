@@ -2,6 +2,7 @@ package models
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 	"time"
@@ -354,4 +355,36 @@ func TestCountDeploymentsByTeam_Branches(t *testing.T) {
 	mock4.ExpectQuery(`count\(\*\) FROM deployments\s+WHERE team_id = \$1 AND status NOT IN`).WillReturnError(errors.New("boom"))
 	_, err = CountVisibleDeploymentsByTeam(ctx, db4, uuid.New())
 	require.ErrorContains(t, err, "boom")
+}
+
+func TestFindActiveDeploymentByTeamEnvName_Branches(t *testing.T) {
+	ctx := context.Background()
+	teamID := uuid.New()
+
+	// Happy path: a matching row is returned. Also covers the env == ""
+	// default branch by passing "" and letting the model substitute EnvDefault.
+	db, mock := newMock(t)
+	mock.ExpectQuery(`FROM deployments\s+WHERE team_id = \$1\s+AND env = \$2\s+AND env_vars->>'_name' = \$3`).
+		WithArgs(teamID, EnvDefault, "truehomie-web").
+		WillReturnRows(deploymentMockRow())
+	d, err := FindActiveDeploymentByTeamEnvName(ctx, db, teamID, "", "truehomie-web")
+	require.NoError(t, err)
+	require.NotNil(t, d)
+
+	// sql.ErrNoRows path: returns (nil, sql.ErrNoRows) verbatim so the handler
+	// can errors.Is-check and translate to a 404 with the canonical envelope.
+	db2, mock2 := newMock(t)
+	mock2.ExpectQuery(`FROM deployments\s+WHERE team_id`).
+		WithArgs(teamID, "production", "missing-app").
+		WillReturnError(errNoRows())
+	_, err = FindActiveDeploymentByTeamEnvName(ctx, db2, teamID, "production", "missing-app")
+	require.ErrorIs(t, err, sql.ErrNoRows)
+
+	// Generic DB error path: wrapped with the function name for ops triage.
+	db3, mock3 := newMock(t)
+	mock3.ExpectQuery(`FROM deployments\s+WHERE team_id`).
+		WillReturnError(errors.New("connection reset"))
+	_, err = FindActiveDeploymentByTeamEnvName(ctx, db3, teamID, "production", "foo")
+	require.ErrorContains(t, err, "FindActiveDeploymentByTeamEnvName")
+	require.ErrorContains(t, err, "connection reset")
 }

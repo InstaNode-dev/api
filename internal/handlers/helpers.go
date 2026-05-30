@@ -140,6 +140,10 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the deployment-events read is temporarily unavailable. Retry in 30 seconds; the deploy itself isn't affected. Status: https://instanode.dev/status",
 		UpgradeURL:  "",
 	},
+	"no_existing_deployment_to_redeploy": {
+		AgentAction: "Tell the user no deployment with that name exists on this team. Omit redeploy=true to create one fresh, or list https://instanode.dev/api/v1/deployments to find the app_id and call POST /deploy/{id}/redeploy.",
+		UpgradeURL:  "",
+	},
 	"rate_limit_exceeded": {
 		AgentAction: "Tell the user they've sent too many requests in a short window. Wait 60 seconds and retry — or upgrade to Pro at https://instanode.dev/pricing for higher limits.",
 		UpgradeURL:  "https://instanode.dev/pricing",
