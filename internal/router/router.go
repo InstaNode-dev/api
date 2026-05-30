@@ -260,6 +260,17 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 		AllowMethods:  corsAllowMethods,
 		AllowHeaders:  corsAllowHeaders,
 		ExposeHeaders: "X-Request-ID,X-Instant-Upgrade,X-Instant-Notice",
+		// AUTH-004 follow-up (2026-05-30): /auth/exchange is called from the
+		// dashboard SPA with `credentials: 'include'` so the browser sends
+		// the HttpOnly `instanode_session_exchange` cookie cross-origin
+		// (instanode.dev → api.instanode.dev). For the browser to ALLOW the
+		// SPA to read the response body, the response must carry
+		// `Access-Control-Allow-Credentials: true`. Without it, fetch
+		// rejects the read with the generic "Failed to fetch" / "blocked
+		// by CORS policy" error. Safe because AllowOrigins is an explicit
+		// allowlist (no `*` — the CORS spec forbids credentials + wildcard
+		// origin precisely to prevent rogue sites from siphoning cookies).
+		AllowCredentials: true,
 		// BUG-API-303 (QA 2026-05-29): without Access-Control-Max-Age the
 		// browser re-issues an OPTIONS preflight before every CORS request.
 		// 24h (corsMaxAgeSeconds) is the modern browsers' clamp ceiling —

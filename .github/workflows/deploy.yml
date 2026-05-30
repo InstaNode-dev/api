@@ -248,7 +248,6 @@ jobs:
             --build-arg VERSION="${{ steps.meta.outputs.version }}" \
             -t "${IMAGE_REPO}:${{ steps.meta.outputs.version }}" \
             -t "${IMAGE_REPO}:latest" \
-            -t "${IMAGE_REPO}:staging" \
             --push \
             .
 
@@ -278,10 +277,14 @@ jobs:
             "deployment/${K8S_DEPLOYMENT}" \
             "${K8S_CONTAINER}=${IMAGE}" \
             -n "${K8S_NAMESPACE}"
+          # 2026-05-30: bumped 180s → 300s after a real rollout took ~240s
+          # (image pull + readiness on a fresh node) and the workflow timed
+          # out even though the pod came up healthy. The job exited red but
+          # prod was correct, so the false-failure forced a manual rerun.
           kubectl rollout status \
             "deployment/${K8S_DEPLOYMENT}" \
             -n "${K8S_NAMESPACE}" \
-            --timeout=180s
+            --timeout=300s
 
       - name: Verify rolled-out image tag matches built version
         run: |
@@ -298,8 +301,10 @@ jobs:
       - name: Curl live /healthz and confirm new SHA is reported
         run: |
           SHORT_SHA="${{ steps.meta.outputs.short_sha }}"
-          # Allow up to ~30s for the new pod to start serving the public URL.
-          for i in 1 2 3 4 5 6; do
+          # 2026-05-30: extended 30s → 60s to match the rollout-timeout bump.
+          # If rollout took the full 5 min, the new pods are only just live
+          # when this step starts and the public LB needs a few s to route.
+          for i in $(seq 1 12); do
             BODY=$(curl -fsSL --max-time 5 "${HEALTHZ_URL}" || echo "")
             echo "Attempt ${i}: ${BODY}"
             if echo "${BODY}" | grep -q "${SHORT_SHA}"; then
