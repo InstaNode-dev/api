@@ -139,6 +139,26 @@ func ServeOpenAPI(c *fiber.Ctx) error {
 	return c.SendString(openAPISpecProd)
 }
 
+// OpenAPISpecProduction returns the production-rendered OpenAPI 3.1 spec
+// (with the dev-only /internal/set-tier path stripped) as a JSON string.
+//
+// This is the canonical accessor for cross-stack contract snapshotting —
+// the cmd/openapi-snapshot tool writes its output to api/openapi.snapshot.json,
+// which dashboard and instanode-web consume to generate typed clients.
+//
+// Why an accessor (rather than exporting the const): the production spec is
+// the const minus the dev-only path entry. Callers that snapshot the raw const
+// would ship a spec that lies about the prod surface — every consumer would
+// generate a typed client for an endpoint that 404s in production. Routing
+// the snapshot through this function keeps "what the snapshot says" == "what
+// production serves".
+func OpenAPISpecProduction() string {
+	openAPISpecOnce.Do(func() {
+		openAPISpecProd = stripInternalSetTierPath(openAPISpec)
+	})
+	return openAPISpecProd
+}
+
 // openAPISpec is embedded at build time. It covers all stable, agent-facing endpoints.
 // Generated credentials and tier limits are documented here so AI agents can
 // consume instant.dev programmatically without reading the source code.

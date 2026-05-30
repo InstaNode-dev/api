@@ -2,6 +2,7 @@
         docker-up docker-down docker-logs \
         migrate migrate-platform migrate-customers \
         docker-build smoke-buildinfo \
+        openapi-snapshot openapi-snapshot-check \
         k8s-deploy k8s-delete k8s-status k8s-regen-migrations \
         gen-secrets install-cli \
         storage-verify-isolation \
@@ -183,6 +184,40 @@ smoke-buildinfo:
 	  echo "$$out" | grep -q "Version=smoke-ver" || (echo "FAIL: $$out" && exit 1) && \
 	  echo "smoke-buildinfo: OK ($$out)" && \
 	  rm -rf $$tmpdir
+
+# ── Cross-stack OpenAPI contract snapshot ─────────────────────────────────────
+#
+# api/openapi.snapshot.json is the source-of-truth artifact that the
+# dashboard and instanode-web repos consume to generate their typed API
+# clients (via openapi-typescript). It is the canonicalised JSON output of
+# handlers.OpenAPISpecProduction() — the same spec served at GET /openapi.json
+# in production.
+#
+# Workflow:
+#   - Edit internal/handlers/openapi.go (add a path, change a schema).
+#   - Run `make openapi-snapshot` — regenerates openapi.snapshot.json.
+#   - Commit both files in the same PR (rule 22: contract surface checklist).
+#   - CI runs `make openapi-snapshot-check` and fails the PR if the
+#     committed snapshot differs from a freshly regenerated one.
+#
+# The snapshot tool canonicalises (sorted keys, 2-space indent) so that
+# whitespace-only edits to the const do not flip the snapshot — only real
+# contract changes do.
+openapi-snapshot:
+	@go run ./cmd/openapi-snapshot/
+
+openapi-snapshot-check:
+	@go run ./cmd/openapi-snapshot/ -out /tmp/openapi.snapshot.regenerated.json
+	@if ! diff -q openapi.snapshot.json /tmp/openapi.snapshot.regenerated.json >/dev/null; then \
+	  echo ""; \
+	  echo "::error::openapi.snapshot.json is out of date."; \
+	  echo "::error::Run \`make openapi-snapshot\` and commit the updated file."; \
+	  echo ""; \
+	  echo "Drift (committed → regenerated):"; \
+	  diff -u openapi.snapshot.json /tmp/openapi.snapshot.regenerated.json | head -80 || true; \
+	  exit 1; \
+	fi
+	@echo "openapi-snapshot-check: snapshot matches handlers.OpenAPISpecProduction()"
 
 # Regen the SQL ConfigMap from the actual migration file (run after schema changes)
 k8s-regen-migrations:
