@@ -109,11 +109,21 @@ func TestRespondError_KnownCode_PopulatesAgentAction(t *testing.T) {
 			wantActionSubstr: "too many requests",
 		},
 		{
-			name:             "invalid_token points at login, no upgrade_url",
+			// BUG-API-020 (QA 2026-05-29): post-fix the `invalid_token`
+			// agent_action no longer points at the login flow (that was the
+			// wrong remediation for the 9 non-auth emit sites — webhook URL
+			// path token, invitation token, storage path token, onboarding
+			// claim JWT, stack manifest needs token, deploy logs path
+			// token). The new copy describes the URL-path-token surface
+			// and points at the docs. Assertion: the sentence must
+			// reference the URL/path/UUID surface and must NOT redirect to
+			// /login (which lives under the `unauthorized` code that this
+			// table also exercises). No upgrade_url either way.
+			name:             "invalid_token describes the URL-path-token surface, no upgrade_url",
 			code:             "invalid_token",
 			status:           fiber.StatusBadRequest,
 			wantUpgradeURL:   false,
-			wantActionSubstr: "log in at https://instanode.dev/login",
+			wantActionSubstr: "url path tokens",
 		},
 		{
 			name:             "unauthorized points at login",
