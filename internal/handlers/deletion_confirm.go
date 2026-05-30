@@ -507,7 +507,23 @@ func EmailConfirmDeletionRedirectHandler(dashboardBaseURL string) fiber.Handler 
 	return func(c *fiber.Ctx) error {
 		token := c.Query("t")
 		if strings.TrimSpace(token) == "" {
-			return c.Status(http.StatusBadRequest).SendString("Missing token")
+			// BUG-API-047 / BUG-API-204 / BUG-API-273 (QA 2026-05-29):
+			// the missing-token branch used to SendString("Missing token")
+			// which served Content-Type: text/plain with no envelope,
+			// no request_id, no agent_action — an envelope-bypass that
+			// broke the universal {ok,error,message,request_id,agent_action}
+			// contract every other 4xx in the api carries. Agents grepping
+			// on `error: missing_token` (the canonical code already used
+			// across onboarding.go, deletion_confirm.go:275, magic_link.go)
+			// silently failed because this surface returned a plain string.
+			// Route through respondError so the envelope shape + the
+			// existing `missing_token` codeToAgentAction entry land here
+			// too. The handler is browser-initiated (email-link click) but
+			// the response shape needs to match the rest of the API for
+			// agent-driven probes (e.g. an MCP tool unwrapping the JSON
+			// envelope before opening the dashboard).
+			return respondError(c, http.StatusBadRequest, "missing_token",
+				"Sign-in link is missing its `t=...` token. Open the link from the email exactly as we sent it.")
 		}
 		// We deliberately encode the token as a query param on the
 		// dashboard URL so the dashboard's React router picks it up
