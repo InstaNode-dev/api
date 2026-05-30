@@ -435,17 +435,7 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// expiry the file silently becomes stale-but-still-served — that's
 	// the right call vs returning 410, which would lock out researchers
 	// during a deploy freeze.
-	expiresAt := time.Now().UTC().AddDate(1, 0, 0).Format("2006-01-02T15:04:05Z")
-	securityTxt := "Contact: mailto:security@instanode.dev\n" +
-		"Contact: https://instanode.dev/security\n" +
-		"Expires: " + expiresAt + "\n" +
-		"Preferred-Languages: en\n" +
-		"Canonical: https://api.instanode.dev/.well-known/security.txt\n" +
-		"Policy: https://instanode.dev/security\n"
-	serveSecurityTxt := func(c *fiber.Ctx) error {
-		c.Set(fiber.HeaderContentType, "text/plain; charset=utf-8")
-		return c.SendString(securityTxt)
-	}
+	serveSecurityTxt := makeSecurityTxtHandler(time.Now())
 	app.Get("/.well-known/security.txt", serveSecurityTxt)
 	// Some scanners + older guidance hit /security.txt at the root. RFC
 	// 9116 §3 names the .well-known path as canonical (the file itself
