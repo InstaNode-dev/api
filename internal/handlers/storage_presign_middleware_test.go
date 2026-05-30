@@ -99,8 +99,15 @@ func TestPresign_RegistryHasMiddleware(t *testing.T) {
 		why    string
 	}{
 		{
-			needle: "middleware.OptionalAuth(cfg)",
-			why:    "session JWT cross-check requires OptionalAuth to populate team_id when present",
+			// H46 F1 (2026-05-21) intent + the 2026-05-30 follow-up fix:
+			// the chain MUST use OptionalAuthStrict so a malformed/expired
+			// bearer 401s instead of silently downgrading to the
+			// anonymous-via-token path. The earlier needle here was
+			// OptionalAuth(cfg) (matched both variants by prefix) —
+			// post-2026-05-30 we pin the strict variant explicitly so a
+			// future drop-back to bare OptionalAuth fails this test.
+			needle: "middleware.OptionalAuthStrict(cfg)",
+			why:    "session JWT cross-check (strict): present-but-bad bearer must 401, missing bearer still anonymous",
 		},
 		{
 			needle: "middleware.PresignTokenRateLimit(rdb)",
@@ -151,7 +158,11 @@ func TestPresign_TestHelpersMirrorMiddleware(t *testing.T) {
 	block := srcStr[idx:end]
 
 	mustHave := []string{
-		"middleware.OptionalAuth(cfg)",
+		// Mirror the production strict-auth wiring (see
+		// TestPresign_RegistryHasMiddleware). A testhelpers mirror that
+		// stays on bare OptionalAuth means handler tests would falsely
+		// pass while production rejects.
+		"middleware.OptionalAuthStrict(cfg)",
 		"middleware.PresignTokenRateLimit(rdb)",
 		`middleware.Idempotency(rdb, "storage.presign")`,
 	}

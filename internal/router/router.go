@@ -634,8 +634,13 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// boundary for the anonymous case; strict mode ensures a caller who
 	// *thinks* they're authenticated but presents a stale session
 	// doesn't sign for an unowned tenant prefix.
+	//
+	// 2026-05-30: the H46 F1 fix landed in the comment but not in the
+	// chain (the route was still using bare OptionalAuth) — caught by
+	// the registry-iterating regression test in
+	// optional_auth_strict_coverage_test.go. Now matches the comment.
 	app.Post("/storage/:token/presign",
-		middleware.OptionalAuth(cfg),
+		middleware.OptionalAuthStrict(cfg),
 		middleware.PresignTokenRateLimit(rdb),
 		middleware.Idempotency(rdb, "storage.presign"),
 		storageH.PresignStorage,
@@ -703,7 +708,7 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	deployGroup.Post("/:id/redeploy", deployH.Redeploy)
 
 	// Stacks — Phase 6 multi-service.
-	// New/Get/Logs/Delete use OptionalAuth (anonymous stacks supported, same as /db/new etc.).
+	// New/Get/Logs/Delete are anonymous-capable (same model as /db/new etc.).
 	// UpdateEnv/Redeploy require auth (mutations on owned stacks).
 	// RequireWritable rejects impersonated sessions on all mutating
 	// stack endpoints (POST/PATCH/DELETE) so an admin viewing the
@@ -711,10 +716,24 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// Idempotency middleware on /stacks/new + /stacks/:slug/redeploy
 	// covers accidental double-clicks / agent retries the same way it
 	// does for /deploy/new (multipart-aware fingerprint) and /db/new etc.
-	app.Post("/stacks/new", middleware.OptionalAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "stacks.new"), stackH.New)
+	//
+	// MUTATING routes (POST/DELETE) use OptionalAuthStrict for the same
+	// reason as /db/new etc. (T19 P1-7, 2026-05-20): a present-but-bad
+	// bearer header returns 401 instead of silently downgrading the
+	// caller to anonymous-tier provisioning. /stacks/new + DELETE
+	// /stacks/:slug were missed in the original strict-mode wave — this
+	// closes the surface (rule 17 / MR-P1-38 follow-up). A missing
+	// Authorization header still passes through as anonymous, since the
+	// routes are explicitly anonymous-capable.
+	//
+	// READ routes (GET) intentionally stay non-strict: a logged-out tab
+	// reading /stacks/:slug (e.g. follow-up after revocation) should not
+	// 401 the page — it should serve the anonymous read view if the slug
+	// belongs to an anonymous stack, or 404 otherwise.
+	app.Post("/stacks/new", middleware.OptionalAuthStrict(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "stacks.new"), stackH.New)
 	app.Get("/stacks/:slug", middleware.OptionalAuth(cfg), stackH.Get)
 	app.Get("/stacks/:slug/logs/:svc", middleware.OptionalAuth(cfg), stackH.Logs)
-	app.Delete("/stacks/:slug", middleware.OptionalAuth(cfg), middleware.RequireWritable(), stackH.Delete)
+	app.Delete("/stacks/:slug", middleware.OptionalAuthStrict(cfg), middleware.RequireWritable(), stackH.Delete)
 	app.Patch("/stacks/:slug/env", middleware.RequireAuth(cfg), middleware.RequireWritable(), stackH.UpdateEnv)
 	app.Post("/stacks/:slug/redeploy", middleware.RequireAuth(cfg), middleware.RequireWritable(), middleware.Idempotency(rdb, "stacks.redeploy"), stackH.Redeploy)
 
