@@ -9,6 +9,9 @@ package handlers
 // white-box test exercises every branch deterministically.
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -130,10 +133,27 @@ func TestShouldSkipEmailConfirmation_bvwave(t *testing.T) {
 
 func TestEmailConfirmDeletionRedirectHandler(t *testing.T) {
 	h := EmailConfirmDeletionRedirectHandler("https://dash.local/")
-	app := fiber.New()
+	// BUG-API-047/204/273: respondError returns ErrResponseWritten as a
+	// sentinel — fiber's default ErrorHandler would otherwise overwrite
+	// the JSON body with the sentinel string. Mirror the production
+	// router's swallow-sentinel handler so the assertions read the body
+	// the handler actually wrote.
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			if errors.Is(err, ErrResponseWritten) {
+				return nil
+			}
+			return fiber.DefaultErrorHandler(c, err)
+		},
+	})
 	app.Get("/auth/email/confirm-deletion", h)
 
-	// Missing token → 400.
+	// BUG-API-047 / BUG-API-204 / BUG-API-273 (QA 2026-05-29):
+	// missing-token branch must return the canonical {ok,error,message,
+	// request_id,agent_action} envelope on Content-Type application/json,
+	// NOT text/plain "Missing token" which broke agents grepping on
+	// `error: missing_token`. Pin both the wire format and the canonical
+	// error code so a future revert to SendString fails this test.
 	resp, err := app.Test(httptest.NewRequest("GET", "/auth/email/confirm-deletion", nil))
 	if err != nil {
 		t.Fatal(err)
@@ -141,7 +161,36 @@ func TestEmailConfirmDeletionRedirectHandler(t *testing.T) {
 	if resp.StatusCode != 400 {
 		t.Errorf("missing token status = %d; want 400", resp.StatusCode)
 	}
+	ct := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("BUG-API-204/273: missing-token Content-Type = %q; want application/json (envelope, not text/plain)", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	var env struct {
+		OK          bool   `json:"ok"`
+		Error       string `json:"error"`
+		Message     string `json:"message"`
+		RequestID   string `json:"request_id"`
+		AgentAction string `json:"agent_action"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("BUG-API-204/273: missing-token body not JSON: %v (body=%q)", err, string(body))
+	}
+	if env.OK {
+		t.Errorf("BUG-API-204/273: envelope.ok = true; want false on 400")
+	}
+	if env.Error != "missing_token" {
+		t.Errorf("BUG-API-047: envelope.error = %q; want %q (canonical code used across onboarding.go/magic_link.go/deletion_confirm.go)", env.Error, "missing_token")
+	}
+	if env.Message == "" {
+		t.Errorf("BUG-API-204/273: envelope.message empty")
+	}
+	// codeToAgentAction has a `missing_token` entry, so the envelope
+	// MUST carry a non-empty agent_action through respondError.
+	if env.AgentAction == "" {
+		t.Errorf("BUG-API-204/273: envelope.agent_action empty — codeToAgentAction[missing_token] should populate this")
+	}
 
 	// With token → 302 to the dashboard confirm page.
 	resp, err = app.Test(httptest.NewRequest("GET", "/auth/email/confirm-deletion?t=abc", nil))
