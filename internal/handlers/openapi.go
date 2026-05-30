@@ -1623,6 +1623,19 @@ const openAPISpec = `{
         }
       }
     },
+    "/auth/exchange": {
+      "post": {
+        "summary": "Exchange the AUTH-004 bridge cookie for a session JWT",
+        "description": "Final leg of the AUTH-004 cross-origin sign-in handshake. The /auth/email/callback and /auth/github/callback handlers set a short-lived HttpOnly auth_exchange_cookie and 302 to https://instanode.dev/login/callback?signed_in=1. The dashboard then makes a credentials:include POST to this endpoint. CORS contract: response MUST include Access-Control-Allow-Origin: https://instanode.dev AND Access-Control-Allow-Credentials: true — the browser blocks the read otherwise. Request MUST be a CORS-simple POST (no custom headers like Accept: application/json), since adding one forces a preflight that PreflightAllowlist may reject. Returns 200 + the bearer JWT (24h, HS256, aud=https://api.instanode.dev) on success. The 2026-05-29 to 2026-05-30 prod-login outage chained three failures along this exact endpoint — documenting it here so any future regression is catchable by the cross-stack contract gate (api PR #202).",
+        "requestBody": { "required": false, "description": "No body. The bridge cookie travels in the Cookie header via credentials:include." },
+        "responses": {
+          "200": { "description": "Cookie verified; JWT minted", "content": { "application/json": { "schema": { "type": "object", "required": ["ok", "token"], "properties": { "ok": { "type": "boolean" }, "token": { "type": "string", "description": "Session JWT — store in localStorage and send as Authorization: Bearer for /api/v1/* calls" } } } } } },
+          "400": { "description": "Bridge cookie missing / expired (canonical envelope with error code cookie_missing_or_expired)" },
+          "401": { "description": "Cookie present but signature invalid or aud mismatch" },
+          "503": { "description": "JWT signing failed (downstream)" }
+        }
+      }
+    },
     "/auth/email/callback": {
       "get": {
         "summary": "Consume a magic link, mint a session JWT, 302 to <return_to>",
