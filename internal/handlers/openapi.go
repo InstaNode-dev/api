@@ -2909,12 +2909,12 @@ const openAPISpec = `{
       },
       "StackRequest": {
         "type": "object",
-        "description": "Multipart form. The 'manifest' field is the YAML instant.yaml text; each service declared under services: must have a matching multipart field named after the service whose content is a gzipped tar archive of that service's build context.",
+        "description": "Multipart form. The 'manifest' field is the YAML instant.yaml text; each service declared under services: must have a matching multipart field named after the service whose content is a gzipped tar archive of that service's build context. Codegen note: the dynamic per-service field is expressed via additionalProperties (OpenAPI cannot model literal-named fields whose names come from another field at runtime). Treat additionalProperties as: 'for every service S in manifest.services, send a multipart field named S whose value is the gzipped tar of S's build context.' DOG-30 (QA 2026-05-29).",
         "properties": {
           "manifest": { "type": "string", "description": "instant.yaml contents. Example: services:\\n  api:\\n    build: ./api\\n    port: 8080\\n  web:\\n    build: ./web\\n    port: 8080\\n    expose: true\\n    env: { API_URL: service://api }" },
-          "name": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9 _-]*$", "description": "REQUIRED. Short human-readable label for this stack (1-64 chars after trimming; must start with a letter or digit, then letters/digits/spaces/underscores/hyphens). Missing/empty → 400 name_required. Bad format/length → 400 invalid_name." },
-          "<service-name>": { "type": "string", "format": "binary", "description": "One field per service declared in the manifest, named after the service. Value is a gzipped tar archive containing that service's Dockerfile + source. Total request body cap is 200 MB." }
+          "name": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9 _-]*$", "description": "REQUIRED. Short human-readable label for this stack (1-64 chars after trimming; must start with a letter or digit, then letters/digits/spaces/underscores/hyphens). Missing/empty → 400 name_required. Bad format/length → 400 invalid_name." }
         },
+        "additionalProperties": { "type": "string", "format": "binary", "description": "One multipart field per service declared in the manifest, with the field NAME equal to the real service name (e.g. 'api' or 'web', NOT the literal placeholder '<service-name>') and the VALUE a gzipped tar archive (≤50 MiB) containing that service's Dockerfile + source. Codegen clients should emit one upload field per manifest entry." },
         "required": ["manifest", "name"]
       },
       "StackResponse": {
