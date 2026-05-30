@@ -47,7 +47,7 @@ func TestHealthzShape(t *testing.T) {
 		m := reader.Get(c.UserContext())
 		return c.JSON(fiber.Map{
 			"ok":                true,
-			"service":           "instant.dev",
+			"service":           "instanode-api",
 			"commit_id":         buildinfo.GitSHA,
 			"build_time":        buildinfo.BuildTime,
 			"version":           buildinfo.Version,
@@ -75,7 +75,12 @@ func TestHealthzShape(t *testing.T) {
 	// Buildinfo contract — every field is non-empty; commit_id specifically
 	// falls back to "dev" when -ldflags is omitted (go run, go test).
 	require.Equal(t, true, got["ok"])
-	require.Equal(t, "instant.dev", got["service"])
+	// BUG-API-146/148/309: `service` must align with the runtime brand
+	// ("instanode-api"), not the legacy "instant.dev" string. Canaries
+	// + log-line correlation key on the new value.
+	require.Equal(t, "instanode-api", got["service"])
+	require.NotEqual(t, "instant.dev", got["service"],
+		"BUG-API-146: legacy brand string must not regress into /healthz.service")
 	require.NotEmpty(t, got["commit_id"], "commit_id MUST be present on /healthz")
 	require.NotEmpty(t, got["build_time"])
 	require.NotEmpty(t, got["version"])
