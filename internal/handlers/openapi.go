@@ -574,7 +574,7 @@ const openAPISpec = `{
         "responses": {
           "200": { "description": "Deployment kept permanently", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
           "401": { "description": "Unauthorized" },
-          "402": { "description": "upgrade_required — anonymous tier. agent_action points at https://api.instanode.dev/start." },
+          "402": { "description": "claim_required — anonymous tier. The remediation is a FREE claim, not a paid upgrade; upgrade_url points at https://instanode.dev/claim." },
           "404": { "description": "Not found (or owned by another team)" }
         }
       }
@@ -594,7 +594,7 @@ const openAPISpec = `{
         "responses": {
           "200": { "description": "TTL updated", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
           "400": { "description": "invalid_hours — outside 1..8760" },
-          "402": { "description": "upgrade_required — anonymous tier" },
+          "402": { "description": "claim_required — anonymous tier (remediation is a free claim, not a paid upgrade)" },
           "404": { "description": "Not found" }
         }
       }

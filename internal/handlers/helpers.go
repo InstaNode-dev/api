@@ -129,6 +129,19 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user this feature requires the Pro plan or higher. Upgrade at https://instanode.dev/pricing — takes 30 seconds.",
 		UpgradeURL:  "https://instanode.dev/pricing",
 	},
+	// B7-P1-7 (BugBash 2026-05-20): `claim_required` is the honest 402
+	// for "you're on anonymous tier and the action requires an account,
+	// but the upgrade is a FREE claim, not a paid plan." Previously the
+	// anonymous-tier walls on /api/v1/deployments/:id/{make-permanent,ttl}
+	// emitted `upgrade_required`, which an agent branching on error code
+	// alone routes to https://instanode.dev/pricing — the wrong URL.
+	// Keep the agent_action sentence parallel to upgrade_required (Tell
+	// the user … claim …), but point UpgradeURL at the free /claim flow
+	// so the JSON `upgrade_url` field is correct for code-only routers.
+	"claim_required": {
+		AgentAction: "Tell the user this action requires a claimed account (free, no payment). Have them claim at https://instanode.dev/claim — takes 30 seconds.",
+		UpgradeURL:  "https://instanode.dev/claim",
+	},
 	// "tier_unavailable" was removed 2026-05-29 along with the Team-tier
 	// checkout/change-plan guards (CEO BIZ-1). The only emitters of this
 	// code lived in those two billing branches; with both gone, the
