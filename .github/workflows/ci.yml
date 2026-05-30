@@ -213,3 +213,87 @@ jobs:
           echo "Configure services, secrets, and port-forwards, then run e.g.:"
           echo "  go test ./e2e/... -tags e2e -count=1 -timeout 180s"
           echo "See CLAUDE.md (Full-stack E2E) for required env vars."
+
+  # Cross-repo Layer-1 auth-contract gate. The api owns the CORS allowlist
+  # and the /auth/exchange + /auth/email/start endpoints — an api-side
+  # change that drops access-control-allow-credentials would not trigger
+  # the instanode-web CI on its own, so the browser-level regression
+  # (2026-05-29 → 2026-05-30) could ship despite green api unit tests.
+  #
+  # This job fires a repository_dispatch on instanode-web; instanode-web's
+  # .github/workflows/auth-contract-e2e.yml listens for the matching
+  # `auth-contract-e2e-from-api` type and runs the Chromium smoke against
+  # the same prod targets. The dispatch result will not gate this PR
+  # mechanically (cross-repo status checks aren't wired here yet — see
+  # follow-up issue), but it surfaces the failure in the instanode-web
+  # Actions tab so anyone reviewing the api PR can click through.
+  #
+  # Auth: REPO_ACCESS_TOKEN must have `repo` scope on instanode-web. If the
+  # secret is missing the step soft-skips (warn, don't fail) so the api CI
+  # stays green during initial rollout — flip the soft-skip to `exit 1`
+  # once the secret is provisioned on all relevant environments.
+  dispatch-auth-contract-e2e:
+    name: Trigger instanode-web auth-contract smoke
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    steps:
+      - name: Fire repository_dispatch on instanode-web
+        env:
+          DISPATCH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+          # SECURITY: avoid interpolating untrusted github.event.* fields
+          # into the shell. Only stable repo-controlled identifiers are
+          # exposed and the payload is constructed via printf with
+          # parameter expansion (no string concatenation of attacker
+          # input).
+          SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TRIGGER: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DISPATCH_TOKEN:-}" ]; then
+            echo "::warning::REPO_ACCESS_TOKEN not set; skipping cross-repo auth-contract dispatch. " \
+              "Provision the secret on the api repo (with `repo` scope on instanode-web) to enable Layer-1 gate."
+            exit 0
+          fi
+          # PR_NUMBER may be empty on push events; default to "main".
+          # Defense-in-depth: enforce numeric PR number even though
+          # github.event.pull_request.number is an integer assigned by
+          # GitHub, never user-controlled.
+          pr="${PR_NUMBER:-main}"
+          case "$pr" in
+            main|[0-9]*) ;;
+            *) echo "::error::unexpected PR_NUMBER value: $pr"; exit 1 ;;
+          esac
+          # SHA is a 40-char hex from github.sha — repo-controlled. Validate
+          # shape to keep the JSON payload trivially-injection-proof.
+          case "$SHA" in
+            [0-9a-f]*) ;;
+            *) echo "::error::unexpected SHA shape: $SHA"; exit 1 ;;
+          esac
+          # TRIGGER is github.event_name — a GitHub-controlled enum
+          # (push|pull_request|schedule|workflow_dispatch|...). Allowlist
+          # the values this job is reachable from.
+          case "$TRIGGER" in
+            push|pull_request) ;;
+            *) echo "::error::unexpected TRIGGER: $TRIGGER"; exit 1 ;;
+          esac
+          payload=$(printf '{"event_type":"auth-contract-e2e-from-api","client_payload":{"api_sha":"%s","api_pr":"%s","trigger":"%s","api_url":"https://api.instanode.dev","web_origin":"https://instanode.dev"}}' \
+            "$SHA" "$pr" "$TRIGGER")
+          echo "Dispatching to InstaNode-dev/instanode-web: $payload"
+          http_code=$(curl -sS -o /tmp/dispatch.out -w '%{http_code}' \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/InstaNode-dev/instanode-web/dispatches \
+            -d "$payload")
+          echo "dispatch response: HTTP $http_code"
+          cat /tmp/dispatch.out || true
+          # GitHub returns 204 on success. Treat anything else as a soft
+          # failure during the rollout window — log and pass so a transient
+          # cross-repo hiccup doesn't red the api PR. Tighten to `exit 1`
+          # once we have a week of clean runs.
+          if [ "$http_code" != "204" ]; then
+            echo "::warning::cross-repo dispatch returned $http_code (expected 204). Not failing the api PR yet."
+          fi

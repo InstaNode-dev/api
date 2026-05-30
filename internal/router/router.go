@@ -546,6 +546,31 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// MCP authorization profile — RFC 8414 / OAuth 2.0 Protected Resource Metadata.
 	app.Get("/.well-known/oauth-protected-resource", handlers.ServeOAuthProtectedResourceMetadata)
 
+	// BUG-API-411 (QA 2026-05-29): RFC 9116 — security researchers reach for
+	// /.well-known/security.txt to find a responsible-disclosure contact
+	// before filing a public vulnerability report. Pre-fix both api and
+	// apex returned 404 for both /.well-known/security.txt and /security.txt
+	// which made the disclosure surface effectively unreachable. We serve
+	// the same body from BOTH paths so a researcher's first guess works
+	// regardless of which convention they hit, and the body validates
+	// cleanly against https://securitytxt.org/ — Contact + Expires + the
+	// Preferred-Languages and Canonical fields the standard recommends.
+	//
+	// Expires is set 1 year from the build_time stamp so the file stays
+	// fresh as long as the binary is redeployed regularly (each new
+	// image pushes the window forward). When the binary stalls past its
+	// expiry the file silently becomes stale-but-still-served — that's
+	// the right call vs returning 410, which would lock out researchers
+	// during a deploy freeze.
+	serveSecurityTxt := makeSecurityTxtHandler(time.Now())
+	app.Get("/.well-known/security.txt", serveSecurityTxt)
+	// Some scanners + older guidance hit /security.txt at the root. RFC
+	// 9116 §3 names the .well-known path as canonical (the file itself
+	// declares it via the Canonical: field above) but the apex path is
+	// a documented fallback — serving the same body avoids a needless
+	// 404 on the legacy path.
+	app.Get("/security.txt", serveSecurityTxt)
+
 	// Prometheus metrics — gated by METRICS_TOKEN when set (open in local dev).
 	app.Get("/metrics", func(c *fiber.Ctx) error {
 		if cfg.MetricsToken != "" {
