@@ -221,6 +221,14 @@ func TestAgentActionContract_RegistryCoverage(t *testing.T) {
 		// flagged it. If a future feature reintroduces a "tier is genuinely
 		// unavailable" surface, re-add the code + its emitter in one PR.
 		"upgrade_required", "rate_limit_exceeded",
+		// B7-P1-7 (BugBash 2026-05-20): `claim_required` is the honest
+		// 402 for anonymous-tier walls whose remediation is a FREE claim
+		// (e.g. POST /api/v1/deployments/:id/{make-permanent,ttl}). A
+		// drop from the registry without an in-PR migration to a different
+		// code is a contract regression — agents that branch on the code
+		// would either lose the agent_action or route the user to the
+		// paid pricing page when the wall is free to clear.
+		"claim_required",
 		// Auth.
 		"unauthorized", "auth_required", "invalid_token", "missing_token",
 		"vault_requires_auth", "invitation_invalid", "already_accepted",
