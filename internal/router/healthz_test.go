@@ -43,17 +43,36 @@ func TestHealthzShape(t *testing.T) {
 	reader := migrations.NewReader(sqlDB, 0, nil)
 
 	app := fiber.New()
+	// Pin the process-start instant 42 seconds in the past so the
+	// uptime_seconds assertion below has a stable expected value.
+	// router.go reads processStartFunc() per request — production
+	// captures it at package load via time.Now(), the test fixture
+	// here mirrors the same code shape with a fixed offset.
+	fixedStart := time.Now().Add(-42 * time.Second)
 	app.Get("/healthz", func(c *fiber.Ctx) error {
 		m := reader.Get(c.UserContext())
+		uptimeSeconds := int64(time.Since(fixedStart).Seconds())
+		// BUG-API-300: mirror the router.go stamp of
+		// Cache-Control: no-store so the wire-contract assertion
+		// below catches a future regression that drops the header.
+		c.Set(fiber.HeaderCacheControl, "no-store")
 		return c.JSON(fiber.Map{
 			"ok":                true,
-			"service":           "instant.dev",
+			"service":           "instanode-api",
 			"commit_id":         buildinfo.GitSHA,
 			"build_time":        buildinfo.BuildTime,
 			"version":           buildinfo.Version,
 			"migration_version": m.PublicVersion(),
 			"migration_count":   m.Count,
 			"migration_status":  m.Status,
+			// BUG-API-417 (QA 2026-05-29): mirror the router.go addition
+			// of the live `now` server timestamp. Keeps the in-process
+			// fixture aligned with prod so a future deletion of the
+			// router.go emit also fails here.
+			"now": time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+			// BUG-P272 (QA 2026-05-29): mirror the router.go addition of
+			// uptime_seconds so the wire-shape contract is pinned here too.
+			"uptime_seconds": uptimeSeconds,
 		})
 	})
 
@@ -70,7 +89,12 @@ func TestHealthzShape(t *testing.T) {
 	// Buildinfo contract — every field is non-empty; commit_id specifically
 	// falls back to "dev" when -ldflags is omitted (go run, go test).
 	require.Equal(t, true, got["ok"])
-	require.Equal(t, "instant.dev", got["service"])
+	// BUG-API-146/148/309: `service` must align with the runtime brand
+	// ("instanode-api"), not the legacy "instant.dev" string. Canaries
+	// + log-line correlation key on the new value.
+	require.Equal(t, "instanode-api", got["service"])
+	require.NotEqual(t, "instant.dev", got["service"],
+		"BUG-API-146: legacy brand string must not regress into /healthz.service")
 	require.NotEmpty(t, got["commit_id"], "commit_id MUST be present on /healthz")
 	require.NotEmpty(t, got["build_time"])
 	require.NotEmpty(t, got["version"])
@@ -80,6 +104,22 @@ func TestHealthzShape(t *testing.T) {
 	require.Equal(t, buildinfo.GitSHA, got["commit_id"])
 	require.Equal(t, buildinfo.BuildTime, got["build_time"])
 	require.Equal(t, buildinfo.Version, got["version"])
+
+	// BUG-API-417: `now` is the wall-clock the server emits so canaries
+	// can detect clock skew between their host and the api pod without
+	// an extra round trip. Format pinned to RFC 3339 with millisecond
+	// precision (matches audit-log + forwarder_sent rows) and the value
+	// must parse back to a time within a generous 5-second window of
+	// the test's own clock (sqlmock + fiber.Test is in-process so the
+	// drift is microseconds in practice).
+	require.NotEmpty(t, got["now"], "BUG-API-417: /healthz must emit a server `now` timestamp so clients can detect clock skew")
+	nowStr, ok := got["now"].(string)
+	require.True(t, ok, "BUG-API-417: `now` must be a JSON string (RFC 3339)")
+	parsedNow, parseErr := time.Parse("2006-01-02T15:04:05.000Z", nowStr)
+	require.NoError(t, parseErr, "BUG-API-417: `now` must parse as `2006-01-02T15:04:05.000Z` (RFC 3339 with ms); got %q", nowStr)
+	drift := time.Since(parsedNow)
+	require.Less(t, drift.Abs(), 5*time.Second,
+		"BUG-API-417: `now` must be within 5s of the test's wall clock (UTC); got drift=%s", drift)
 
 	// Migration contract — new fields the canary reads to detect drift
 	// between binary commit and DB schema state. BUG-API-090/217: the
@@ -91,6 +131,33 @@ func TestHealthzShape(t *testing.T) {
 		"BUG-API-090: migration_version must not leak filename suffix to anon /healthz callers")
 	require.Equal(t, float64(22), got["migration_count"]) // JSON numbers decode as float64
 	require.Equal(t, "ok", got["migration_status"])
+
+	// BUG-P272 (QA 2026-05-29): `uptime_seconds` is the new pod-liveness
+	// field. Must be a non-negative integer-valued JSON number. The
+	// fixture pinned the start instant to ~42s ago, so 41-44s is the
+	// tolerant range (in-process fiber.Test takes <50ms; ±2s is room
+	// to spare for slow CI runners). Drift outside that window is
+	// either a clock bug or a regression that swapped the offset.
+	require.NotNil(t, got["uptime_seconds"], "BUG-P272: /healthz must emit uptime_seconds (int64)")
+	uptimeRaw, ok := got["uptime_seconds"].(float64)
+	require.True(t, ok, "BUG-P272: uptime_seconds must be a JSON number (decoded as float64)")
+	require.GreaterOrEqual(t, uptimeRaw, 40.0, "BUG-P272: uptime_seconds floor — fixture pinned start 42s ago")
+	require.LessOrEqual(t, uptimeRaw, 45.0, "BUG-P272: uptime_seconds ceiling — fixture pinned start 42s ago")
+	// JSON-number must round-trip to an integer (no fractional seconds —
+	// sub-second jitter has no diagnostic value at this surface and
+	// would defeat HTTP-cache dedup for any proxy in front).
+	require.Equal(t, float64(int64(uptimeRaw)), uptimeRaw,
+		"BUG-P272: uptime_seconds must round to an integer; got %f", uptimeRaw)
+
+	// BUG-API-300 (QA 2026-05-29): /healthz is the rule-14 build-SHA
+	// gate surface. Without a Cache-Control directive every intermediary
+	// (CF edge, browser fetch cache, NR synthetic) may return a stale
+	// commit_id for seconds-to-minutes after a rollout, silently breaking
+	// the "did the new image actually land" verification. Pin
+	// `no-store` here so any future deletion of the header on the
+	// router.go path fails this assertion before merge.
+	require.Equal(t, "no-store", resp.Header.Get("Cache-Control"),
+		"BUG-API-300: /healthz must stamp Cache-Control: no-store so build-SHA reads never come from a cached layer")
 
 	require.NoError(t, mock.ExpectationsWereMet())
 }

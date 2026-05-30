@@ -51,6 +51,43 @@ func New(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.G
 	return app
 }
 
+// processStart is captured once per process so /healthz can report
+// `uptime_seconds` for liveness diagnostics without an external clock.
+// Sampled via time.Now() at package-load time — there is no production
+// reason to mutate it after first read. Tests that want to assert a
+// specific uptime override it via processStartFunc.
+//
+// BUG-P272 (QA 2026-05-29): `/healthz` previously did not expose
+// uptime, leaving canaries / agents unable to distinguish "freshly
+// rolled pod" from "pod that's been alive for hours" without a
+// separate metrics scrape. The new `uptime_seconds` field plus the
+// existing `build_time` give a self-contained "when did this pod
+// start and how long has it been up" signal on every shallow probe.
+var processStart = time.Now()
+
+// processStartFunc is the seam that lets tests pin the uptime value.
+// Production code reads processStart directly; test code can swap
+// processStartFunc to a fixed instant to assert the JSON field.
+var processStartFunc = func() time.Time { return processStart }
+
+// probeOptionsHandler returns a Fiber handler that responds 204 + an
+// Allow header to bare `OPTIONS /<probe>` calls. Without it Fiber's
+// "no route for verb" path returns 405 — fine for browser preflight
+// (the CORS middleware lower in the chain handles Origin-bearing
+// requests) but surprising for curl / uptime-checker / SDK probes
+// that do not set Origin. Used by the shallow probe surfaces
+// (/livez, /healthz, /readyz, /openapi.json) per BUG-API-024 /
+// BUG-API-025. The Allow header mirrors the verbs the routed
+// handlers expose so an HTTP-conformant client sees the same allow
+// set whether it reads it from a 405 envelope or a 204 OPTIONS
+// response.
+func probeOptionsHandler(allow string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		c.Set("Allow", allow)
+		return c.SendStatus(fiber.StatusNoContent)
+	}
+}
+
 // NewWithHooks is the production entrypoint — returns both the Fiber
 // app and the ShutdownHooks needed for graceful shutdown.
 func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *middleware.GeoDBs, emailClient *email.Client, planRegistry *plans.Registry, provClient *provisioner.Client, nrApp *newrelic.Application) (*fiber.App, ShutdownHooks) {
@@ -136,8 +173,12 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// GET /livez — "the process is alive." NO database check, NO migration
 	// check, NO auth, NO rate-limit, NO logging context. Pure process-up
 	// signal so a k8s liveness probe can distinguish "process alive" from
-	// "process ready" (the readiness signal lives at /healthz, which checks
-	// DB + migration state).
+	// "process ready" (the deep readiness matrix lives at /readyz — see
+	// handlers/readyz.go; /healthz is the shallow build-SHA + migration
+	// stamp surface that canaries hit post-deploy). BUG-API-202: an
+	// earlier copy of this block said "readiness signal lives at /healthz"
+	// which was wrong — /healthz is the shallow probe, /readyz is the
+	// per-component readiness matrix wired to the k8s readinessProbe.
 	//
 	// Wired here BEFORE the app.Use(...) chain so the kubelet's probe
 	// traffic (~6/min/pod from livenessProbe + readinessProbe split, per
@@ -148,6 +189,15 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	app.Get("/livez", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"alive": true})
 	})
+	// BUG-API-025 (QA 2026-05-29): bare `OPTIONS /livez` (no Origin
+	// header, e.g. curl/uptime-checker style probes) used to fall
+	// through to Fiber's "no route" handler and return 405 because
+	// the CORS middleware (which is the usual OPTIONS responder)
+	// skips when Origin is unset. Browser preflight (Origin present)
+	// still flows through fiberCORS below — this OPTIONS shim only
+	// covers the no-Origin probe lane and returns 204 with the same
+	// Allow header set Fiber would have emitted on a routed 405.
+	app.Options("/livez", probeOptionsHandler("GET, HEAD, OPTIONS"))
 
 	// ── Middleware chain (order matters) ─────────────────────────────────────
 	// SecurityHeaders runs BEFORE RequestID so the static defense-in-depth
@@ -190,6 +240,10 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	}
 	const corsAllowMethods = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
 	const corsAllowHeaders = "Content-Type,Authorization,X-Request-ID,X-E2E-Test-Token,X-E2E-Source-IP"
+	// corsMaxAgeSeconds — 24h preflight cache (Firefox/Safari upper bound;
+	// Chrome will clamp to 2h regardless). BUG-API-303 (QA 2026-05-29):
+	// without this value the browser re-preflights every CORS request.
+	const corsMaxAgeSeconds = 86400
 	// BUG-API-066/067: Fiber's CORS middleware sets Access-Control-Allow-*
 	// headers but does NOT validate the inbound preflight request — a
 	// browser asking for TRACE or Cookie still gets a 204 even though
@@ -206,6 +260,26 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 		AllowMethods:  corsAllowMethods,
 		AllowHeaders:  corsAllowHeaders,
 		ExposeHeaders: "X-Request-ID,X-Instant-Upgrade,X-Instant-Notice",
+		// AUTH-004 follow-up (2026-05-30): /auth/exchange is called from the
+		// dashboard SPA with `credentials: 'include'` so the browser sends
+		// the HttpOnly `instanode_session_exchange` cookie cross-origin
+		// (instanode.dev → api.instanode.dev). For the browser to ALLOW the
+		// SPA to read the response body, the response must carry
+		// `Access-Control-Allow-Credentials: true`. Without it, fetch
+		// rejects the read with the generic "Failed to fetch" / "blocked
+		// by CORS policy" error. Safe because AllowOrigins is an explicit
+		// allowlist (no `*` — the CORS spec forbids credentials + wildcard
+		// origin precisely to prevent rogue sites from siphoning cookies).
+		AllowCredentials: true,
+		// BUG-API-303 (QA 2026-05-29): without Access-Control-Max-Age the
+		// browser re-issues an OPTIONS preflight before every CORS request.
+		// 24h (corsMaxAgeSeconds) is the modern browsers' clamp ceiling —
+		// Chrome caps at 2h, Firefox 24h, Safari 7d, so the practical
+		// effect is per-browser but we ask for the maximum standard value
+		// so cooperative agents (and reverse proxies) cache for the longest
+		// period. Pairs with the Vary: Origin header already emitted to
+		// keep per-origin caches safe.
+		MaxAge: corsMaxAgeSeconds,
 	}))
 	app.Use(middleware.GeoEnrich(geoDbs))
 	app.Use(middleware.Fingerprint())
@@ -358,17 +432,60 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 		// the numeric prefix only via State.PublicVersion so canaries
 		// keep their commit_id+count+version tuple but no domain
 		// knowledge leaks. migration_count + migration_status unchanged.
+		// BUG-API-417 (QA 2026-05-29): include the server's current wall
+		// clock in /healthz so canaries / SDKs / agents can detect clock
+		// skew between their host and the api pod without an extra round
+		// trip. RFC 3339 with millisecond precision matches the format
+		// used in audit-log and forwarder_sent rows; `now` is sourced
+		// from time.Now().UTC() so the value is unambiguous regardless
+		// of the pod's local TZ. build_time is the immutable image stamp;
+		// `now` is the live read — keeping both lets a probe compute the
+		// pod's uptime as a sanity check too.
+		// BUG-API-146/148/309 (QA 2026-05-29): the `service` field used to
+		// emit "instant.dev" — the legacy brand name. Now emits "instanode-api"
+		// so /healthz aligns with the runtime brand (instanode.dev) and the
+		// log-line serviceName ("api" / "instant-api"). Canaries that key on
+		// `service` to disambiguate api vs worker vs provisioner /healthz
+		// stamps benefit from the new value too — see handlers/readyz.go
+		// where worker/provisioner probes report "instanode-worker" and
+		// "instanode-provisioner" in sibling repos.
+		// BUG-P272 (QA 2026-05-29): expose `uptime_seconds` (int64) so
+		// canaries / agents can answer "how long has this pod been up?"
+		// without a separate metrics scrape. Computed from processStartFunc()
+		// (a test-overridable seam) and rounded to seconds — sub-second
+		// jitter has no diagnostic value at this surface and would defeat
+		// HTTP-cache deduplication if anyone proxies the response.
+		uptimeSeconds := int64(time.Since(processStartFunc()).Seconds())
+		// BUG-API-300 (QA 2026-05-29): /healthz is the canonical surface
+		// the rule-14 build-SHA gate reads after every deploy. Without a
+		// Cache-Control hint, any intermediary (Cloudflare edge, browser
+		// fetch cache, kubectl-port-forward'd browser tab, NR synthetic
+		// monitor) may return a stale commit_id read for seconds-to-minutes
+		// after a rollout — silently breaking the "did the new image
+		// actually land" verification. Stamp `no-store` so probes always
+		// hit the live pod. Cost: a few hundred bytes of header per probe;
+		// upside: zero stale build-SHA reads, matching the contract canaries
+		// already assume. Pairs with the OPTIONS shim above.
+		c.Set(fiber.HeaderCacheControl, "no-store")
 		return c.JSON(fiber.Map{
 			"ok":                true,
-			"service":           "instant.dev",
+			"service":           "instanode-api",
 			"commit_id":         buildinfo.GitSHA,
 			"build_time":        buildinfo.BuildTime,
 			"version":           buildinfo.Version,
 			"migration_version": mstate.PublicVersion(),
 			"migration_count":   mstate.Count,
 			"migration_status":  mstate.Status,
+			"now":               time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+			"uptime_seconds":    uptimeSeconds,
 		})
 	})
+	// BUG-API-025 (QA 2026-05-29): mirror the /livez OPTIONS shim on
+	// /healthz so curl/uptime-checker style probes that send a bare
+	// `OPTIONS /healthz` (no Origin) get a 204 instead of the 405 Fiber
+	// returns when no route matches the verb. Browser CORS preflight
+	// (Origin present) still flows through fiberCORS below.
+	app.Options("/healthz", probeOptionsHandler("GET, HEAD, OPTIONS"))
 
 	// /readyz — deep, component-by-component readiness probe wired to
 	// the k8s readinessProbe (NOT livenessProbe — see /healthz above
@@ -379,6 +496,8 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// motivation (RETRO 2026-05-20).
 	readyzH := handlers.NewReadyzHandler(cfg, db, rdb, provClient)
 	app.Get("/readyz", readyzH.Get)
+	// BUG-API-025 (QA 2026-05-29): same OPTIONS shim as /healthz/livez.
+	app.Options("/readyz", probeOptionsHandler("GET, HEAD, OPTIONS"))
 
 	// OpenAPI spec — machine-readable description of the agent-facing API.
 	// T19 P0-1 (BugHunt 2026-05-20): pass ENVIRONMENT so the served spec
@@ -392,6 +511,14 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// the session_token redirected there.
 	handlers.SetReturnToAllowsLocalhost(cfg.Environment != "production")
 	app.Get("/openapi.json", handlers.ServeOpenAPI)
+	// BUG-API-024 (QA 2026-05-29): bare `OPTIONS /openapi.json` (no
+	// Origin header — e.g. an SDK doing a preflight probe before a
+	// custom-header GET) used to return 405 because no route matched
+	// the verb. The CORS middleware below only responds when Origin
+	// is set. Register an explicit OPTIONS handler so the no-Origin
+	// probe lane returns 204 + the Allow header set the browser CORS
+	// preflight would otherwise see via fiberCORS.
+	app.Options("/openapi.json", probeOptionsHandler("GET, HEAD, OPTIONS"))
 
 	// /llms.txt — agent discovery doc, 302 to marketing where it's the
 	// source of truth. Agents that hit api.instanode.dev first land here
@@ -974,6 +1101,12 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// Deploy management endpoints — Phase 6 (aliases under /api/v1)
 	api.Get("/deployments", deployH.List)
 	api.Get("/deployments/:id", deployH.Get)
+	// GET /deployments/:id/events — failure-timeline read surface (swarm
+	// triggering incident 2026-05-30: silent-deploy-failure bug class). Same
+	// RBAC as GET /deployments/:id; returns the deployment_events rows the
+	// worker's deploy_failure_autopsy job writes, ordered DESC by created_at.
+	// Read-only — events are written by the worker, never by the api.
+	api.Get("/deployments/:id/events", deployH.Events)
 	api.Delete("/deployments/:id", deployH.Delete)
 	// Wave FIX-I — two-step email-confirmed deletion. POST confirms
 	// (validates ?token=<plaintext> against the hashed pending row),

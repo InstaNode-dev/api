@@ -139,6 +139,26 @@ func ServeOpenAPI(c *fiber.Ctx) error {
 	return c.SendString(openAPISpecProd)
 }
 
+// OpenAPISpecProduction returns the production-rendered OpenAPI 3.1 spec
+// (with the dev-only /internal/set-tier path stripped) as a JSON string.
+//
+// This is the canonical accessor for cross-stack contract snapshotting —
+// the cmd/openapi-snapshot tool writes its output to api/openapi.snapshot.json,
+// which dashboard and instanode-web consume to generate typed clients.
+//
+// Why an accessor (rather than exporting the const): the production spec is
+// the const minus the dev-only path entry. Callers that snapshot the raw const
+// would ship a spec that lies about the prod surface — every consumer would
+// generate a typed client for an endpoint that 404s in production. Routing
+// the snapshot through this function keeps "what the snapshot says" == "what
+// production serves".
+func OpenAPISpecProduction() string {
+	openAPISpecOnce.Do(func() {
+		openAPISpecProd = stripInternalSetTierPath(openAPISpec)
+	})
+	return openAPISpecProd
+}
+
 // openAPISpec is embedded at build time. It covers all stable, agent-facing endpoints.
 // Generated credentials and tier limits are documented here so AI agents can
 // consume instant.dev programmatically without reading the source code.
@@ -2031,6 +2051,47 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/deployments/{id}/events": {
+      "get": {
+        "summary": "List deployment_events rows (failure timeline) for a deployment",
+        "description": "Returns the deployment_events rows for a deployment owned by the caller's team, ordered by created_at DESC (most recent first). Closes the silent-deploy-failure gap (swarm 2026-05-30): GET /api/v1/deployments/{id} surfaces only the LATEST failure_autopsy row inside the optional 'failure' field; agents debugging a stuck deploy need the full chronological timeline so they can distinguish a single OOM from a retry storm.\n\nEach row carries kind (e.g. 'failure_autopsy'), reason (e.g. 'kaniko_oom', 'image_pull_failed', 'OOMKilled'), exit_code (nullable integer), event (k8s event reason or build error text), last_lines (tail of Kaniko / pod stdout, up to ~200 lines), hint (user-facing remediation copy), and created_at (RFC3339).\n\nRead-only — events are written by the worker (deploy_failure_autopsy + deploy_status_reconcile), never by the api. RBAC mirrors GET /api/v1/deployments/{id} exactly: a cross-team request returns 404 (NOT 403) so the platform never confirms the existence of deployments owned by another team.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Deployment app_id (the short public token returned by POST /deploy/new, same value GET /api/v1/deployments/{id} accepts)." },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }, "description": "Max rows to return. Default 50, hard cap 200. Values above 200 are silently clamped; values < 1 fall back to the default." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Events list (may be empty for a healthy / never-failed deployment).",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DeploymentEventsResponse" },
+                "example": {
+                  "ok": true,
+                  "deployment_id": "b6fcf286-3a8b-4d6e-9e2c-1f9a0c5f8d12",
+                  "events": [
+                    {
+                      "kind": "failure_autopsy",
+                      "reason": "kaniko_oom",
+                      "exit_code": 137,
+                      "event": "OOMKilled",
+                      "last_lines": ["INFO[0123] Taking snapshot of files...", "fatal: out of memory"],
+                      "hint": "Kaniko ran out of memory during the build. Try a smaller base image, or upgrade your tier for more build RAM.",
+                      "created_at": "2026-05-30T17:42:11Z"
+                    }
+                  ],
+                  "count": 1
+                }
+              }
+            }
+          },
+          "400": { "description": "invalid_id — empty id in the URL.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "401": { "description": "Unauthorized — missing or invalid bearer token.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "404": { "description": "not_found — deployment id doesn't exist OR belongs to another team. Cross-team requests resolve to 404 (NOT 403) so the platform never confirms the existence of deployments owned by another team.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "503": { "description": "fetch_failed / events_query_failed — transient DB failure during the deployment lookup or the events list. Safe to retry.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      }
+    },
     "/api/v1/deployments/{id}/confirm-deletion": {
       "post": {
         "summary": "Confirm a pending deletion (paid tiers, Wave FIX-I)",
@@ -2909,12 +2970,12 @@ const openAPISpec = `{
       },
       "StackRequest": {
         "type": "object",
-        "description": "Multipart form. The 'manifest' field is the YAML instant.yaml text; each service declared under services: must have a matching multipart field named after the service whose content is a gzipped tar archive of that service's build context.",
+        "description": "Multipart form. The 'manifest' field is the YAML instant.yaml text; each service declared under services: must have a matching multipart field named after the service whose content is a gzipped tar archive of that service's build context. Codegen note: the dynamic per-service field is expressed via additionalProperties (OpenAPI cannot model literal-named fields whose names come from another field at runtime). Treat additionalProperties as: 'for every service S in manifest.services, send a multipart field named S whose value is the gzipped tar of S's build context.' DOG-30 (QA 2026-05-29).",
         "properties": {
           "manifest": { "type": "string", "description": "instant.yaml contents. Example: services:\\n  api:\\n    build: ./api\\n    port: 8080\\n  web:\\n    build: ./web\\n    port: 8080\\n    expose: true\\n    env: { API_URL: service://api }" },
-          "name": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9 _-]*$", "description": "REQUIRED. Short human-readable label for this stack (1-64 chars after trimming; must start with a letter or digit, then letters/digits/spaces/underscores/hyphens). Missing/empty → 400 name_required. Bad format/length → 400 invalid_name." },
-          "<service-name>": { "type": "string", "format": "binary", "description": "One field per service declared in the manifest, named after the service. Value is a gzipped tar archive containing that service's Dockerfile + source. Total request body cap is 200 MB." }
+          "name": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9 _-]*$", "description": "REQUIRED. Short human-readable label for this stack (1-64 chars after trimming; must start with a letter or digit, then letters/digits/spaces/underscores/hyphens). Missing/empty → 400 name_required. Bad format/length → 400 invalid_name." }
         },
+        "additionalProperties": { "type": "string", "format": "binary", "description": "One multipart field per service declared in the manifest, with the field NAME equal to the real service name (e.g. 'api' or 'web', NOT the literal placeholder '<service-name>') and the VALUE a gzipped tar archive (≤50 MiB) containing that service's Dockerfile + source. Codegen clients should emit one upload field per manifest entry." },
         "required": ["manifest", "name"]
       },
       "StackResponse": {
@@ -3028,7 +3089,8 @@ const openAPISpec = `{
           "allowed_ips": { "type": "string", "description": "Comma-separated list of CIDRs or IP literals (e.g. \"1.2.3.4,10.0.0.0/8,2001:db8::/32\"). Required when private=true; max 32 entries. Each entry is validated via Go's net.ParseCIDR / net.ParseIP — invalid entries surface in the 400 message so an agent can fix the literal that broke. Larger allowlists belong in CF Access or a real VPN, not an nginx annotation." },
           "notify_webhook": { "type": "string", "description": "Optional https:// URL fired by POST when the deploy reaches a terminal state (status='healthy' or 'failed'). Lets callers subscribe instead of polling GET /deploy/:id. Rejected with 400 + agent_action if the URL is not https, the hostname is unresolvable, or resolves to a private/loopback/link-local/CGNAT IP (SSRF protection). Payload shape: { event: 'deploy.healthy' | 'deploy.failed', deploy_id, app_id, url, commit_id, build_time, duration_s, error_message? }. 2xx → notify_state='sent'; 4xx → 'failed' (no retry — user URL is broken); 5xx/network → up to 3 retries, then 'failed'." },
           "notify_webhook_secret": { "type": "string", "description": "Optional HMAC-SHA256 signing key. When set, every dispatch includes an X-InstaNode-Signature: sha256=<hex(hmac(secret, body))> header. Stored AES-256-GCM encrypted; plaintext never leaves the request. Omit to dispatch without a signature header." },
-          "ttl_policy": { "type": "string", "enum": ["auto_24h", "permanent"], "description": "Wave FIX-J. Sets the deploy's lifecycle. 'auto_24h' (default for new deploys) means the deploy auto-expires 24h from creation; the response's agent_action sentence tells the LLM the three explicit routes to keep it permanent. 'permanent' opts the deploy out of TTL up front — useful for production deploys where the agent already knows the user wants it kept. Anonymous tier is FORCED to auto_24h regardless of caller intent. Team-wide default can be flipped via PATCH /api/v1/team/settings." }
+          "ttl_policy": { "type": "string", "enum": ["auto_24h", "permanent"], "description": "Wave FIX-J. Sets the deploy's lifecycle. 'auto_24h' (default for new deploys) means the deploy auto-expires 24h from creation; the response's agent_action sentence tells the LLM the three explicit routes to keep it permanent. 'permanent' opts the deploy out of TTL up front — useful for production deploys where the agent already knows the user wants it kept. Anonymous tier is FORCED to auto_24h regardless of caller intent. Team-wide default can be flipped via PATCH /api/v1/team/settings." },
+          "redeploy": { "type": "boolean", "default": false, "description": "When true with a matching 'name', replace the existing deployment in place (same app_id + URL, same provider_id) instead of minting a fresh one. The platform looks up the team's most-recent non-terminal deployment whose env_vars._name matches the supplied 'name' (scoped to the resolved 'env'), then routes through the same compute path as POST /deploy/:id/redeploy. Closes the agent-UX gap (2026-05-30): multiple /deploy/new calls for the same logical app used to fan out into N distinct URLs because there was no way to upsert by name. Truthy values: 'true', '1', 'yes' (case-insensitive); anything else is false. Errors: 400 redeploy_requires_name when 'name' is empty; 404 no_existing_deployment_to_redeploy when no live row matches (omit 'redeploy' to create a new deployment, or call GET /api/v1/deployments first to discover the id); 409 not_ready when the matching row exists but has no provider_id yet (initial build still running). Default false: leaving the field absent keeps the legacy fan-out behaviour." }
         },
         "required": ["tarball", "name"]
       },
@@ -3059,12 +3121,39 @@ const openAPISpec = `{
               "expires_at": { "type": "string", "format": "date-time", "description": "Wave FIX-J. When the deploy auto-expires. Omitted when ttl_policy='permanent'." },
               "reminders_sent": { "type": "integer", "description": "Wave FIX-J. Count of reminder emails dispatched (0..6). Present when ttl_policy != 'permanent'." },
               "make_permanent_url": { "type": "string", "description": "Wave FIX-J. Absolute https URL the LLM agent can POST to in order to opt the deploy out of TTL. Present when ttl_policy != 'permanent'." },
-              "extend_ttl_url": { "type": "string", "description": "Wave FIX-J. Absolute https URL the LLM agent can POST to with {hours} to set a custom TTL. Present when ttl_policy != 'permanent'." }
+              "extend_ttl_url": { "type": "string", "description": "Wave FIX-J. Absolute https URL the LLM agent can POST to with {hours} to set a custom TTL. Present when ttl_policy != 'permanent'." },
+              "redeployed": { "type": "boolean", "description": "Mirror of the top-level 'redeployed' flag — included inside item so a client that reads only item still sees the in-place-vs-fresh branch indicator. True when this row was reused via POST /deploy/new redeploy=true, false on the fresh-deploy path." }
             }
           },
           "note": { "type": "string" },
+          "redeployed": { "type": "boolean", "description": "True when this response served an in-place redeploy (POST /deploy/new redeploy=true matched an existing deployment), false on the fresh-deploy path. Always present so agents have a single response shape across both branches." },
           "agent_action": { "type": "string", "description": "Wave FIX-J. Verbatim sentence the LLM agent relays to the user. Present on 202 responses when ttl_policy='auto_24h'; tells the user the three routes to keep the deploy permanent." }
         }
+      },
+      "DeploymentEvent": {
+        "type": "object",
+        "description": "One row from the deployment_events table — the worker's autopsy / lifecycle record for a deployment. Today's writer is deploy_failure_autopsy + deploy_status_reconcile (kind='failure_autopsy'); the kind field is open-ended so future event types (e.g. 'lifecycle') can be added without breaking the schema.",
+        "properties": {
+          "kind":       { "type": "string", "description": "Event kind. Today: 'failure_autopsy'. Future kinds may include 'lifecycle'." },
+          "reason":     { "type": "string", "description": "Short slug describing the failure (e.g. 'kaniko_oom', 'image_pull_failed', 'OOMKilled', 'CrashLoopBackOff'). See models.FailureReason* constants for the closed set used by the failure_autopsy kind." },
+          "exit_code":  { "type": ["integer", "null"], "description": "Process exit code when known (137 = SIGKILL, often OOM). null when the failure mode has no exit code (image pull failure, etc.)." },
+          "event":      { "type": "string", "description": "k8s event reason or build error text. Empty string when no upstream event was captured." },
+          "last_lines": { "type": "array", "items": { "type": "string" }, "description": "Tail of Kaniko / pod stdout at the moment of failure capture, oldest-first. Up to ~200 lines. Empty array when no log lines were available (pod GC'd before capture)." },
+          "hint":       { "type": "string", "description": "Plain-language likely cause + suggested remedy. Sourced from models.HintForReason; safe to relay verbatim to the user." },
+          "created_at": { "type": "string", "format": "date-time", "description": "When the worker wrote the autopsy row (RFC3339)." }
+        },
+        "required": ["kind", "reason", "exit_code", "event", "last_lines", "hint", "created_at"]
+      },
+      "DeploymentEventsResponse": {
+        "type": "object",
+        "description": "Response payload for GET /api/v1/deployments/{id}/events. Events are ordered by created_at DESC (most recent first). The count field is the length of the returned events array, NOT the total number of rows in deployment_events for this deployment — pagination is silent: callers wanting more than 200 rows must accept the cap.",
+        "properties": {
+          "ok":            { "type": "boolean" },
+          "deployment_id": { "type": "string", "format": "uuid", "description": "The deployment's primary key UUID. Resolved from the app_id slug in the URL path." },
+          "events":        { "type": "array", "items": { "$ref": "#/components/schemas/DeploymentEvent" } },
+          "count":         { "type": "integer", "description": "Length of the events array. 0 when the deployment has no events yet (healthy / never-failed)." }
+        },
+        "required": ["ok", "deployment_id", "events", "count"]
       },
       "GitHubConnection": {
         "type": "object",
@@ -3246,9 +3335,10 @@ const openAPISpec = `{
           "rpo_minutes":             { "type": "integer", "description": "Recovery Point Objective in minutes — the maximum window of data loss a restore can incur. 0 means no backup/RPO guarantee for the tier." },
           "rto_minutes":             { "type": "integer", "description": "Recovery Time Objective in minutes — the target time to restore service after an incident. 0 means no RTO guarantee for the tier." },
           "annual_discount_percent": { "type": "integer", "description": "Discount percent of the {tier}_yearly variant vs 12x the monthly. 0 when no yearly variant exists." },
-          "upgrade_url":             { "type": "string", "format": "uri" }
+          "upgrade_url":             { "type": ["string", "null"], "format": "uri", "description": "Pricing/upgrade URL for non-terminal tiers. null for the terminal tier (Team today) — there is nothing to upgrade to. Pairs with is_terminal_tier; SDKs/dashboards rendering an Upgrade CTA should suppress when null. DOG-26 (QA 2026-05-29)." },
+          "is_terminal_tier":        { "type": "boolean", "description": "True for the top tier in the rank ladder (Team today). When true, upgrade_url is null. Lets clients render an Upgrade CTA conditionally without string-matching tier names. DOG-26." }
         },
-        "required": ["tier", "display_name", "price_usd_monthly", "paid_from_day_one", "storage_limit_mb", "connections_limit", "deployments_apps", "upgrade_url"]
+        "required": ["tier", "display_name", "price_usd_monthly", "paid_from_day_one", "storage_limit_mb", "connections_limit", "deployments_apps", "upgrade_url", "is_terminal_tier"]
       },
       "CapabilitiesResponse": {
         "type": "object",

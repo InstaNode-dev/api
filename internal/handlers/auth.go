@@ -408,7 +408,18 @@ func (h *AuthHandler) GitHub(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "invalid_body", "Request body must be valid JSON")
 	}
 	if body.Code == "" {
-		return respondError(c, fiber.StatusBadRequest, "missing_code", "code field is required")
+		// BUG-API-184 (QA 2026-05-29): the error message used to read
+		// "code field is required" — accurate but agent-unhelpful. An
+		// LLM agent that 4xx'd here needed to either know the GitHub
+		// OAuth code-exchange contract already or open /openapi.json to
+		// learn what to send. Stamp the full required-fields list inline
+		// (the request body has only one field today, but the contract
+		// shape is what the agent needs — `{ "code": "<github_oauth_code>" }`)
+		// so the message is a self-contained instruction. Keep the
+		// `missing_code` error code stable for back-compat (agents
+		// branching on .error stay green).
+		return respondError(c, fiber.StatusBadRequest, "missing_code",
+			"Request body is missing the required `code` field. POST `{\"code\": \"<github_oauth_code>\"}` after exchanging your OAuth authorization code at GitHub.")
 	}
 
 	if h.cfg.GitHubClientID == "" || h.cfg.GitHubClientSecret == "" {
@@ -514,10 +525,18 @@ func (h *AuthHandler) GoogleCallback(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusBadRequest, "invalid_body", "Request body must be valid JSON")
 	}
 	if body.Code == "" {
-		return respondError(c, fiber.StatusBadRequest, "missing_code", "code field is required")
+		// BUG-API-184 (QA 2026-05-29): mirror the GitHub surface so the
+		// agent-actionable message names BOTH fields the Google callback
+		// expects (code + redirect_uri). Same code stays for back-compat;
+		// only the human/agent-facing message gains the shape hint.
+		return respondError(c, fiber.StatusBadRequest, "missing_code",
+			"Request body is missing the required `code` field. POST `{\"code\": \"<google_oauth_code>\", \"redirect_uri\": \"<uri>\"}` after exchanging your OAuth authorization code at Google.")
 	}
 	if body.RedirectURI == "" {
-		return respondError(c, fiber.StatusBadRequest, "missing_redirect_uri", "redirect_uri field is required")
+		// BUG-API-184: same treatment — name the field and the body shape
+		// so an LLM hitting this 4xx has everything it needs to retry.
+		return respondError(c, fiber.StatusBadRequest, "missing_redirect_uri",
+			"Request body is missing the required `redirect_uri` field. POST `{\"code\": \"<google_oauth_code>\", \"redirect_uri\": \"<uri>\"}` matching the redirect_uri you registered with Google.")
 	}
 
 	accessToken, err := exchangeGoogleAuthorizationCode(c.Context(), h.cfg.GoogleClientID, h.cfg.GoogleClientSecret, body.Code, body.RedirectURI)
@@ -1112,8 +1131,26 @@ func (h *AuthHandler) consumeOAuthState(ctx context.Context, state string) bool 
 // remember to escape — defense in depth.
 func renderAuthError(c *fiber.Ctx, status int, headline, detail string) error {
 	c.Set("Content-Type", "text/html; charset=utf-8")
+	// BUG-API-404 (QA 2026-05-29): the OAuth / magic-link callback HTML
+	// is a per-request rendering of session-bound state — a back-button,
+	// browser-history-restore, or service-worker re-fetch must NOT replay
+	// it (the underlying token has been consumed or expired). Without
+	// Cache-Control, the body could be re-served by the browser fetch
+	// cache or any intermediary, which both leaks the "you tried this
+	// link" UX state across sessions AND, in the success-redirect cousin
+	// of this surface, would re-set the exchange cookie. `no-store`
+	// (RFC 9111 §5.2.2.5) is the strongest stop-cache directive and
+	// matches the contract every other auth-result surface in the api
+	// already follows.
+	c.Set(fiber.HeaderCacheControl, "no-store")
+	// BUG-API-257 (QA 2026-05-29): the <html> element used to ship with
+	// no `lang` attribute. WCAG 3.1.1 "Language of Page" requires a
+	// programmatically determinable primary language; assistive tech
+	// (VoiceOver, NVDA) falls back to the OS locale otherwise, mis-
+	// pronouncing English copy in non-English locales. `lang="en"` is
+	// the correct value for the static English-only copy below.
 	body := fmt.Sprintf(`<!DOCTYPE html>
-<html>
+<html lang="en">
 <head><meta charset="UTF-8"><title>Sign-in error</title></head>
 <body style="font-family:sans-serif;max-width:480px;margin:48px auto;padding:24px;color:#111;">
   <h2>%s</h2>

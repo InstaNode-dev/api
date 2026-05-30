@@ -136,6 +136,14 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	// TestCodeToAgentAction_NoOrphans. If a future feature reintroduces
 	// a "tier is genuinely unavailable" surface, re-add the entry here
 	// and emit it from the new site in the same PR.
+	"events_query_failed": {
+		AgentAction: "Tell the user the deployment-events read is temporarily unavailable. Retry in 30 seconds; the deploy itself isn't affected. Status: https://instanode.dev/status",
+		UpgradeURL:  "",
+	},
+	"no_existing_deployment_to_redeploy": {
+		AgentAction: "Tell the user no deployment with that name exists on this team. Omit redeploy=true to create one fresh, or list https://instanode.dev/api/v1/deployments to find the app_id and call POST /deploy/{id}/redeploy.",
+		UpgradeURL:  "",
+	},
 	"rate_limit_exceeded": {
 		AgentAction: "Tell the user they've sent too many requests in a short window. Wait 60 seconds and retry — or upgrade to Pro at https://instanode.dev/pricing for higher limits.",
 		UpgradeURL:  "https://instanode.dev/pricing",
@@ -226,8 +234,20 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"auth_required": {
 		AgentAction: "Tell the user this action requires an authenticated session. Have them log in or sign up at https://instanode.dev/login — both flows mint a token.",
 	},
+	// BUG-API-020 (QA 2026-05-29): the `invalid_token` code is emitted from
+	// 9 handler sites — webhook receiver path token (webhook.go:528/811),
+	// invitation token (teams.go:170/248), storage URL path token
+	// (storage_presign.go:114), onboarding claim JWT (onboarding.go:92/282/294),
+	// stack manifest needs token (stack.go:539), deploy logs URL path token
+	// (logs.go:148). None of them are an INSTANODE_TOKEN. The pre-fix
+	// agent_action sent agents on the wrong remediation path ("have the user
+	// log in") for every one of those surfaces. The new copy stays neutral —
+	// the token in the URL path or claim JWT — and points at the docs page
+	// covering both shapes. The auth/Bearer 401 path is unaffected (it lives
+	// at middleware/auth.go:61 in `unauthorizedAgentAction`, which still
+	// names INSTANODE_TOKEN because there the wording is correct).
 	"invalid_token": {
-		AgentAction: "Tell the user their INSTANODE_TOKEN is invalid or expired. Have them log in at https://instanode.dev/login to mint a new one.",
+		AgentAction: "Tell the user the supplied token is invalid or expired. URL path tokens must be a valid UUID returned by a provision response (POST /db/new, /webhook/new, /storage/new etc.); onboarding claim JWTs come from anonymous provision flows — see https://instanode.dev/docs.",
 	},
 	"missing_token": {
 		AgentAction: "Tell the user no INSTANODE_TOKEN was provided. Have them log in at https://instanode.dev/login and pass it via Authorization: Bearer <token>.",
@@ -255,6 +275,16 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	// ── Expired / gone ─────────────────────────────────────────────────────
 	"webhook_inactive": {
 		AgentAction: "Tell the user this webhook token has expired or been deactivated. Have them provision a fresh one with POST https://instanode.dev/webhook/new.",
+	},
+	// BUG-API-423 (QA 2026-05-29): /webhook/receive/:token's 404 used to
+	// emit the generic `not_found` code which agents grepping for the
+	// specific surface couldn't disambiguate from any other route 404.
+	// `webhook_not_found` makes the surface explicit so a webhook sender
+	// can distinguish "I have the wrong URL" from "I'm hitting a
+	// completely unrelated 404". Same wire shape (400/404 status,
+	// message body unchanged) — only the code keyword is sharper.
+	"webhook_not_found": {
+		AgentAction: "Tell the user this webhook token does not exist. Confirm the URL path token is the one returned by POST https://instanode.dev/webhook/new — anon resources also auto-expire after 24h.",
 	},
 	"resource_not_found": {
 		AgentAction: "Tell the user this resource no longer exists — anonymous resources auto-expire after 24h. Have them provision a fresh one at https://instanode.dev/docs/quickstart.",
@@ -321,7 +351,14 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	// StatusNotFound / StatusMethodNotAllowed / StatusRequestEntityTooLarge
 	// / StatusUnsupportedMediaType.
 	"not_found": {
-		AgentAction: "Tell the user the URL is wrong or the resource no longer exists. Have them check the path against https://instanode.dev/docs — anon resources also auto-expire after 24h, so re-provision if needed.",
+		// BUG-API-105 (QA 2026-05-29): the agent_action used to tack on
+		// "anon resources also auto-expire after 24h" — irrelevant when
+		// the 404 is a typo'd internal path or unknown route, and
+		// actively misleading on authenticated misroutes. Hint kept
+		// behind a "see /docs" pointer; the auto-expire footnote now
+		// only fires when the surface-specific 404 (resource_not_found
+		// / webhook_not_found / etc.) emits it.
+		AgentAction: "Tell the user the URL is wrong or the resource no longer exists. Have them check the path against https://instanode.dev/docs — if they were calling a token-keyed URL the token may have expired or been mistyped.",
 	},
 	"method_not_allowed": {
 		AgentAction: "Tell the user the HTTP method is wrong for this URL. Have them check the Allow response header (or https://instanode.dev/docs) for the supported methods.",

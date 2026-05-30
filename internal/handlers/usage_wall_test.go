@@ -133,6 +133,79 @@ func TestUsageWall_ReturnsFalseWhenNoRecentRow(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+// TestUsageWall_CacheHeadersOnEvery200Path is the registry-iterating
+// regression for BUG-API-420. /api/v1/usage/wall has three distinct 200
+// code paths in GetWall (team-tier short-circuit, no-recent-row,
+// row-found-with-metadata) — every one MUST stamp the same Cache-Control
+// and Vary headers, otherwise a dashboard polling the endpoint on every
+// nav re-hits the DB on the busy team-scoped audit_log table. The cases
+// table mirrors the three code paths in usage_wall.go; adding a fourth
+// path without updating this test (which would mean the path skips the
+// cache header) is the bug class rule 18 protects against.
+func TestUsageWall_CacheHeadersOnEvery200Path(t *testing.T) {
+	cases := []struct {
+		name  string
+		prime func(mock sqlmock.Sqlmock, teamID uuid.UUID)
+	}{
+		{
+			name: "team_tier_short_circuit",
+			prime: func(mock sqlmock.Sqlmock, teamID uuid.UUID) {
+				expectTeamLookup(mock, teamID, "team")
+			},
+		},
+		{
+			name: "no_recent_row",
+			prime: func(mock sqlmock.Sqlmock, teamID uuid.UUID) {
+				expectTeamLookup(mock, teamID, "hobby")
+				mock.ExpectQuery(`SELECT metadata, created_at\s+FROM audit_log`).
+					WithArgs(teamID, "near_quota_wall", sqlmock.AnyArg()).
+					WillReturnError(sql.ErrNoRows)
+			},
+		},
+		{
+			name: "row_found_with_metadata",
+			prime: func(mock sqlmock.Sqlmock, teamID uuid.UUID) {
+				expectTeamLookup(mock, teamID, "hobby")
+				metadata := `{"tier":"hobby","axis":"storage","service":"postgres","current":1,"limit":2,"percent_used":50}`
+				mock.ExpectQuery(`SELECT metadata, created_at\s+FROM audit_log`).
+					WithArgs(teamID, "near_quota_wall", sqlmock.AnyArg()).
+					WillReturnRows(sqlmock.NewRows([]string{"metadata", "created_at"}).
+						AddRow(metadata, time.Now().Add(-1*time.Hour)))
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+			require.NoError(t, err)
+			defer db.Close()
+
+			teamID := uuid.New()
+			tc.prime(mock, teamID)
+
+			app := newUsageWallApp(t, db, teamID)
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/usage/wall", nil)
+			resp, err := app.Test(req, 5000)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+			// BUG-API-420: Cache-Control: private, max-age=30 keeps
+			// per-team caching local to the browser (never a shared
+			// CDN) and clamps staleness to 30s — well under the
+			// dashboard's 5-min poll interval.
+			assert.Equal(t, "private, max-age=30", resp.Header.Get("Cache-Control"),
+				"BUG-API-420: %s path must emit Cache-Control: private, max-age=30", tc.name)
+			// Vary: Authorization prevents team A's banner state from
+			// being served to team B (per-team cache key).
+			assert.Equal(t, "Authorization", resp.Header.Get("Vary"),
+				"BUG-API-420: %s path must emit Vary: Authorization so per-team cache keys never cross teams", tc.name)
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
 // TestUsageWall_TeamTierShortCircuits verifies the team-tier early
 // return: a team-tier caller MUST get near_wall=false without an
 // audit_log query (sqlmock strict mode catches the unexpected query).

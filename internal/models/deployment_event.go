@@ -167,6 +167,92 @@ type UpsertAutopsyParams struct {
 	Hint         string
 }
 
+// DeploymentEventsListMaxLimit is the hard cap on the number of rows returned
+// by GetDeploymentEvents (and therefore by GET /api/v1/deployments/:id/events).
+// A caller asking for more is silently clamped — same shape as the per-request
+// page-size caps elsewhere in the API. Kept generous (200) so an agent doing a
+// single fetch sees the full failure timeline of even the most chatty deploy,
+// but low enough that an unbounded ?limit= can't fan out into a multi-MB
+// response from a misbehaving client.
+const DeploymentEventsListMaxLimit = 200
+
+// DeploymentEventsListDefaultLimit is the default page size when ?limit= is
+// omitted. Matches the contract documented in CLAUDE.md and in the OpenAPI
+// description so an agent reading the spec sees the same number the handler
+// applies.
+const DeploymentEventsListDefaultLimit = 50
+
+// GetDeploymentEvents returns up to `limit` rows from deployment_events for the
+// given deployment, ordered by created_at DESC (most recent first). Drives
+// GET /api/v1/deployments/:id/events — agents and the dashboard read the full
+// failure timeline (not just the most recent autopsy) so they can show
+// progression: a kaniko_oom that retried into an image_pull_failed, etc.
+//
+// limit is clamped to [1, DeploymentEventsListMaxLimit]; values < 1 fall back
+// to DeploymentEventsListDefaultLimit. The handler is responsible for any
+// caller-facing validation messaging; this layer just enforces the bound.
+//
+// Returns an empty slice (not nil) when no events exist — the handler can
+// serialise [] directly without a nil check, and JSON consumers always see an
+// `events` array even on a fresh / never-failed deployment.
+func GetDeploymentEvents(ctx context.Context, db *sql.DB, deploymentID uuid.UUID, limit int) ([]*DeploymentEvent, error) {
+	if limit < 1 {
+		limit = DeploymentEventsListDefaultLimit
+	}
+	if limit > DeploymentEventsListMaxLimit {
+		limit = DeploymentEventsListMaxLimit
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, deployment_id, kind, reason, exit_code, event, last_lines, hint, created_at
+		FROM deployment_events
+		WHERE deployment_id = $1
+		ORDER BY created_at DESC
+		LIMIT $2
+	`, deploymentID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("models.GetDeploymentEvents: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]*DeploymentEvent, 0, limit)
+	for rows.Next() {
+		var (
+			ev           DeploymentEvent
+			lastLinesRaw []byte
+		)
+		if err := rows.Scan(
+			&ev.ID,
+			&ev.DeploymentID,
+			&ev.Kind,
+			&ev.Reason,
+			&ev.ExitCode,
+			&ev.Event,
+			&lastLinesRaw,
+			&ev.Hint,
+			&ev.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("models.GetDeploymentEvents scan: %w", err)
+		}
+		if len(lastLinesRaw) > 0 {
+			if err := json.Unmarshal(lastLinesRaw, &ev.LastLines); err != nil {
+				// Defensive: same posture as GetLatestDeploymentAutopsy —
+				// a corrupt jsonb blob degrades to an empty slice rather
+				// than 500ing the whole list.
+				ev.LastLines = nil
+			}
+		}
+		if ev.LastLines == nil {
+			ev.LastLines = []string{}
+		}
+		out = append(out, &ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("models.GetDeploymentEvents rows: %w", err)
+	}
+	return out, nil
+}
+
 // UpsertDeploymentAutopsy inserts or updates the failure autopsy row.
 func UpsertDeploymentAutopsy(ctx context.Context, db *sql.DB, p UpsertAutopsyParams) error {
 	lastLines := p.LastLines

@@ -320,6 +320,20 @@ func (h *CLIAuthHandler) GetCurrentUser(c *fiber.Ctx) error {
 		}
 	}
 
+	// AUTH-146 (QA 2026-05-29): /auth/me returns the caller's
+	// session-bound identity (user_id, team_id, email, tier,
+	// experiments-bucket, admin flags, impersonation state). None of
+	// those values are safe to cache — a service worker, browser
+	// back-cache after logout, or an intermediate proxy that respects
+	// the default heuristic-cache rules could re-serve them to a
+	// subsequent session (different user on the same machine, post-
+	// rotation token, post-impersonation drop). `Cache-Control:
+	// no-store` is the unconditional opt-out — RFC 9111 §5.2.2.5: "no
+	// part of either the immediate request or response is stored by
+	// any cache." Paired with the existing 24h-clamped JWT and
+	// jti-revocation on logout, this closes the per-machine
+	// stale-identity vector.
+	c.Set("Cache-Control", "no-store")
 	return c.JSON(resp)
 }
 

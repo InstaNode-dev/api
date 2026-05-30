@@ -529,11 +529,18 @@ func (h *WebhookHandler) Receive(c *fiber.Ctx) error {
 	}
 
 	// Look up the resource to ensure it exists and is active.
+	// BUG-API-423 (QA 2026-05-29): both the "row missing" and the "row
+	// exists but is a different resource type" branches return the same
+	// surface-specific code (`webhook_not_found`) so a webhook sender
+	// can branch on the code without parsing the message string. The
+	// shared code is intentional — we MUST NOT confirm whether the
+	// token belongs to a different resource type, since that would let
+	// a probe enumerate resources by token shape.
 	resource, err := models.GetResourceByToken(ctx, h.db, tokenUUID)
 	if err != nil {
 		var notFound *models.ErrResourceNotFound
 		if errors.As(err, &notFound) {
-			return respondError(c, fiber.StatusNotFound, "not_found", "Webhook token not found")
+			return respondError(c, fiber.StatusNotFound, "webhook_not_found", "Webhook token not found")
 		}
 		slog.Error("webhook.receive.lookup_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
@@ -546,7 +553,7 @@ func (h *WebhookHandler) Receive(c *fiber.Ctx) error {
 	// genuinely missing token — never confirm the token belongs to a
 	// different resource type).
 	if resource.ResourceType != models.ResourceTypeWebhook {
-		return respondError(c, fiber.StatusNotFound, "not_found", "Webhook token not found")
+		return respondError(c, fiber.StatusNotFound, "webhook_not_found", "Webhook token not found")
 	}
 
 	if resStatus, _ := resourcestatus.Parse(resource.Status); !resStatus.IsActive() {

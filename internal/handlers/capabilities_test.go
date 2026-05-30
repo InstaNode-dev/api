@@ -39,7 +39,9 @@ type capabilityTier struct {
 	BackupRestoreEnabled  bool           `json:"backup_restore_enabled"`
 	ManualBackupsPerDay   int            `json:"manual_backups_per_day"`
 	AnnualDiscountPercent int            `json:"annual_discount_percent"`
-	UpgradeURL            string         `json:"upgrade_url"`
+	// DOG-26: UpgradeURL is *string — terminal tier (Team) emits null.
+	UpgradeURL     *string `json:"upgrade_url"`
+	IsTerminalTier bool    `json:"is_terminal_tier"`
 }
 
 // newCapabilitiesApp wires a minimal Fiber app with the /capabilities
@@ -165,7 +167,17 @@ func TestCapabilities_DerivesPriceFromPlanRegistry(t *testing.T) {
 		assert.Equal(t, c.wantPriceUSD, got.PriceUSDMonthly, "%s price_usd_monthly", c.tier)
 		assert.Equal(t, c.wantPaid, got.PaidFromDayOne, "%s paid_from_day_one", c.tier)
 		assert.Equal(t, c.wantDisplay, got.DisplayName, "%s display_name", c.tier)
-		assert.Equal(t, "https://instanode.dev/pricing/", got.UpgradeURL, "%s upgrade_url", c.tier)
+		// DOG-26: terminal tier (Team — top of the rank ladder) emits
+		// upgrade_url=null + is_terminal_tier=true. Every other tier
+		// emits the pricing URL.
+		if c.tier == "team" {
+			assert.Nil(t, got.UpgradeURL, "%s upgrade_url must be null (terminal tier)", c.tier)
+			assert.True(t, got.IsTerminalTier, "%s is_terminal_tier must be true", c.tier)
+		} else {
+			require.NotNil(t, got.UpgradeURL, "%s upgrade_url must be non-null", c.tier)
+			assert.Equal(t, "https://instanode.dev/pricing/", *got.UpgradeURL, "%s upgrade_url", c.tier)
+			assert.False(t, got.IsTerminalTier, "%s is_terminal_tier must be false (non-terminal)", c.tier)
+		}
 	}
 }
 
@@ -235,6 +247,64 @@ func TestCapabilities_SkipsYearlyVariants(t *testing.T) {
 	for i, want := range wantOrder {
 		assert.Equal(t, want, body.Tiers[i].Tier, "position %d", i)
 	}
+}
+
+// TestCapabilities_TerminalTierUpgradeURLIsNull pins DOG-26: the top tier
+// in the rank ladder (Team today) emits upgrade_url=null + is_terminal_tier=
+// true. Every non-terminal tier emits the pricing URL + is_terminal_tier=false.
+//
+// Registry-iterating per CLAUDE.md rule 18: tomorrow's plans.yaml + rank.go
+// addition (e.g. an `enterprise` tier above team) automatically shifts the
+// terminal marker — this test reads the live rank ordering rather than
+// hardcoding "team" as the terminal name, so adding a new top tier doesn't
+// require touching this assertion.
+func TestCapabilities_TerminalTierUpgradeURLIsNull(t *testing.T) {
+	reg := plans.Default()
+	app := newCapabilitiesApp(t, reg)
+	_, body := callCapabilities(t, app)
+	require.NotEmpty(t, body.Tiers, "expected at least one tier")
+
+	// Last row in the rank-sorted slice is the terminal tier by
+	// construction (capabilities.go sorts entries by rank ascending).
+	terminal := body.Tiers[len(body.Tiers)-1]
+	assert.True(t, terminal.IsTerminalTier,
+		"DOG-26: top-of-ladder tier (%q) must have is_terminal_tier=true", terminal.Tier)
+	assert.Nil(t, terminal.UpgradeURL,
+		"DOG-26: top-of-ladder tier (%q) must have upgrade_url=null — nothing to upgrade to", terminal.Tier)
+
+	// Every other row must be non-terminal with a populated URL.
+	for _, tr := range body.Tiers[:len(body.Tiers)-1] {
+		assert.False(t, tr.IsTerminalTier,
+			"DOG-26: non-terminal tier %q must have is_terminal_tier=false", tr.Tier)
+		require.NotNil(t, tr.UpgradeURL,
+			"DOG-26: non-terminal tier %q must have a non-null upgrade_url", tr.Tier)
+		assert.Equal(t, "https://instanode.dev/pricing/", *tr.UpgradeURL,
+			"non-terminal tier %q upgrade_url", tr.Tier)
+	}
+}
+
+// TestCapabilities_CacheControlPublicMaxAge60 pins BUG-API-039 /
+// BUG-API-311: /api/v1/capabilities is dashboard-hit on every nav
+// (sidebar tiles, billing card, settings) and the tier matrix is
+// immutable for the life of the running pod (only changes on a
+// plans.yaml edit + redeploy). Without a Cache-Control hint each nav
+// re-fetched the full ~4 KB matrix; sidebar fanout meant 4-6 redundant
+// fetches per nav (BUG-DASH-016).
+//
+// Pin `public, max-age=60, must-revalidate` so the browser/edge cache
+// serves the matrix for a minute while still re-validating on expiry.
+// A future deletion of the c.Set call fails this assertion before merge.
+func TestCapabilities_CacheControlPublicMaxAge60(t *testing.T) {
+	reg := plans.Default()
+	app := newCapabilitiesApp(t, reg)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/capabilities", nil)
+	resp, err := app.Test(req, -1)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "public, max-age=60, must-revalidate",
+		resp.Header.Get("Cache-Control"),
+		"BUG-API-039/311: /api/v1/capabilities must stamp Cache-Control: public, max-age=60, must-revalidate so dashboard nav fanout doesn't re-fetch the same immutable matrix every navigation")
 }
 
 // TestCapabilities_AnnualDiscountFromYAML — when a {tier}_yearly variant

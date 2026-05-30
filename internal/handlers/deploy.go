@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"instant.dev/internal/config"
 	"instant.dev/internal/email"
+	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
@@ -190,6 +192,29 @@ func emitDeployAudit(db *sql.DB, kind string, d *models.Deployment, extra map[st
 			)
 		}
 	})
+}
+
+// shouldRedeployInPlace returns true when the caller asked for in-place
+// redeploy via the `redeploy` multipart form field. Accepted truthy values:
+// "true", "1", "yes" (case-insensitive). Anything else — including missing
+// field, empty string, "false", "0" — returns false so the legacy
+// fresh-deploy behaviour stays the default. Posture mirrors the other
+// truthy form-field helpers on this endpoint (private, etc.) so the
+// agent's mental model stays consistent across boolean flags.
+func shouldRedeployInPlace(form *multipart.Form) bool {
+	if form == nil {
+		return false
+	}
+	vals, ok := form.Value["redeploy"]
+	if !ok || len(vals) == 0 {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(vals[0])) {
+	case "true", "1", "yes":
+		return true
+	default:
+		return false
+	}
 }
 
 // generateAppID produces an 8-char lowercase hex string via crypto/rand.
@@ -611,6 +636,108 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		return envErr
 	}
 
+	// ── In-place redeploy branch (POST /deploy/new redeploy=true) ───────────
+	//
+	// Agent UX fix (2026-05-30): three /deploy/new calls for the same logical
+	// app produced three different app_ids + URLs. MCP `redeploy` exists but
+	// requires the caller to already know the original app_id. By accepting
+	// redeploy=true on /deploy/new and routing to the same compute path as
+	// POST /deploy/:id/redeploy, the agent can replace-in-place by name —
+	// the discovery key it already has.
+	//
+	// Branch placement: AFTER tarball + name + env are validated (so the
+	// 400s for missing-tarball / missing-name / invalid-env still fire
+	// first), BEFORE the per-tier deployments_apps cap (a redeploy reuses
+	// an existing slot — it must not consume a new one) and BEFORE we mint
+	// a fresh app_id.
+	if shouldRedeployInPlace(form) {
+		// `name` is guaranteed non-empty here: requireName() at the top of
+		// this handler returns an error (and bails) on any empty / whitespace
+		// / UTF-8-invalid input, so an in-place redeploy with redeploy=true
+		// always has a usable name to match against. No defence-in-depth
+		// check needed; an unreachable branch would just confuse coverage.
+		existing, lookupErr := models.FindActiveDeploymentByTeamEnvName(c.Context(), h.db, team.ID, environment, name)
+		if errors.Is(lookupErr, sql.ErrNoRows) {
+			// Note: the lookup is team-scoped, so a row owned by another
+			// team produces the same 404 as "no row exists at all" — we
+			// never leak the existence of another team's deployment. This
+			// is intentional (mirrors the 404-not-403 rule on
+			// /deploy/:id/redeploy).
+			metrics.DeployRedeployInPlaceTotal.WithLabelValues("not_found").Inc()
+			return respondErrorWithAgentAction(c, fiber.StatusNotFound,
+				"no_existing_deployment_to_redeploy",
+				"No active deployment named "+quoteForError(name)+" was found in env="+environment+".",
+				"omit redeploy:true to create a new deployment, or list deployments first to find the id",
+				"")
+		}
+		if lookupErr != nil {
+			slog.Error("deploy.new.redeploy_lookup_failed",
+				"error", lookupErr, "team_id", team.ID, "env", environment,
+				"request_id", middleware.GetRequestID(c))
+			return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed",
+				"Failed to look up existing deployment")
+		}
+
+		// Defence in depth: the SQL query is already team-scoped, but assert
+		// the row's team_id matches the auth'd team before we touch compute.
+		// If this ever trips, something is very wrong in the model layer.
+		if existing.TeamID != team.ID {
+			metrics.DeployRedeployInPlaceTotal.WithLabelValues("wrong_team").Inc()
+			return respondErrorWithAgentAction(c, fiber.StatusNotFound,
+				"no_existing_deployment_to_redeploy",
+				"No active deployment named "+quoteForError(name)+" was found in env="+environment+".",
+				"omit redeploy:true to create a new deployment, or list deployments first to find the id",
+				"")
+		}
+
+		// The existing row may have no provider_id yet (initial build still
+		// running). compute.Redeploy needs a real provider id, so reject
+		// with 409 — same posture as POST /deploy/:id/redeploy.
+		if existing.ProviderID == "" {
+			metrics.DeployRedeployInPlaceTotal.WithLabelValues("not_found").Inc()
+			return respondError(c, fiber.StatusConflict, "not_ready",
+				"Existing deployment has no provider ID yet — initial build may still be running. Try again in a few seconds.")
+		}
+
+		// Flip the row to 'building' (mirrors POST /deploy/:id/redeploy).
+		if err := models.UpdateDeploymentStatus(c.Context(), h.db, existing.ID, "building", ""); err != nil {
+			slog.Warn("deploy.new.redeploy_status_update_failed",
+				"app_id", existing.AppID, "error", err)
+		}
+
+		// Audit BEFORE the async build (source="deploy_new_in_place" so the
+		// activity feed can distinguish redeploys that came in via
+		// /deploy/new from those via /deploy/:id/redeploy).
+		emitDeployAudit(h.db, models.AuditKindDeployRedeployRequested, existing, map[string]any{
+			"app_id": existing.AppID,
+			"env":    existing.Env,
+			"source": "deploy_new_in_place",
+		})
+
+		// Launch the shared async compute path. The helper covers
+		// vault-ref resolution, internal-env-key stripping, the
+		// compute.Redeploy call, status updates, audit_log terminal events,
+		// failure-autopsy capture, and build-log fetch — all the work the
+		// /deploy/:id/redeploy goroutine does.
+		h.runRedeployAsync(existing, tarball)
+
+		metrics.DeployRedeployInPlaceTotal.WithLabelValues("success").Inc()
+
+		slog.Info("deploy.new.redeploy_in_place_accepted",
+			"app_id", existing.AppID, "provider_id", existing.ProviderID,
+			"team_id", team.ID, "env", existing.Env, "name", name,
+			"request_id", middleware.GetRequestID(c))
+
+		item := deploymentToMap(existing)
+		item["redeployed"] = true
+		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+			"ok":         true,
+			"item":       item,
+			"redeployed": true,
+			"note":       "In-place redeploy accepted (same app_id + URL). Poll GET /deploy/" + existing.AppID + " for status.",
+		})
+	}
+
 	// Generate app ID.
 	appID, err := generateAppID()
 	if err != nil {
@@ -843,10 +970,16 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		"ttl_policy", saved.TTLPolicy,
 		"request_id", middleware.GetRequestID(c))
 
+	// redeployed:false always present on the fresh path so agents have a
+	// single, stable response shape across both branches of /deploy/new
+	// (see also the redeploy=true branch above which sets redeployed:true).
+	freshItem := deploymentToMap(saved)
+	freshItem["redeployed"] = false
 	resp := fiber.Map{
-		"ok":   true,
-		"item": deploymentToMap(saved),
-		"note": "Deployment is building. Poll GET /deploy/" + appID + " for status.",
+		"ok":         true,
+		"item":       freshItem,
+		"redeployed": false,
+		"note":       "Deployment is building. Poll GET /deploy/" + appID + " for status.",
 	}
 
 	// Wave FIX-J: when the deploy is on the auto_24h default, the response
@@ -891,6 +1024,112 @@ func (h *DeployHandler) Get(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"ok":   true,
 		"item": deploymentToMapWithDB(d, h.db),
+	})
+}
+
+// ── GET /api/v1/deployments/:id/events ───────────────────────────────────────
+
+// Events handles GET /api/v1/deployments/:id/events — returns the failure
+// timeline (and any other deployment_events rows) for a deployment owned by
+// the caller's team.
+//
+// Triggering incident (2026-05-30): the platform's silent-deploy-failure bug
+// class left users without any read surface for the autopsy rows that
+// deploy_failure_autopsy writes. GET /deploy/:id surfaces only the LATEST
+// failure_autopsy row inside the `failure` field of the deployment envelope;
+// agents debugging "why is it stuck in building?" need the full chronological
+// timeline so they can distinguish a single OOM from a retry storm.
+//
+// RBAC mirrors GET /deploy/:id exactly:
+//   - 404 on unknown :id
+//   - 404 (NOT 403) on cross-team access — never confirm existence of
+//     deployments owned by a different team
+//
+// Query params:
+//   - ?limit=N  default 50, max 200, clamped silently
+//
+// Response (200): { ok, deployment_id, events: [...], count }
+// Response (404): canonical envelope with agent_action from codeToAgentAction
+// Response (503): canonical envelope on DB failure
+//
+// Read-only — does not mutate deployment_events; that's the worker's job.
+func (h *DeployHandler) Events(c *fiber.Ctx) error {
+	team, err := h.requireTeam(c)
+	if err != nil {
+		// requireTeam already wrote a respondError envelope.
+		return err
+	}
+
+	appID := c.Params("id")
+	if appID == "" {
+		metrics.DeployEventsQueryTotal.WithLabelValues("invalid").Inc()
+		return respondError(c, fiber.StatusBadRequest, "invalid_id",
+			"Deployment id is required")
+	}
+
+	d, err := models.GetDeploymentByAppID(c.Context(), h.db, appID)
+	if err != nil {
+		var notFound *models.ErrDeploymentNotFound
+		if errors.As(err, &notFound) {
+			metrics.DeployEventsQueryTotal.WithLabelValues("not_found").Inc()
+			return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
+		}
+		metrics.DeployEventsQueryTotal.WithLabelValues("error").Inc()
+		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed",
+			"Failed to fetch deployment")
+	}
+
+	if d.TeamID != team.ID {
+		// 404 not 403: never confirm the existence of deployments owned by
+		// other teams. Mirrors the GET /deploy/:id branch above.
+		metrics.DeployEventsQueryTotal.WithLabelValues("not_found").Inc()
+		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
+	}
+
+	// limit clamp lives in the model so the bounds are enforced in exactly
+	// one place; the handler just parses the query string. A non-integer or
+	// negative input falls through to the default (50) — same posture as
+	// other list endpoints (GET /api/v1/deployments).
+	limit := models.DeploymentEventsListDefaultLimit
+	if raw := c.Query("limit"); raw != "" {
+		if parsed, perr := strconv.Atoi(raw); perr == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+
+	events, err := models.GetDeploymentEvents(c.Context(), h.db, d.ID, limit)
+	if err != nil {
+		metrics.DeployEventsQueryTotal.WithLabelValues("error").Inc()
+		slog.Error("deploy.events.list_failed",
+			"deployment_id", d.ID, "app_id", appID, "error", err)
+		return respondError(c, fiber.StatusServiceUnavailable, "events_query_failed",
+			"Failed to fetch deployment events")
+	}
+
+	out := make([]fiber.Map, 0, len(events))
+	for _, ev := range events {
+		row := fiber.Map{
+			"kind":       ev.Kind,
+			"reason":     ev.Reason,
+			"event":      ev.Event,
+			"last_lines": ev.LastLines,
+			"hint":       ev.Hint,
+			"created_at": ev.CreatedAt.UTC().Format(time.RFC3339),
+		}
+		if ev.ExitCode.Valid {
+			row["exit_code"] = ev.ExitCode.Int32
+		} else {
+			row["exit_code"] = nil
+		}
+		out = append(out, row)
+	}
+
+	metrics.DeployEventsQueryTotal.WithLabelValues("ok").Inc()
+	return c.JSON(fiber.Map{
+		"ok":            true,
+		"deployment_id": d.ID,
+		"events":        out,
+		"count":         len(out),
 	})
 }
 
@@ -1271,12 +1510,52 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 		slog.Warn("deploy.redeploy.status_update_failed", "app_id", appID, "error", err)
 	}
 
-	// Kick off async redeploy.
+	// Emit audit trail BEFORE the async build runs — same shape as
+	// deploy.created on the fresh path. Distinct kind so subscribers can
+	// tell "new app" from "existing app rebuilt".
+	emitDeployAudit(h.db, models.AuditKindDeployRedeployRequested, d, map[string]any{
+		"app_id": d.AppID,
+		"env":    d.Env,
+		"source": "redeploy_endpoint",
+	})
+
+	// Kick off async redeploy via the shared compute path used by both
+	// POST /deploy/:id/redeploy and POST /deploy/new redeploy=true.
+	h.runRedeployAsync(d, tarball)
+
+	slog.Info("deploy.redeploy.accepted",
+		"app_id", appID, "provider_id", d.ProviderID, "team_id", team.ID)
+
+	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+		"ok":   true,
+		"note": "Redeploy in progress. Poll GET /deploy/" + appID + " for status.",
+		"item": deploymentToMap(d),
+	})
+}
+
+// runRedeployAsync is the shared compute-path entry point for an in-place
+// redeploy. It launches the build+rollout in a background goroutine via
+// safego.Go and returns immediately. Both POST /deploy/:id/redeploy and
+// POST /deploy/new (redeploy=true) call this helper so the vault-resolve,
+// env-strip, compute.Redeploy, status-update, failure-autopsy, and
+// build-log-fetch logic live in exactly ONE place.
+//
+// Caller contract:
+//   - d.ProviderID must be non-empty (verified by the caller — the redeploy
+//     path requires a provider id, which the fresh /deploy/new path mints
+//     asynchronously inside runDeploy).
+//   - d.Status should already have been flipped to "building" by the caller
+//     so the dashboard reflects work in progress while the goroutine runs.
+//   - The audit trail (deploy.redeploy.requested) is the caller's
+//     responsibility — runRedeployAsync only emits the deploy.healthy /
+//     deploy.failed terminal-state events.
+func (h *DeployHandler) runRedeployAsync(d *models.Deployment, tarball []byte) {
 	safego.Go("deploy.redeploy", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 
 		startedAt := time.Now()
+		appID := d.AppID
 
 		// P0-4: resolve vault:// refs before the compute call, mirroring
 		// runDeploy. Without this the redeployed container receives the
@@ -1331,15 +1610,6 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 		emitDeployAudit(h.db, models.AuditKindDeployHealthy, d, map[string]any{
 			"time_to_healthy_seconds": int(time.Since(startedAt).Round(time.Second).Seconds()),
 		})
-	})
-
-	slog.Info("deploy.redeploy.accepted",
-		"app_id", appID, "provider_id", d.ProviderID, "team_id", team.ID)
-
-	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
-		"ok":   true,
-		"note": "Redeploy in progress. Poll GET /deploy/" + appID + " for status.",
-		"item": deploymentToMap(d),
 	})
 }
 

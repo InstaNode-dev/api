@@ -189,6 +189,48 @@ var (
 		Help: "Teardown sweeps where compute was destroyed but the row could not be marked 'deleted'",
 	})
 
+	// DeployEventsQueryTotal counts inbound GET /api/v1/deployments/:id/events
+	// calls, labelled by `result` so on-call can split a real query rate from
+	// the 404 / 400 noise floor. Used by both agents (debugging a failed
+	// deploy) and the dashboard's FailureTimeline panel.
+	//
+	// result values (closed set, bounded cardinality):
+	//   "ok"        — 200, events returned (count may be 0)
+	//   "not_found" — 404, deployment id doesn't exist OR belongs to another team
+	//   "invalid"   — 400, malformed id / bad query param
+	//   "error"     — 5xx, DB lookup failed
+	//
+	// Companion alert (infra repo follow-up):
+	//   "deploy events query error rate" — fires when
+	//   rate(instant_deploy_events_query_total{result="error"}[10m]) /
+	//   rate(instant_deploy_events_query_total[10m]) > 5%. Per rule 25 the
+	//   alert JSON ships with the metric — tracked as a TODO in the PR body
+	//   because the infra repo is a separate review surface.
+	DeployEventsQueryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_deploy_events_query_total",
+		Help: "GET /api/v1/deployments/:id/events calls by result (ok|not_found|invalid|error)",
+	}, []string{"result"})
+
+	// DeployRedeployInPlaceTotal counts the POST /deploy/new in-place
+	// redeploy outcomes (redeploy=true form field). Labels:
+	//
+	//   outcome = "success"      — match found, redeploy compute path invoked
+	//             "not_found"    — no live deployment for (team, env, name)
+	//             "wrong_team"   — name exists on a different team (404 is
+	//                              still returned — we never confirm existence)
+	//
+	// Closes the agent-UX gap surfaced 2026-05-30 (duplicate-URL incident):
+	// agents previously called /deploy/new repeatedly, minting a fresh
+	// app_id per call. A rising `outcome="not_found"` rate means agents
+	// are guessing names — pair with the MCP `list_deployments` tool to
+	// teach them the discovery path. `outcome="success"` is the healthy
+	// state — the platform served an in-place update instead of fanning
+	// out a new URL.
+	DeployRedeployInPlaceTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_deploy_redeploy_total",
+		Help: "POST /deploy/new redeploy=true outcomes (success/not_found/wrong_team). Closes the duplicate-URL agent-UX gap (2026-05-30).",
+	}, []string{"outcome"})
+
 	// NatsAuthFailures counts NATS credential-issuance failures from the
 	// common/queueprovider abstraction. MR-P0-5 (NATS per-tenant isolation,
 	// 2026-05-20). A non-zero rate is almost always one of:
