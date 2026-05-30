@@ -34,6 +34,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"instant.dev/internal/config"
 	"instant.dev/internal/email"
+	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
@@ -891,6 +892,112 @@ func (h *DeployHandler) Get(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"ok":   true,
 		"item": deploymentToMapWithDB(d, h.db),
+	})
+}
+
+// ── GET /api/v1/deployments/:id/events ───────────────────────────────────────
+
+// Events handles GET /api/v1/deployments/:id/events — returns the failure
+// timeline (and any other deployment_events rows) for a deployment owned by
+// the caller's team.
+//
+// Triggering incident (2026-05-30): the platform's silent-deploy-failure bug
+// class left users without any read surface for the autopsy rows that
+// deploy_failure_autopsy writes. GET /deploy/:id surfaces only the LATEST
+// failure_autopsy row inside the `failure` field of the deployment envelope;
+// agents debugging "why is it stuck in building?" need the full chronological
+// timeline so they can distinguish a single OOM from a retry storm.
+//
+// RBAC mirrors GET /deploy/:id exactly:
+//   - 404 on unknown :id
+//   - 404 (NOT 403) on cross-team access — never confirm existence of
+//     deployments owned by a different team
+//
+// Query params:
+//   - ?limit=N  default 50, max 200, clamped silently
+//
+// Response (200): { ok, deployment_id, events: [...], count }
+// Response (404): canonical envelope with agent_action from codeToAgentAction
+// Response (503): canonical envelope on DB failure
+//
+// Read-only — does not mutate deployment_events; that's the worker's job.
+func (h *DeployHandler) Events(c *fiber.Ctx) error {
+	team, err := h.requireTeam(c)
+	if err != nil {
+		// requireTeam already wrote a respondError envelope.
+		return err
+	}
+
+	appID := c.Params("id")
+	if appID == "" {
+		metrics.DeployEventsQueryTotal.WithLabelValues("invalid").Inc()
+		return respondError(c, fiber.StatusBadRequest, "invalid_id",
+			"Deployment id is required")
+	}
+
+	d, err := models.GetDeploymentByAppID(c.Context(), h.db, appID)
+	if err != nil {
+		var notFound *models.ErrDeploymentNotFound
+		if errors.As(err, &notFound) {
+			metrics.DeployEventsQueryTotal.WithLabelValues("not_found").Inc()
+			return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
+		}
+		metrics.DeployEventsQueryTotal.WithLabelValues("error").Inc()
+		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed",
+			"Failed to fetch deployment")
+	}
+
+	if d.TeamID != team.ID {
+		// 404 not 403: never confirm the existence of deployments owned by
+		// other teams. Mirrors the GET /deploy/:id branch above.
+		metrics.DeployEventsQueryTotal.WithLabelValues("not_found").Inc()
+		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
+	}
+
+	// limit clamp lives in the model so the bounds are enforced in exactly
+	// one place; the handler just parses the query string. A non-integer or
+	// negative input falls through to the default (50) — same posture as
+	// other list endpoints (GET /api/v1/deployments).
+	limit := models.DeploymentEventsListDefaultLimit
+	if raw := c.Query("limit"); raw != "" {
+		if parsed, perr := strconv.Atoi(raw); perr == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+
+	events, err := models.GetDeploymentEvents(c.Context(), h.db, d.ID, limit)
+	if err != nil {
+		metrics.DeployEventsQueryTotal.WithLabelValues("error").Inc()
+		slog.Error("deploy.events.list_failed",
+			"deployment_id", d.ID, "app_id", appID, "error", err)
+		return respondError(c, fiber.StatusServiceUnavailable, "events_query_failed",
+			"Failed to fetch deployment events")
+	}
+
+	out := make([]fiber.Map, 0, len(events))
+	for _, ev := range events {
+		row := fiber.Map{
+			"kind":       ev.Kind,
+			"reason":     ev.Reason,
+			"event":      ev.Event,
+			"last_lines": ev.LastLines,
+			"hint":       ev.Hint,
+			"created_at": ev.CreatedAt.UTC().Format(time.RFC3339),
+		}
+		if ev.ExitCode.Valid {
+			row["exit_code"] = ev.ExitCode.Int32
+		} else {
+			row["exit_code"] = nil
+		}
+		out = append(out, row)
+	}
+
+	metrics.DeployEventsQueryTotal.WithLabelValues("ok").Inc()
+	return c.JSON(fiber.Map{
+		"ok":            true,
+		"deployment_id": d.ID,
+		"events":        out,
+		"count":         len(out),
 	})
 }
 

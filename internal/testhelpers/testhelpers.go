@@ -1164,6 +1164,10 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	// public route (mirrors router.go) — NOT here under the RequireAuth group.
 	api.Get("/deployments", deployH.List)
 	api.Get("/deployments/:id", deployH.Get)
+	// GET /deployments/:id/events — failure-timeline read surface (swarm
+	// 2026-05-30 silent-deploy-failure fix). Mirrors router.go so handler
+	// tests exercise the same route registration the live API serves.
+	api.Get("/deployments/:id/events", deployH.Events)
 	api.Delete("/deployments/:id", deployH.Delete)
 	api.Patch("/deployments/:id", deployH.Patch)
 	// Wave FIX-I — two-step email-confirmed deletion endpoints.
