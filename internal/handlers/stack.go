@@ -471,11 +471,19 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		}
 	}
 
-	// Step 1: Parse multipart form (max 200 MB — stacks have multiple tarballs).
+	// Step 1: Parse multipart form. The global Fiber BodyLimit is 50 MiB
+	// (router.go), so the aggregate of all service tarballs in this one
+	// request must stay under 50 MiB. Anything over 50 MiB is rejected
+	// upstream by Fiber's ErrorHandler with `payload_too_large` (T19 P1-2)
+	// and never reaches this handler. Agents bundling many large services
+	// should split into multiple stacks rather than one giant request.
+	// B7-P1-1 (bug-burner round 3, 2026-05-30): pre-fix said "max 200 MB" —
+	// a lie. The 50 MiB ground truth lives in router.go; this message + the
+	// upload_size_message_test.go registry test enforce it.
 	form, err := c.MultipartForm()
 	if err != nil {
 		return respondError(c, fiber.StatusBadRequest, "invalid_form",
-			"Request must be multipart/form-data (max 200 MB)")
+			"Request must be multipart/form-data (aggregate cap 50 MiB across all service tarballs)")
 	}
 
 	// Step 2: Parse + validate + resolve manifest.
