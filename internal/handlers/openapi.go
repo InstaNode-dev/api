@@ -2051,6 +2051,47 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/deployments/{id}/events": {
+      "get": {
+        "summary": "List deployment_events rows (failure timeline) for a deployment",
+        "description": "Returns the deployment_events rows for a deployment owned by the caller's team, ordered by created_at DESC (most recent first). Closes the silent-deploy-failure gap (swarm 2026-05-30): GET /api/v1/deployments/{id} surfaces only the LATEST failure_autopsy row inside the optional 'failure' field; agents debugging a stuck deploy need the full chronological timeline so they can distinguish a single OOM from a retry storm.\n\nEach row carries kind (e.g. 'failure_autopsy'), reason (e.g. 'kaniko_oom', 'image_pull_failed', 'OOMKilled'), exit_code (nullable integer), event (k8s event reason or build error text), last_lines (tail of Kaniko / pod stdout, up to ~200 lines), hint (user-facing remediation copy), and created_at (RFC3339).\n\nRead-only — events are written by the worker (deploy_failure_autopsy + deploy_status_reconcile), never by the api. RBAC mirrors GET /api/v1/deployments/{id} exactly: a cross-team request returns 404 (NOT 403) so the platform never confirms the existence of deployments owned by another team.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Deployment app_id (the short public token returned by POST /deploy/new, same value GET /api/v1/deployments/{id} accepts)." },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }, "description": "Max rows to return. Default 50, hard cap 200. Values above 200 are silently clamped; values < 1 fall back to the default." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Events list (may be empty for a healthy / never-failed deployment).",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DeploymentEventsResponse" },
+                "example": {
+                  "ok": true,
+                  "deployment_id": "b6fcf286-3a8b-4d6e-9e2c-1f9a0c5f8d12",
+                  "events": [
+                    {
+                      "kind": "failure_autopsy",
+                      "reason": "kaniko_oom",
+                      "exit_code": 137,
+                      "event": "OOMKilled",
+                      "last_lines": ["INFO[0123] Taking snapshot of files...", "fatal: out of memory"],
+                      "hint": "Kaniko ran out of memory during the build. Try a smaller base image, or upgrade your tier for more build RAM.",
+                      "created_at": "2026-05-30T17:42:11Z"
+                    }
+                  ],
+                  "count": 1
+                }
+              }
+            }
+          },
+          "400": { "description": "invalid_id — empty id in the URL.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "401": { "description": "Unauthorized — missing or invalid bearer token.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "404": { "description": "not_found — deployment id doesn't exist OR belongs to another team. Cross-team requests resolve to 404 (NOT 403) so the platform never confirms the existence of deployments owned by another team.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+          "503": { "description": "fetch_failed / events_query_failed — transient DB failure during the deployment lookup or the events list. Safe to retry.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      }
+    },
     "/api/v1/deployments/{id}/confirm-deletion": {
       "post": {
         "summary": "Confirm a pending deletion (paid tiers, Wave FIX-I)",
@@ -3085,6 +3126,31 @@ const openAPISpec = `{
           "note": { "type": "string" },
           "agent_action": { "type": "string", "description": "Wave FIX-J. Verbatim sentence the LLM agent relays to the user. Present on 202 responses when ttl_policy='auto_24h'; tells the user the three routes to keep the deploy permanent." }
         }
+      },
+      "DeploymentEvent": {
+        "type": "object",
+        "description": "One row from the deployment_events table — the worker's autopsy / lifecycle record for a deployment. Today's writer is deploy_failure_autopsy + deploy_status_reconcile (kind='failure_autopsy'); the kind field is open-ended so future event types (e.g. 'lifecycle') can be added without breaking the schema.",
+        "properties": {
+          "kind":       { "type": "string", "description": "Event kind. Today: 'failure_autopsy'. Future kinds may include 'lifecycle'." },
+          "reason":     { "type": "string", "description": "Short slug describing the failure (e.g. 'kaniko_oom', 'image_pull_failed', 'OOMKilled', 'CrashLoopBackOff'). See models.FailureReason* constants for the closed set used by the failure_autopsy kind." },
+          "exit_code":  { "type": ["integer", "null"], "description": "Process exit code when known (137 = SIGKILL, often OOM). null when the failure mode has no exit code (image pull failure, etc.)." },
+          "event":      { "type": "string", "description": "k8s event reason or build error text. Empty string when no upstream event was captured." },
+          "last_lines": { "type": "array", "items": { "type": "string" }, "description": "Tail of Kaniko / pod stdout at the moment of failure capture, oldest-first. Up to ~200 lines. Empty array when no log lines were available (pod GC'd before capture)." },
+          "hint":       { "type": "string", "description": "Plain-language likely cause + suggested remedy. Sourced from models.HintForReason; safe to relay verbatim to the user." },
+          "created_at": { "type": "string", "format": "date-time", "description": "When the worker wrote the autopsy row (RFC3339)." }
+        },
+        "required": ["kind", "reason", "exit_code", "event", "last_lines", "hint", "created_at"]
+      },
+      "DeploymentEventsResponse": {
+        "type": "object",
+        "description": "Response payload for GET /api/v1/deployments/{id}/events. Events are ordered by created_at DESC (most recent first). The count field is the length of the returned events array, NOT the total number of rows in deployment_events for this deployment — pagination is silent: callers wanting more than 200 rows must accept the cap.",
+        "properties": {
+          "ok":            { "type": "boolean" },
+          "deployment_id": { "type": "string", "format": "uuid", "description": "The deployment's primary key UUID. Resolved from the app_id slug in the URL path." },
+          "events":        { "type": "array", "items": { "$ref": "#/components/schemas/DeploymentEvent" } },
+          "count":         { "type": "integer", "description": "Length of the events array. 0 when the deployment has no events yet (healthy / never-failed)." }
+        },
+        "required": ["ok", "deployment_id", "events", "count"]
       },
       "GitHubConnection": {
         "type": "object",

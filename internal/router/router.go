@@ -1076,6 +1076,12 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// Deploy management endpoints — Phase 6 (aliases under /api/v1)
 	api.Get("/deployments", deployH.List)
 	api.Get("/deployments/:id", deployH.Get)
+	// GET /deployments/:id/events — failure-timeline read surface (swarm
+	// triggering incident 2026-05-30: silent-deploy-failure bug class). Same
+	// RBAC as GET /deployments/:id; returns the deployment_events rows the
+	// worker's deploy_failure_autopsy job writes, ordered DESC by created_at.
+	// Read-only — events are written by the worker, never by the api.
+	api.Get("/deployments/:id/events", deployH.Events)
 	api.Delete("/deployments/:id", deployH.Delete)
 	// Wave FIX-I — two-step email-confirmed deletion. POST confirms
 	// (validates ?token=<plaintext> against the hashed pending row),
