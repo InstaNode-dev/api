@@ -651,15 +651,11 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 	// an existing slot — it must not consume a new one) and BEFORE we mint
 	// a fresh app_id.
 	if shouldRedeployInPlace(form) {
-		if name == "" {
-			metrics.DeployRedeployInPlaceTotal.WithLabelValues("missing_name").Inc()
-			return respondErrorWithAgentAction(c, fiber.StatusBadRequest,
-				"redeploy_requires_name",
-				"redeploy=true requires the 'name' form field so the existing deployment can be located.",
-				"include 'name' so the existing deployment can be located",
-				"")
-		}
-
+		// `name` is guaranteed non-empty here: requireName() at the top of
+		// this handler returns an error (and bails) on any empty / whitespace
+		// / UTF-8-invalid input, so an in-place redeploy with redeploy=true
+		// always has a usable name to match against. No defence-in-depth
+		// check needed; an unreachable branch would just confuse coverage.
 		existing, lookupErr := models.FindActiveDeploymentByTeamEnvName(c.Context(), h.db, team.ID, environment, name)
 		if errors.Is(lookupErr, sql.ErrNoRows) {
 			// Note: the lookup is team-scoped, so a row owned by another

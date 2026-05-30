@@ -218,7 +218,6 @@ var (
 	//             "not_found"    — no live deployment for (team, env, name)
 	//             "wrong_team"   — name exists on a different team (404 is
 	//                              still returned — we never confirm existence)
-	//             "missing_name" — caller set redeploy=true but omitted name
 	//
 	// Closes the agent-UX gap surfaced 2026-05-30 (duplicate-URL incident):
 	// agents previously called /deploy/new repeatedly, minting a fresh
@@ -229,7 +228,7 @@ var (
 	// out a new URL.
 	DeployRedeployInPlaceTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "instant_deploy_redeploy_total",
-		Help: "POST /deploy/new redeploy=true outcomes (success/not_found/wrong_team/missing_name). Closes the duplicate-URL agent-UX gap (2026-05-30).",
+		Help: "POST /deploy/new redeploy=true outcomes (success/not_found/wrong_team). Closes the duplicate-URL agent-UX gap (2026-05-30).",
 	}, []string{"outcome"})
 
 	// NatsAuthFailures counts NATS credential-issuance failures from the

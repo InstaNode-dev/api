@@ -470,14 +470,12 @@ func TestDeployNew_Redeploy_EmptyProviderID_Returns409(t *testing.T) {
 // the upstream NoName test when requireName happens to forward an empty
 // name (which it does for the rejected-too-short cases — covered by
 // requireName's own test suite).
-func TestDeployNew_Redeploy_MissingName_DocsTrail(t *testing.T) {
-	// The branch at deploy.go:655-661 fires only when requireName has
-	// returned a NON-error empty name. requireName's contract makes that
-	// path unreachable in production today; the arm is a permanent
-	// defence-in-depth. Mark this test as a documentation breadcrumb so
-	// future maintainers see the reasoning trail.
-	t.Skip("documentation breadcrumb — see test comment; arm is unreachable via HTTP until requireName changes")
-}
+// The defence-in-depth `if name == ""` arm that this test used to
+// document was removed (see deploy.go above the FindActiveDeploymentByTeamEnvName
+// call) once it was proven unreachable: requireName() always returns either
+// an error or a non-empty trimmed string. The metric label "missing_name"
+// is therefore unused and is intentionally absent from
+// DeployRedeployInPlaceTotal's documented outcomes.
 
 // ── ctx + helper sanity check (compile-only) ────────────────────────────
 //
