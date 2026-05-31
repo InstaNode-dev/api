@@ -4,7 +4,7 @@ package handlers
 //
 // POST /stacks/new, GET /stacks/:slug, GET /stacks/:slug/logs/:svc, and
 // DELETE /stacks/:slug use OptionalAuth — anonymous users can deploy stacks
-// exactly as they provision databases (same tier system, 24h TTL, fingerprint dedup).
+// exactly as they provision databases (same tier system, 6h TTL, fingerprint dedup).
 //
 // PATCH /stacks/:slug/env and POST /stacks/:slug/redeploy require auth (mutations
 // on owned stacks only). GET /api/v1/stacks requires auth (team-scoped listing).
@@ -58,6 +58,18 @@ import (
 // mutating a stack that is about to be deleted is a lost race, not a
 // legitimate request.
 const stackStatusDeleting = "deleting"
+
+// anonymousStackTTL is the lifetime of an anonymous (no-team) stack. A stack
+// is live compute (build pod + running services), so the anonymous window is
+// tighter than the 24h anon-resource data TTL — claiming/upgrading is the path
+// to keep a deployed app past this window. Kept as a named constant so the
+// expires_at write, the response "expires_in" field, and the user-facing note
+// copy stay in lock-step (rule 16: one token, all call sites).
+const anonymousStackTTL = 6 * time.Hour
+
+// anonymousStackTTLLabel is the human string for anonymousStackTTL, surfaced in
+// the /stacks/new response (expires_in) and the upgrade-nudge note.
+const anonymousStackTTLLabel = "6h"
 
 // openMultipartFile opens an uploaded multipart file. It is a package-level
 // indirection (defaulting to the real (*multipart.FileHeader).Open) so coverage
@@ -423,8 +435,9 @@ func (h *StackHandler) runStackRedeploy(
 //   - {serviceName}: gzipped tarball for each service declared in the manifest
 //   - name: optional human label for the stack
 //
-// Anonymous deploys are supported (no auth required). Anonymous stacks expire in 24h,
-// matching the same model used by /db/new, /cache/new, etc.
+// Anonymous deploys are supported (no auth required). Anonymous stacks expire in 6h
+// (anonymousStackTTL) — a stack is live compute, so the window is tighter than the
+// 24h anon-resource data TTL; claim/upgrade to keep a deployed app past it.
 func (h *StackHandler) New(c *fiber.Ctx) error {
 	// OptionalAuth: team is nil for anonymous deployments (router uses OptionalAuth).
 	team, authErr := h.optionalStackTeam(c)
@@ -660,7 +673,7 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		stackEnv = validated
 	}
 
-	// Anonymous stacks: nil TeamID + 24h TTL + fingerprint (same model as /db/new).
+	// Anonymous stacks: nil TeamID + 6h TTL + fingerprint (same model as /db/new).
 	// Authenticated stacks: real TeamID + plan tier from the team record.
 	var (
 		stackTeamID      *uuid.UUID
@@ -669,7 +682,7 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		stackTier        = "anonymous"
 	)
 	if anon {
-		exp := time.Now().Add(24 * time.Hour)
+		exp := time.Now().Add(anonymousStackTTL)
 		stackExpiresAt = &exp
 		stackFingerprint = middleware.GetFingerprint(c)
 	} else {
@@ -843,7 +856,7 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 	// Step 9: Return 202.
 	noteMsg := "Stack is building. Poll GET /stacks/" + slug + " for status."
 	if anon {
-		noteMsg += " Anonymous stacks expire in 24h. Upgrade at " + urls.StartURLPrefix + ""
+		noteMsg += " Anonymous stacks expire in " + anonymousStackTTLLabel + ". Upgrade at " + urls.StartURLPrefix + ""
 	}
 	if len(warnings) > 0 {
 		noteMsg = fmt.Sprintf("%d warning(s) from manifest parsing. %s", len(warnings), noteMsg)
@@ -863,7 +876,7 @@ func (h *StackHandler) New(c *fiber.Ctx) error {
 		"tier":     stackTier,
 		"expires_in": func() string {
 			if anon {
-				return "24h"
+				return anonymousStackTTLLabel
 			}
 			return ""
 		}(),

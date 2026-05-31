@@ -842,7 +842,7 @@ func TestStackList_WithRows(t *testing.T) {
 // ── Anonymous-path New coverage (needs a real Redis for the rate-limit) ──────
 
 // TestStackNew_Anonymous_Succeeds drives the full anonymous /stacks/new path:
-// fingerprint rate-limit (fail-open / not-exceeded), anon TeamID=nil + 24h TTL,
+// fingerprint rate-limit (fail-open / not-exceeded), anon TeamID=nil + 6h TTL,
 // CreateStackWithCap with stackCapLimit=-1, and the anon vault-reject loop
 // (no vault refs here → passes).
 func TestStackNew_Anonymous_Succeeds(t *testing.T) {
