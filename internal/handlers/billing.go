@@ -336,6 +336,16 @@ var billingPortalFactory = func(db *sql.DB, h *BillingHandler) BillingPortal {
 	return &razorpaybilling.Portal{DB: db, Cfg: h.cfg}
 }
 
+// promoteDeploymentTTLsForTeamFn wraps the models call the
+// subscription.charged webhook makes after an upgrade tx commits. It exists
+// as a package-level swap-point ONLY so the error-branch coverage test in
+// billing_ttl_promote_error_test.go can drive the slog.Error +
+// metrics.TierUpgradeTTLPromote("error") path without sabotaging the real
+// postgres test DB (which would also break the prior UpgradeTeamAllTiers
+// step). Production callers never reassign this — a single-goroutine test,
+// before the handler is exercised, swaps it, runs one request, restores it.
+var promoteDeploymentTTLsForTeamFn = models.PromoteDeploymentTTLsForTeam
+
 // billingPortal returns the BillingPortal for this handler via the factory.
 func (h *BillingHandler) billingPortal() BillingPortal {
 	return billingPortalFactory(h.db, h)
@@ -1903,7 +1913,7 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 	// into the Loops email forwarder) — the subscription.upgraded email
 	// already covers customer comms.
 	if plans.Rank(tier) >= plans.Rank("hobby") {
-		promoteResult, promoteErr := models.PromoteDeploymentTTLsForTeam(ctx, h.db, teamID)
+		promoteResult, promoteErr := promoteDeploymentTTLsForTeamFn(ctx, h.db, teamID)
 		switch {
 		case promoteErr != nil:
 			metrics.TierUpgradeTTLPromote.WithLabelValues("error").Inc()

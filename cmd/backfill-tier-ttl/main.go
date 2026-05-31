@@ -57,6 +57,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -101,12 +102,26 @@ const candidateTeamSQL = `
 	 ORDER BY t.created_at ASC
 `
 
-func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
+// exitFn is os.Exit at runtime; tests swap it so the main() body becomes
+// a measurable statement instead of an irreducible coverage hole. Mirrors
+// the pattern in cmd/openapi-snapshot/main.go.
+var exitFn = os.Exit
+
+// openDB is the *sql.DB factory; tests swap it for a sqlmock-backed handle
+// so the run() body is exercisable without a real postgres listener. Default
+// uses lib/pq.
+var openDB = func(dsn string) (*sql.DB, error) { return sql.Open("postgres", dsn) }
+
+// promoteFn is the model call the apply-loop drives. Tests swap it so the
+// success/error reporting branches at the bottom of run() are reachable
+// without a populated platform DB.
+var promoteFn = models.PromoteDeploymentTTLsForTeam
+
+func main() { exitFn(run(os.Args[1:], os.Stdout, os.Stderr)) }
 
 // run is the testable body of main — splits CLI parsing from os.Exit so the
-// command's exit-code surface can be pinned by a unit test if the harness
-// is ever extended.
-func run(args []string, stdout, stderr *os.File) int {
+// command's exit-code surface can be pinned by a unit test.
+func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("backfill-tier-ttl", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	apply := fs.Bool("apply", false, "actually mutate the DB (default: dry-run, no mutations)")
@@ -120,7 +135,7 @@ func run(args []string, stdout, stderr *os.File) int {
 		return backfillExitUsage
 	}
 
-	db, err := sql.Open("postgres", *dbURL)
+	db, err := openDB(*dbURL)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "backfill-tier-ttl: open db: %v\n", err)
 		return backfillExitUsage
@@ -176,7 +191,7 @@ func run(args []string, stdout, stderr *os.File) int {
 
 	var ok, errored int
 	for _, c := range candidates {
-		result, promoteErr := models.PromoteDeploymentTTLsForTeam(ctx, db, c.teamID)
+		result, promoteErr := promoteFn(ctx, db, c.teamID)
 		if promoteErr != nil {
 			errored++
 			_, _ = fmt.Fprintf(stderr, "  team=%s ERROR: %v\n", c.teamID, promoteErr)
