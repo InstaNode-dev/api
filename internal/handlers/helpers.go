@@ -154,7 +154,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		UpgradeURL:  "",
 	},
 	"no_existing_deployment_to_redeploy": {
-		AgentAction: "Tell the user no deployment with that name exists on this team. Omit redeploy=true to create one fresh, or list https://instanode.dev/api/v1/deployments to find the app_id and call POST /deploy/{id}/redeploy.",
+		AgentAction: "Tell the user no deployment with that name exists on this team. Omit redeploy=true to create one fresh, or list https://api.instanode.dev/api/v1/deployments to find the app_id and call POST /deploy/{id}/redeploy.",
 		UpgradeURL:  "",
 	},
 	"rate_limit_exceeded": {
@@ -311,10 +311,10 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the team needs at least one owner. Have them promote another member to owner at https://instanode.dev/app/team before changing or removing this one.",
 	},
 	"cannot_remove_primary": {
-		AgentAction: "Tell the user they can't remove the primary user — every team needs a primary. Have them promote another member first via POST https://instanode.dev/api/v1/team/members/<other_user_id>/promote-to-primary, then retry the removal.",
+		AgentAction: "Tell the user they can't remove the primary user — every team needs a primary. Have them promote another member first via POST https://api.instanode.dev/api/v1/team/members/<other_user_id>/promote-to-primary, then retry the removal.",
 	},
 	"cannot_assign_owner_role": {
-		AgentAction: "Tell the user the owner role can't be assigned via PATCH role — ownership transfers atomically. Have them call POST https://instanode.dev/api/v1/team/members/<user_id>/promote-to-primary instead.",
+		AgentAction: "Tell the user the owner role can't be assigned via PATCH role — ownership transfers atomically. Have them call POST https://api.instanode.dev/api/v1/team/members/<user_id>/promote-to-primary instead.",
 	},
 
 	// ── Body-validation errors ─────────────────────────────────────────────
@@ -502,7 +502,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user one or more required fields are missing. Check the response message for the field list and retry — see https://instanode.dev/docs.",
 	},
 	"missing_backup_id": {
-		AgentAction: "Tell the user the backup_id path parameter is missing. Use GET https://instanode.dev/api/v1/backups to find an id and retry.",
+		AgentAction: "Tell the user the backup_id path parameter is missing. Use GET https://api.instanode.dev/api/v1/backups to find an id and retry.",
 	},
 	"missing_confirm_slug": {
 		AgentAction: "Tell the user the confirm_slug field is required to confirm this destructive action — supply the slug exactly as shown in the prompt and retry — see https://instanode.dev/docs.",
@@ -657,13 +657,13 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the approval_id is not a valid UUID. Check the approval link in your email and retry — see https://instanode.dev/docs/promote.",
 	},
 	"invalid_backup_id": {
-		AgentAction: "Tell the user the backup_id is not a valid UUID. List backups at GET https://instanode.dev/api/v1/backups and retry.",
+		AgentAction: "Tell the user the backup_id is not a valid UUID. List backups at GET https://api.instanode.dev/api/v1/backups and retry.",
 	},
 	"invalid_target": {
 		AgentAction: "Tell the user the target value is invalid. Check the docs at https://instanode.dev/docs for the allowed targets.",
 	},
 	"invalid_target_resource_id": {
-		AgentAction: "Tell the user the target_resource_id is not a valid UUID. List resources at GET https://instanode.dev/api/v1/resources and retry.",
+		AgentAction: "Tell the user the target_resource_id is not a valid UUID. List resources at GET https://api.instanode.dev/api/v1/resources and retry.",
 	},
 	"invalid_parent_resource_id": {
 		AgentAction: "Tell the user the parent_resource_id is not a valid UUID. Check the resource list at https://instanode.dev/app/resources and retry.",
@@ -719,7 +719,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the parent resource referenced by this request no longer exists. Re-provision the parent or retarget — see https://instanode.dev/docs.",
 	},
 	"backup_not_found": {
-		AgentAction: "Tell the user the backup id is unknown. List available backups at GET https://instanode.dev/api/v1/backups and retry.",
+		AgentAction: "Tell the user the backup id is unknown. List available backups at GET https://api.instanode.dev/api/v1/backups and retry.",
 	},
 	"approval_not_found": {
 		AgentAction: "Tell the user the approval link is invalid or expired. The team owner can re-issue the approval — see https://instanode.dev/docs/promote.",
@@ -867,7 +867,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	},
 	// (invitation_invalid covered in the auth/token section above)
 	"backup_resource_mismatch": {
-		AgentAction: "Tell the user this backup belongs to a different resource. List the resource's backups at GET https://instanode.dev/api/v1/resources/<id>/backups and retry.",
+		AgentAction: "Tell the user this backup belongs to a different resource. List the resource's backups at GET https://api.instanode.dev/api/v1/resources/<id>/backups and retry.",
 	},
 	"restore_in_progress": {
 		AgentAction: "Tell the user a restore is already in progress on this resource. Wait for it to complete — see https://instanode.dev/app/resources.",

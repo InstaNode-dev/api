@@ -102,8 +102,26 @@ func assertContract(t *testing.T, name, s string) {
 		"%s: agent_action must start with \"Tell the user\" (the imperative the LLM agent re-articulates to the human). Got: %q", name, s)
 
 	// 4. Full HTTPS URL.
-	assert.Contains(t, s, "https://instanode.dev/",
-		"%s: agent_action must contain a full https://instanode.dev/ URL — not a relative path. Got: %q", name, s)
+	//
+	// The string MUST contain at least one absolute https URL on either of
+	// the two canonical instanode.dev surfaces:
+	//
+	//   - https://instanode.dev/...        — marketing + dashboard (/pricing,
+	//                                        /login, /app, /docs, /status,
+	//                                        /support, /llms-full.txt, /claim).
+	//   - https://api.instanode.dev/...    — programmatic API surface
+	//                                        (/api/v1/..., /healthz, /readyz,
+	//                                        /approve/<token>, /start, /webhooks).
+	//
+	// A relative path ("/pricing") or a bare hostname ("instanode.dev/pricing"
+	// without the scheme) forces the LLM agent to guess, which is the
+	// regression this assertion was added to prevent. The dual-host allowance
+	// reflects the actual prod topology — see TestAgentActionContract_APIPathsUseAPIHost
+	// for the companion invariant that pins API paths to the api-host.
+	hasHost := strings.Contains(s, "https://instanode.dev/") ||
+		strings.Contains(s, "https://api.instanode.dev/")
+	assert.True(t, hasHost,
+		"%s: agent_action must contain a full https://instanode.dev/ OR https://api.instanode.dev/ URL — not a relative path. Got: %q", name, s)
 
 	// 5. Soft length ceiling — LLMs reproduce sub-tweet copy verbatim.
 	assert.Less(t, len(s), 280,
@@ -201,6 +219,60 @@ func TestAgentActionContract(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			require.NotEmpty(t, s, "%s: string must not be empty", name)
 			assertContract(t, name, s)
+		})
+	}
+}
+
+// TestAgentActionContract_APIPathsUseAPIHost is the bug-burner R11 regression
+// gate: every agent_action string that mentions a programmatic API path
+// (anything containing "/api/v") MUST attach it to the api-host
+// (https://api.instanode.dev/api/v...), NEVER the marketing/dashboard host
+// (https://instanode.dev/api/v...).
+//
+// Why this matters: api.instanode.dev is the only host that actually serves
+// /api/v1/* routes — the marketing site (instanode.dev) returns HTML 404 for
+// /api/v1/anything. Pre-fix, 11 agent_action strings shipped with the wrong
+// host, telling LLM agents to relay a non-working curl/POST URL to users.
+//
+// The test iterates the LIVE contract registry (agentActionContractCases),
+// so any new agent_action — static const, builder, or codeToAgentAction
+// entry — that re-introduces the bug fails this gate. Hand-typed slices
+// would themselves be a single-site fallacy (CLAUDE.md rule 18).
+func TestAgentActionContract_APIPathsUseAPIHost(t *testing.T) {
+	cases := agentActionContractCases()
+	require.NotEmpty(t, cases, "agentActionContractCases must list every string")
+
+	// Bug-burner R11: also include the long-form deploy-TTL string that is
+	// excluded from the full contract gate by length (it documents THREE
+	// next actions and is intentionally > 280 chars). The host invariant
+	// still applies to it — it was already correct, but covering it here
+	// means a future edit that flips the host will fail this gate.
+	cases["newAgentActionDeployAutoExpire24h(id,ts)"] = newAgentActionDeployAutoExpire24h(
+		"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		"2026-06-01T00:00:00Z",
+	)
+
+	const (
+		wrongHostAPIPrefix = "https://instanode.dev/api/v"
+		rightHostAPIPrefix = "https://api.instanode.dev/api/v"
+	)
+
+	for name, s := range cases {
+		t.Run(name, func(t *testing.T) {
+			assert.NotContains(t, s, wrongHostAPIPrefix,
+				"%s: agent_action mentions an /api/v path on the marketing host (https://instanode.dev/api/v...) — that URL returns HTML 404. Switch to https://api.instanode.dev/api/v...  Got: %q",
+				name, s)
+
+			// Sanity: if the string mentions "/api/v" at all, it must use
+			// the api-host. This catches a hypothetical future bug where
+			// someone writes a bare "instanode.dev/api/v" (no scheme) — the
+			// NotContains above would miss it but the substring check below
+			// catches the structural mistake.
+			if strings.Contains(s, "/api/v") {
+				assert.Contains(t, s, rightHostAPIPrefix,
+					"%s: agent_action mentions an /api/v path but does not use the canonical api-host (%s...). Got: %q",
+					name, rightHostAPIPrefix, s)
+			}
 		})
 	}
 }
