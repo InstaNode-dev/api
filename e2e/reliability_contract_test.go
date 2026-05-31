@@ -135,6 +135,14 @@ var auditConsumerSpec = map[string]auditConsumerExpectation{
 	"team.tombstoned":         {IntentionallyNoConsumer: true},
 	"team.updated":            {IntentionallyNoConsumer: true},
 
+	// Team TTL-policy promote (P1 fix 2026-05-31): emitted from
+	// billing.handleSubscriptionCharged after PromoteDeploymentTTLsForTeam
+	// flips the team default and/or promotes auto_24h deploys. Internal
+	// observability only — the subscription.upgraded email already covers
+	// customer comms for the upgrade itself, so a second template here
+	// would be redundant noise.
+	"team.ttl_policies_promoted": {IntentionallyNoConsumer: true},
+
 	// Payment grace lifecycle
 	"payment.grace_started":    {Emails: true, Forwards: true},
 	"payment.grace_reminder":   {Emails: true, Forwards: true},

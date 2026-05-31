@@ -561,6 +561,114 @@ func MakeDeploymentPermanent(ctx context.Context, db *sql.DB, id uuid.UUID) erro
 	return nil
 }
 
+// PromoteDeploymentTTLsResult is the count breakdown returned by
+// PromoteDeploymentTTLsForTeam so callers can log + emit metrics without
+// re-querying the DB. See PromoteDeploymentTTLsForTeam for the contract.
+type PromoteDeploymentTTLsResult struct {
+	// DeploysPromoted is the number of deployments rows whose ttl_policy
+	// transitioned from 'auto_24h' to 'permanent' on this call. Zero means
+	// the team had no auto_24h-TTL deploys to promote (a noop is valid
+	// success — e.g. a team upgrading their second time).
+	DeploysPromoted int64
+	// TeamDefaultFlipped is true when the team's default_deployment_ttl_policy
+	// was changed from 'auto_24h' to 'permanent' on this call. False means
+	// the default was already 'permanent' (noop) OR the team had explicitly
+	// set a non-auto_24h value (we DO NOT clobber a user-explicit choice).
+	TeamDefaultFlipped bool
+}
+
+// PromoteDeploymentTTLsForTeam promotes a team's deployment TTL state to
+// match a paid-tier upgrade. Two effects, both inside a single transaction
+// so a partial failure cannot leave the team half-promoted:
+//
+//  1. teams.default_deployment_ttl_policy: if currently 'auto_24h', flip
+//     to 'permanent' so all FUTURE POST /deploy/new calls inherit a
+//     permanent default. If the current value is anything else
+//     ('permanent' already, or a future 'custom'/'<user-explicit>'), the
+//     team default is LEFT UNTOUCHED — a user who explicitly chose a
+//     non-auto_24h default must keep their choice across an upgrade.
+//
+//  2. deployments: every row where ttl_policy='auto_24h' AND status NOT IN
+//     ('deleted','expired') is updated SET ttl_policy='permanent',
+//     expires_at=NULL, reminders_sent=0, last_reminder_at=NULL,
+//     updated_at=now(). Rows already 'permanent' or 'custom' are LEFT
+//     UNTOUCHED — promotion only targets the 24h-auto-expire class so we
+//     don't clobber a user-chosen custom TTL or burn the reminders ledger
+//     on rows that already escaped the 24h fate.
+//
+// Returns a PromoteDeploymentTTLsResult so the caller can record metrics +
+// audit metadata without a follow-up query. A non-nil error means the
+// transaction was rolled back and neither effect landed.
+//
+// CALLER CONTRACT: this function is tier-policy-agnostic. The caller MUST
+// gate invocation on a tier check (plans.Rank(newTier) >= plans.Rank("hobby"))
+// — invoking it for a free/anonymous tier upgrade is a category error
+// (those tiers don't get permanent deploys). The handler-side test
+// TestUpgradeWebhook_DoesNotCallPromoteOnFreeTier pins the guard.
+//
+// Distinct from ElevateDeploymentTiersByTeam (which is invoked from
+// UpgradeTeamAllTiers and lifts the per-row `tier` column for ALL
+// non-terminal deploys regardless of ttl_policy). This function is the
+// narrower companion that ALSO flips the team default — a tier elevation
+// alone doesn't change what FUTURE deploys inherit, which is the second
+// half of the "Pro user's next deploy still got auto_24h" regression.
+func PromoteDeploymentTTLsForTeam(ctx context.Context, db *sql.DB, teamID uuid.UUID) (PromoteDeploymentTTLsResult, error) {
+	var result PromoteDeploymentTTLsResult
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return result, fmt.Errorf("models.PromoteDeploymentTTLsForTeam: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// 1. Team default: flip 'auto_24h' → 'permanent', preserve everything
+	// else. The WHERE clause is the load-bearing piece — a user who has
+	// explicitly opted into a non-auto_24h default (or already permanent)
+	// MUST be left alone. RowsAffected tells the caller whether we flipped.
+	res, err := tx.ExecContext(ctx, `
+		UPDATE teams
+		   SET default_deployment_ttl_policy = 'permanent'
+		 WHERE id = $1
+		   AND COALESCE(default_deployment_ttl_policy, 'auto_24h') = 'auto_24h'
+	`, teamID)
+	if err != nil {
+		return result, fmt.Errorf("models.PromoteDeploymentTTLsForTeam: flip_team_default: %w", err)
+	}
+	teamRows, err := res.RowsAffected()
+	if err != nil {
+		return result, fmt.Errorf("models.PromoteDeploymentTTLsForTeam: team_rows_affected: %w", err)
+	}
+	result.TeamDefaultFlipped = teamRows > 0
+
+	// 2. Existing auto_24h deployments: promote to permanent. ONLY ttl_policy
+	// = 'auto_24h' rows are touched — 'custom' and 'permanent' are left as-is
+	// per the contract. Terminal statuses ('deleted','expired') are skipped
+	// because they no longer consume infrastructure.
+	res, err = tx.ExecContext(ctx, `
+		UPDATE deployments
+		   SET ttl_policy       = 'permanent',
+		       expires_at       = NULL,
+		       reminders_sent   = 0,
+		       last_reminder_at = NULL,
+		       updated_at       = now()
+		 WHERE team_id = $1
+		   AND ttl_policy = 'auto_24h'
+		   AND status NOT IN ('deleted', 'expired')
+	`, teamID)
+	if err != nil {
+		return result, fmt.Errorf("models.PromoteDeploymentTTLsForTeam: promote_deploys: %w", err)
+	}
+	deployRows, err := res.RowsAffected()
+	if err != nil {
+		return result, fmt.Errorf("models.PromoteDeploymentTTLsForTeam: deploys_rows_affected: %w", err)
+	}
+	result.DeploysPromoted = deployRows
+
+	if err := tx.Commit(); err != nil {
+		return result, fmt.Errorf("models.PromoteDeploymentTTLsForTeam: commit: %w", err)
+	}
+	return result, nil
+}
+
 // ElevateDeploymentTiersByTeam promotes every non-terminal deployment owned by
 // the team to newTier and clears the anonymous 24h TTL. Called from the
 // Razorpay subscription.charged webhook (via UpgradeTeamAllTiers) and from the

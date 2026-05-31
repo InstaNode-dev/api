@@ -69,6 +69,18 @@ const (
 	// from a human, not an automated template.
 	AuditKindBillingChargeUndeliverable = "billing.charge_undeliverable"
 
+	// AuditKindTeamTTLPoliciesPromoted fires when a paid-tier upgrade
+	// (free→hobby/hobby_plus/pro/growth/team) promotes the team's
+	// deployment TTL state via PromoteDeploymentTTLsForTeam: existing
+	// auto_24h deploys flipped to permanent + the team default flipped
+	// if it was still auto_24h. Metadata carries `count_deploys_promoted`
+	// (int), `team_default_flipped` (bool), and `reason` ("tier_upgrade").
+	// This kind is intentionally NOT wired into the worker's customer-email
+	// forwarder — it's an internal observability signal, not a user-facing
+	// notification (the upgrade itself already triggers the
+	// subscription.upgraded email, which is enough customer comms).
+	AuditKindTeamTTLPoliciesPromoted = "team.ttl_policies_promoted"
+
 	// Promote approval lifecycle (PR #65) — non-dev promotes require an
 	// email-link approval before the worker executes them.
 	AuditKindPromoteApprovalRequested = "promote.approval_requested"

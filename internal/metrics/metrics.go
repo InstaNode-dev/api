@@ -94,6 +94,36 @@ var (
 		Help: "Conversion funnel steps",
 	}, []string{"step"})
 
+	// TierUpgradeTTLPromote counts invocations of the deployment-TTL
+	// promote path triggered by a paid-tier upgrade
+	// (PromoteDeploymentTTLsForTeam in api/internal/models/deployment.go,
+	// called from billing.go handleSubscriptionCharged for tiers
+	// hobby/hobby_plus/pro/growth/team).
+	//
+	// Labels:
+	//   outcome — "success"  : the promote tx committed AND at least one
+	//                          of {deploys promoted, team default flipped}
+	//                          actually changed.
+	//             "noop"     : the promote tx committed but nothing
+	//                          changed (team had no auto_24h deploys AND
+	//                          the team default was already non-auto_24h).
+	//                          Healthy state — e.g. a second upgrade for a
+	//                          team whose state is already promoted.
+	//             "error"    : the promote tx errored — the upgrade itself
+	//                          still committed (fail-open) but the per-deploy
+	//                          TTL state may still carry auto_24h until the
+	//                          operator runs the backfill script. NR alert
+	//                          pages at outcome="error" > 0 over 10m.
+	//
+	// A sustained zero rate of "success" on a deploy that's seeing
+	// `subscription.upgraded` audit emits would indicate the promote call
+	// itself isn't wired in — the regression guard is the registry test
+	// TestPromoteHookFiresOnEveryPaidTierUpgrade.
+	TierUpgradeTTLPromote = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_tier_upgrade_ttl_promote_total",
+		Help: "Paid-tier upgrade deployment-TTL promote outcomes (see PromoteDeploymentTTLsForTeam)",
+	}, []string{"outcome"})
+
 	// RedisErrors counts Redis operation errors by operation name.
 	RedisErrors = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "instant_redis_errors_total",

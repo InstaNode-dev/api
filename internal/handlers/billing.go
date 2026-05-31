@@ -1874,6 +1874,61 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 		return upgradeErr
 	}
 
+	// ── Deployment-TTL promotion (P1 fix, 2026-05-31) ───────────────────────
+	//
+	// The atomic upgrade above already promotes every active deployment's
+	// `tier` column AND, as a side-effect, sets ttl_policy='permanent' on
+	// every non-terminal row regardless of its prior ttl_policy. That covers
+	// the "existing 24h deploys keep auto-expiring after upgrade" half of
+	// the bug — BUT it does NOT touch teams.default_deployment_ttl_policy,
+	// so the user's NEXT POST /deploy/new still inherits auto_24h and the
+	// "Your deployment will expire in 6 hours" email re-fires for fresh
+	// post-upgrade deploys. The promote call below closes that gap.
+	//
+	// Tier guard: only fire for paid tiers (hobby and up). plans.Rank
+	// returns -1 for unknown tiers and 1 for "free"; "hobby"=2 is the
+	// floor. Anonymous (0) and free (1) intentionally skip — those tiers
+	// don't get permanent deploys and a flip would be a contract change.
+	// The guard is unit-tested via TestPromoteDeploymentTTLs_TierGuard.
+	//
+	// Fail-open: the upgrade tx has already committed by this point. A
+	// promote error MUST NOT 500 the webhook (Razorpay redelivery cannot
+	// help — the tier flip already landed, and the operator can run the
+	// backfill script to repair the per-deploy state). A loud slog.Error +
+	// the "error" metric outcome is the operator-visible signal.
+	//
+	// Audit row: emitted best-effort so the customer can see in their
+	// /api/v1/audit feed that the upgrade rolled their TTL policies
+	// forward. This is a separate, internal-only audit kind (not wired
+	// into the Loops email forwarder) — the subscription.upgraded email
+	// already covers customer comms.
+	if plans.Rank(tier) >= plans.Rank("hobby") {
+		promoteResult, promoteErr := models.PromoteDeploymentTTLsForTeam(ctx, h.db, teamID)
+		switch {
+		case promoteErr != nil:
+			metrics.TierUpgradeTTLPromote.WithLabelValues("error").Inc()
+			slog.Error("billing.subscription.charged.ttl_promote_failed",
+				"error", promoteErr,
+				"team_id", teamID,
+				"tier", tier,
+				"subscription_id", sub.ID,
+				"note", "fail-open — tier upgrade committed; operator may run cmd/backfill-tier-ttl to repair per-deploy state",
+			)
+		case promoteResult.DeploysPromoted > 0 || promoteResult.TeamDefaultFlipped:
+			metrics.TierUpgradeTTLPromote.WithLabelValues("success").Inc()
+			slog.Info("billing.subscription.charged.ttl_promoted",
+				"team_id", teamID,
+				"tier", tier,
+				"subscription_id", sub.ID,
+				"deploys_promoted", promoteResult.DeploysPromoted,
+				"team_default_flipped", promoteResult.TeamDefaultFlipped,
+			)
+			emitTTLPoliciesPromotedAudit(ctx, h.db, teamID, promoteResult, "tier_upgrade")
+		default:
+			metrics.TierUpgradeTTLPromote.WithLabelValues("noop").Inc()
+		}
+	}
+
 	// Enqueue an explicit propagation row for the worker's propagation_runner.
 	// This is the durable "user upgraded, infra not yet regraded" signal —
 	// the entitlement_reconciler is still the eventually-consistent backstop,
@@ -3477,6 +3532,41 @@ func emitSubscriptionChangeAudit(ctx context.Context, db *sql.DB, teamID uuid.UU
 			"team_id", teamID,
 			"from_tier", fromTier,
 			"to_tier", toTier,
+			"error", err,
+		)
+	}
+}
+
+// emitTTLPoliciesPromotedAudit writes a team.ttl_policies_promoted row when
+// PromoteDeploymentTTLsForTeam actually changed something (deploys promoted,
+// team default flipped, or both). Best-effort: the upgrade has already
+// committed by the time this is called, and a missed audit row must NOT
+// fail the webhook.
+//
+// reason is a short slug naming what triggered the promote ("tier_upgrade"
+// today; future operator-initiated paths can pass their own slug).
+func emitTTLPoliciesPromotedAudit(ctx context.Context, db *sql.DB, teamID uuid.UUID, result models.PromoteDeploymentTTLsResult, reason string) {
+	if db == nil {
+		return
+	}
+	meta := map[string]any{
+		"count_deploys_promoted": result.DeploysPromoted,
+		"team_default_flipped":   result.TeamDefaultFlipped,
+		"reason":                 reason,
+	}
+	metaBlob, _ := json.Marshal(meta)
+
+	if err := models.InsertAuditEvent(ctx, db, models.AuditEvent{
+		TeamID:   teamID,
+		Actor:    "system",
+		Kind:     models.AuditKindTeamTTLPoliciesPromoted,
+		Summary:  "team deployment TTL policies promoted on " + reason,
+		Metadata: metaBlob,
+	}); err != nil {
+		slog.Warn("audit.emit.failed",
+			"kind", models.AuditKindTeamTTLPoliciesPromoted,
+			"team_id", teamID,
+			"reason", reason,
 			"error", err,
 		)
 	}
