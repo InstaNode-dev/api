@@ -116,13 +116,13 @@ func run(args []string, stdout, stderr *os.File) int {
 		return backfillExitUsage
 	}
 	if *dbURL == "" {
-		fmt.Fprintln(stderr, "backfill-tier-ttl: DATABASE_URL is unset and -database-url not supplied")
+		_, _ = fmt.Fprintln(stderr, "backfill-tier-ttl: DATABASE_URL is unset and -database-url not supplied")
 		return backfillExitUsage
 	}
 
 	db, err := sql.Open("postgres", *dbURL)
 	if err != nil {
-		fmt.Fprintf(stderr, "backfill-tier-ttl: open db: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "backfill-tier-ttl: open db: %v\n", err)
 		return backfillExitUsage
 	}
 	defer func() { _ = db.Close() }()
@@ -130,13 +130,13 @@ func run(args []string, stdout, stderr *os.File) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
-		fmt.Fprintf(stderr, "backfill-tier-ttl: ping db: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "backfill-tier-ttl: ping db: %v\n", err)
 		return backfillExitUsage
 	}
 
 	rows, err := db.QueryContext(ctx, candidateTeamSQL)
 	if err != nil {
-		fmt.Fprintf(stderr, "backfill-tier-ttl: list candidates: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "backfill-tier-ttl: list candidates: %v\n", err)
 		return backfillExitUsage
 	}
 	defer func() { _ = rows.Close() }()
@@ -145,7 +145,7 @@ func run(args []string, stdout, stderr *os.File) int {
 	for rows.Next() {
 		var c candidate
 		if err := rows.Scan(&c.teamID, &c.tier, &c.teamDefault, &c.autoDeployCount); err != nil {
-			fmt.Fprintf(stderr, "backfill-tier-ttl: scan: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "backfill-tier-ttl: scan: %v\n", err)
 			return backfillExitUsage
 		}
 		// Skip teams already fully promoted — nothing to do, keeps the
@@ -156,7 +156,7 @@ func run(args []string, stdout, stderr *os.File) int {
 		candidates = append(candidates, c)
 	}
 	if err := rows.Err(); err != nil {
-		fmt.Fprintf(stderr, "backfill-tier-ttl: rows: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "backfill-tier-ttl: rows: %v\n", err)
 		return backfillExitUsage
 	}
 
@@ -164,13 +164,13 @@ func run(args []string, stdout, stderr *os.File) int {
 	if *apply {
 		mode = "APPLY"
 	}
-	fmt.Fprintf(stdout, "backfill-tier-ttl: mode=%s candidates=%d\n", mode, len(candidates))
+	_, _ = fmt.Fprintf(stdout, "backfill-tier-ttl: mode=%s candidates=%d\n", mode, len(candidates))
 	for _, c := range candidates {
-		fmt.Fprintf(stdout, "  team=%s tier=%s team_default=%s auto_deploys=%d\n",
+		_, _ = fmt.Fprintf(stdout, "  team=%s tier=%s team_default=%s auto_deploys=%d\n",
 			c.teamID, c.tier, c.teamDefault, c.autoDeployCount)
 	}
 	if !*apply {
-		fmt.Fprintln(stdout, "backfill-tier-ttl: dry-run complete — re-run with -apply to mutate")
+		_, _ = fmt.Fprintln(stdout, "backfill-tier-ttl: dry-run complete — re-run with -apply to mutate")
 		return backfillExitOK
 	}
 
@@ -179,14 +179,14 @@ func run(args []string, stdout, stderr *os.File) int {
 		result, promoteErr := models.PromoteDeploymentTTLsForTeam(ctx, db, c.teamID)
 		if promoteErr != nil {
 			errored++
-			fmt.Fprintf(stderr, "  team=%s ERROR: %v\n", c.teamID, promoteErr)
+			_, _ = fmt.Fprintf(stderr, "  team=%s ERROR: %v\n", c.teamID, promoteErr)
 			continue
 		}
 		ok++
-		fmt.Fprintf(stdout, "  team=%s OK promoted_deploys=%d team_default_flipped=%t\n",
+		_, _ = fmt.Fprintf(stdout, "  team=%s OK promoted_deploys=%d team_default_flipped=%t\n",
 			c.teamID, result.DeploysPromoted, result.TeamDefaultFlipped)
 	}
-	fmt.Fprintf(stdout, "backfill-tier-ttl: applied — ok=%d errored=%d\n", ok, errored)
+	_, _ = fmt.Fprintf(stdout, "backfill-tier-ttl: applied — ok=%d errored=%d\n", ok, errored)
 	if errored > 0 {
 		// The function is idempotent — operator re-runs for the residual.
 		return backfillExitPartial
