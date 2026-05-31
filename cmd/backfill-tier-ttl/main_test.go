@@ -347,6 +347,22 @@ func TestRun_DBURLFromEnv(t *testing.T) {
 	}
 }
 
+// TestOpenDB_DefaultFactory covers line 113 — the default openDB closure
+// that wraps sql.Open("postgres", dsn). sql.Open is lazy (no real connection
+// until first use), so we only assert it returns a non-nil *sql.DB without
+// touching a real database. Without this test, the default factory body
+// never runs because every other test swaps openDB to a sqlmock stub.
+func TestOpenDB_DefaultFactory(t *testing.T) {
+	db, err := openDB("postgres://probe:probe@127.0.0.1:1/probe?sslmode=disable")
+	if err != nil {
+		t.Fatalf("sql.Open should not error on a syntactically-valid DSN: %v", err)
+	}
+	if db == nil {
+		t.Fatalf("expected non-nil *sql.DB")
+	}
+	_ = db.Close()
+}
+
 // Compile-time guard: the os package import in main.go must still be live
 // even if a future refactor stops using os.Stdout/os.Stderr directly.
 var _ = os.Stdout
