@@ -46,14 +46,19 @@ import (
 // successive requests can return different identities (existing-user + link).
 type fakeOAuthServer struct {
 	ghID           string
-	ghEmail        string // email returned by /gh/user (empty → forces /gh/emails fetch)
-	ghPrimaryEmail string // email returned by /gh/emails as primary+verified
+	ghEmail        string // email returned by /gh/user (public profile email — no longer trusted)
+	ghPrimaryEmail string // email returned by /gh/emails as primary+verified (defaults to ghEmail)
+	ghUnverified   bool   // when true, /gh/emails returns verified:false (simulate unverified)
 	ghTokenErr     bool
 	gAud           string
 	gSub           string // google subject id (default g-sub-123)
 	gEmail         string // google email (default g@example.com)
+	gUnverified    bool   // when true, Google userinfo/tokeninfo report email NOT verified
 	gTokenNoAccess bool
 }
+
+// gVerified renders the Google verified flag (default true) for the harness.
+func (f *fakeOAuthServer) gVerified() bool { return !f.gUnverified }
 
 func (f *fakeOAuthServer) gSubOr() string {
 	if f.gSub != "" {
@@ -89,11 +94,24 @@ func (f *fakeOAuthServer) handler() http.Handler {
 	})
 	mux.HandleFunc("/gh/emails", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `[{"email":%q,"primary":true,"verified":true}]`, f.ghPrimaryEmail)
+		// fetchGitHubUser now ALWAYS resolves the email from /user/emails
+		// (the public /user email is no longer trusted — bug bash #9). For a
+		// realistic verified-primary, fall back to ghEmail when ghPrimaryEmail
+		// isn't explicitly set. Tests that want to simulate an unverified /
+		// missing primary set ghUnverified=true.
+		primary := f.ghPrimaryEmail
+		if primary == "" {
+			primary = f.ghEmail
+		}
+		verified := "true"
+		if f.ghUnverified {
+			verified = "false"
+		}
+		_, _ = fmt.Fprintf(w, `[{"email":%q,"primary":true,"verified":%s}]`, primary, verified)
 	})
 	mux.HandleFunc("/g/tokeninfo", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"sub":%q,"email":%q,"name":"G User","aud":%q}`, f.gSubOr(), f.gEmailOr(), f.gAud)
+		_, _ = fmt.Fprintf(w, `{"sub":%q,"email":%q,"name":"G User","aud":%q,"email_verified":%q}`, f.gSubOr(), f.gEmailOr(), f.gAud, map[bool]string{true: "true", false: "false"}[f.gVerified()])
 	})
 	mux.HandleFunc("/g/token", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -105,7 +123,7 @@ func (f *fakeOAuthServer) handler() http.Handler {
 	})
 	mux.HandleFunc("/g/userinfo", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"id":%q,"email":%q,"name":"G User"}`, f.gSubOr(), f.gEmailOr())
+		_, _ = fmt.Fprintf(w, `{"id":%q,"email":%q,"name":"G User","verified_email":%t}`, f.gSubOr(), f.gEmailOr(), f.gVerified())
 	})
 	return mux
 }
