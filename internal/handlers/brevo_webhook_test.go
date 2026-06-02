@@ -86,8 +86,12 @@ func expectClassificationUpdate(mock sqlmock.Sqlmock, class, providerID string, 
 // expectDeliveredUpdate sets up a sqlmock expectation for the
 // delivered-stamping path (classification + delivered_at).
 func expectDeliveredUpdate(mock sqlmock.Sqlmock, providerID string, rowsAffected int64) {
+	// The delivered UPDATE now carries the terminal-class non-clobber guard
+	// (bug bash #6): classification NOT IN (bounced_hard, bounced_soft,
+	// rejected, complaint, unsubscribed) — 5 extra positional args.
 	mock.ExpectExec(`UPDATE forwarder_sent`).
-		WithArgs("delivered", "brevo", providerID).
+		WithArgs("delivered", "brevo", providerID,
+			"bounced_hard", "bounced_soft", "rejected", "complaint", "unsubscribed").
 		WillReturnResult(sqlmock.NewResult(0, rowsAffected))
 }
 
@@ -321,6 +325,12 @@ func TestBrevoTxWebhook_UnknownMessageID_Returns200MatchedFalse(t *testing.T) {
 
 	// UPDATE runs but affects 0 rows.
 	expectDeliveredUpdate(mock, "msg-orphan", 0)
+	// bug bash #6: a 0-row delivered UPDATE now probes whether a row exists at
+	// all (terminal-kept) vs truly unknown. Empty result → Scan returns
+	// ErrNoRows → genuinely unknown → matched:false.
+	mock.ExpectQuery(`SELECT classification FROM forwarder_sent`).
+		WithArgs("brevo", "msg-orphan").
+		WillReturnRows(sqlmock.NewRows([]string{"classification"}))
 
 	h := handlers.NewBrevoTransactionalWebhookHandler(db, &config.Config{BrevoWebhookSecret: testBrevoTxSecret})
 	app := brevoTxApp(t, h)
@@ -329,6 +339,39 @@ func TestBrevoTxWebhook_UnknownMessageID_Returns200MatchedFalse(t *testing.T) {
 	resp := postBrevoTx(t, app, testBrevoTxSecret, body)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d; want 200 (Brevo retries on non-2xx; orphans must NOT amplify retry traffic)", resp.StatusCode)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// ── 9b. bug bash #6: an out-of-order 'delivered' must NOT clobber a terminal
+//        bounce/complaint. The UPDATE excludes terminal classes (0 rows), the
+//        existence probe finds the kept terminal class → matched:true, no
+//        downgrade.
+
+func TestBrevoTxWebhook_DeliveredAfterBounce_KeepsTerminalClass(t *testing.T) {
+	db, mock, _ := sqlmock.New()
+	defer db.Close()
+
+	// Terminal-guarded UPDATE matches no row (classification already terminal).
+	expectDeliveredUpdate(mock, "msg-bounced", 0)
+	// Existence probe returns the preserved terminal class.
+	mock.ExpectQuery(`SELECT classification FROM forwarder_sent`).
+		WithArgs("brevo", "msg-bounced").
+		WillReturnRows(sqlmock.NewRows([]string{"classification"}).AddRow("bounced_hard"))
+
+	h := handlers.NewBrevoTransactionalWebhookHandler(db, &config.Config{BrevoWebhookSecret: testBrevoTxSecret})
+	app := brevoTxApp(t, h)
+
+	body := `{"event":"delivered","email":"u@example.com","message-id":"msg-bounced"}`
+	resp := postBrevoTx(t, app, testBrevoTxSecret, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d; want 200", resp.StatusCode)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(raw), `"matched":true`) {
+		t.Errorf("delivered-after-bounce must be matched:true (known message, terminal class kept); got %s", string(raw))
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
