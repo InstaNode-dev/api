@@ -710,28 +710,32 @@ func exchangeGitHubCode(ctx context.Context, clientID, clientSecret, code string
 		return nil, fmt.Errorf("github profile decode: %w", err)
 	}
 
-	if profile.Email == "" {
-		// Fetch primary email separately
-		emailReq, _ := http.NewRequestWithContext(ctx, "GET", githubUserEmailURL, nil)
-		emailReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
-		emailResp, err := client.Do(emailReq)
-		if err == nil {
-			defer func() { _ = emailResp.Body.Close() }()
-			body, _ := io.ReadAll(emailResp.Body)
-			var emails []struct {
-				Email    string `json:"email"`
-				Primary  bool   `json:"primary"`
-				Verified bool   `json:"verified"`
-			}
-			if json.Unmarshal(body, &emails) == nil {
-				for _, e := range emails {
-					// Only accept the primary AND verified address —
-					// an unverified email is attacker-controllable and
-					// must never seed a platform identity.
-					if e.Primary && e.Verified {
-						profile.Email = e.Email
-						break
-					}
+	// SECURITY (bug bash #9): GitHub's /user endpoint returns the account's
+	// PUBLIC profile email, which can be UNVERIFIED and is attacker-settable —
+	// trusting it lets an attacker link into a victim's account by email. We
+	// therefore IGNORE profile.Email entirely and ALWAYS resolve the address
+	// from /user/emails, accepting ONLY a primary+verified entry. If none
+	// exists, Email stays "" and findOrCreateUserGitHub refuses to link/create.
+	profile.Email = ""
+	emailReq, _ := http.NewRequestWithContext(ctx, "GET", githubUserEmailURL, nil)
+	emailReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
+	emailResp, err := client.Do(emailReq)
+	if err == nil {
+		defer func() { _ = emailResp.Body.Close() }()
+		body, _ := io.ReadAll(emailResp.Body)
+		var emails []struct {
+			Email    string `json:"email"`
+			Primary  bool   `json:"primary"`
+			Verified bool   `json:"verified"`
+		}
+		if json.Unmarshal(body, &emails) == nil {
+			for _, e := range emails {
+				// Only accept the primary AND verified address — an unverified
+				// email is attacker-controllable and must never seed/link a
+				// platform identity.
+				if e.Primary && e.Verified {
+					profile.Email = e.Email
+					break
 				}
 			}
 		}
@@ -759,6 +763,14 @@ func (h *AuthHandler) findOrCreateUserGitHub(ctx context.Context, gh *gitHubUser
 	if !errors.As(err, &notFound) {
 		// Unexpected DB error
 		return nil, nil, fmt.Errorf("findOrCreateUserGitHub lookup: %w", err)
+	}
+
+	// SECURITY (bug bash #9): an EXISTING github_id match (handled above) may
+	// proceed regardless, but link-by-email / new-identity creation MUST have a
+	// verified primary email (fetchGitHubUser only sets gh.Email from a
+	// primary+verified /user/emails entry). Refuse otherwise.
+	if gh.Email == "" {
+		return nil, nil, errOAuthEmailUnverified
 	}
 
 	// No GitHub-ID match. Before creating a brand-new team/user — which
@@ -832,7 +844,20 @@ type googleUser struct {
 	Sub   string
 	Email string
 	Name  string
+	// EmailVerified is Google's assertion that it controls/verified the
+	// address. Populated from the ID-token's `email_verified` (a STRING
+	// "true"/"false" on the tokeninfo endpoint) or the userinfo v2
+	// `verified_email` (bool). We refuse to link-by-email or seed a new
+	// identity on an unverified email (bug bash #7).
+	EmailVerified bool
 }
+
+// errOAuthEmailUnverified is returned by findOrCreateUserGitHub /
+// findOrCreateUserGoogle when an OAuth provider could not assert a verified
+// primary email and the request would otherwise create or link an identity
+// by that email. Closes the account-takeover vector (bug bash #7/#9). The
+// OAuth callbacks map it to a 4xx login failure.
+var errOAuthEmailUnverified = errors.New("oauth provider did not supply a verified email")
 
 func verifyGoogleIDToken(ctx context.Context, clientID, idToken string) (*googleUser, error) {
 	verifyURL := fmt.Sprintf("%s?id_token=%s", googleTokenInfoURL, url.QueryEscape(idToken))
@@ -850,11 +875,12 @@ func verifyGoogleIDToken(ctx context.Context, clientID, idToken string) (*google
 	}
 
 	var payload struct {
-		Sub   string `json:"sub"`
-		Email string `json:"email"`
-		Name  string `json:"name"`
-		Aud   string `json:"aud"`
-		Error string `json:"error_description"`
+		Sub           string `json:"sub"`
+		Email         string `json:"email"`
+		Name          string `json:"name"`
+		Aud           string `json:"aud"`
+		Error         string `json:"error_description"`
+		EmailVerified string `json:"email_verified"` // tokeninfo returns "true"/"false" as a string
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return nil, fmt.Errorf("google payload decode: %w", err)
@@ -867,9 +893,10 @@ func verifyGoogleIDToken(ctx context.Context, clientID, idToken string) (*google
 	}
 
 	return &googleUser{
-		Sub:   payload.Sub,
-		Email: payload.Email,
-		Name:  payload.Name,
+		Sub:           payload.Sub,
+		Email:         payload.Email,
+		Name:          payload.Name,
+		EmailVerified: payload.EmailVerified == "true",
 	}, nil
 }
 
@@ -931,9 +958,10 @@ func fetchGoogleUserInfoOAuth2V2(ctx context.Context, accessToken string) (*goog
 	}
 
 	var payload struct {
-		ID    string `json:"id"`
-		Email string `json:"email"`
-		Name  string `json:"name"`
+		ID            string `json:"id"`
+		Email         string `json:"email"`
+		Name          string `json:"name"`
+		VerifiedEmail bool   `json:"verified_email"` // userinfo v2 returns a bool
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return nil, fmt.Errorf("google userinfo decode: %w", err)
@@ -946,9 +974,10 @@ func fetchGoogleUserInfoOAuth2V2(ctx context.Context, accessToken string) (*goog
 	}
 
 	return &googleUser{
-		Sub:   payload.ID,
-		Email: payload.Email,
-		Name:  payload.Name,
+		Sub:           payload.ID,
+		Email:         payload.Email,
+		Name:          payload.Name,
+		EmailVerified: payload.VerifiedEmail,
 	}, nil
 }
 
@@ -1381,6 +1410,15 @@ func (h *AuthHandler) findOrCreateUserGoogle(ctx context.Context, g *googleUser)
 	var notFound *models.ErrUserNotFound
 	if !errors.As(err, &notFound) {
 		return nil, nil, fmt.Errorf("findOrCreateUserGoogle lookup: %w", err)
+	}
+
+	// SECURITY (bug bash #7): only an EXISTING google_id match (handled above)
+	// may proceed on an unverified email. For link-by-email or new-identity
+	// creation we MUST require a Google-verified email — otherwise an attacker
+	// who controls an unverified Google account whose email equals a victim's
+	// could link into / impersonate the victim's account.
+	if !g.EmailVerified {
+		return nil, nil, errOAuthEmailUnverified
 	}
 
 	// Match existing account by email and link google_id when unset.

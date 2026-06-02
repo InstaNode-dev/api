@@ -229,3 +229,67 @@ func TestAuth_generateOAuthState_And_generateSessionID(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, s2, 32)
 }
+
+// --- bug bash #9: GitHub email must come from a primary+verified entry ---
+
+func TestAuth_exchangeGitHubCode_IgnoresUnverifiedPublicEmail(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/gh/token", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"access_token":"x"}`))
+	})
+	mux.HandleFunc("/gh/user", func(w http.ResponseWriter, r *http.Request) {
+		// Attacker-controllable PUBLIC profile email — must be ignored.
+		_, _ = w.Write([]byte(`{"id":7,"login":"octocat","email":"attacker-public@evil.test"}`))
+	})
+	mux.HandleFunc("/gh/emails", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[{"email":"real-verified@example.com","primary":true,"verified":true}]`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	setHelperURLs(t, srv.URL)
+
+	gh, err := exchangeGitHubCode(context.Background(), "id", "secret", "code")
+	require.NoError(t, err)
+	require.Equal(t, "real-verified@example.com", gh.Email,
+		"must resolve the verified primary, NOT the public /user email")
+}
+
+func TestAuth_exchangeGitHubCode_NoVerifiedPrimary_EmptyEmail(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/gh/token", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"access_token":"x"}`))
+	})
+	mux.HandleFunc("/gh/user", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":8,"login":"octocat","email":"public@evil.test"}`))
+	})
+	mux.HandleFunc("/gh/emails", func(w http.ResponseWriter, r *http.Request) {
+		// Primary but NOT verified → must be ignored, leaving Email empty.
+		_, _ = w.Write([]byte(`[{"email":"public@evil.test","primary":true,"verified":false}]`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	setHelperURLs(t, srv.URL)
+
+	gh, err := exchangeGitHubCode(context.Background(), "id", "secret", "code")
+	require.NoError(t, err)
+	require.Equal(t, "", gh.Email, "no primary+verified email → Email empty (login then refused)")
+}
+
+// --- bug bash #7: Google verified_email flows onto googleUser.EmailVerified ---
+
+func TestAuth_fetchGoogleUserInfo_VerifiedEmailFlag(t *testing.T) {
+	serve := func(body string) *googleUser {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/g/userinfo", func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(body))
+		})
+		srv := httptest.NewServer(mux)
+		defer srv.Close()
+		setHelperURLs(t, srv.URL)
+		g, err := fetchGoogleUserInfoOAuth2V2(context.Background(), "tok")
+		require.NoError(t, err)
+		return g
+	}
+	require.True(t, serve(`{"id":"g1","email":"u@example.com","verified_email":true}`).EmailVerified)
+	require.False(t, serve(`{"id":"g1","email":"u@example.com","verified_email":false}`).EmailVerified)
+}
