@@ -1089,10 +1089,16 @@ func TestBrevo_Receive_UnknownMessageID_Returns200MatchedFalse(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
-	// 0 rows affected → matched=false branch
+	// 0 rows affected → existence probe → no row → matched=false branch.
+	// (bug bash #6: delivered UPDATE now carries the terminal-class guard +
+	// a follow-up SELECT to distinguish terminal-kept from genuinely unknown.)
 	mock.ExpectExec(`UPDATE forwarder_sent`).
-		WithArgs("delivered", "brevo", "stranger").
+		WithArgs("delivered", "brevo", "stranger",
+			"bounced_hard", "bounced_soft", "rejected", "complaint", "unsubscribed").
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`SELECT classification FROM forwarder_sent`).
+		WithArgs("brevo", "stranger").
+		WillReturnRows(sqlmock.NewRows([]string{"classification"}))
 
 	cfg := &config.Config{BrevoWebhookSecret: "correct_secret_at_least_32_bytes_xx"}
 	app := brevoTxAppCoverage(t, db, cfg)
