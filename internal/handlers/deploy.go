@@ -541,6 +541,13 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 	// entry; for k8s this includes the kaniko build + apply pipeline.
 	emitDeployAudit(h.db, models.AuditKindDeployHealthy, d, map[string]any{
 		"time_to_healthy_seconds": int(time.Since(startedAt).Round(time.Second).Seconds()),
+		// app_url/app_name/env let the worker's deploy.healthy email render
+		// "your app is live at <url>". d.AppURL is not yet populated in-memory
+		// here (UpdateDeploymentProviderID only persisted it to the row), so
+		// read result.AppURL directly.
+		"app_url":  result.AppURL,
+		"app_name": d.AppID,
+		"env":      d.Env,
 	})
 }
 
@@ -1607,8 +1614,14 @@ func (h *DeployHandler) runRedeployAsync(d *models.Deployment, tarball []byte) {
 			return
 		}
 		_ = models.UpdateDeploymentStatus(ctx, h.db, d.ID, result.Status, "")
+		// In-place redeploy keeps the same URL — d.AppURL was loaded from the
+		// existing row. Carry it (plus app_name/env) so the deploy.healthy
+		// email renders identically to the fresh-deploy path.
 		emitDeployAudit(h.db, models.AuditKindDeployHealthy, d, map[string]any{
 			"time_to_healthy_seconds": int(time.Since(startedAt).Round(time.Second).Seconds()),
+			"app_url":                 d.AppURL,
+			"app_name":                d.AppID,
+			"env":                     d.Env,
 		})
 	})
 }
