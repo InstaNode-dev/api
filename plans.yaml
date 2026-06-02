@@ -425,6 +425,10 @@ plans:
       alerts: true
       custom_domains: true
       sla: true
+      # Team sits above Growth ($199 vs $99); it gets dedicated infra too
+      # (bug bash 2026-06-02 #12). Without this, IsDedicatedTier(team)=false
+      # denied the top tier isolated Postgres/Redis/Mongo.
+      dedicated: true
 
   # team_yearly — $1990/yr ≈ $165.83/mo (~17% off $199 x 12).
   team_yearly:
@@ -465,6 +469,7 @@ plans:
       alerts: true
       custom_domains: true
       sla: true
+      dedicated: true # mirrors team (bug bash #12)
 
   # growth — $99/mo. Sits between Pro ($49) and Team ($199) as the
   # "unlimited supporting services" step for teams whose Postgres/Redis

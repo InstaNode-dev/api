@@ -422,7 +422,7 @@ func (h *WebhookHandler) newWebhookAuthenticated(
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
-		ExpiresAt:        nil,
+		ExpiresAt:        resourceExpiryForTier(team.PlanTier), // free→24h TTL, paid→permanent (bug bash #4)
 		CreatedRequestID: requestID,
 	})
 	if err != nil {

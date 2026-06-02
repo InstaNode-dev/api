@@ -456,7 +456,7 @@ func TestDeployDelete_PaidTier_QueuesPendingConfirmation(t *testing.T) {
 	assert.Contains(t, []int{http.StatusAccepted, http.StatusOK}, resp.StatusCode)
 }
 
-func TestDeployCancelDelete_CrossTeam_Returns403(t *testing.T) {
+func TestDeployCancelDelete_CrossTeam_Returns404(t *testing.T) {
 	requireTestDB(t)
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
@@ -477,7 +477,9 @@ func TestDeployCancelDelete_CrossTeam_Returns403(t *testing.T) {
 	resp, err := app.Test(req, 10000)
 	require.NoError(t, err)
 	defer resp.Body.Close()
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	// bug bash #22: cross-tenant access returns 404 (not 403) so a non-owner
+	// can't confirm the deployment exists.
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
 func TestDeployCancelDelete_UnknownID_Returns404(t *testing.T) {

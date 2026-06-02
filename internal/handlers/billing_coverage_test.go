@@ -1089,10 +1089,16 @@ func TestBrevo_Receive_UnknownMessageID_Returns200MatchedFalse(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer db.Close()
-	// 0 rows affected → matched=false branch
+	// 0 rows affected → existence probe → no row → matched=false branch.
+	// (bug bash #6: delivered UPDATE now carries the terminal-class guard +
+	// a follow-up SELECT to distinguish terminal-kept from genuinely unknown.)
 	mock.ExpectExec(`UPDATE forwarder_sent`).
-		WithArgs("delivered", "brevo", "stranger").
+		WithArgs("delivered", "brevo", "stranger",
+			"bounced_hard", "bounced_soft", "rejected", "complaint", "unsubscribed").
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`SELECT classification FROM forwarder_sent`).
+		WithArgs("brevo", "stranger").
+		WillReturnRows(sqlmock.NewRows([]string{"classification"}))
 
 	cfg := &config.Config{BrevoWebhookSecret: "correct_secret_at_least_32_bytes_xx"}
 	app := brevoTxAppCoverage(t, db, cfg)
@@ -1106,4 +1112,35 @@ func TestBrevo_Receive_UnknownMessageID_Returns200MatchedFalse(t *testing.T) {
 	var body map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 	assert.Equal(t, false, body["matched"])
+}
+
+// TestBrevo_Receive_Delivered_ProbeError covers the delivered-handler SELECT
+// existence-probe error branch (brevo_webhook.go: `if qErr != nil`). When the
+// terminal-class-guarded UPDATE affects 0 rows, the handler runs a follow-up
+// SELECT to distinguish "terminal-kept" from "genuinely unknown". If THAT
+// probe errors (a real DB fault, not ErrNoRows), the handler must surface the
+// error (→ 500) rather than mislabel the message — Brevo will retry.
+func TestBrevo_Receive_Delivered_ProbeError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+	mock.ExpectExec(`UPDATE forwarder_sent`).
+		WithArgs("delivered", "brevo", "stranger",
+			"bounced_hard", "bounced_soft", "rejected", "complaint", "unsubscribed").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	// Probe returns a non-ErrNoRows fault → qErr != nil branch.
+	mock.ExpectQuery(`SELECT classification FROM forwarder_sent`).
+		WithArgs("brevo", "stranger").
+		WillReturnError(errors.New("probe boom"))
+
+	cfg := &config.Config{BrevoWebhookSecret: "correct_secret_at_least_32_bytes_xx"}
+	app := brevoTxAppCoverage(t, db, cfg)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/brevo/correct_secret_at_least_32_bytes_xx",
+		bytes.NewBufferString(`{"event":"delivered","email":"u@example.com","message-id":"stranger"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, -1)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	require.NoError(t, mock.ExpectationsWereMet())
 }

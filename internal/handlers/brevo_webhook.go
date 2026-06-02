@@ -483,13 +483,21 @@ func (h *BrevoTransactionalWebhookHandler) Receive(c *fiber.Ctx) error {
 // GREATEST so a re-delivery of the same event doesn't bump the
 // timestamp.
 func handleBrevoDelivered(ctx context.Context, h *BrevoTransactionalWebhookHandler, evt brevoTransactionalEvent) (bool, error) {
+	// bug bash #6: a 'delivered' event must NOT clobber a TERMINAL negative
+	// outcome. Brevo delivers webhook events out of order, so a late
+	// 'delivered' (SMTP-accept) can arrive after a 'bounced_*' / 'rejected' /
+	// 'complaint' / 'unsubscribed' has already been recorded — overwriting the
+	// ledger's truth surface (rule 12). The guard preserves terminal classes.
 	res, err := h.db.ExecContext(ctx, `
 		UPDATE forwarder_sent
 		   SET classification = $1,
 		       delivered_at   = COALESCE(GREATEST(delivered_at, NOW()), NOW())
 		 WHERE provider = $2
 		   AND provider_id = $3
-	`, LedgerClassDelivered, brevoProviderName, evt.MessageID)
+		   AND classification NOT IN ($4, $5, $6, $7, $8)
+	`, LedgerClassDelivered, brevoProviderName, evt.MessageID,
+		LedgerClassBouncedHard, LedgerClassBouncedSoft, LedgerClassRejected,
+		LedgerClassComplaint, LedgerClassUnsubscribed)
 	if err != nil {
 		return false, err
 	}
@@ -497,14 +505,37 @@ func handleBrevoDelivered(ctx context.Context, h *BrevoTransactionalWebhookHandl
 	if err != nil {
 		return false, err
 	}
-	if n == 0 {
+	if n > 0 {
+		slog.Info("webhook.brevo.delivered",
+			"message_id", evt.MessageID,
+			"recipient_masked", models.MaskEmail(evt.Email),
+			"rows_updated", n,
+		)
+		return true, nil
+	}
+	// n == 0: either no row matches this messageId, OR the row exists but
+	// already holds a terminal class we intentionally preserved. Distinguish
+	// the two so a real-but-terminal message isn't mislabeled "unknown".
+	var existingClass string
+	qErr := h.db.QueryRowContext(ctx, `
+		SELECT classification FROM forwarder_sent
+		 WHERE provider = $1 AND provider_id = $2
+		 LIMIT 1
+	`, brevoProviderName, evt.MessageID).Scan(&existingClass)
+	if qErr == sql.ErrNoRows {
 		warnUnknownBrevoMessage(ctx, evt, brevoEventDelivered)
 		return false, nil
 	}
-	slog.Info("webhook.brevo.delivered",
+	if qErr != nil {
+		return false, qErr
+	}
+	// Row matched but a terminal classification was kept — this IS a known
+	// message (matched=true), we just don't downgrade the outcome.
+	slog.Info("webhook.brevo.delivered_kept_terminal",
 		"message_id", evt.MessageID,
 		"recipient_masked", models.MaskEmail(evt.Email),
-		"rows_updated", n,
+		"kept_classification", existingClass,
+		"note", "out-of-order delivered ignored — terminal class preserved (bug bash #6)",
 	)
 	return true, nil
 }
