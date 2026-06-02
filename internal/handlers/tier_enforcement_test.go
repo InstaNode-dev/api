@@ -536,8 +536,8 @@ func TestPlansRegistry_IsDedicatedTier(t *testing.T) {
 		{"hobby_yearly", false},
 		{"pro", false},
 		{"pro_yearly", false},
-		{"growth", true}, // the only dedicated tier in plans.yaml
-		{"team", false},  // team is unlimited but not dedicated
+		{"growth", true}, // dedicated infra
+		{"team", true},   // bug bash #12: Team ($199, above Growth) is dedicated too
 	}
 
 	for _, c := range cases {
