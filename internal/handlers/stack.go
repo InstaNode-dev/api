@@ -1265,30 +1265,38 @@ func (h *StackHandler) UpdateEnv(c *fiber.Ctx) error {
 		"keys_deleted": deletes,
 		"total_after":  len(merged),
 	})
-	go func(teamID uuid.UUID, stackID uuid.UUID, slug string, meta []byte) {
+	// safego.Go (not a bare `go func`) so a panic in the audit insert is
+	// recovered instead of crashing the worker goroutine / process — matches
+	// the runStackDeploy/runStackRedeploy launches in this file.
+	safego.Go("stack.env.audit", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if aErr := models.InsertAuditEvent(ctx, h.db, models.AuditEvent{
-			TeamID:       teamID,
+			TeamID:       team.ID,
 			Actor:        auditActorSystem,
 			Kind:         "stack.env.updated",
 			ResourceType: "stack",
-			ResourceID:   uuid.NullUUID{UUID: stackID, Valid: true},
+			ResourceID:   uuid.NullUUID{UUID: stack.ID, Valid: true},
 			Summary:      "updated env vars on stack <code>" + slug + "</code>",
-			Metadata:     meta,
+			Metadata:     auditMeta,
 		}); aErr != nil {
 			slog.Warn("stack.env.audit_failed",
-				"error", aErr, "team_id", teamID, "stack_id", stackID, "slug", slug)
+				"error", aErr, "team_id", team.ID, "stack_id", stack.ID, "slug", slug)
 		}
-	}(team.ID, stack.ID, slug, auditMeta)
+	})
 
 	slog.Info("stack.env.updated",
 		"slug", slug, "team_id", team.ID, "stack_id", stack.ID,
 		"keys_set", len(body.Env)-deletes, "keys_deleted", deletes, "total_after", len(merged))
 
 	return c.JSON(fiber.Map{
-		"ok":      true,
-		"env":     merged,
+		"ok": true,
+		// Redact outbound env vars — mirrors DeployHandler.UpdateEnv and
+		// GET /deploy/:id. The stored value (persisted above) is the
+		// unredacted merged map; only the response JSON is masked so
+		// secrets carried over from earlier PATCHes never echo in cleartext
+		// into proxy logs / agent transcripts.
+		"env":     redactEnvVars(merged),
 		"message": "Env vars persisted. Call POST /stacks/" + slug + "/redeploy to apply.",
 	})
 }
