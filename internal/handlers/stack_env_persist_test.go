@@ -119,10 +119,14 @@ func TestStack_PatchEnv_PersistsAndReturns(t *testing.T) {
 		}
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 		assert.True(t, body.OK)
+		// The RESPONSE redacts secret-bearing values (bug bash #1): DATABASE_URL
+		// (key contains "URL") is masked to "***", while a non-secret key like
+		// NODE_ENV passes through. The STORED value stays unredacted — asserted
+		// against the DB below. This mirrors DeployHandler.UpdateEnv.
 		assert.Equal(t, map[string]string{
-			"DATABASE_URL": "postgres://example",
+			"DATABASE_URL": "***",
 			"NODE_ENV":     "production",
-		}, body.Env, "response carries the merged env")
+		}, body.Env, "response masks secret values but keeps non-secret keys")
 
 		// DB round-trip — pre-fix this would still be `{}` because the
 		// handler dropped the payload. With migration 062 + UpdateStackEnvVars
