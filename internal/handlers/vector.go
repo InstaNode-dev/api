@@ -481,7 +481,7 @@ func (h *VectorHandler) newVectorAuthenticated(
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
-		ExpiresAt:        nil, // permanent
+		ExpiresAt:        resourceExpiryForTier(tier), // free→24h TTL, paid→permanent (bug bash #4)
 		CreatedRequestID: requestID,
 		ParentResourceID: parentRootID,
 	})

@@ -488,7 +488,7 @@ func (h *QueueHandler) newQueueAuthenticated(
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
-		ExpiresAt:        nil,
+		ExpiresAt:        resourceExpiryForTier(tier), // free→24h TTL, paid→permanent (bug bash #4)
 		CreatedRequestID: requestID,
 	})
 	if err != nil {

@@ -338,7 +338,7 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 		Fingerprint:      fp,
 		CloudVendor:      vendor,
 		CountryCode:      country,
-		ExpiresAt:        nil,
+		ExpiresAt:        resourceExpiryForTier(tier), // free→24h TTL, paid→permanent (bug bash #4)
 		CreatedRequestID: requestID,
 		ParentResourceID: parentRootID,
 	})
@@ -527,7 +527,7 @@ func (h *NoSQLHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 		Fingerprint:      in.Fingerprint,
 		CloudVendor:      in.CloudVendor,
 		CountryCode:      in.CountryCode,
-		ExpiresAt:        nil,
+		ExpiresAt:        resourceExpiryForTier(in.Tier), // free→24h TTL, paid→permanent (bug bash #4)
 		CreatedRequestID: in.RequestID,
 		ParentResourceID: in.ParentRootID,
 	})

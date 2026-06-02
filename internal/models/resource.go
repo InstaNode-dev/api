@@ -320,6 +320,7 @@ func GetActiveResourceByFingerprintType(ctx context.Context, db *sql.DB, fingerp
 		  AND resource_type = $2
 		  AND env = $3
 		  AND status = 'active'
+		  AND (expires_at IS NULL OR expires_at > NOW())
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, fingerprint, resourceType, env)
@@ -351,6 +352,7 @@ func GetActiveResourceByFingerprint(ctx context.Context, db *sql.DB, fingerprint
 		  AND team_id IS NULL
 		  AND env = $2
 		  AND status = 'active'
+		  AND (expires_at IS NULL OR expires_at > NOW())
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, fingerprint, env)

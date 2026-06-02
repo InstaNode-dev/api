@@ -1425,7 +1425,10 @@ func (h *DeployHandler) CancelDelete(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch deployment")
 	}
 	if d.TeamID != team.ID {
-		return respondError(c, fiber.StatusForbidden, "forbidden", "You do not own this deployment")
+		// 404, not 403 (bug bash #22): a cross-tenant 403 confirms the
+		// deployment EXISTS, leaking its existence to a non-owner. Mirror the
+		// not-found posture used by the other deploy endpoints.
+		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
 	}
 
 	deps := requestDeletionDeps{
