@@ -257,6 +257,41 @@ func TestAuth_GitHub_HappyPath(t *testing.T) {
 	assert.NotEmpty(t, body["token"])
 }
 
+// bug bash #9: GitHub OAuth with NO primary+verified email must be REFUSED
+// (no link/create on an unverified address). ghUnverified makes /gh/emails
+// report verified:false → fetchGitHubUser resolves an empty email →
+// findOrCreateUserGitHub returns errOAuthEmailUnverified.
+func TestAuth_GitHub_UnverifiedEmail_Refused(t *testing.T) {
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	settleAuditDB(t, db)
+	startFakeOAuth(t, &fakeOAuthServer{ghID: uniqueGHID(), ghEmail: testhelpers.UniqueEmail(t), ghUnverified: true})
+
+	app := buildAuthApp(handlers.NewAuthHandler(db, oauthCfg()))
+	resp := oauthPostJSON(t, app, "/auth/github", `{"code":"abc"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("GitHub login with no verified email must NOT succeed; got 200")
+	}
+}
+
+// bug bash #7: Google OAuth with email NOT verified must be REFUSED for a new
+// identity. gUnverified makes userinfo/tokeninfo report the email unverified →
+// findOrCreateUserGoogle returns errOAuthEmailUnverified.
+func TestAuth_Google_UnverifiedEmail_Refused(t *testing.T) {
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	settleAuditDB(t, db)
+	startFakeOAuth(t, &fakeOAuthServer{gSub: "g-unverified-" + uniqueGHID(), gEmail: testhelpers.UniqueEmail(t), gUnverified: true})
+
+	app := buildAuthApp(handlers.NewAuthHandler(db, oauthCfg()))
+	resp := oauthPostJSON(t, app, "/auth/google", `{"id_token":"abc"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("Google login with unverified email must NOT succeed; got 200")
+	}
+}
+
 func TestAuth_GitHub_MissingCodeAndBadBody(t *testing.T) {
 	app := buildAuthApp(handlers.NewAuthHandler(nil, oauthCfg()))
 
