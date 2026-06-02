@@ -97,7 +97,7 @@ const AgentActionPauseRequiresPro = "Tell the user pausing resources requires th
 // when the row is already in 'paused' state. The remedy is "do nothing"
 // (the resource is in the requested state) or call /resume to flip back —
 // both of which the action verb covers via "Have them".
-const AgentActionResourceAlreadyPaused = "Tell the user this resource is already paused. Have them call POST https://instanode.dev/api/v1/resources/:id/resume to bring it back online."
+const AgentActionResourceAlreadyPaused = "Tell the user this resource is already paused. Have them call POST https://api.instanode.dev/api/v1/resources/:id/resume to bring it back online."
 
 // AgentActionResourceNotPaused is returned by POST /resources/:id/resume when
 // the row isn't in 'paused' state — typically because it's already active.
@@ -298,7 +298,7 @@ const AgentActionBindingFamilyDisabled = "Tell the user this server has family b
 // (raw or family root) doesn't exist.
 func newAgentActionBindingNotFound(envKey string) string {
 	return fmt.Sprintf(
-		"Tell the user the resource referenced in resource_bindings.%s doesn't exist. Have them list their families with GET https://instanode.dev/api/v1/resources/families and use a valid root id.",
+		"Tell the user the resource referenced in resource_bindings.%s doesn't exist. Have them list their families with GET https://api.instanode.dev/api/v1/resources/families and use a valid root id.",
 		envKey,
 	)
 }
@@ -321,7 +321,7 @@ func newAgentActionBindingNoEnvTwin(rootID, resourceName, env string) string {
 		name = rootID
 	}
 	return fmt.Sprintf(
-		"Tell the user to provision a %s twin of %q first: POST https://instanode.dev/api/v1/resources/%s/provision-twin with {\"env\":\"%s\"}. The deploy targets env=%s but no family member exists there.",
+		"Tell the user to provision a %s twin of %q first: POST https://api.instanode.dev/api/v1/resources/%s/provision-twin with {\"env\":\"%s\"}. The deploy targets env=%s but no family member exists there.",
 		env, name, rootID, env, env,
 	)
 }

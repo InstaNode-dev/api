@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -208,7 +209,12 @@ func TestPauseResource_AlreadyPaused_409(t *testing.T) {
 	action, _ := body["agent_action"].(string)
 	require.NotEmpty(t, action, "409 already_paused must carry agent_action")
 	assert.Contains(t, action, "Tell the user")
-	assert.Contains(t, action, "https://instanode.dev/")
+	// agent_action contains an https URL on either the marketing or api host.
+	// The dual-host allowance mirrors assertContract in
+	// agent_action_contract_test.go; api-path strings live on api.instanode.dev.
+	hasHost := strings.Contains(action, "https://instanode.dev/") ||
+		strings.Contains(action, "https://api.instanode.dev/")
+	assert.True(t, hasHost, "agent_action must contain a full https URL on either instanode.dev or api.instanode.dev. Got: %q", action)
 }
 
 // TestResumeResource_NotPaused_409 — resume on an active row is 409 not_paused.
