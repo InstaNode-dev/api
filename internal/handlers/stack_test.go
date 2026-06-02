@@ -24,6 +24,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/stretchr/testify/assert"
@@ -455,7 +456,8 @@ services:
 }
 
 // TestStackNew_Anonymous_Returns202 verifies that POST /stacks/new without auth
-// returns 202 with tier=anonymous and expires_in=24h — same model as /db/new, /cache/new.
+// returns 202 with tier=anonymous and expires_in=6h. A stack is live compute, so
+// the anon window is tighter than the 24h anon-resource data TTL (anonymousStackTTL).
 func TestStackNew_Anonymous_Returns202(t *testing.T) {
 	requireTestDB(t)
 	db, cleanDB := testhelpers.SetupTestDB(t)
@@ -485,10 +487,12 @@ func TestStackNew_Anonymous_Returns202(t *testing.T) {
 	assert.True(t, body.OK)
 	assert.NotEmpty(t, body.StackID)
 	assert.Equal(t, "anonymous", body.Tier)
-	assert.Equal(t, "24h", body.ExpiresIn)
+	assert.Equal(t, "6h", body.ExpiresIn,
+		"anonymous stack TTL must be 6h (anonymousStackTTL), not the 24h data-resource TTL")
+	assert.Contains(t, body.Note, "6h", "note must state the 6h anon-stack window")
 	assert.Contains(t, body.Note, "api.instanode.dev/start", "upgrade URL must appear in note")
 
-	// Verify DB: stack has nil team_id and non-nil expires_at.
+	// Verify DB: stack has nil team_id and expires_at ≈ now()+6h.
 	var teamIDNull sql.NullString
 	var expiresAtNull sql.NullTime
 	require.NoError(t,
@@ -497,7 +501,12 @@ func TestStackNew_Anonymous_Returns202(t *testing.T) {
 		).Scan(&teamIDNull, &expiresAtNull),
 	)
 	assert.False(t, teamIDNull.Valid, "anonymous stack must have NULL team_id")
-	assert.True(t, expiresAtNull.Valid, "anonymous stack must have non-NULL expires_at")
+	require.True(t, expiresAtNull.Valid, "anonymous stack must have non-NULL expires_at")
+	// Allow a 5-minute skew for test-execution + clock drift; the point is
+	// "6h not 24h", so a generous window still fails loudly on a regression.
+	delta := time.Until(expiresAtNull.Time)
+	assert.InDelta(t, (6 * time.Hour).Seconds(), delta.Seconds(), 300,
+		"anonymous stack expires_at must be ≈ now()+6h")
 }
 
 // TestStackGet_NotFound verifies that GET /stacks/nonexistent returns 404.
