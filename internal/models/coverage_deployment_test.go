@@ -201,10 +201,19 @@ func TestDeploymentSimpleUpdaters_Branches(t *testing.T) {
 	// SetDeploymentTTL
 	db8, mock8 := newMock(t)
 	mock8.ExpectExec(`SET expires_at = \$1,\s+ttl_policy = 'custom'`).WillReturnResult(sqlmock.NewResult(0, 1))
-	require.NoError(t, SetDeploymentTTL(ctx, db8, id, 48))
+	ok8, err8 := SetDeploymentTTL(ctx, db8, id, 48)
+	require.NoError(t, err8)
+	require.True(t, ok8, "1 row affected → applied")
 	db8b, mock8b := newMock(t)
 	mock8b.ExpectExec(`ttl_policy = 'custom'`).WillReturnError(errors.New("boom"))
-	require.ErrorContains(t, SetDeploymentTTL(ctx, db8b, id, 48), "boom")
+	_, err8b := SetDeploymentTTL(ctx, db8b, id, 48)
+	require.ErrorContains(t, err8b, "boom")
+	// 0 rows affected (permanent/terminal guard matched nothing) → applied=false.
+	db8c, mock8c := newMock(t)
+	mock8c.ExpectExec(`ttl_policy = 'custom'`).WillReturnResult(sqlmock.NewResult(0, 0))
+	ok8c, err8c := SetDeploymentTTL(ctx, db8c, id, 48)
+	require.NoError(t, err8c)
+	require.False(t, ok8c, "0 rows affected → not applied")
 
 	// MarkDeploymentExpired
 	db9, mock9 := newMock(t)

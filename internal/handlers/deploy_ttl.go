@@ -143,19 +143,6 @@ func (h *DeployHandler) SetTTL(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
 	}
 
-	// Bug-bash #3/#5/#6: a permanent deploy must not be silently flipped back to
-	// an expiring TTL, and a terminal (expired/deleted/stopped) deploy can't have
-	// its lifecycle changed. Guard both before the write (the model adds a
-	// defense-in-depth WHERE clause for the permanent case too).
-	if d.TTLPolicy == models.DeployTTLPolicyPermanent {
-		return respondError(c, fiber.StatusConflict, "already_permanent",
-			"This deployment is permanent — it has no TTL to set. (Downgrading a permanent deploy is support-only.)")
-	}
-	if models.IsDeploymentTerminal(d.Status) {
-		return respondError(c, fiber.StatusConflict, "invalid_state",
-			fmt.Sprintf("Cannot set a TTL on a %s deployment", d.Status))
-	}
-
 	if team.PlanTier == "anonymous" {
 		// B7-P1-7 (see MakePermanent above): emit `claim_required` so an
 		// agent branching on error code routes the user to the free claim
@@ -180,12 +167,32 @@ func (h *DeployHandler) SetTTL(c *fiber.Ctx) error {
 			"")
 	}
 
-	if err := models.SetDeploymentTTL(c.Context(), h.db, d.ID, body.Hours); err != nil {
+	// The status-guarded UPDATE is the AUTHORITATIVE guard (bug-bash #3/#5/#6,
+	// hardened post-review): it only touches a row whose ttl_policy != 'permanent'
+	// AND whose status is non-terminal. Doing the check in SQL — rather than a
+	// pre-read of the looked-up row — removes the check-then-act TOCTOU where a
+	// deploy reaped/made-permanent between the read and the write would still get
+	// a re-armed TTL + reminders_sent=0 reset.
+	applied, err := models.SetDeploymentTTL(c.Context(), h.db, d.ID, body.Hours)
+	if err != nil {
 		slog.Error("deploy.set_ttl.failed",
 			"deploy_id", d.ID, "team_id", team.ID, "error", err,
 			"request_id", middleware.GetRequestID(c))
 		return respondError(c, fiber.StatusServiceUnavailable, "update_failed",
 			"Failed to set TTL")
+	}
+	if !applied {
+		// The UPDATE matched no row → the deploy is permanent or terminal. Re-read
+		// (authoritative, not a stale pre-read) only to choose the precise code:
+		// `already_permanent` for a permanent deploy, else `invalid_state`. A
+		// fetch error here still yields an honest 409 rather than a phantom 200.
+		cur, ferr := models.GetDeploymentByID(c.Context(), h.db, d.ID)
+		if ferr == nil && cur.TTLPolicy == models.DeployTTLPolicyPermanent {
+			return respondError(c, fiber.StatusConflict, "already_permanent",
+				"This deployment is permanent — it has no TTL to set. (Downgrading a permanent deploy is support-only.)")
+		}
+		return respondError(c, fiber.StatusConflict, "invalid_state",
+			"Cannot set a TTL: the deployment is in a terminal state (expired/deleted/stopped) or changed concurrently.")
 	}
 
 	updated, err := models.GetDeploymentByID(c.Context(), h.db, d.ID)
