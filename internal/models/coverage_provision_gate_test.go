@@ -18,6 +18,7 @@ func deploymentMockCols() []string {
 		"notify_webhook", "notify_webhook_secret", "notify_state", "notify_attempts",
 		"expires_at", "ttl_policy", "reminders_sent", "last_reminder_at",
 		"source", "image_ref", "registry_creds_enc",
+		"git_url", "git_ref", "git_token_enc",
 	}
 }
 
@@ -28,6 +29,7 @@ func deploymentMockRow() *sqlmock.Rows {
 		nil, nil, "unset", 0,
 		nil, "auto_24h", 0, nil,
 		"tarball", "", "", // source, image_ref, registry_creds_enc (mig 064)
+		"", "", "", // git_url, git_ref, git_token_enc (mig 065)
 	)
 }
 

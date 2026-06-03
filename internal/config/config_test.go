@@ -62,7 +62,7 @@ func allKeys() []string {
 		"DEPLOY_DOMAIN", "COMPUTE_PROVIDER", "KUBE_NAMESPACE_APPS",
 		"METRICS_TOKEN", "DASHBOARD_BASE_URL", "API_PUBLIC_URL",
 		"DELETION_CONFIRMATION_TTL_MINUTES", "FAMILY_BINDINGS_ENABLED",
-		"DEPLOY_SOURCE_IMAGE_ENABLED",
+		"DEPLOY_SOURCE_IMAGE_ENABLED", "DEPLOY_SOURCE_GIT_ENABLED",
 		"BREVO_WEBHOOK_SECRET", "SES_SNS_SUBSCRIPTION_ARN",
 		"SENDGRID_WEBHOOK_PUBLIC_KEY",
 		"WORKER_INTERNAL_JWT_SECRET", "ADMIN_PATH_PREFIX",
@@ -245,6 +245,9 @@ func TestLoad_HappyPath_AppliesDefaults(t *testing.T) {
 	if cfg.DeploySourceImageEnabled {
 		t.Error("DeploySourceImageEnabled default must be false (off until operator canary)")
 	}
+	if cfg.DeploySourceGitEnabled {
+		t.Error("DeploySourceGitEnabled default must be false (off until operator canary)")
+	}
 	// Object store mode resolution: with everything empty → "admin" / "minio-admin"
 	if cfg.ObjectStoreMode != "admin" || cfg.ObjectStoreBackend != "minio-admin" {
 		t.Errorf("ObjectStoreMode/Backend defaults: %q/%q", cfg.ObjectStoreMode, cfg.ObjectStoreBackend)
@@ -346,6 +349,21 @@ func TestLoad_DeploySourceImageEnabled(t *testing.T) {
 		applyBaselineEnv(t, map[string]string{"DEPLOY_SOURCE_IMAGE_ENABLED": val})
 		if Load().DeploySourceImageEnabled {
 			t.Errorf("DEPLOY_SOURCE_IMAGE_ENABLED=%q should stay disabled", val)
+		}
+	}
+}
+
+func TestLoad_DeploySourceGitEnabled(t *testing.T) {
+	for _, val := range []string{"true", "1", "yes", "TRUE", "  Yes  "} {
+		applyBaselineEnv(t, map[string]string{"DEPLOY_SOURCE_GIT_ENABLED": val})
+		if !Load().DeploySourceGitEnabled {
+			t.Errorf("DEPLOY_SOURCE_GIT_ENABLED=%q should enable", val)
+		}
+	}
+	for _, val := range []string{"false", "0", "no", "maybe", ""} {
+		applyBaselineEnv(t, map[string]string{"DEPLOY_SOURCE_GIT_ENABLED": val})
+		if Load().DeploySourceGitEnabled {
+			t.Errorf("DEPLOY_SOURCE_GIT_ENABLED=%q should stay disabled", val)
 		}
 	}
 }

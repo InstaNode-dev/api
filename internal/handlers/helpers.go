@@ -493,7 +493,13 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the deployment tarball is missing. POST a multipart form with 'tarball' (.tar.gz, <=50 MiB) — see https://instanode.dev/docs/deploy.",
 	},
 	"invalid_source": {
-		AgentAction: "Tell the user the 'source' field is invalid. Use source=tarball (default — upload a .tar.gz) or source=image (deploy a prebuilt image_ref) — see https://instanode.dev/docs/deploy.",
+		AgentAction: "Tell the user the 'source' field is invalid. Use source=tarball (default — upload a .tar.gz), source=image (deploy a prebuilt image_ref), or source=git (build a repo URL) — see https://instanode.dev/docs/deploy.",
+	},
+	"source_git_disabled": {
+		AgentAction: "Tell the user deploying from a git repo (source=git) is still rolling out and not yet enabled. Upload source as a tarball (<=10 MiB) or use source=image for now — see https://instanode.dev/docs/deploy.",
+	},
+	"invalid_git_url": {
+		AgentAction: "Tell the user the git_url is invalid. Pass an http(s) clone URL with a host and no embedded credentials, e.g. https://github.com/owner/repo — for a private repo send the token via git_token — see https://instanode.dev/docs/deploy.",
 	},
 	"source_image_disabled": {
 		AgentAction: "Tell the user deploying from a prebuilt image (source=image) is still rolling out and not yet enabled. Upload source as a tarball (<=10 MiB) for now — see https://instanode.dev/docs/deploy.",

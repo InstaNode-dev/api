@@ -319,6 +319,10 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'tarball'`,
 		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS image_ref TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS registry_creds_enc TEXT NOT NULL DEFAULT ''`,
+		// 065_deploy_source_git — P3 git-source deploy columns.
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS git_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS git_ref TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS git_token_enc TEXT NOT NULL DEFAULT ''`,
 		// teams.default_deployment_ttl_policy — Wave FIX-J team preference.
 		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS default_deployment_ttl_policy TEXT NOT NULL DEFAULT 'auto_24h'`,
 		// 012_audit_log — per-team event stream consumed by the dashboard's

@@ -26,6 +26,8 @@ import (
 	"io"
 	"log/slog"
 	"mime/multipart"
+	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -126,12 +128,125 @@ func applyImageSourceOpts(opts *compute.DeployOptions, d *models.Deployment, aes
 	opts.RegistryAuth = plain
 }
 
-// encryptRegistryCreds AES-256-GCM-encrypts a BYO private-registry docker
-// config JSON for at-rest storage. ParseAESKey is the only failure mode worth
-// a distinct branch (a misconfigured/short AES_KEY); crypto.Encrypt over a
-// valid key does not fail for these inputs, so its error is returned verbatim
-// without a separate handler branch. Returns the ciphertext for persistence.
-func encryptRegistryCreds(aesKeyHex, plaintext string) (string, error) {
+// validateGitURL checks a source=git clone URL is a well-formed http(s) URL with
+// a host (e.g. https://github.com/owner/repo). We accept only http/https — ssh
+// (git@…) and git:// schemes are rejected because the build pod authenticates
+// with a token over https, and an arbitrary scheme is an SSRF / scheme-confusion
+// risk on shared build infra. Returns the trimmed, validated URL.
+func validateGitURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("git_url is required for source=git (e.g. https://github.com/owner/repo)")
+	}
+	if len(raw) > 512 {
+		return "", fmt.Errorf("git_url is too long")
+	}
+	for _, r := range raw {
+		if r <= ' ' || r > '~' {
+			return "", fmt.Errorf("git_url contains invalid characters")
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("git_url is not a valid URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("git_url must be an http(s) URL (e.g. https://github.com/owner/repo), not %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("git_url must include a host (e.g. https://github.com/owner/repo)")
+	}
+	if u.User != nil {
+		// Reject inline credentials (https://user:pass@host) — pass a token via
+		// the git_token field so it's encrypted at rest, not embedded in the URL.
+		return "", fmt.Errorf("git_url must not embed credentials; pass a private-repo token via git_token instead")
+	}
+	// SSRF guard: reject a host that IS, or resolves to, an internal address —
+	// loopback, RFC1918 private, link-local (incl. the 169.254.169.254 cloud
+	// metadata endpoint), or unspecified. The build pod's egress NetworkPolicy
+	// is the authoritative runtime control (and blocks DNS-rebinding too); this
+	// gives a clean 400 for the common direct attempts instead of a build failure.
+	if err := screenGitHost(u.Hostname()); err != nil {
+		return "", err
+	}
+	return raw, nil
+}
+
+// gitHostLookupIP resolves a git_url host to IP addresses for SSRF screening.
+// A package var so tests can stub DNS deterministically.
+var gitHostLookupIP = net.LookupIP
+
+// isBlockedDeployIP reports whether an IP is in a range a deploy must never be
+// pointed at: loopback, RFC1918 private, link-local unicast/multicast (incl.
+// the 169.254.169.254 cloud metadata endpoint), or the unspecified address.
+func isBlockedDeployIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
+// screenGitHost rejects a host that is — or whose DNS resolves to — an internal
+// address (SSRF guard). A literal IP is checked directly (no DNS); a hostname is
+// resolved and rejected if ANY result is internal. A resolution failure is
+// itself rejected (fail-closed) — a host we can't resolve can't be cloned anyway.
+func screenGitHost(rawHost string) error {
+	host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(rawHost)), ".")
+	if host == "" {
+		return fmt.Errorf("git_url must include a host (e.g. https://github.com/owner/repo)")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if isBlockedDeployIP(ip) {
+			return fmt.Errorf("git_url host %q is not an allowed address", host)
+		}
+		return nil
+	}
+	ips, err := gitHostLookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return fmt.Errorf("git_url host %q could not be resolved", host)
+	}
+	for _, ip := range ips {
+		if isBlockedDeployIP(ip) {
+			return fmt.Errorf("git_url host %q resolves to a disallowed internal address", host)
+		}
+	}
+	return nil
+}
+
+// applyGitSourceOpts populates DeployOptions for a source=git deployment from
+// the persisted row: sets Source/GitURL/GitRef, clears Tarball, and decrypts the
+// optional private-repo token into GitAuth. A decrypt failure (or bad key) is
+// logged and falls back to an unauthenticated clone — public repos still build.
+// No-op for non-git sources.
+func applyGitSourceOpts(opts *compute.DeployOptions, d *models.Deployment, aesKeyHex string) {
+	if d.Source != "git" {
+		return
+	}
+	opts.Source = "git"
+	opts.GitURL = d.GitURL
+	opts.GitRef = d.GitRef
+	opts.Tarball = nil
+	if d.GitTokenEnc == "" {
+		return
+	}
+	key, kerr := crypto.ParseAESKey(aesKeyHex)
+	if kerr != nil {
+		slog.Error("deploy.git.aes_key_invalid", "app_id", d.AppID, "error", kerr)
+		return
+	}
+	plain, derr := crypto.Decrypt(key, d.GitTokenEnc)
+	if derr != nil {
+		slog.Error("deploy.run_deploy.git_token_decrypt_failed", "app_id", d.AppID, "error", derr)
+		return
+	}
+	opts.GitAuth = plain
+}
+
+// encryptDeploySecret AES-256-GCM-encrypts a sensitive deploy input (a BYO
+// private-registry docker config JSON, or a private-repo git token) for at-rest
+// storage. ParseAESKey is the only failure mode worth a distinct branch (a
+// misconfigured/short AES_KEY); crypto.Encrypt over a valid key does not fail
+// for these inputs, so its error is returned verbatim without a separate
+// handler branch. Returns the ciphertext for persistence.
+func encryptDeploySecret(aesKeyHex, plaintext string) (string, error) {
 	key, err := crypto.ParseAESKey(aesKeyHex)
 	if err != nil {
 		return "", err
@@ -398,6 +513,13 @@ func deploymentToMapWithDB(d *models.Deployment, db *sql.DB) fiber.Map {
 		m["image_ref"] = d.ImageRef
 		m["registry_creds_set"] = d.RegistryCredsEnc != ""
 	}
+	if d.Source == "git" {
+		// git_url + git_ref are caller-supplied (no secret) and echoed back;
+		// git_token is NEVER returned — only git_token_set lifecycle metadata.
+		m["git_url"] = d.GitURL
+		m["git_ref"] = d.GitRef
+		m["git_token_set"] = d.GitTokenEnc != ""
+	}
 	if d.NotifyWebhook != "" {
 		m["notify_attempts"] = d.NotifyAttempts
 		m["notify_secret_set"] = d.NotifyWebhookSecret != ""
@@ -618,9 +740,11 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 		Private:    d.Private,
 		AllowedIPs: d.AllowedIPs,
 	}
-	// Multi-source (migration 064): a source=image deploy carries no tarball —
-	// the compute layer deploys d.ImageRef directly (skip Kaniko).
+	// Multi-source (migration 064/065): image deploys carry no tarball (deploy
+	// d.ImageRef directly); git deploys carry no tarball (Kaniko builds the repo
+	// via git context). Each helper is a no-op unless its source matches.
 	applyImageSourceOpts(&opts, d, h.cfg.AESKey)
+	applyGitSourceOpts(&opts, d, h.cfg.AESKey)
 	result, err := h.compute.Deploy(ctx, opts)
 	if err != nil {
 		slog.Error("deploy.run_deploy.failed",
@@ -703,6 +827,7 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 
 	var tarball []byte
 	var imageRef, registryCredsEnc string
+	var gitURL, gitRef, gitTokenEnc string
 
 	switch source {
 	case "image":
@@ -726,12 +851,44 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		// config JSON, encrypted at rest (AES-256-GCM, like notify_webhook_secret)
 		// and never echoed back. Absent → the platform ghcr-pull secret is used.
 		if vals := form.Value["registry_creds"]; len(vals) > 0 && strings.TrimSpace(vals[0]) != "" {
-			enc, encErr := encryptRegistryCreds(h.cfg.AESKey, strings.TrimSpace(vals[0]))
+			enc, encErr := encryptDeploySecret(h.cfg.AESKey, strings.TrimSpace(vals[0]))
 			if encErr != nil {
 				return respondError(c, fiber.StatusServiceUnavailable, "encrypt_failed",
 					"Could not secure registry credentials")
 			}
 			registryCredsEnc = enc
+		}
+	case "git":
+		// Flag-gated (P3): the git-context build path is off until an operator
+		// enables it post-canary (DEPLOY_SOURCE_GIT_ENABLED=true). Until then
+		// reject cleanly so tarball/image deploys are never affected.
+		if !h.cfg.DeploySourceGitEnabled {
+			return respondError(c, fiber.StatusNotImplemented, "source_git_disabled",
+				"Deploying from a git repo (source=git) is rolling out and not yet enabled. Upload source (tarball ≤10MB) or use source=image for now.")
+		}
+		raw := ""
+		if vals := form.Value["git_url"]; len(vals) > 0 {
+			raw = strings.TrimSpace(vals[0])
+		}
+		validURL, urlErr := validateGitURL(raw)
+		if urlErr != nil {
+			return respondError(c, fiber.StatusBadRequest, "invalid_git_url", urlErr.Error())
+		}
+		gitURL = validURL
+		// Optional ref (branch/tag/SHA). Empty → Kaniko builds the default branch.
+		if vals := form.Value["git_ref"]; len(vals) > 0 {
+			gitRef = strings.TrimSpace(vals[0])
+		}
+		// Optional read-only token for a PRIVATE repo, encrypted at rest (same
+		// posture as registry_creds) and never echoed back. Absent → the repo
+		// is treated as public.
+		if vals := form.Value["git_token"]; len(vals) > 0 && strings.TrimSpace(vals[0]) != "" {
+			enc, encErr := encryptDeploySecret(h.cfg.AESKey, strings.TrimSpace(vals[0]))
+			if encErr != nil {
+				return respondError(c, fiber.StatusServiceUnavailable, "encrypt_failed",
+					"Could not secure the git access token")
+			}
+			gitTokenEnc = enc
 		}
 	case "tarball":
 		tarballs := form.File["tarball"]
@@ -759,7 +916,7 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		tarball = b
 	default:
 		return respondError(c, fiber.StatusBadRequest, "invalid_source",
-			"Field 'source' must be 'tarball' (default) or 'image'")
+			"Field 'source' must be 'tarball' (default), 'image', or 'git'")
 	}
 
 	// Required name field — the human-readable deployment label.
@@ -1091,6 +1248,9 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		Source:              source,
 		ImageRef:            imageRef,
 		RegistryCredsEnc:    registryCredsEnc,
+		GitURL:              gitURL,
+		GitRef:              gitRef,
+		GitTokenEnc:         gitTokenEnc,
 	})
 	if errors.Is(err, models.ErrDeploymentCapReached) {
 		// Over the per-tier cap — surfaced atomically inside the
