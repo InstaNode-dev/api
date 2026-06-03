@@ -92,8 +92,11 @@ func TestSetDeploymentTTL_PermanentGuard(t *testing.T) {
 	_, err := db.Exec(`UPDATE deployments SET ttl_policy='permanent', expires_at=NULL WHERE id=$1`, deployID)
 	require.NoError(t, err)
 
-	// Direct model call must NOT flip the permanent row.
-	require.NoError(t, models.SetDeploymentTTL(context.Background(), db, deployID, 24))
+	// Direct model call must NOT flip the permanent row — the WHERE guard
+	// matches no row, so it reports applied=false (no error).
+	appliedPerm, err := models.SetDeploymentTTL(context.Background(), db, deployID, 24)
+	require.NoError(t, err)
+	require.False(t, appliedPerm, "permanent row must not be updated → applied=false")
 	var policy string
 	var expiresAt sql.NullTime
 	require.NoError(t, db.QueryRow(`SELECT ttl_policy, expires_at FROM deployments WHERE id=$1`, deployID).Scan(&policy, &expiresAt))
