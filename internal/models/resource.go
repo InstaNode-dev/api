@@ -454,7 +454,9 @@ func SetWebhookHMACSecret(ctx context.Context, db *sql.DB, resourceID uuid.UUID,
 	return nil
 }
 
-// SoftDeleteResource marks a resource status as 'deleted'.
+// SoftDeleteResource marks a resource status as 'deleted'. Used by the
+// provision-rollback paths (db/cache/nosql/queue/storage/vector), which always
+// operate on a row they just created — they don't need the concurrency guard.
 func SoftDeleteResource(ctx context.Context, db *sql.DB, id uuid.UUID) error {
 	_, err := db.ExecContext(ctx, `
 		UPDATE resources SET status = 'deleted' WHERE id = $1
@@ -463,6 +465,28 @@ func SoftDeleteResource(ctx context.Context, db *sql.DB, id uuid.UUID) error {
 		return fmt.Errorf("models.SoftDeleteResource: %w", err)
 	}
 	return nil
+}
+
+// SoftDeleteResourceIfActive flips status to 'deleted' ONLY when the row is not
+// already deleted, returning whether THIS call performed the transition.
+//
+// The `status != 'deleted'` guard makes a concurrent DELETE single-shot: when
+// two requests race (both read the row before either commits), the UPDATE
+// serializes at the row and exactly one reports deleted==true. The DELETE
+// handler fires the DESTRUCTIVE deprovision RPC only on that winning call, so
+// the physical backend is torn down once — never twice against already-gone
+// infra (the truehomie-db DROP incident class). This is the authoritative
+// idempotency guard for DELETE /resources/:id, replacing a status pre-read
+// that had a check-then-act TOCTOU under concurrency.
+func SoftDeleteResourceIfActive(ctx context.Context, db *sql.DB, id uuid.UUID) (bool, error) {
+	res, err := db.ExecContext(ctx, `
+		UPDATE resources SET status = 'deleted' WHERE id = $1 AND status != 'deleted'
+	`, id)
+	if err != nil {
+		return false, fmt.Errorf("models.SoftDeleteResourceIfActive: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 // ErrResourceNotActive is returned by PauseResource when the row exists but
@@ -676,10 +700,11 @@ func UpdateProviderResourceID(ctx context.Context, db *sql.DB, resourceID uuid.U
 // resource to newTier and clears its TTL (expires_at = NULL).
 //
 // Called from the Razorpay subscription.charged webhook. Picks up two cases:
-//   1) Resources that are already permanent (expires_at IS NULL) — a hobby
-//      user upgrading to pro: lift their existing resources to the new tier.
-//   2) Resources still on anonymous TTL (expires_at > now()) — a freshly
-//      claimed user paying for the first time: clear the TTL + set tier.
+//  1. Resources that are already permanent (expires_at IS NULL) — a hobby
+//     user upgrading to pro: lift their existing resources to the new tier.
+//  2. Resources still on anonymous TTL (expires_at > now()) — a freshly
+//     claimed user paying for the first time: clear the TTL + set tier.
+//
 // This is the second half of "pay from day one": claim transfers team
 // ownership but does NOT clear the TTL or change tier. Only payment does.
 //
