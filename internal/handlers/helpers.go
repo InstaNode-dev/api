@@ -1048,7 +1048,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user reading the deployment tarball failed mid-upload. Retry the upload with a clean tarball — see https://instanode.dev/docs/deploy.",
 	},
 	"tarball_too_large": {
-		AgentAction: "Tell the user the deployment tarball exceeded the 50 MiB cap. Trim node_modules / build artefacts and retry — see https://instanode.dev/docs/deploy.",
+		AgentAction: "Tell the user the deploy upload exceeds the 10MB cap. Slim it — exclude node_modules, .git, and build output (use a .dockerignore). For large projects, deploy a prebuilt image instead of uploading source: see https://instanode.dev/docs/deploy.",
 	},
 	"no_services": {
 		AgentAction: "Tell the user the stack manifest declared no services. Add at least one service block — see https://instanode.dev/docs/stacks.",

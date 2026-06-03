@@ -3098,7 +3098,7 @@ const openAPISpec = `{
       "DeployRequest": {
         "type": "object",
         "properties": {
-          "tarball": { "type": "string", "format": "binary", "description": "gzipped tar archive containing the Dockerfile + source (max 50 MB). When MINIO_ENDPOINT is configured the build context is uploaded to MinIO and kaniko pulls it via the S3 path; otherwise it falls back to a k8s Secret which caps at ~1 MiB." },
+          "tarball": { "type": "string", "format": "binary", "description": "gzipped tar archive containing the Dockerfile + source (max 10 MB). Over the cap returns 413 tarball_too_large with an agent_action — slim the upload (exclude node_modules/.git/build output) or deploy a prebuilt image instead of uploading source. When MINIO_ENDPOINT is configured the build context is uploaded to MinIO and kaniko pulls it via the S3 path; otherwise it falls back to a k8s Secret which caps at ~1 MiB." },
           "name": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9 _-]*$", "description": "REQUIRED. Short human-readable label for this deployment (1-64 chars after trimming; must start with a letter or digit, then letters/digits/spaces/underscores/hyphens). Missing/empty → 400 name_required. Bad format/length → 400 invalid_name." },
           "port": { "type": "integer", "description": "Container port (default 8080)" },
           "env": { "type": "string", "description": "Environment scope (production / staging / dev / ...). Defaults to 'development' when omitted (migration 026 — the resolved env is echoed back as 'environment' on the response so callers know which bucket they landed in)." },

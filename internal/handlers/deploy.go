@@ -51,6 +51,29 @@ import (
 // "agent locks the staging app to the office IP", not corporate networking.
 const maxAllowedIPs = 32
 
+// maxTarballBytes caps direct source uploads at 10 MB (was 50 MB). A 10 MB
+// gzipped source tar is ample for app code; larger almost always means
+// vendored deps / build output / binaries that belong in the build, not the
+// upload. Over-cap requests get a 413 + an agent_action nudging the caller to
+// deploy from a prebuilt image (source=image) instead of uploading source.
+// Enforced at the handler (NOT the Fiber global BodyLimit, which stays 50 MiB
+// for /stacks/new's multi-service aggregate + webhook routes).
+const maxTarballBytes = 10 << 20
+
+// enforceTarballCap returns a 413 response (and ErrResponseWritten) when an
+// uploaded tarball exceeds maxTarballBytes, with a routed agent_action
+// (codeToAgentAction["tarball_too_large"]) nudging the caller to slim the
+// upload or deploy a prebuilt image. Shared by /deploy/new and its
+// redeploy=true branch so the cap can never drift between the two. Returns
+// nil when the upload is within the cap.
+func enforceTarballCap(c *fiber.Ctx, fh *multipart.FileHeader) error {
+	if fh.Size > maxTarballBytes {
+		return respondError(c, fiber.StatusRequestEntityTooLarge, "tarball_too_large",
+			fmt.Sprintf("Tarball must be at most 10 MB; yours is %d MB. Slim the upload (exclude node_modules/.git/build output) or deploy a prebuilt image instead of uploading source.", fh.Size>>20))
+	}
+	return nil
+}
+
 // errCodeDeploymentNotRedeployable is the error code returned by POST
 // /deploy/:id/redeploy when the deployment is in a terminal status
 // (expired / deleted / stopped). Redeploying such a row would resurrect an
@@ -583,9 +606,8 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 			"Multipart field 'tarball' is required")
 	}
 	fh := tarballs[0]
-	if fh.Size > 50<<20 {
-		return respondError(c, fiber.StatusBadRequest, "tarball_too_large",
-			"Tarball must be at most 50 MB")
+	if err := enforceTarballCap(c, fh); err != nil {
+		return err
 	}
 	f, err := openMultipartFile(fh)
 	if err != nil {
@@ -1495,6 +1517,9 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 			"Multipart field 'tarball' is required")
 	}
 	fh := tarballs[0]
+	// NOTE: the redeploy path keeps the 50 MB cap for now; the 10 MB
+	// enforceTarballCap cap is applied on the primary /deploy/new path in P1.
+	// Tightening redeploy + /stacks/new to 10 MB is the P1.1 fast-follow.
 	if fh.Size > 50<<20 {
 		return respondError(c, fiber.StatusBadRequest, "tarball_too_large",
 			"Tarball must be at most 50 MB")
