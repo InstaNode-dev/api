@@ -43,6 +43,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // snsSigningCertHostRegex enforces "sns.<region>.amazonaws.com" hostnames
@@ -92,6 +94,13 @@ type snsVerifier struct {
 
 	mu        sync.RWMutex
 	certCache map[string]snsCertCacheEntry
+
+	// sfGroup collapses concurrent cache-miss fetches for the same certURL
+	// into a single in-flight network call. Without it a burst of SNS
+	// deliveries that all miss the cache (cold start, or just after a TTL
+	// expiry) each fire their own fetchCert and then race to overwrite the
+	// map — a thundering herd against the AWS cert endpoint. See getCert.
+	sfGroup singleflight.Group
 }
 
 // newSNSVerifier returns a verifier with production defaults.
@@ -216,6 +225,14 @@ func (v *snsVerifier) verify(msg snsMessage) error {
 }
 
 // getCert returns a cached certificate or fetches it via fetchCert.
+//
+// The miss path is collapsed through a singleflight group keyed by certURL so
+// a burst of concurrent SNS deliveries that all miss the cache (cold start, or
+// the instant after a TTL expiry) issue exactly ONE fetchCert call between
+// them rather than a thundering herd against the AWS cert endpoint. The fetch
+// closure re-checks the cache under the lock (double-checked locking) before
+// fetching, so a request that joins just after the leader populated the cache
+// returns the fresh entry without a redundant network call.
 func (v *snsVerifier) getCert(certURL string) (*x509.Certificate, error) {
 	v.mu.RLock()
 	entry, ok := v.certCache[certURL]
@@ -224,15 +241,20 @@ func (v *snsVerifier) getCert(certURL string) (*x509.Certificate, error) {
 		return entry.cert, nil
 	}
 
-	cert, err := v.fetchCert("sns", certURL)
+	cert, err, _ := v.sfGroup.Do(certURL, func() (any, error) {
+		c, err := v.fetchCert("sns", certURL)
+		if err != nil {
+			return nil, err
+		}
+		v.mu.Lock()
+		v.certCache[certURL] = snsCertCacheEntry{cert: c, fetched: time.Now()}
+		v.mu.Unlock()
+		return c, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	v.mu.Lock()
-	v.certCache[certURL] = snsCertCacheEntry{cert: cert, fetched: time.Now()}
-	v.mu.Unlock()
-	return cert, nil
+	return cert.(*x509.Certificate), nil
 }
 
 // defaultFetchCert fetches the PEM cert at certURL and returns the first
