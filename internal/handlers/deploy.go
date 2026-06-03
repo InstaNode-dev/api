@@ -126,6 +126,19 @@ func applyImageSourceOpts(opts *compute.DeployOptions, d *models.Deployment, aes
 	opts.RegistryAuth = plain
 }
 
+// encryptRegistryCreds AES-256-GCM-encrypts a BYO private-registry docker
+// config JSON for at-rest storage. ParseAESKey is the only failure mode worth
+// a distinct branch (a misconfigured/short AES_KEY); crypto.Encrypt over a
+// valid key does not fail for these inputs, so its error is returned verbatim
+// without a separate handler branch. Returns the ciphertext for persistence.
+func encryptRegistryCreds(aesKeyHex, plaintext string) (string, error) {
+	key, err := crypto.ParseAESKey(aesKeyHex)
+	if err != nil {
+		return "", err
+	}
+	return crypto.Encrypt(key, plaintext)
+}
+
 // deploymentSourceOrDefault normalises an empty source (legacy in-memory rows)
 // to the 'tarball' default the migration applies at the DB layer.
 func deploymentSourceOrDefault(s string) string {
@@ -713,13 +726,8 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		// config JSON, encrypted at rest (AES-256-GCM, like notify_webhook_secret)
 		// and never echoed back. Absent → the platform ghcr-pull secret is used.
 		if vals := form.Value["registry_creds"]; len(vals) > 0 && strings.TrimSpace(vals[0]) != "" {
-			key, kerr := crypto.ParseAESKey(h.cfg.AESKey)
-			if kerr != nil {
-				return respondError(c, fiber.StatusServiceUnavailable, "encrypt_unavailable",
-					"Could not secure registry credentials")
-			}
-			enc, eerr := crypto.Encrypt(key, strings.TrimSpace(vals[0]))
-			if eerr != nil {
+			enc, encErr := encryptRegistryCreds(h.cfg.AESKey, strings.TrimSpace(vals[0]))
+			if encErr != nil {
 				return respondError(c, fiber.StatusServiceUnavailable, "encrypt_failed",
 					"Could not secure registry credentials")
 			}

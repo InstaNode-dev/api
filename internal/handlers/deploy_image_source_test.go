@@ -85,6 +85,27 @@ func TestValidateImageRef_TooLong(t *testing.T) {
 	}
 }
 
+func TestEncryptRegistryCreds(t *testing.T) {
+	const keyHex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	// bad key (not 64 hex chars) → ParseAESKey error path.
+	if _, err := encryptRegistryCreds("tooshort", `{"auths":{}}`); err == nil {
+		t.Error("a malformed AES key must return an error")
+	}
+	// good key → ciphertext that round-trips.
+	ct, err := encryptRegistryCreds(keyHex, `{"auths":{"ghcr.io":{}}}`)
+	if err != nil {
+		t.Fatalf("encryptRegistryCreds(good key): %v", err)
+	}
+	if ct == "" {
+		t.Fatal("ciphertext must be non-empty")
+	}
+	key, _ := crypto.ParseAESKey(keyHex)
+	plain, derr := crypto.Decrypt(key, ct)
+	if derr != nil || plain != `{"auths":{"ghcr.io":{}}}` {
+		t.Errorf("round-trip failed: plain=%q err=%v", plain, derr)
+	}
+}
+
 func TestApplyImageSourceOpts(t *testing.T) {
 	const keyHex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 	key, _ := crypto.ParseAESKey(keyHex)

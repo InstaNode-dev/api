@@ -142,6 +142,43 @@ func TestDeployNew_SourceImage_FlagOn_InvalidRef_400(t *testing.T) {
 	assert.Equal(t, "invalid_image_ref", env.Error)
 }
 
+// TestDeployNew_SourceImage_EncryptFailure_503 — when AES_KEY is misconfigured,
+// encrypting BYO registry creds fails and the handler returns 503 rather than
+// persisting unencrypted secrets. AES parsing is request-time, so a bad key on
+// the test config only trips this path (the app still builds).
+func TestDeployNew_SourceImage_EncryptFailure_503(t *testing.T) {
+	daDeployNeedsDB(t)
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
+	defer cleanRedis()
+
+	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
+	jwt := testhelpers.MustSignSessionJWT(t, uuid.NewString(), teamID, "enc@example.com")
+	app, cleanApp := testhelpers.NewTestAppWithServices(t, db, rdb, "deploy",
+		func(c *config.Config) {
+			c.DeploySourceImageEnabled = true
+			c.AESKey = "not-a-valid-hex-key" // crypto.ParseAESKey rejects → encrypt fails
+		})
+	defer cleanApp()
+
+	body, ct := buildImageDeployForm(t, map[string]string{
+		"name":           "enc-fail-app",
+		"source":         "image",
+		"image_ref":      "ghcr.io/owner/app:v1",
+		"registry_creds": `{"auths":{}}`,
+	})
+	resp := postDeploy(t, app, body, ct, jwt)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	var env struct {
+		Error string `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&env))
+	assert.Equal(t, "encrypt_failed", env.Error)
+}
+
 // TestDeployNew_SourceImage_FlagOn_Accepted — the happy path: flag on, valid
 // image_ref + BYO private-registry creds → 202, the response item echoes
 // source=image + image_ref + registry_creds_set:true (never the creds), and
