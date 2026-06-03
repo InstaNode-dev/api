@@ -3,9 +3,12 @@ package handlers
 // deploy_image_source_test.go — unit tests for P2 source=image validation.
 
 import (
+	"strings"
 	"testing"
 
+	"instant.dev/internal/crypto"
 	"instant.dev/internal/models"
+	"instant.dev/internal/providers/compute"
 )
 
 func TestValidateImageRef(t *testing.T) {
@@ -72,5 +75,53 @@ func TestDeploymentToMap_ImageSource(t *testing.T) {
 	}
 	if _, ok := m2["registry_creds_set"]; ok {
 		t.Error("tarball deploy must not emit registry_creds_set")
+	}
+}
+
+func TestValidateImageRef_TooLong(t *testing.T) {
+	long := "ghcr.io/o/" + strings.Repeat("a", 600) // valid host, but >512 total
+	if _, err := validateImageRef(long); err == nil {
+		t.Error("an image_ref over 512 chars must be rejected")
+	}
+}
+
+func TestApplyImageSourceOpts(t *testing.T) {
+	const keyHex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	key, _ := crypto.ParseAESKey(keyHex)
+	cipher, _ := crypto.Encrypt(key, `{"auths":{}}`)
+
+	// non-image → no-op (tarball deploy untouched)
+	o := compute.DeployOptions{Tarball: []byte("x")}
+	applyImageSourceOpts(&o, &models.Deployment{Source: "tarball"}, keyHex)
+	if o.Source != "" || o.Tarball == nil {
+		t.Errorf("tarball deploy must be untouched, got %+v", o)
+	}
+
+	// image, no creds → Source/ImageRef set, Tarball cleared, no RegistryAuth
+	o = compute.DeployOptions{Tarball: []byte("x")}
+	applyImageSourceOpts(&o, &models.Deployment{Source: "image", ImageRef: "ghcr.io/o/a:1"}, keyHex)
+	if o.Source != "image" || o.ImageRef != "ghcr.io/o/a:1" || o.Tarball != nil || o.RegistryAuth != "" {
+		t.Errorf("image no-creds: %+v", o)
+	}
+
+	// image + creds → RegistryAuth decrypted
+	o = compute.DeployOptions{}
+	applyImageSourceOpts(&o, &models.Deployment{Source: "image", ImageRef: "r", RegistryCredsEnc: cipher}, keyHex)
+	if o.RegistryAuth != `{"auths":{}}` {
+		t.Errorf("creds decrypt: got %q", o.RegistryAuth)
+	}
+
+	// image + bad ciphertext → decrypt fails → no RegistryAuth (fallback)
+	o = compute.DeployOptions{}
+	applyImageSourceOpts(&o, &models.Deployment{Source: "image", RegistryCredsEnc: "not-valid-base64!!"}, keyHex)
+	if o.RegistryAuth != "" {
+		t.Error("bad ciphertext must not set RegistryAuth")
+	}
+
+	// bad AES key → no RegistryAuth
+	o = compute.DeployOptions{}
+	applyImageSourceOpts(&o, &models.Deployment{Source: "image", RegistryCredsEnc: cipher}, "tooshort")
+	if o.RegistryAuth != "" {
+		t.Error("bad AES key must not set RegistryAuth")
 	}
 }

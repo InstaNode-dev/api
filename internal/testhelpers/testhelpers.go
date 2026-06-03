@@ -313,6 +313,12 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS reminders_sent INT NOT NULL DEFAULT 0`,
 		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS last_reminder_at TIMESTAMPTZ`,
 		`CREATE INDEX IF NOT EXISTS idx_deployments_expires_pending ON deployments (expires_at) WHERE expires_at IS NOT NULL AND status NOT IN ('deleted', 'expired')`,
+		// 064_deploy_source_image — P2 prebuilt-image deploy source. CHECK
+		// omitted in test DDL (handler validates; production migration carries
+		// the source IN ('tarball','image','git') constraint).
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'tarball'`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS image_ref TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS registry_creds_enc TEXT NOT NULL DEFAULT ''`,
 		// teams.default_deployment_ttl_policy — Wave FIX-J team preference.
 		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS default_deployment_ttl_policy TEXT NOT NULL DEFAULT 'auto_24h'`,
 		// 012_audit_log — per-team event stream consumed by the dashboard's
@@ -953,10 +959,18 @@ func NewTestApp(t *testing.T, db *sql.DB, rdb *redis.Client) (*fiber.App, func()
 // NewTestAppWithServices creates a Fiber app identical to NewTestApp but with
 // an explicit comma-separated list of enabled services (e.g. "postgres,redis,mongodb,queue,webhook,storage").
 // Use this in tests that exercise /db/new, /cache/new, or /nosql/new.
-func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, services string) (*fiber.App, func()) {
+// The optional mutators run against the test config after defaults are set but
+// before any handler is constructed — use them to flip feature flags (e.g.
+// DeploySourceImageEnabled) for a single test without widening every caller.
+func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, services string, mutators ...func(*config.Config)) (*fiber.App, func()) {
 	t.Helper()
 	cfg := testConfig()
 	cfg.EnabledServices = services
+	for _, m := range mutators {
+		if m != nil {
+			m(cfg)
+		}
+	}
 	planReg := plans.Default()
 
 	app := fiber.New(fiber.Config{

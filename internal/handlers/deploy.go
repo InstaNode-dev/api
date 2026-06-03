@@ -98,6 +98,34 @@ func validateImageRef(ref string) (string, error) {
 	return ref, nil
 }
 
+// applyImageSourceOpts populates DeployOptions for a source=image deployment
+// from the persisted row: sets Source/ImageRef, clears Tarball, and decrypts
+// the optional BYO registry creds into RegistryAuth. A decrypt failure (or bad
+// key) is logged and falls back to the platform pull secret — public/GHCR
+// images still deploy. No-op for non-image sources.
+func applyImageSourceOpts(opts *compute.DeployOptions, d *models.Deployment, aesKeyHex string) {
+	if d.Source != "image" {
+		return
+	}
+	opts.Source = "image"
+	opts.ImageRef = d.ImageRef
+	opts.Tarball = nil
+	if d.RegistryCredsEnc == "" {
+		return
+	}
+	key, kerr := crypto.ParseAESKey(aesKeyHex)
+	if kerr != nil {
+		slog.Error("deploy.image.aes_key_invalid", "app_id", d.AppID, "error", kerr)
+		return
+	}
+	plain, derr := crypto.Decrypt(key, d.RegistryCredsEnc)
+	if derr != nil {
+		slog.Error("deploy.run_deploy.registry_creds_decrypt_failed", "app_id", d.AppID, "error", derr)
+		return
+	}
+	opts.RegistryAuth = plain
+}
+
 // deploymentSourceOrDefault normalises an empty source (legacy in-memory rows)
 // to the 'tarball' default the migration applies at the DB layer.
 func deploymentSourceOrDefault(s string) string {
@@ -578,24 +606,8 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 		AllowedIPs: d.AllowedIPs,
 	}
 	// Multi-source (migration 064): a source=image deploy carries no tarball —
-	// the compute layer deploys d.ImageRef directly (skip Kaniko). Decrypt the
-	// optional BYO pull creds into RegistryAuth; a decrypt failure is logged
-	// and falls back to the platform pull secret (public/GHCR images still work).
-	if d.Source == "image" {
-		opts.Source = "image"
-		opts.ImageRef = d.ImageRef
-		opts.Tarball = nil
-		if d.RegistryCredsEnc != "" {
-			if key, kerr := crypto.ParseAESKey(h.cfg.AESKey); kerr == nil {
-				if plain, derr := crypto.Decrypt(key, d.RegistryCredsEnc); derr == nil {
-					opts.RegistryAuth = plain
-				} else {
-					slog.Error("deploy.run_deploy.registry_creds_decrypt_failed",
-						"app_id", d.AppID, "error", derr)
-				}
-			}
-		}
-	}
+	// the compute layer deploys d.ImageRef directly (skip Kaniko).
+	applyImageSourceOpts(&opts, d, h.cfg.AESKey)
 	result, err := h.compute.Deploy(ctx, opts)
 	if err != nil {
 		slog.Error("deploy.run_deploy.failed",
