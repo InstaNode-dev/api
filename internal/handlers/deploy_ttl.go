@@ -143,6 +143,19 @@ func (h *DeployHandler) SetTTL(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusNotFound, "not_found", "Deployment not found")
 	}
 
+	// Bug-bash #3/#5/#6: a permanent deploy must not be silently flipped back to
+	// an expiring TTL, and a terminal (expired/deleted/stopped) deploy can't have
+	// its lifecycle changed. Guard both before the write (the model adds a
+	// defense-in-depth WHERE clause for the permanent case too).
+	if d.TTLPolicy == models.DeployTTLPolicyPermanent {
+		return respondError(c, fiber.StatusConflict, "already_permanent",
+			"This deployment is permanent — it has no TTL to set. (Downgrading a permanent deploy is support-only.)")
+	}
+	if models.IsDeploymentTerminal(d.Status) {
+		return respondError(c, fiber.StatusConflict, "invalid_state",
+			fmt.Sprintf("Cannot set a TTL on a %s deployment", d.Status))
+	}
+
 	if team.PlanTier == "anonymous" {
 		// B7-P1-7 (see MakePermanent above): emit `claim_required` so an
 		// agent branching on error code routes the user to the free claim

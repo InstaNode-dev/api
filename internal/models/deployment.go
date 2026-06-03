@@ -740,6 +740,10 @@ func ElevateDeploymentTiersByTeam(ctx context.Context, db *sql.DB, teamID uuid.U
 // warning cycle again instead of skipping reminders that fired earlier.
 func SetDeploymentTTL(ctx context.Context, db *sql.DB, id uuid.UUID, hours int) error {
 	expiresAt := time.Now().UTC().Add(time.Duration(hours) * time.Hour)
+	// `ttl_policy != 'permanent'` is defense-in-depth (the handler already
+	// rejects a permanent deploy with 409): if a concurrent MakePermanent races
+	// this UPDATE, the WHERE clause prevents silently un-permanenting the deploy
+	// — the row simply isn't touched (bug-bash #6).
 	_, err := db.ExecContext(ctx, `
 		UPDATE deployments
 		SET expires_at = $1,
@@ -747,7 +751,7 @@ func SetDeploymentTTL(ctx context.Context, db *sql.DB, id uuid.UUID, hours int) 
 		    reminders_sent = 0,
 		    last_reminder_at = NULL,
 		    updated_at = now()
-		WHERE id = $2
+		WHERE id = $2 AND ttl_policy != 'permanent'
 	`, expiresAt, id)
 	if err != nil {
 		return fmt.Errorf("models.SetDeploymentTTL: %w", err)
