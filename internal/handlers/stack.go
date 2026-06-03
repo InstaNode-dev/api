@@ -1150,18 +1150,19 @@ type updateStackEnvBody struct {
 // NEVER persisted — the silent-data-loss failure mode. Now backed by
 // migration 062's stacks.env_vars JSONB column. The handler:
 //
-//  1. Loads existing env_vars from the row.
-//  2. Merges the incoming body's `env` map into the existing set (PATCH
-//     semantics — each call is incremental, not replace-all). Setting a
-//     key to the empty string deletes it (matches the dashboard contract
-//     and the env-var convention for "absent" elsewhere on the platform).
-//  3. Validates every key against isValidEnvKey (POSIX [A-Z_][A-Z0-9_]*),
+//  1. Validates every key against isValidEnvKey (POSIX [A-Z_][A-Z0-9_]*),
 //     mirroring deploy.go and /stacks/new so PATCH cannot smuggle in a
 //     key shape the create/redeploy paths would reject async.
-//  4. Persists via UpdateStackEnvVars.
-//  5. Emits a best-effort audit_log row (kind=stack.env.updated) for the
+//  2. Atomically merges the incoming body's `env` map into the existing set
+//     (PATCH semantics — each call is incremental, not replace-all) via
+//     models.MergeStackEnvVars, a single row-locked transaction. Setting a
+//     key to the empty string deletes it (matches the dashboard contract
+//     and the env-var convention for "absent" elsewhere on the platform).
+//     The row lock serializes concurrent PATCHes so no key is lost to a
+//     read-modify-write race (bug-bash #10).
+//  3. Emits a best-effort audit_log row (kind=stack.env.updated) for the
 //     dashboard activity feed and the support panel.
-//  6. Returns the FULL merged env in the response so the caller doesn't
+//  4. Returns the FULL merged env in the response so the caller doesn't
 //     have to re-GET to see the new state.
 //
 // Auth required — anonymous stacks cannot be mutated after creation.
@@ -1213,44 +1214,23 @@ func (h *StackHandler) UpdateEnv(c *fiber.Ctx) error {
 			"Env-var key "+quoteForError(badKey)+" must match POSIX shape [A-Z_][A-Z0-9_]*")
 	}
 
-	// Load existing env, merge, save. Empty-string value deletes the key —
-	// matches the dashboard's PATCH-with-delete affordance.
-	existing, err := models.GetStackEnvVars(c.Context(), h.db, stack.ID)
+	// Load-merge-save ATOMICALLY in one row-locked transaction. Empty-string
+	// value deletes the key — matches the dashboard's PATCH-with-delete
+	// affordance. The single MergeStackEnvVars call replaces the previous
+	// GetStackEnvVars → merge-in-Go → UpdateStackEnvVars sequence, which had a
+	// lost-update race: two concurrent PATCHes both read the same snapshot and
+	// the second blind-overwrote the first, silently dropping a key (bug-bash
+	// #10). MergeStackEnvVars serializes concurrent PATCHes via SELECT ... FOR
+	// UPDATE, so the second reads the first's committed result.
+	merged, deletes, err := models.MergeStackEnvVars(c.Context(), h.db, stack.ID, body.Env)
 	if err != nil {
-		var notFound *models.ErrStackNotFound
-		if errors.As(err, &notFound) {
-			// Row vanished between GetStackBySlug and here. Treat as 404.
-			return respondError(c, fiber.StatusNotFound, "not_found", "Stack not found")
-		}
-		slog.Error("stack.env.fetch_failed",
-			"slug", slug, "team_id", team.ID, "stack_id", stack.ID, "error", err)
-		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed",
-			"Failed to fetch existing env vars")
-	}
-	if existing == nil {
-		existing = map[string]string{}
-	}
-	merged := make(map[string]string, len(existing)+len(body.Env))
-	for k, v := range existing {
-		merged[k] = v
-	}
-	deletes := 0
-	for k, v := range body.Env {
-		if v == "" {
-			delete(merged, k)
-			deletes++
-			continue
-		}
-		merged[k] = v
-	}
-
-	if err := models.UpdateStackEnvVars(c.Context(), h.db, stack.ID, merged); err != nil {
 		if errors.Is(err, models.ErrStackEnvVarsTooLarge) {
 			return respondError(c, fiber.StatusRequestEntityTooLarge, "env_too_large",
 				"Total env_vars payload exceeds 64KiB. Trim values or split across services.")
 		}
 		var notFound *models.ErrStackNotFound
 		if errors.As(err, &notFound) {
+			// Row vanished between GetStackBySlug and the merge tx. Treat as 404.
 			return respondError(c, fiber.StatusNotFound, "not_found", "Stack not found")
 		}
 		slog.Error("stack.env.persist_failed",

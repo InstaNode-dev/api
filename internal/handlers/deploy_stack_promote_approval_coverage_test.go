@@ -628,7 +628,7 @@ func TestStackUpdateEnv_TooLarge_Returns413(t *testing.T) {
 		VALUES ($1, $2, $3, 'healthy', 'pro', 'production') RETURNING id
 	`, teamID, slug, "instant-stack-"+slug).Scan(&stackID))
 
-	// A single value > 64KiB blows the cap inside UpdateStackEnvVars.
+	// A single value > 64KiB blows the cap inside MergeStackEnvVars.
 	big := make([]byte, 70*1024)
 	for i := range big {
 		big[i] = 'A'
