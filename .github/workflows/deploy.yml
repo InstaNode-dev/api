@@ -135,6 +135,14 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: '1.25'
+          # This workflow checks the api repo out into ./api (path: api above),
+          # so setup-go's default go.sum lookup at the checkout root misses and
+          # the module cache is never restored — every run cold-downloads the
+          # full dep tree (~2 min), leaving the test step exposed to transient
+          # runner blips (seen 2026-06-03: a cold-download run SIGTERM'd and the
+          # deploy only landed on a warm re-run). Point the cache key at the real
+          # go.sum so deps are restored from cache.
+          cache-dependency-path: api/go.sum
 
       - name: Stage sibling repos for go.mod replace (../common, ../proto)
         # The api repo's go.mod uses `replace instant.dev/common => ../common`
