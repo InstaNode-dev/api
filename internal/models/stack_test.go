@@ -21,6 +21,7 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -192,4 +193,64 @@ func TestUpdateStackServiceImageRef_BackfillsColumn(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.Equal(t, ref, got[0].ImageRef,
 		"UpdateStackServiceImageRef must back-fill the column for subsequent reads")
+}
+
+// TestMergeStackEnvVars_ConcurrentPatchesNoLostUpdate is the bug-bash #10
+// regression: PATCH /stacks/:slug/env used to load-merge-save non-atomically
+// (GetStackEnvVars → merge-in-Go → UpdateStackEnvVars), so two concurrent
+// PATCHes with disjoint keys both read the same snapshot and the second
+// blind-overwrote the first — silently dropping a key. MergeStackEnvVars does
+// the whole merge inside ONE row-locked transaction (SELECT ... FOR UPDATE), so
+// the two PATCHes serialize and BOTH keys must survive.
+//
+// We fire N concurrent disjoint-key merges against a real seeded row and assert
+// every key is present afterwards. With the old non-atomic path this fails
+// (lost updates); with the row lock it passes deterministically.
+func TestMergeStackEnvVars_ConcurrentPatchesNoLostUpdate(t *testing.T) {
+	requireDBStack(t)
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	ensureStackTablesModels(t, db)
+	// env_vars (migration 062) is not in ensureStackTablesModels' base DDL.
+	_, err := db.Exec(`ALTER TABLE stacks ADD COLUMN IF NOT EXISTS env_vars JSONB NOT NULL DEFAULT '{}'::jsonb`)
+	require.NoError(t, err)
+
+	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
+	stackID := seedStack(t, db, teamID)
+
+	// 16 goroutines, each upserting a unique key. Under a lost-update race some
+	// of these writes would be clobbered; under the row lock all 16 survive.
+	const n = 16
+	keys := make([]string, n)
+	for i := range keys {
+		keys[i] = "KEY_" + uuid.NewString()[:8]
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // release all at once to maximize contention
+			_, _, e := models.MergeStackEnvVars(context.Background(), db, stackID,
+				map[string]string{keys[i]: "v"})
+			errs[i] = e
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, e := range errs {
+		require.NoErrorf(t, e, "merge %d (%s) errored", i, keys[i])
+	}
+
+	final, err := models.GetStackEnvVars(context.Background(), db, stackID)
+	require.NoError(t, err)
+	for _, k := range keys {
+		assert.Equalf(t, "v", final[k],
+			"key %s was lost — concurrent PATCH dropped it (lost-update regression)", k)
+	}
+	assert.Len(t, final, n, "all %d concurrent disjoint keys must survive", n)
 }
