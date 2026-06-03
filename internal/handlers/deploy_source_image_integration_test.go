@@ -82,8 +82,8 @@ func TestDeployNew_SourceImage_FlagOff_501(t *testing.T) {
 	assert.Equal(t, "source_image_disabled", env.Error)
 }
 
-// TestDeployNew_InvalidSource_400 — an unrecognised source (neither tarball
-// nor image, e.g. "git" which is not yet wired) is a clean 400.
+// TestDeployNew_InvalidSource_400 — an unrecognised source (none of tarball,
+// image, or git — e.g. "svn") is a clean 400. (Was "git" before P3 wired it.)
 func TestDeployNew_InvalidSource_400(t *testing.T) {
 	daDeployNeedsDB(t)
 	db, cleanDB := testhelpers.SetupTestDB(t)
@@ -98,7 +98,7 @@ func TestDeployNew_InvalidSource_400(t *testing.T) {
 
 	body, ct := buildImageDeployForm(t, map[string]string{
 		"name":   "bad-source-app",
-		"source": "git",
+		"source": "svn", // not tarball/image/git → default → invalid_source
 	})
 	resp := postDeploy(t, app, body, ct, jwt)
 	defer resp.Body.Close()
