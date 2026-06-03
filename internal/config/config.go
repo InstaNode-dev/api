@@ -479,6 +479,22 @@ func Load() *Config {
 	cfg.GitHubAppWebhookSecret = os.Getenv("GITHUB_APP_WEBHOOK_SECRET")
 	cfg.GitHubAppClientID = os.Getenv("GITHUB_APP_CLIENT_ID")
 	cfg.GitHubAppClientSecret = os.Getenv("GITHUB_APP_CLIENT_SECRET")
+	// Fail-closed when the App is enabled: an empty GITHUB_APP_WEBHOOK_SECRET
+	// makes the webhook HMAC verifiable with a publicly-known (empty) key — any
+	// attacker could forge a valid X-Hub-Signature-256. Likewise an empty
+	// private key / App ID can't mint tokens. Panic at Load (like JWT_SECRET)
+	// rather than silently serve an auth-bypassing webhook. (Review HIGH-1.)
+	if cfg.GitHubAppEnabled {
+		if len(strings.TrimSpace(cfg.GitHubAppWebhookSecret)) < 16 {
+			panic(&ErrMissingConfig{Key: "GITHUB_APP_WEBHOOK_SECRET (>=16 chars required when GITHUB_APP_ENABLED=true)"})
+		}
+		if strings.TrimSpace(cfg.GitHubAppPrivateKey) == "" {
+			panic(&ErrMissingConfig{Key: "GITHUB_APP_PRIVATE_KEY (required when GITHUB_APP_ENABLED=true)"})
+		}
+		if strings.TrimSpace(cfg.GitHubAppID) == "" {
+			panic(&ErrMissingConfig{Key: "GITHUB_APP_ID (required when GITHUB_APP_ENABLED=true)"})
+		}
+	}
 
 	if len(cfg.JWTSecret) < 32 {
 		panic("JWT_SECRET must be at least 32 bytes")

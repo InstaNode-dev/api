@@ -1232,6 +1232,8 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	githubAppH := handlers.NewGitHubAppHandler(db, cfg, planReg)
 	app.Get("/integrations/github/install", middleware.RequireAuth(cfg), githubAppH.Install)
 	app.Get("/integrations/github/callback", githubAppH.Callback)
+	githubAppWebhookH := handlers.NewGitHubAppWebhookHandler(db, rdb, cfg, planReg)
+	app.Post("/webhooks/github", githubAppWebhookH.Receive)
 
 	// A/B-experiment conversion sink — wired into the test app so
 	// handler tests can exercise the full route stack (router +

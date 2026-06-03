@@ -374,8 +374,18 @@ func TestLoad_DeploySourceGitEnabled(t *testing.T) {
 }
 
 func TestLoad_GitHubAppEnabled(t *testing.T) {
+	// When enabling the App, Load() fails closed unless the webhook secret +
+	// private key + app id are present (review HIGH-1), so set them here.
+	appSecrets := func(enabled string) map[string]string {
+		return map[string]string{
+			"GITHUB_APP_ENABLED":        enabled,
+			"GITHUB_APP_WEBHOOK_SECRET": "a-sufficiently-long-webhook-secret",
+			"GITHUB_APP_PRIVATE_KEY":    "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----",
+			"GITHUB_APP_ID":             "12345",
+		}
+	}
 	for _, val := range []string{"true", "1", "yes", "TRUE", "  Yes  "} {
-		applyBaselineEnv(t, map[string]string{"GITHUB_APP_ENABLED": val})
+		applyBaselineEnv(t, appSecrets(val))
 		if !Load().GitHubAppEnabled {
 			t.Errorf("GITHUB_APP_ENABLED=%q should enable", val)
 		}
@@ -386,6 +396,28 @@ func TestLoad_GitHubAppEnabled(t *testing.T) {
 			t.Errorf("GITHUB_APP_ENABLED=%q should stay disabled", val)
 		}
 	}
+
+	// Fail-closed: enabling without each required secret must panic, not
+	// silently serve an HMAC-bypassable / token-less App.
+	mustPanic := func(name string, env map[string]string) {
+		defer func() {
+			if recover() == nil {
+				t.Errorf("%s: Load() must panic", name)
+			}
+		}()
+		applyBaselineEnv(t, env)
+		_ = Load()
+	}
+	mustPanic("no webhook secret", map[string]string{"GITHUB_APP_ENABLED": "true"})
+	mustPanic("no private key", map[string]string{
+		"GITHUB_APP_ENABLED":        "true",
+		"GITHUB_APP_WEBHOOK_SECRET": "a-sufficiently-long-webhook-secret",
+	})
+	mustPanic("no app id", map[string]string{
+		"GITHUB_APP_ENABLED":        "true",
+		"GITHUB_APP_WEBHOOK_SECRET": "a-sufficiently-long-webhook-secret",
+		"GITHUB_APP_PRIVATE_KEY":    "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----",
+	})
 	// the GITHUB_APP_* values are plumbed verbatim.
 	applyBaselineEnv(t, map[string]string{
 		"GITHUB_APP_ID":             "12345",

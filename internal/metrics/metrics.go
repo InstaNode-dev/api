@@ -308,6 +308,23 @@ var (
 		Help: "Inbound Brevo transactional-webhook events by normalized class (delivered/bounced_hard/bounced_soft/rejected/complaint/deferred/unsubscribed/error/unhandled/missing_message_id/unauthorized/invalid_payload/oversized)",
 	}, []string{"event"})
 
+	// GitHubWebhookReceivedTotal counts inbound GitHub App webhook deliveries to
+	// POST /webhooks/github by event type and outcome. (P4.2 — push-to-deploy.)
+	// event  = "push" | "installation" | "ping" | other X-GitHub-Event value
+	// result = "ok" | "bad_signature" | "replay" | "no_match" | "disabled" | "error"
+	// Lazy *Vec — no series at /metrics until the first delivery of each label set.
+	GitHubWebhookReceivedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_github_webhook_received_total",
+		Help: "Inbound GitHub App webhook deliveries by event and result",
+	}, []string{"event", "result"})
+
+	// GitHubPushDeployTotal counts push→auto-redeploy outcomes (P4.2).
+	// result = "enqueued" | "rate_limited" | "no_connection" | "error"
+	GitHubPushDeployTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_github_pushdeploy_total",
+		Help: "GitHub App push-to-deploy outcomes by result",
+	}, []string{"result"})
+
 	// WebhookAuthFailuresTotal counts inbound webhook auth failures across
 	// every email-provider webhook surface (Brevo HMAC + SES/SNS RSA).
 	// Distinguishes:

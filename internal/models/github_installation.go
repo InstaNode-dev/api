@@ -34,6 +34,17 @@ func (e *ErrGitHubInstallationNotFound) Error() string {
 	return fmt.Sprintf("github installation not found: %d", e.InstallationID)
 }
 
+// ErrGitHubInstallationTeamConflict is returned when an upsert would rebind an
+// installation that already belongs to a DIFFERENT team — the install-callback
+// hijack guard (review HIGH-2). A re-install by the same team is allowed.
+type ErrGitHubInstallationTeamConflict struct {
+	InstallationID int64
+}
+
+func (e *ErrGitHubInstallationTeamConflict) Error() string {
+	return fmt.Sprintf("github installation %d is already linked to another team", e.InstallationID)
+}
+
 const githubInstallationColumns = `installation_id, team_id, account_login,
        suspended_at, created_at, updated_at`
 
@@ -54,17 +65,25 @@ func scanGitHubInstallation(row interface {
 // installation_id is GitHub's primary key; a re-install (or a callback replay)
 // updates team_id/account_login and clears any prior suspension.
 func UpsertGitHubInstallation(ctx context.Context, db *sql.DB, installationID int64, teamID uuid.UUID, accountLogin string) (*GitHubInstallation, error) {
+	// The DO UPDATE is guarded by `WHERE team_id = EXCLUDED.team_id` so a
+	// re-install by the SAME team refreshes the row, but a request carrying a
+	// different team cannot rebind an installation it doesn't own — the update
+	// matches no row, RETURNING is empty, and we surface a team conflict instead
+	// of silently hijacking the victim's installation (review HIGH-2).
 	row := db.QueryRowContext(ctx, `
 		INSERT INTO github_installations (installation_id, team_id, account_login)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (installation_id) DO UPDATE
-			SET team_id = EXCLUDED.team_id,
-			    account_login = EXCLUDED.account_login,
+			SET account_login = EXCLUDED.account_login,
 			    suspended_at = NULL,
 			    updated_at = now()
+			WHERE github_installations.team_id = EXCLUDED.team_id
 		RETURNING `+githubInstallationColumns,
 		installationID, teamID, accountLogin)
 	i, err := scanGitHubInstallation(row)
+	if err == sql.ErrNoRows {
+		return nil, &ErrGitHubInstallationTeamConflict{InstallationID: installationID}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("models.UpsertGitHubInstallation: %w", err)
 	}
