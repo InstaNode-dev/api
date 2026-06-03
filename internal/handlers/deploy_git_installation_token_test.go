@@ -74,7 +74,10 @@ func runApply(t *testing.T, setup func(sqlmock.Sqlmock), minter installationToke
 	if setup != nil {
 		setup(mock)
 	}
-	h := &DeployHandler{db: db, githubApp: minter}
+	h := &DeployHandler{db: db}
+	if minter != nil {
+		h.SetGitHubApp(minter) // exercise the setter (not a struct-literal field write)
+	}
 	d := &models.Deployment{ID: uuid.New(), TeamID: team, AppID: "gitdep"}
 	h.applyInstallationAuth(context.Background(), opts, d)
 }
