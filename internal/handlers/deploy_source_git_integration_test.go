@@ -161,17 +161,17 @@ func TestDeployNew_SourceGit_FlagOn_Accepted(t *testing.T) {
 	assert.Empty(t, env.Item.GitToken, "git token must NEVER be echoed back")
 	require.NotEmpty(t, env.Item.ID)
 
-	// runDeploy is async — poll the row until the noop provider stamps it
-	// healthy with a provider id (proves applyGitSourceOpts → compute.Deploy ran).
-	// Generous deadline: the async runDeploy goroutine does DB writes that can
-	// be slow under `-race -p 1` with the full suite loaded.
+	// runDeploy is async — poll the row until the noop provider drives it to a
+	// terminal status (proves applyGitSourceOpts → compute.Deploy ran). Poll on
+	// status, NOT provider_id: runDeploy writes provider_id before status in two
+	// UPDATEs, so breaking on provider_id races the status write. 30s ceiling.
 	deadline := time.Now().Add(30 * time.Second)
 	var status, providerID string
 	var gitURLCol sql.NullString
 	for time.Now().Before(deadline) {
 		row := db.QueryRow(`SELECT status, COALESCE(provider_id,''), git_url FROM deployments WHERE id = $1`, env.Item.ID)
 		require.NoError(t, row.Scan(&status, &providerID, &gitURLCol))
-		if providerID != "" {
+		if status == "healthy" || status == "failed" {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
