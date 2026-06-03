@@ -805,6 +805,7 @@ func respondPauseUpgradeRequired(c *fiber.Ctx, currentTier string) error {
 		"message":      "Pausing resources requires the Pro plan or higher. Your team is on the " + currentTier + " plan.",
 		"upgrade_url":  "https://instanode.dev/pricing",
 		"agent_action": AgentActionPauseRequiresPro,
+		"request_id":   middleware.GetRequestID(c),
 	})
 	return ErrResponseWritten
 }
