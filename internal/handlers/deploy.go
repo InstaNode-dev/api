@@ -34,6 +34,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"instant.dev/internal/config"
+	"instant.dev/internal/crypto"
 	"instant.dev/internal/email"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
@@ -66,6 +67,46 @@ const maxTarballBytes = 10 << 20
 // upload or deploy a prebuilt image. Shared by /deploy/new and its
 // redeploy=true branch so the cap can never drift between the two. Returns
 // nil when the upload is within the cap.
+// validateImageRef checks a source=image reference is fully qualified
+// (host/path[:tag][@digest]). We REJECT bare names ("nginx", "owner/repo")
+// that Docker would silently resolve against Docker Hub — a deploy must name
+// its registry explicitly so there's no ambiguity about what gets pulled and
+// run on shared nodes. Returns the trimmed, validated ref.
+func validateImageRef(ref string) (string, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", fmt.Errorf("image_ref is required for source=image (e.g. ghcr.io/owner/app:tag)")
+	}
+	if len(ref) > 512 {
+		return "", fmt.Errorf("image_ref is too long")
+	}
+	for _, r := range ref {
+		if r <= ' ' || r > '~' {
+			return "", fmt.Errorf("image_ref contains invalid characters")
+		}
+	}
+	slash := strings.IndexByte(ref, '/')
+	if slash < 0 {
+		return "", fmt.Errorf("image_ref must include a registry host (e.g. ghcr.io/owner/app:tag), not a bare name")
+	}
+	host := ref[:slash]
+	// A registry host has a dot, a port, or is localhost. "owner/repo" (Docker
+	// Hub implicit namespace) is rejected — name docker.io explicitly.
+	if host != "localhost" && !strings.ContainsAny(host, ".:") {
+		return "", fmt.Errorf("image_ref must start with a registry host (e.g. ghcr.io/...), got %q", host)
+	}
+	return ref, nil
+}
+
+// deploymentSourceOrDefault normalises an empty source (legacy in-memory rows)
+// to the 'tarball' default the migration applies at the DB layer.
+func deploymentSourceOrDefault(s string) string {
+	if s == "" {
+		return "tarball"
+	}
+	return s
+}
+
 func enforceTarballCap(c *fiber.Ctx, fh *multipart.FileHeader) error {
 	if fh.Size > maxTarballBytes {
 		return respondError(c, fiber.StatusRequestEntityTooLarge, "tarball_too_large",
@@ -307,6 +348,14 @@ func deploymentToMapWithDB(d *models.Deployment, db *sql.DB) fiber.Map {
 		// secret is NEVER returned — only its lifecycle metadata.
 		"notify_webhook": d.NotifyWebhook,
 		"notify_state":   d.NotifyState,
+		// Multi-source deploys (migration 064). source defaults to 'tarball'.
+		// image_ref is echoed (caller-supplied, no secret); registry_creds is
+		// NEVER returned — only registry_creds_set lifecycle metadata.
+		"source": deploymentSourceOrDefault(d.Source),
+	}
+	if d.Source == "image" {
+		m["image_ref"] = d.ImageRef
+		m["registry_creds_set"] = d.RegistryCredsEnc != ""
 	}
 	if d.NotifyWebhook != "" {
 		m["notify_attempts"] = d.NotifyAttempts
@@ -528,6 +577,25 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 		Private:    d.Private,
 		AllowedIPs: d.AllowedIPs,
 	}
+	// Multi-source (migration 064): a source=image deploy carries no tarball —
+	// the compute layer deploys d.ImageRef directly (skip Kaniko). Decrypt the
+	// optional BYO pull creds into RegistryAuth; a decrypt failure is logged
+	// and falls back to the platform pull secret (public/GHCR images still work).
+	if d.Source == "image" {
+		opts.Source = "image"
+		opts.ImageRef = d.ImageRef
+		opts.Tarball = nil
+		if d.RegistryCredsEnc != "" {
+			if key, kerr := crypto.ParseAESKey(h.cfg.AESKey); kerr == nil {
+				if plain, derr := crypto.Decrypt(key, d.RegistryCredsEnc); derr == nil {
+					opts.RegistryAuth = plain
+				} else {
+					slog.Error("deploy.run_deploy.registry_creds_decrypt_failed",
+						"app_id", d.AppID, "error", derr)
+				}
+			}
+		}
+	}
 	result, err := h.compute.Deploy(ctx, opts)
 	if err != nil {
 		slog.Error("deploy.run_deploy.failed",
@@ -599,30 +667,79 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 			"Request must be multipart/form-data (max 50 MB)")
 	}
 
-	// tarball field.
-	tarballs := form.File["tarball"]
-	if len(tarballs) == 0 {
-		return respondError(c, fiber.StatusBadRequest, "missing_tarball",
-			"Multipart field 'tarball' is required")
+	// Source mode (migration 064): "tarball" (default — build the uploaded
+	// source with Kaniko) or "image" (BYO — deploy a prebuilt image_ref
+	// directly, no upload/build). source=image is naturally Hobby+ (the
+	// per-tier deploy cap below gates anon/free, which have deployments_apps=0).
+	source := "tarball"
+	if vals := form.Value["source"]; len(vals) > 0 && strings.TrimSpace(vals[0]) != "" {
+		source = strings.ToLower(strings.TrimSpace(vals[0]))
 	}
-	fh := tarballs[0]
-	if err := enforceTarballCap(c, fh); err != nil {
-		return err
-	}
-	f, err := openMultipartFile(fh)
-	if err != nil {
-		return respondError(c, fiber.StatusBadRequest, "tarball_open_failed",
-			"Failed to read tarball")
-	}
-	defer func() { _ = f.Close() }()
 
-	// P0-3: io.ReadAll, not a single f.Read — a lone Read short-reads on
-	// disk-spilled multipart files (n is discarded), truncating large tarballs.
-	// Mirrors how stack.go reads its tarball field.
-	tarball, err := io.ReadAll(f)
-	if err != nil {
-		return respondError(c, fiber.StatusBadRequest, "tarball_read_failed",
-			"Failed to read tarball bytes")
+	var tarball []byte
+	var imageRef, registryCredsEnc string
+
+	switch source {
+	case "image":
+		// Flag-gated (P2): the skip-Kaniko deploy path is off until an operator
+		// enables it post-canary (DEPLOY_SOURCE_IMAGE_ENABLED=true). Until then
+		// reject cleanly so tarball deploys are never affected by unproven code.
+		if !h.cfg.DeploySourceImageEnabled {
+			return respondError(c, fiber.StatusNotImplemented, "source_image_disabled",
+				"Deploying from a prebuilt image (source=image) is rolling out and not yet enabled. Upload source (tarball ≤10MB) for now.")
+		}
+		raw := ""
+		if vals := form.Value["image_ref"]; len(vals) > 0 {
+			raw = strings.TrimSpace(vals[0])
+		}
+		validRef, refErr := validateImageRef(raw)
+		if refErr != nil {
+			return respondError(c, fiber.StatusBadRequest, "invalid_image_ref", refErr.Error())
+		}
+		imageRef = validRef
+		// Optional BYO registry creds for a PRIVATE image: a complete docker
+		// config JSON, encrypted at rest (AES-256-GCM, like notify_webhook_secret)
+		// and never echoed back. Absent → the platform ghcr-pull secret is used.
+		if vals := form.Value["registry_creds"]; len(vals) > 0 && strings.TrimSpace(vals[0]) != "" {
+			key, kerr := crypto.ParseAESKey(h.cfg.AESKey)
+			if kerr != nil {
+				return respondError(c, fiber.StatusServiceUnavailable, "encrypt_unavailable",
+					"Could not secure registry credentials")
+			}
+			enc, eerr := crypto.Encrypt(key, strings.TrimSpace(vals[0]))
+			if eerr != nil {
+				return respondError(c, fiber.StatusServiceUnavailable, "encrypt_failed",
+					"Could not secure registry credentials")
+			}
+			registryCredsEnc = enc
+		}
+	case "tarball":
+		tarballs := form.File["tarball"]
+		if len(tarballs) == 0 {
+			return respondError(c, fiber.StatusBadRequest, "missing_tarball",
+				"Multipart field 'tarball' is required (or use source=image with image_ref)")
+		}
+		fh := tarballs[0]
+		if err := enforceTarballCap(c, fh); err != nil {
+			return err
+		}
+		f, ferr := openMultipartFile(fh)
+		if ferr != nil {
+			return respondError(c, fiber.StatusBadRequest, "tarball_open_failed",
+				"Failed to read tarball")
+		}
+		defer func() { _ = f.Close() }()
+		// P0-3: io.ReadAll, not a single f.Read — a lone Read short-reads on
+		// disk-spilled multipart files (n is discarded), truncating large tarballs.
+		b, rerr := io.ReadAll(f)
+		if rerr != nil {
+			return respondError(c, fiber.StatusBadRequest, "tarball_read_failed",
+				"Failed to read tarball bytes")
+		}
+		tarball = b
+	default:
+		return respondError(c, fiber.StatusBadRequest, "invalid_source",
+			"Field 'source' must be 'tarball' (default) or 'image'")
 	}
 
 	// Required name field — the human-readable deployment label.
@@ -951,6 +1068,9 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 		NotifyWebhook:       notifyURL,
 		NotifyWebhookSecret: notifySecret,
 		TTLPolicy:           ttlPolicy,
+		Source:              source,
+		ImageRef:            imageRef,
+		RegistryCredsEnc:    registryCredsEnc,
 	})
 	if errors.Is(err, models.ErrDeploymentCapReached) {
 		// Over the per-tier cap — surfaced atomically inside the

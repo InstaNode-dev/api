@@ -174,6 +174,14 @@ type Config struct {
 	// and fail token validation (deterministic disable for rollback).
 	FamilyBindingsEnabled bool
 
+	// DeploySourceImageEnabled gates the P2 multi-source "source=image" path
+	// (deploy a prebuilt image instead of uploading source). Default FALSE:
+	// the skip-Kaniko compute branch changes the live deploy path and can't be
+	// validated in CI (no real cluster), so it stays off until the operator
+	// flips DEPLOY_SOURCE_IMAGE_ENABLED=true after a canary. Off → /deploy/new
+	// rejects source=image with 501; tarball deploys are unaffected.
+	DeploySourceImageEnabled bool
+
 	// Email-feedback webhook secrets. Each provider authenticates its
 	// callbacks differently — these env vars give the handler the shared
 	// secret (Brevo, SendGrid) or topic ARN (SES via SNS) it needs to
@@ -419,6 +427,14 @@ func Load() *Config {
 		cfg.FamilyBindingsEnabled = false
 	default:
 		cfg.FamilyBindingsEnabled = true
+	}
+
+	// DEPLOY_SOURCE_IMAGE_ENABLED: default FALSE (off until operator canary).
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DEPLOY_SOURCE_IMAGE_ENABLED"))) {
+	case "true", "1", "yes":
+		cfg.DeploySourceImageEnabled = true
+	default:
+		cfg.DeploySourceImageEnabled = false
 	}
 
 	if len(cfg.JWTSecret) < 32 {
