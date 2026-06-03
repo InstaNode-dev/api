@@ -18,6 +18,7 @@ package handlers
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -117,6 +118,14 @@ func (h *GitHubAppHandler) Callback(c *fiber.Ctx) error {
 	}
 	// account_login is enriched by the installation webhook (P4.2); empty here.
 	if _, err := models.UpsertGitHubInstallation(c.Context(), h.db, instID, teamUUID, ""); err != nil {
+		var conflict *models.ErrGitHubInstallationTeamConflict
+		if errors.As(err, &conflict) {
+			// The installation is already linked to a different team — refuse
+			// rather than rebind (anti-hijack, review HIGH-2).
+			slog.Warn("github_app.callback.team_conflict", "installation_id", instID, "team_id", teamID)
+			return respondError(c, fiber.StatusConflict, "install_conflict",
+				"This GitHub installation is already linked to another InstaNode team")
+		}
 		slog.Error("github_app.callback.persist_failed", "error", err, "installation_id", instID)
 		return respondError(c, fiber.StatusServiceUnavailable, "install_persist_failed",
 			"Could not save the GitHub installation")

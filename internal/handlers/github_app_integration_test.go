@@ -6,6 +6,7 @@ package handlers_test
 // DB-gated; skips locally without a DB.
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"instant.dev/internal/config"
+	"instant.dev/internal/models"
 	"instant.dev/internal/testhelpers"
 )
 
@@ -177,6 +179,41 @@ func TestGitHubAppCallback_PersistError_503(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
+
+// An installation already linked to team A cannot be rebound by team B's
+// callback → 409 install_conflict (review HIGH-2 anti-hijack).
+func TestGitHubAppCallback_InstallConflict_409(t *testing.T) {
+	daDeployNeedsDB(t)
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
+	defer cleanRedis()
+
+	teamA := testhelpers.MustCreateTeamDB(t, db, "pro")
+	teamB := testhelpers.MustCreateTeamDB(t, db, "pro")
+	const instID int64 = 556677
+	// team A owns the installation first.
+	_, err := models.UpsertGitHubInstallation(context.Background(), db, instID, uuid.MustParse(teamA), "acme")
+	require.NoError(t, err)
+
+	app, clean := testhelpers.NewTestAppWithServices(t, db, rdb, "deploy", appEnabled)
+	defer clean()
+
+	// team B tries to bind the same installation via a state legitimately signed
+	// for team B → must be refused.
+	state := signInstallState(t, teamB)
+	req := httptest.NewRequest(http.MethodGet,
+		"/integrations/github/callback?installation_id=556677&state="+state, nil)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusConflict, resp.StatusCode)
+
+	// team A's row is untouched.
+	inst, gerr := models.GetGitHubInstallation(context.Background(), db, instID)
+	require.NoError(t, gerr)
+	assert.Equal(t, teamA, inst.TeamID.String(), "victim installation must remain bound to team A")
 }
 
 func TestGitHubAppCallback_PersistsAndRedirects(t *testing.T) {

@@ -668,8 +668,8 @@ func TestOpenAPI_CoversAllRegisteredRoutes(t *testing.T) {
 		// webhook URL — returns 405 + Allow: POST so a dashboard sees
 		// "URL exists, method wrong" rather than silently abandoning a
 		// 401. Not an agent-facing surface; stays out of OpenAPI.
-		"GET /api/v1/email/webhook/brevo": true,
-		"GET /api/v1/email/webhook/ses":   true,
+		"GET /api/v1/email/webhook/brevo":     true,
+		"GET /api/v1/email/webhook/ses":       true,
 		"POST /internal/teams/{id}/terminate": true,
 		// Worker-only resend driver. Auth is the shared
 		// WORKER_INTERNAL_JWT_SECRET HS256 token; agents must never call
@@ -709,6 +709,11 @@ func TestOpenAPI_CoversAllRegisteredRoutes(t *testing.T) {
 		// in P4.3 alongside the flag flip. See SCOPE-P4-github-app + github_app.go.
 		"GET /integrations/github/install":  true,
 		"GET /integrations/github/callback": true,
+		// App-level GitHub webhook (P4.2) — GitHub-facing (HMAC-authed), not an
+		// agent-facing API; flag-gated OFF until P4.3. Documenting it in the
+		// agent OpenAPI would mislead agents (same rationale as the manual
+		// /webhooks/github/{webhook_id} receiver, which is also not in the spec).
+		"POST /webhooks/github": true,
 	}
 
 	var missing []string

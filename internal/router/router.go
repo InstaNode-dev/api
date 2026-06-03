@@ -694,6 +694,12 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	app.Get("/integrations/github/install", middleware.RequireAuth(cfg), githubAppH.Install)
 	app.Get("/integrations/github/callback", githubAppH.Callback)
 
+	// App-level GitHub webhook (P4.2) — one endpoint for ALL installations,
+	// signed with the App webhook secret. No auth/RequireAuth: the HMAC is the
+	// boundary (mirrors the manual receiver above).
+	githubAppWebhookH := handlers.NewGitHubAppWebhookHandler(db, rdb, cfg, planRegistry)
+	app.Post("/webhooks/github", githubAppWebhookH.Receive)
+
 	// Deploy — Phase 6 (auth required on all endpoints).
 	// POST /deploy/new is gated by RequireEnvAccess(ActionDeploy) — the
 	// env scope arrives as a multipart form field (not JSON or query), so

@@ -30,6 +30,19 @@ func TestUpsertGitHubInstallation(t *testing.T) {
 	mock2.ExpectQuery(`INSERT INTO github_installations`).WillReturnError(errors.New("boom"))
 	_, err = UpsertGitHubInstallation(ctx, db2, 42, uuid.New(), "acme")
 	require.ErrorContains(t, err, "boom")
+
+	// team conflict: the WHERE-guarded DO UPDATE matches no row (installation
+	// already owned by another team), RETURNING is empty → ErrNoRows →
+	// ErrGitHubInstallationTeamConflict (review HIGH-2, anti-hijack).
+	db3, mock3 := newMock(t)
+	mock3.ExpectQuery(`INSERT INTO github_installations`).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"installation_id", "team_id", "account_login", "suspended_at", "created_at", "updated_at",
+		})) // no rows → ErrNoRows
+	_, err = UpsertGitHubInstallation(ctx, db3, 42, uuid.New(), "acme")
+	var conflict *ErrGitHubInstallationTeamConflict
+	require.ErrorAs(t, err, &conflict)
+	require.Contains(t, conflict.Error(), "another team")
 }
 
 func TestGetGitHubInstallation(t *testing.T) {

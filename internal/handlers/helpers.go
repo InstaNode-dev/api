@@ -513,6 +513,9 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"install_persist_failed": {
 		AgentAction: "Tell the user the GitHub installation could not be saved due to a transient backend error. Retry the install shortly — see https://instanode.dev/status.",
 	},
+	"install_conflict": {
+		AgentAction: "Tell the user this GitHub installation is already linked to a different InstaNode team. Uninstall the InstaNode app from GitHub and re-install under the intended team, or contact support to move it — see https://instanode.dev/docs/deploy.",
+	},
 	"state_unavailable": {
 		AgentAction: "Tell the user the GitHub install could not be started due to a transient backend error. Retry shortly — see https://instanode.dev/status.",
 	},
