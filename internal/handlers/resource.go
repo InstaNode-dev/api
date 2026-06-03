@@ -216,21 +216,28 @@ func (h *ResourceHandler) Delete(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
 	}
 
-	// Idempotent DELETE (bug-bash #4/#12): a repeated DELETE (retry, double-click,
-	// concurrent call) must NOT re-soft-delete and, worse, re-deprovision the
-	// backend a second time. The first DELETE already tore it down — report
-	// success and do nothing.
-	if resource.Status == "deleted" {
-		return c.JSON(fiber.Map{"ok": true, "already_deleted": true, "id": resource.ID.String()})
-	}
-
-	if err := models.SoftDeleteResource(c.Context(), h.db, resource.ID); err != nil {
+	// Idempotent DELETE (bug-bash #4/#12, hardened post-review): a repeated
+	// DELETE (retry, double-click, CONCURRENT call) must NOT re-fire the
+	// destructive deprovision against already-gone backend infra. The original
+	// fix used a `status == "deleted"` pre-read, but that is a check-then-act
+	// TOCTOU: two concurrent DELETEs both read status='active' and both
+	// deprovision. The authoritative guard is the atomic status-gated UPDATE —
+	// only the call that actually transitions active→deleted (RowsAffected==1)
+	// proceeds to deprovision; any racer/retry gets a no-op success.
+	deleted, err := models.SoftDeleteResourceIfActive(c.Context(), h.db, resource.ID)
+	if err != nil {
 		slog.Error("resource.delete.failed",
 			"error", err,
 			"resource_id", resource.ID,
 			"request_id", requestID,
 		)
 		return respondError(c, fiber.StatusServiceUnavailable, "delete_failed", "Failed to delete resource")
+	}
+	if !deleted {
+		// Already deleted (sequential retry) or a concurrent DELETE won the
+		// race. Either way the backend is being / was torn down by the winner —
+		// report idempotent success WITHOUT re-firing deprovision.
+		return c.JSON(fiber.Map{"ok": true, "already_deleted": true, "id": resource.ID.String()})
 	}
 
 	// Deprovision the physical resource.

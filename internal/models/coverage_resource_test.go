@@ -234,6 +234,34 @@ func TestSoftDeleteResource_Branches(t *testing.T) {
 	require.ErrorContains(t, SoftDeleteResource(ctx, db2, uuid.New()), "boom")
 }
 
+func TestSoftDeleteResourceIfActive_Branches(t *testing.T) {
+	ctx := context.Background()
+
+	// Winner: the status-gated UPDATE flips a row → deleted==true.
+	db, mock := newMock(t)
+	mock.ExpectExec(`UPDATE resources SET status = 'deleted' WHERE id = \$1 AND status != 'deleted'`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	got, err := SoftDeleteResourceIfActive(ctx, db, uuid.New())
+	require.NoError(t, err)
+	require.True(t, got, "a row was transitioned → deleted must be true")
+
+	// Loser/retry: row already deleted, 0 rows affected → deleted==false
+	// (this is the guard that stops the second concurrent DELETE from
+	// re-firing the destructive deprovision).
+	db2, mock2 := newMock(t)
+	mock2.ExpectExec(`UPDATE resources SET status = 'deleted' WHERE id = \$1 AND status != 'deleted'`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	got2, err := SoftDeleteResourceIfActive(ctx, db2, uuid.New())
+	require.NoError(t, err)
+	require.False(t, got2, "no row affected → deleted must be false (no deprovision)")
+
+	// Error path.
+	db3, mock3 := newMock(t)
+	mock3.ExpectExec(`UPDATE resources SET status = 'deleted'`).WillReturnError(errors.New("boom"))
+	_, err = SoftDeleteResourceIfActive(ctx, db3, uuid.New())
+	require.ErrorContains(t, err, "boom")
+}
+
 func TestPauseResource_Branches(t *testing.T) {
 	ctx := context.Background()
 	db, mock := newMock(t)
