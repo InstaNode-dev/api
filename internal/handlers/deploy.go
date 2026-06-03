@@ -38,6 +38,7 @@ import (
 	"instant.dev/internal/config"
 	"instant.dev/internal/crypto"
 	"instant.dev/internal/email"
+	"instant.dev/internal/github"
 	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
@@ -240,6 +241,43 @@ func applyGitSourceOpts(opts *compute.DeployOptions, d *models.Deployment, aesKe
 	opts.GitAuth = plain
 }
 
+// applyInstallationAuth fills opts.GitAuth with a minted GitHub App installation
+// token for a source=git deploy that has no stored PAT but is linked to a live
+// installation (P4.2b). No-op for non-git, PAT-present, or App-disabled deploys.
+// Fail-soft: any miss leaves GitAuth empty (public-repo clone).
+func (h *DeployHandler) applyInstallationAuth(ctx context.Context, opts *compute.DeployOptions, d *models.Deployment) {
+	if opts.Source != "git" || opts.GitAuth != "" || h.githubApp == nil {
+		return
+	}
+	if tok := h.installationCloneToken(ctx, d); tok != "" {
+		opts.GitAuth = tok
+	}
+}
+
+// installationCloneToken mints a short-lived GitHub App installation token for
+// cloning the deploy's repo (P4.2b), or "" if the deploy isn't linked to a live
+// installation we own. Fail-soft throughout: any lookup/mint failure returns ""
+// so the build falls back to a public clone rather than erroring. The
+// installation MUST belong to the deploy's team and not be suspended — never
+// mint for an installation the team doesn't own / that's been revoked.
+func (h *DeployHandler) installationCloneToken(ctx context.Context, d *models.Deployment) string {
+	conn, err := models.GetGitHubConnectionByAppID(ctx, h.db, d.ID)
+	if err != nil || !conn.InstallationID.Valid {
+		return ""
+	}
+	inst, ierr := models.GetGitHubInstallation(ctx, h.db, conn.InstallationID.Int64)
+	if ierr != nil || inst.SuspendedAt.Valid || inst.TeamID != d.TeamID {
+		return ""
+	}
+	tok, terr := h.githubApp.InstallationToken(ctx, conn.InstallationID.Int64)
+	if terr != nil {
+		slog.Warn("deploy.git.installation_token_mint_failed",
+			"app_id", d.AppID, "installation_id", conn.InstallationID.Int64, "error", terr)
+		return ""
+	}
+	return tok
+}
+
 // encryptDeploySecret AES-256-GCM-encrypts a sensitive deploy input (a BYO
 // private-registry docker config JSON, or a private-repo git token) for at-rest
 // storage. ParseAESKey is the only failure mode worth a distinct branch (a
@@ -325,6 +363,16 @@ type DeployHandler struct {
 	// circuit-broken *email.BreakingClient (P0-1
 	// CIRCUIT-RETRY-AUDIT-2026-05-20).
 	emailClient email.Mailer
+	// githubApp mints short-lived installation tokens for source=git clones of
+	// repos linked to a GitHub App installation (P4.2b). nil when
+	// GITHUB_APP_ENABLED is off → git clones fall back to a stored PAT / public.
+	// An interface so tests inject a fake minter (github.App satisfies it).
+	githubApp installationTokenMinter
+}
+
+// installationTokenMinter is the subset of *github.App the deploy path needs.
+type installationTokenMinter interface {
+	InstallationToken(ctx context.Context, installationID int64) (string, error)
 }
 
 // NewDeployHandler initialises the handler and selects the compute backend based on
@@ -346,8 +394,24 @@ func NewDeployHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, planReg
 	default:
 		cp = noop.New()
 	}
-	return &DeployHandler{db: db, rdb: rdb, cfg: cfg, compute: cp, planRegistry: planRegistry}
+	h := &DeployHandler{db: db, rdb: rdb, cfg: cfg, compute: cp, planRegistry: planRegistry}
+	// Wire the GitHub App token minter when enabled (P4.2b). Construction can
+	// only fail on a malformed key, which config.Load already rejects at startup
+	// when GITHUB_APP_ENABLED=true — log + leave nil (git clones fall back).
+	if cfg.GitHubAppEnabled {
+		if app, err := github.NewApp(cfg.GitHubAppID, cfg.GitHubAppPrivateKey, rdb); err != nil {
+			slog.Error("deploy: github app minter init failed — git installation tokens disabled", "error", err)
+		} else {
+			h.githubApp = app
+		}
+	}
+	return h
 }
+
+// SetGitHubApp injects the installation-token minter (tests pass a fake; matches
+// the SetEmailClient/SetComputeProvider setter rationale — keep the constructor
+// signature stable).
+func (h *DeployHandler) SetGitHubApp(m installationTokenMinter) { h.githubApp = m }
 
 // SetEmailClient wires the email client used by the two-step deletion
 // flow. Separate setter (rather than a constructor arg) to keep the
@@ -745,6 +809,7 @@ func (h *DeployHandler) runDeploy(d *models.Deployment, tarball []byte) {
 	// via git context). Each helper is a no-op unless its source matches.
 	applyImageSourceOpts(&opts, d, h.cfg.AESKey)
 	applyGitSourceOpts(&opts, d, h.cfg.AESKey)
+	h.applyInstallationAuth(ctx, &opts, d)
 	result, err := h.compute.Deploy(ctx, opts)
 	if err != nil {
 		slog.Error("deploy.run_deploy.failed",
