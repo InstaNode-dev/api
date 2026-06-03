@@ -19,6 +19,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"instant.dev/internal/config"
 )
 
 // TestNewTestAppWithServices_RegistersDeployEventsRoute boots a deploy-enabled
@@ -49,4 +51,28 @@ func TestNewTestAppWithServices_RegistersDeployEventsRoute(t *testing.T) {
 	// missing route would 404 from the router before middleware fires.
 	require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
 		"deploy events route must be registered under the /api/v1 group")
+}
+
+// TestNewTestAppWithServices_AppliesConfigMutator proves the variadic config
+// mutator seam runs against the test config before handlers are built. Handler
+// tests exercise this with feature-flag mutators, but per-package coverage only
+// credits the `testhelpers` package when an in-package test passes a mutator —
+// so this gives the mutator loop its own coverage. A nil mutator interleaved
+// with a real one confirms the nil-skip guard.
+func TestNewTestAppWithServices_AppliesConfigMutator(t *testing.T) {
+	db, cleanDB := SetupTestDB(t)
+	defer cleanDB()
+	rdb, cleanRedis := SetupTestRedis(t)
+	defer cleanRedis()
+
+	applied := false
+	_, cleanApp := NewTestAppWithServices(t, db, rdb, "deploy",
+		nil, // skipped by the m != nil guard
+		func(c *config.Config) {
+			c.DeploySourceImageEnabled = true
+			applied = true
+		})
+	defer cleanApp()
+
+	require.True(t, applied, "config mutator must run against the test config")
 }
