@@ -63,6 +63,8 @@ func allKeys() []string {
 		"METRICS_TOKEN", "DASHBOARD_BASE_URL", "API_PUBLIC_URL",
 		"DELETION_CONFIRMATION_TTL_MINUTES", "FAMILY_BINDINGS_ENABLED",
 		"DEPLOY_SOURCE_IMAGE_ENABLED", "DEPLOY_SOURCE_GIT_ENABLED",
+		"GITHUB_APP_ENABLED", "GITHUB_APP_ID", "GITHUB_APP_SLUG", "GITHUB_APP_PRIVATE_KEY",
+		"GITHUB_APP_WEBHOOK_SECRET", "GITHUB_APP_CLIENT_ID", "GITHUB_APP_CLIENT_SECRET",
 		"BREVO_WEBHOOK_SECRET", "SES_SNS_SUBSCRIPTION_ARN",
 		"SENDGRID_WEBHOOK_PUBLIC_KEY",
 		"WORKER_INTERNAL_JWT_SECRET", "ADMIN_PATH_PREFIX",
@@ -248,6 +250,9 @@ func TestLoad_HappyPath_AppliesDefaults(t *testing.T) {
 	if cfg.DeploySourceGitEnabled {
 		t.Error("DeploySourceGitEnabled default must be false (off until operator canary)")
 	}
+	if cfg.GitHubAppEnabled {
+		t.Error("GitHubAppEnabled default must be false (off until operator registers the App)")
+	}
 	// Object store mode resolution: with everything empty → "admin" / "minio-admin"
 	if cfg.ObjectStoreMode != "admin" || cfg.ObjectStoreBackend != "minio-admin" {
 		t.Errorf("ObjectStoreMode/Backend defaults: %q/%q", cfg.ObjectStoreMode, cfg.ObjectStoreBackend)
@@ -256,48 +261,48 @@ func TestLoad_HappyPath_AppliesDefaults(t *testing.T) {
 
 func TestLoad_OverrideDefaults(t *testing.T) {
 	applyBaselineEnv(t, map[string]string{
-		"PORT":                       "9090",
-		"REDIS_URL":                  "redis://r:6379",
-		"ENVIRONMENT":                "production",
-		"INSTANT_ENABLED_SERVICES":   "postgres",
-		"GEOLITE2_DB_PATH":           "/data/geo.mmdb",
-		"RAZORPAY_KEY_ID":            "rzp_test_x",
-		"RESEND_API_KEY":             "re_x",
-		"BREVO_API_KEY":              "br_x",
-		"EMAIL_PROVIDER":             "brevo",
-		"EMAIL_FROM_ADDRESS":         "noreply@x.dev",
-		"EMAIL_FROM_NAME":            "X",
-		"GITHUB_CLIENT_ID":           "gh-x",
-		"GOOGLE_CLIENT_ID":           "g-x",
-		"GOOGLE_REDIRECT_URI":        "https://x/callback",
-		"REDIS_PROVISION_BACKEND":    "upstash",
-		"REDIS_PROVISION_HOST":       "redis.x",
-		"MONGO_HOST":                 "mongo.x",
-		"POSTGRES_PROVISION_BACKEND": "neon",
-		"NEON_API_KEY":               "nk-x",
-		"PROVISIONER_ADDR":           "prov:50051",
-		"PROVISIONER_SECRET":         "ps",
-		"NATS_HOST":                  "nats.x",
-		"QUEUE_BACKEND":              "legacy_open",
-		"NATS_PUBLIC_HOST":           "public.x",
-		"NATS_OPERATOR_SEED":         "SO_seed",
+		"PORT":                           "9090",
+		"REDIS_URL":                      "redis://r:6379",
+		"ENVIRONMENT":                    "production",
+		"INSTANT_ENABLED_SERVICES":       "postgres",
+		"GEOLITE2_DB_PATH":               "/data/geo.mmdb",
+		"RAZORPAY_KEY_ID":                "rzp_test_x",
+		"RESEND_API_KEY":                 "re_x",
+		"BREVO_API_KEY":                  "br_x",
+		"EMAIL_PROVIDER":                 "brevo",
+		"EMAIL_FROM_ADDRESS":             "noreply@x.dev",
+		"EMAIL_FROM_NAME":                "X",
+		"GITHUB_CLIENT_ID":               "gh-x",
+		"GOOGLE_CLIENT_ID":               "g-x",
+		"GOOGLE_REDIRECT_URI":            "https://x/callback",
+		"REDIS_PROVISION_BACKEND":        "upstash",
+		"REDIS_PROVISION_HOST":           "redis.x",
+		"MONGO_HOST":                     "mongo.x",
+		"POSTGRES_PROVISION_BACKEND":     "neon",
+		"NEON_API_KEY":                   "nk-x",
+		"PROVISIONER_ADDR":               "prov:50051",
+		"PROVISIONER_SECRET":             "ps",
+		"NATS_HOST":                      "nats.x",
+		"QUEUE_BACKEND":                  "legacy_open",
+		"NATS_PUBLIC_HOST":               "public.x",
+		"NATS_OPERATOR_SEED":             "SO_seed",
 		"NATS_SYSTEM_ACCOUNT_PUBLIC_KEY": "ACSYS",
-		"NATS_USE_TLS":               "true",
-		"R2_ENDPOINT":                "r2.x",
-		"R2_BUCKET_NAME":             "x-bucket",
-		"R2_API_TOKEN":               "r2tok",
-		"DEPLOY_DOMAIN":              "x.dev",
-		"COMPUTE_PROVIDER":           "k8s",
-		"KUBE_NAMESPACE_APPS":        "x-apps",
-		"METRICS_TOKEN":              strings.Repeat("M", 64),
-		"DASHBOARD_BASE_URL":         "https://dash.x",
-		"API_PUBLIC_URL":             "https://api.x/",
-		"BREVO_WEBHOOK_SECRET":       "brevo-wh",
-		"SES_SNS_SUBSCRIPTION_ARN":   "arn:aws:sns:x",
-		"SENDGRID_WEBHOOK_PUBLIC_KEY": "sg-key",
-		"WORKER_INTERNAL_JWT_SECRET":  "  worker-secret  ",
-		"TRUSTED_PROXY_CIDRS":        "10.0.0.0/8",
-		"MAXMIND_LICENSE_KEY":        "mm",
+		"NATS_USE_TLS":                   "true",
+		"R2_ENDPOINT":                    "r2.x",
+		"R2_BUCKET_NAME":                 "x-bucket",
+		"R2_API_TOKEN":                   "r2tok",
+		"DEPLOY_DOMAIN":                  "x.dev",
+		"COMPUTE_PROVIDER":               "k8s",
+		"KUBE_NAMESPACE_APPS":            "x-apps",
+		"METRICS_TOKEN":                  strings.Repeat("M", 64),
+		"DASHBOARD_BASE_URL":             "https://dash.x",
+		"API_PUBLIC_URL":                 "https://api.x/",
+		"BREVO_WEBHOOK_SECRET":           "brevo-wh",
+		"SES_SNS_SUBSCRIPTION_ARN":       "arn:aws:sns:x",
+		"SENDGRID_WEBHOOK_PUBLIC_KEY":    "sg-key",
+		"WORKER_INTERNAL_JWT_SECRET":     "  worker-secret  ",
+		"TRUSTED_PROXY_CIDRS":            "10.0.0.0/8",
+		"MAXMIND_LICENSE_KEY":            "mm",
 	})
 	cfg := Load()
 	if cfg.Port != "9090" || cfg.Environment != "production" {
@@ -368,6 +373,35 @@ func TestLoad_DeploySourceGitEnabled(t *testing.T) {
 	}
 }
 
+func TestLoad_GitHubAppEnabled(t *testing.T) {
+	for _, val := range []string{"true", "1", "yes", "TRUE", "  Yes  "} {
+		applyBaselineEnv(t, map[string]string{"GITHUB_APP_ENABLED": val})
+		if !Load().GitHubAppEnabled {
+			t.Errorf("GITHUB_APP_ENABLED=%q should enable", val)
+		}
+	}
+	for _, val := range []string{"false", "0", "no", "maybe", ""} {
+		applyBaselineEnv(t, map[string]string{"GITHUB_APP_ENABLED": val})
+		if Load().GitHubAppEnabled {
+			t.Errorf("GITHUB_APP_ENABLED=%q should stay disabled", val)
+		}
+	}
+	// the GITHUB_APP_* values are plumbed verbatim.
+	applyBaselineEnv(t, map[string]string{
+		"GITHUB_APP_ID":             "12345",
+		"GITHUB_APP_PRIVATE_KEY":    "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----",
+		"GITHUB_APP_WEBHOOK_SECRET": "whsec",
+		"GITHUB_APP_CLIENT_ID":      "Iv1.abc",
+		"GITHUB_APP_CLIENT_SECRET":  "cs",
+	})
+	c := Load()
+	if c.GitHubAppID != "12345" || c.GitHubAppWebhookSecret != "whsec" ||
+		c.GitHubAppClientID != "Iv1.abc" || c.GitHubAppClientSecret != "cs" ||
+		c.GitHubAppPrivateKey == "" {
+		t.Errorf("GITHUB_APP_* not plumbed: %+v", c.GitHubAppID)
+	}
+}
+
 func TestLoad_DeletionTTL_OverrideAndInvalid(t *testing.T) {
 	applyBaselineEnv(t, map[string]string{"DELETION_CONFIRMATION_TTL_MINUTES": "30"})
 	if got := Load().DeletionConfirmationTTLMinutes; got != 30 {
@@ -421,16 +455,16 @@ func TestLoad_ObjectStore_MinioFallback(t *testing.T) {
 
 func TestLoad_ObjectStore_ExplicitOverridesFallback(t *testing.T) {
 	applyBaselineEnv(t, map[string]string{
-		"OBJECT_STORE_ENDPOINT":  "nyc3.digitaloceanspaces.com",
-		"OBJECT_STORE_PUBLIC_URL": "https://s3.instanode.dev",
-		"OBJECT_STORE_ACCESS_KEY": "AKIA",
-		"OBJECT_STORE_SECRET_KEY": "SECRET",
-		"OBJECT_STORE_BUCKET":     "do-bucket",
-		"OBJECT_STORE_REGION":     "nyc3",
-		"OBJECT_STORE_SECURE":     "true",
+		"OBJECT_STORE_ENDPOINT":         "nyc3.digitaloceanspaces.com",
+		"OBJECT_STORE_PUBLIC_URL":       "https://s3.instanode.dev",
+		"OBJECT_STORE_ACCESS_KEY":       "AKIA",
+		"OBJECT_STORE_SECRET_KEY":       "SECRET",
+		"OBJECT_STORE_BUCKET":           "do-bucket",
+		"OBJECT_STORE_REGION":           "nyc3",
+		"OBJECT_STORE_SECURE":           "true",
 		"OBJECT_STORE_ALLOW_SHARED_KEY": "true",
 		// Set MINIO_* so we prove they DON'T win.
-		"MINIO_ENDPOINT": "minio:9000",
+		"MINIO_ENDPOINT":  "minio:9000",
 		"MINIO_ROOT_USER": "ignored",
 	})
 	cfg := Load()
@@ -571,16 +605,16 @@ func TestLoad_RazorpayPlanIDs(t *testing.T) {
 	})
 	c := Load()
 	checks := map[string]string{
-		"hobby":      c.RazorpayPlanIDHobby,
-		"hp":         c.RazorpayPlanIDHobbyPlus,
-		"pro":        c.RazorpayPlanIDPro,
-		"growth":     c.RazorpayPlanIDGrowth,
-		"team":       c.RazorpayPlanIDTeam,
-		"hobby_y":    c.RazorpayPlanIDHobbyYearly,
-		"hp_y":       c.RazorpayPlanIDHobbyPlusYearly,
-		"pro_y":      c.RazorpayPlanIDProYearly,
-		"growth_y":   c.RazorpayPlanIDGrowthYearly,
-		"team_y":     c.RazorpayPlanIDTeamYearly,
+		"hobby":    c.RazorpayPlanIDHobby,
+		"hp":       c.RazorpayPlanIDHobbyPlus,
+		"pro":      c.RazorpayPlanIDPro,
+		"growth":   c.RazorpayPlanIDGrowth,
+		"team":     c.RazorpayPlanIDTeam,
+		"hobby_y":  c.RazorpayPlanIDHobbyYearly,
+		"hp_y":     c.RazorpayPlanIDHobbyPlusYearly,
+		"pro_y":    c.RazorpayPlanIDProYearly,
+		"growth_y": c.RazorpayPlanIDGrowthYearly,
+		"team_y":   c.RazorpayPlanIDTeamYearly,
 	}
 	for tag, got := range checks {
 		want := "plan_" + tag

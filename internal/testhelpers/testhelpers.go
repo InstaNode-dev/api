@@ -531,6 +531,16 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS uq_app_github_connection ON app_github_connections(app_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_app_github_connections_team ON app_github_connections(team_id)`,
+		// 066_github_installations — GitHub App (P4.1) installation↔team links.
+		`CREATE TABLE IF NOT EXISTS github_installations (
+			installation_id BIGINT PRIMARY KEY,
+			team_id         UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+			account_login   TEXT NOT NULL DEFAULT '',
+			suspended_at    TIMESTAMPTZ,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_github_installations_team ON github_installations(team_id)`,
 		`CREATE TABLE IF NOT EXISTS pending_github_deploys (
 			id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			connection_id   UUID NOT NULL REFERENCES app_github_connections(id) ON DELETE CASCADE,
@@ -1217,6 +1227,11 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	api.Get("/deployments/:id/github", githubDeployH.Get)
 	api.Delete("/deployments/:id/github", githubDeployH.Disconnect)
 	app.Post("/webhooks/github/:webhook_id", githubDeployH.Receive)
+
+	// GitHub App install flow (P4.1) — mirror router.go.
+	githubAppH := handlers.NewGitHubAppHandler(db, cfg, planReg)
+	app.Get("/integrations/github/install", middleware.RequireAuth(cfg), githubAppH.Install)
+	app.Get("/integrations/github/callback", githubAppH.Callback)
 
 	// A/B-experiment conversion sink — wired into the test app so
 	// handler tests can exercise the full route stack (router +

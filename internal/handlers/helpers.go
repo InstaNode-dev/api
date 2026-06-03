@@ -501,6 +501,21 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"invalid_git_url": {
 		AgentAction: "Tell the user the git_url is invalid. Pass an http(s) clone URL with a host and no embedded credentials, e.g. https://github.com/owner/repo — for a private repo send the token via git_token — see https://instanode.dev/docs/deploy.",
 	},
+	"github_app_disabled": {
+		AgentAction: "Tell the user GitHub App install is still rolling out and not yet enabled. Use the manual webhook (POST https://api.instanode.dev/api/v1/deployments/:id/github) or source=git with a token for now — see https://instanode.dev/docs/deploy.",
+	},
+	"github_app_misconfigured": {
+		AgentAction: "Tell the user GitHub App integration is enabled but not fully configured on the server. This is an operator-side gap — retry later or contact support — see https://instanode.dev/status.",
+	},
+	"invalid_installation_id": {
+		AgentAction: "Tell the user GitHub did not return a valid installation. Restart the install from the dashboard — see https://instanode.dev/docs/deploy.",
+	},
+	"install_persist_failed": {
+		AgentAction: "Tell the user the GitHub installation could not be saved due to a transient backend error. Retry the install shortly — see https://instanode.dev/status.",
+	},
+	"state_unavailable": {
+		AgentAction: "Tell the user the GitHub install could not be started due to a transient backend error. Retry shortly — see https://instanode.dev/status.",
+	},
 	"source_image_disabled": {
 		AgentAction: "Tell the user deploying from a prebuilt image (source=image) is still rolling out and not yet enabled. Upload source as a tarball (<=10 MiB) for now — see https://instanode.dev/docs/deploy.",
 	},

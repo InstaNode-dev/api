@@ -188,6 +188,20 @@ type Config struct {
 	// Off → /deploy/new rejects source=git with 501; tarball/image unaffected.
 	DeploySourceGitEnabled bool
 
+	// GitHub App (P4) — install-once push-to-deploy + short-lived installation
+	// tokens for private-repo clones. Distinct from the GitHub OAuth *login* app
+	// above (GitHubClientID/Secret). GitHubAppEnabled gates the whole feature:
+	// off → /integrations/github/* and POST /webhooks/github reject with 501.
+	// All values are operator k8s secrets (NOT ConfigMap) — the private key can
+	// mint tokens for every installation.
+	GitHubAppEnabled       bool
+	GitHubAppID            string // GITHUB_APP_ID — numeric App ID (JWT iss)
+	GitHubAppSlug          string // GITHUB_APP_SLUG — public slug for the install URL (github.com/apps/<slug>)
+	GitHubAppPrivateKey    string // GITHUB_APP_PRIVATE_KEY — RSA PEM (RS256 signing)
+	GitHubAppWebhookSecret string // GITHUB_APP_WEBHOOK_SECRET — X-Hub-Signature-256 HMAC key
+	GitHubAppClientID      string // GITHUB_APP_CLIENT_ID — for the install/callback OAuth handshake
+	GitHubAppClientSecret  string // GITHUB_APP_CLIENT_SECRET
+
 	// Email-feedback webhook secrets. Each provider authenticates its
 	// callbacks differently — these env vars give the handler the shared
 	// secret (Brevo, SendGrid) or topic ARN (SES via SNS) it needs to
@@ -450,6 +464,21 @@ func Load() *Config {
 	default:
 		cfg.DeploySourceGitEnabled = false
 	}
+
+	// GITHUB_APP_ENABLED: default FALSE (off until the operator registers the
+	// App and provisions GITHUB_APP_* secrets — see infra/GITHUB-APP-RUNBOOK.md).
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GITHUB_APP_ENABLED"))) {
+	case "true", "1", "yes":
+		cfg.GitHubAppEnabled = true
+	default:
+		cfg.GitHubAppEnabled = false
+	}
+	cfg.GitHubAppID = os.Getenv("GITHUB_APP_ID")
+	cfg.GitHubAppSlug = os.Getenv("GITHUB_APP_SLUG")
+	cfg.GitHubAppPrivateKey = os.Getenv("GITHUB_APP_PRIVATE_KEY")
+	cfg.GitHubAppWebhookSecret = os.Getenv("GITHUB_APP_WEBHOOK_SECRET")
+	cfg.GitHubAppClientID = os.Getenv("GITHUB_APP_CLIENT_ID")
+	cfg.GitHubAppClientSecret = os.Getenv("GITHUB_APP_CLIENT_SECRET")
 
 	if len(cfg.JWTSecret) < 32 {
 		panic("JWT_SECRET must be at least 32 bytes")
