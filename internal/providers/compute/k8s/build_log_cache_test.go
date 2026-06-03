@@ -14,6 +14,7 @@ package k8s
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -104,5 +105,63 @@ func TestEvictStaleBuildLogs_KeepsFreshDropsStale(t *testing.T) {
 	}
 	if _, ok := p.buildLogCache.Load("stale"); ok {
 		t.Error("stale entry was not evicted")
+	}
+}
+
+// TestCapBuildLogCacheSize_EvictsOldestOverCap verifies the size cap: a burst
+// of fresh (non-stale) snapshots beyond buildLogCacheMaxEntries is bounded by
+// evicting the OLDEST entries first, while the most-recent cap-many survive.
+// This is the memory-leak guard the TTL sweep alone does not provide — many
+// failures inside one TTL window would otherwise grow the map without bound.
+func TestCapBuildLogCacheSize_EvictsOldestOverCap(t *testing.T) {
+	p := &K8sProvider{clientset: fake.NewSimpleClientset()}
+
+	base := time.Now()
+	overflow := 10
+	total := buildLogCacheMaxEntries + overflow
+	// All fresh (well within TTL) so eviction is driven purely by the size cap,
+	// not by staleness. Older capturedAt for lower indexes → those evict first.
+	for i := 0; i < total; i++ {
+		key := fmt.Sprintf("app-%04d", i)
+		p.buildLogCache.Store(key, &buildLogCacheEntry{
+			lines:      []string{key},
+			capturedAt: base.Add(time.Duration(i) * time.Second),
+		})
+	}
+
+	p.capBuildLogCacheSize()
+
+	var count int
+	p.buildLogCache.Range(func(_, _ any) bool { count++; return true })
+	if count != buildLogCacheMaxEntries {
+		t.Fatalf("cache not capped: got %d entries, want %d", count, buildLogCacheMaxEntries)
+	}
+
+	// The oldest `overflow` entries (lowest indexes) must be gone; the newest
+	// must remain.
+	for i := 0; i < overflow; i++ {
+		if _, ok := p.buildLogCache.Load(fmt.Sprintf("app-%04d", i)); ok {
+			t.Errorf("oldest entry app-%04d should have been evicted", i)
+		}
+	}
+	if _, ok := p.buildLogCache.Load(fmt.Sprintf("app-%04d", total-1)); !ok {
+		t.Errorf("newest entry app-%04d was wrongly evicted", total-1)
+	}
+}
+
+// TestCapBuildLogCacheSize_NoOpUnderCap verifies the cap is a no-op when the
+// cache holds fewer than buildLogCacheMaxEntries entries (the common case).
+func TestCapBuildLogCacheSize_NoOpUnderCap(t *testing.T) {
+	p := &K8sProvider{clientset: fake.NewSimpleClientset()}
+
+	p.buildLogCache.Store("only", &buildLogCacheEntry{
+		lines:      []string{"x"},
+		capturedAt: time.Now(),
+	})
+
+	p.capBuildLogCacheSize()
+
+	if _, ok := p.buildLogCache.Load("only"); !ok {
+		t.Error("under-cap entry was wrongly evicted")
 	}
 }

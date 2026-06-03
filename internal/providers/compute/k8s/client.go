@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -416,6 +417,15 @@ type buildLogCacheEntry struct {
 // delay, but finite so a long-lived api pod does not leak memory on every
 // failed build.
 const buildLogCacheTTL = 30 * time.Minute
+
+// buildLogCacheMaxEntries caps the number of build-log snapshots held at once.
+// The TTL alone is not a memory bound: a burst of failing builds inside one
+// 30-minute window (a broken base image, a wedged registry) would otherwise
+// accumulate one ≤buildLogMaxLines-line snapshot per failure with no ceiling.
+// When a store pushes the cache past this cap we evict the oldest entries —
+// the autopsy for a recent failure is far likelier to be read than one from
+// hundreds of failures ago. 256 entries × 200 lines is a comfortable bound.
+const buildLogCacheMaxEntries = 256
 
 // New creates a K8sProvider targeting the given namespace.
 // buildCtx is optional — when unset, builds fall back to the 1 MiB Secret path.
@@ -1288,8 +1298,41 @@ func (p *K8sProvider) snapshotBuildLogs(ctx context.Context, ns, appID, jobName 
 		lines:      lines,
 		capturedAt: time.Now(),
 	})
+	// Evict-after-store: the TTL sweep above only drops *expired* entries, so a
+	// burst of failures inside one TTL window still grows the map unbounded.
+	// Cap the live entry count, evicting oldest-first.
+	p.capBuildLogCacheSize()
 	slog.Info("k8s.snapshotBuildLogs: captured failed build logs for autopsy",
 		"app_id", appID, "lines", len(lines))
+}
+
+// capBuildLogCacheSize bounds buildLogCache to buildLogCacheMaxEntries, evicting
+// the oldest snapshots first. sync.Map has no length, so we snapshot keys +
+// capture times in one Range pass; if over the cap we sort by capturedAt and
+// delete the excess oldest. A concurrent Store between the Range and the
+// Deletes can only leave us at most a few entries over the cap until the next
+// failure re-runs this — an acceptable slop for a best-effort autopsy cache.
+func (p *K8sProvider) capBuildLogCacheSize() {
+	type keyedEntry struct {
+		key        any
+		capturedAt time.Time
+	}
+	var entries []keyedEntry
+	p.buildLogCache.Range(func(k, v any) bool {
+		if entry, ok := v.(*buildLogCacheEntry); ok {
+			entries = append(entries, keyedEntry{key: k, capturedAt: entry.capturedAt})
+		}
+		return true
+	})
+	if len(entries) <= buildLogCacheMaxEntries {
+		return
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].capturedAt.Before(entries[j].capturedAt)
+	})
+	for _, e := range entries[:len(entries)-buildLogCacheMaxEntries] {
+		p.buildLogCache.Delete(e.key)
+	}
 }
 
 // evictStaleBuildLogs drops buildLogCache entries older than buildLogCacheTTL.
