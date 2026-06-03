@@ -216,6 +216,14 @@ func (h *ResourceHandler) Delete(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusNotFound, "not_found", "Resource not found")
 	}
 
+	// Idempotent DELETE (bug-bash #4/#12): a repeated DELETE (retry, double-click,
+	// concurrent call) must NOT re-soft-delete and, worse, re-deprovision the
+	// backend a second time. The first DELETE already tore it down — report
+	// success and do nothing.
+	if resource.Status == "deleted" {
+		return c.JSON(fiber.Map{"ok": true, "already_deleted": true, "id": resource.ID.String()})
+	}
+
 	if err := models.SoftDeleteResource(c.Context(), h.db, resource.ID); err != nil {
 		slog.Error("resource.delete.failed",
 			"error", err,
