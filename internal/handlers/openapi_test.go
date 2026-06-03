@@ -702,6 +702,13 @@ func TestOpenAPI_CoversAllRegisteredRoutes(t *testing.T) {
 		// the builder and security_txt_test.go for the wire contract.
 		"GET /.well-known/security.txt": true,
 		"GET /security.txt":             true,
+		// GitHub App install flow (P4.1) is flag-gated OFF (GITHUB_APP_ENABLED).
+		// While off, both endpoints return 501 github_app_disabled — documenting
+		// them in the agent-facing OpenAPI now would mislead agents into thinking
+		// the App path works. The contract sync (OpenAPI + llms.txt + MCP) lands
+		// in P4.3 alongside the flag flip. See SCOPE-P4-github-app + github_app.go.
+		"GET /integrations/github/install":  true,
+		"GET /integrations/github/callback": true,
 	}
 
 	var missing []string
