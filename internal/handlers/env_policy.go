@@ -100,6 +100,7 @@ func (h *EnvPolicyHandler) Put(c *fiber.Ctx) error {
 			"role":          role,
 			"allowed_roles": []string{middleware.RoleOwner},
 			"agent_action":  newAgentActionOwnerRequired(role),
+			"request_id":    middleware.GetRequestID(c),
 		})
 	}
 
