@@ -29,14 +29,14 @@ import (
 // session for the supplied tier. Mirrors setupPauseFixture but exposes the
 // app + db + jwt + teamID for arbitrary cross-cutting tests.
 type authedFixture struct {
-	app       interface {
+	app interface {
 		Test(req *http.Request, msTimeout ...int) (*http.Response, error)
 	}
-	db        *sql.DB
-	jwt       string
-	teamID    string
-	userID    string
-	teamUUID  uuid.UUID
+	db       *sql.DB
+	jwt      string
+	teamID   string
+	userID   string
+	teamUUID uuid.UUID
 }
 
 func setupAuthedFixture(t *testing.T, planTier string) authedFixture {
@@ -1486,3 +1486,22 @@ func TestResourceList_AllFieldsPresent(t *testing.T) {
 // ───────────────────────────────────────────────────────────────────────────
 var _ = fmt.Sprintf
 var _ = uuid.Nil
+
+// TestResourceDelete_Idempotent_DoubleDelete — bug-bash #4/#12: a repeated
+// DELETE on an already-deleted resource returns 200 already_deleted and does NOT
+// re-run the soft-delete + backend deprovision.
+func TestResourceDelete_Idempotent_DoubleDelete(t *testing.T) {
+	fix := setupAuthedFixture(t, "hobby")
+	_, tok := insertResourceCov(t, fix.db, fix.teamID, "redis", "hobby")
+
+	r1 := authedDelete(t, fix, "/api/v1/resources/"+tok)
+	_ = r1.Body.Close()
+	require.Equal(t, http.StatusOK, r1.StatusCode)
+
+	r2 := authedDelete(t, fix, "/api/v1/resources/"+tok)
+	defer r2.Body.Close()
+	require.Equal(t, http.StatusOK, r2.StatusCode, "second DELETE must be idempotent 200")
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(r2.Body).Decode(&body))
+	assert.Equal(t, true, body["already_deleted"], "repeat DELETE must report already_deleted")
+}
