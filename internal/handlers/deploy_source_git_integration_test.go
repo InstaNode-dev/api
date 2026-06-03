@@ -163,7 +163,9 @@ func TestDeployNew_SourceGit_FlagOn_Accepted(t *testing.T) {
 
 	// runDeploy is async — poll the row until the noop provider stamps it
 	// healthy with a provider id (proves applyGitSourceOpts → compute.Deploy ran).
-	deadline := time.Now().Add(5 * time.Second)
+	// Generous deadline: the async runDeploy goroutine does DB writes that can
+	// be slow under `-race -p 1` with the full suite loaded.
+	deadline := time.Now().Add(30 * time.Second)
 	var status, providerID string
 	var gitURLCol sql.NullString
 	for time.Now().Before(deadline) {
