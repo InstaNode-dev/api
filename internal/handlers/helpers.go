@@ -516,6 +516,9 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"install_conflict": {
 		AgentAction: "Tell the user this GitHub installation is already linked to a different InstaNode team. Uninstall the InstaNode app from GitHub and re-install under the intended team, or contact support to move it — see https://instanode.dev/docs/deploy.",
 	},
+	"already_permanent": {
+		AgentAction: "Tell the user this deployment is already permanent and has no TTL to set. Downgrading a permanent deploy to an expiring one is support-only — see https://instanode.dev/docs/deploy.",
+	},
 	"state_unavailable": {
 		AgentAction: "Tell the user the GitHub install could not be started due to a transient backend error. Retry shortly — see https://instanode.dev/status.",
 	},
