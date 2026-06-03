@@ -76,6 +76,7 @@ var deploymentColumnsList = []string{
 	"notify_webhook", "notify_webhook_secret", "notify_state", "notify_attempts",
 	"expires_at", "ttl_policy", "reminders_sent", "last_reminder_at",
 	"source", "image_ref", "registry_creds_enc",
+	"git_url", "git_ref", "git_token_enc",
 }
 
 // redeployMockApp wires a minimal Fiber app that drives DeployHandler.New
@@ -254,6 +255,7 @@ func TestDeployNew_Redeploy_WrongTeam_DefenceInDepth(t *testing.T) {
 			sql.NullString{}, sql.NullString{}, "unset", 0, // notify_*
 			sql.NullTime{}, "permanent", 0, sql.NullTime{}, // ttl_*
 			"tarball", "", "", // source, image_ref, registry_creds_enc (mig 064)
+			"", "", "", // git_url, git_ref, git_token_enc (mig 065)
 		))
 
 	body, ct := multipartRedeployMockBody(t, map[string]string{
@@ -325,6 +327,7 @@ func TestDeployNew_Redeploy_UpdateStatusError_StillAccepts(t *testing.T) {
 			sql.NullString{}, sql.NullString{}, "unset", 0,
 			sql.NullTime{}, "permanent", 0, sql.NullTime{},
 			"tarball", "", "", // source, image_ref, registry_creds_enc (mig 064)
+			"", "", "", // git_url, git_ref, git_token_enc (mig 065)
 		))
 
 	// UPDATE deployments SET status = $1 ... → driver error. The handler
@@ -414,6 +417,7 @@ func TestDeployNew_Redeploy_EmptyProviderID_Returns409(t *testing.T) {
 			sql.NullString{}, sql.NullString{}, "unset", 0,
 			sql.NullTime{}, "permanent", 0, sql.NullTime{},
 			"tarball", "", "", // source, image_ref, registry_creds_enc (mig 064)
+			"", "", "", // git_url, git_ref, git_token_enc (mig 065)
 		))
 
 	body, ct := multipartRedeployMockBody(t, map[string]string{

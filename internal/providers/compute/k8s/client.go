@@ -284,6 +284,15 @@ const (
 var (
 	defaultClusterPodCIDRs     = []string{"10.42.0.0/16", "10.244.0.0/16"}
 	defaultClusterServiceCIDRs = []string{"10.43.0.0/16", "10.245.0.0/16"}
+	// privateEgressExceptCIDRs are RFC1918 + loopback ranges denied to build
+	// pods (SSRF defense-in-depth). Link-local/metadata is covered separately by
+	// metadataCIDR (169.254.0.0/16).
+	privateEgressExceptCIDRs = []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"127.0.0.0/8",
+	}
 )
 
 // egressExceptCIDRs returns the IPBlock.Except list for the customer-deploy
@@ -301,10 +310,17 @@ func egressExceptCIDRs() []string {
 		svcs = splitCIDRList(v)
 	}
 
-	except := make([]string, 0, len(pods)+len(svcs)+1)
+	except := make([]string, 0, len(pods)+len(svcs)+1+len(privateEgressExceptCIDRs))
 	except = append(except, pods...)
 	except = append(except, svcs...)
 	except = append(except, metadataCIDR)
+	// Defense-in-depth SSRF guard: deny build-pod egress to all loopback +
+	// RFC1918 private ranges (not just the cluster pod/service CIDRs), so a
+	// source=git/tarball build can never reach an internal service the cluster
+	// CIDRs don't cover. Public SaaS build pods only need public egress (GHCR +
+	// public git hosts), so this is safe. App-layer validateGitURL screens the
+	// host too; this is the runtime backstop (incl. DNS-rebinding).
+	except = append(except, privateEgressExceptCIDRs...)
 	return except
 }
 
@@ -1050,7 +1066,8 @@ func (p *K8sProvider) Deploy(ctx context.Context, opts compute.DeployOptions) (*
 	ns := deployNamespace(opts.AppID)
 	var imageTag string
 
-	if opts.Source == "image" {
+	switch opts.Source {
+	case "image":
 		// BYO prebuilt image — skip Kaniko entirely. No build Job, no MinIO
 		// upload, no build NetworkPolicy. We deploy opts.ImageRef directly.
 		imageTag = opts.ImageRef
@@ -1065,7 +1082,18 @@ func (p *K8sProvider) Deploy(ctx context.Context, opts compute.DeployOptions) (*
 		if err := p.ensureImagePullSecret(ctx, ns, opts.RegistryAuth); err != nil {
 			return nil, fmt.Errorf("k8s.Deploy(image): pull secret: %w", err)
 		}
-	} else {
+	case "git":
+		// source=git (P3): kaniko clones + builds the repo via its git context —
+		// no tarball upload. Build first, then setupTenantNamespace (same order
+		// as tarball, so the build pod isn't constrained by the runtime quota).
+		imageTag = imageName(opts.AppID)
+		if err := p.buildImageFromGit(ctx, ns, opts.AppID, imageTag, opts.GitURL, opts.GitRef, opts.GitAuth); err != nil {
+			return nil, fmt.Errorf("k8s.Deploy(git): build image: %w", err)
+		}
+		if err := p.setupTenantNamespace(ctx, ns, opts.AppID, opts.TeamID, opts.Tier); err != nil {
+			return nil, fmt.Errorf("k8s.Deploy(git): setup namespace: %w", err)
+		}
+	default:
 		imageTag = imageName(opts.AppID)
 		// Step 1: Build the Docker image from the tarball.
 		if err := p.buildImage(ctx, ns, opts.AppID, imageTag, opts.Tarball); err != nil {
@@ -1490,7 +1518,7 @@ func (p *K8sProvider) buildImage(ctx context.Context, ns, appID, imageTag string
 	_ = p.clientset.BatchV1().Jobs(ns).Delete(ctx, jobName, metav1.DeleteOptions{
 		PropagationPolicy: &prop,
 	})
-	if err := p.createKanikoJob(ctx, ns, jobName, ctxSecret, authSecret, imageTag, s3URL); err != nil {
+	if err := p.createKanikoJob(ctx, ns, jobName, ctxSecret, authSecret, imageTag, s3URL, "", ""); err != nil {
 		return fmt.Errorf("k8s.buildImage: create kaniko job: %w", err)
 	}
 
@@ -1508,6 +1536,136 @@ func (p *K8sProvider) buildImage(ctx context.Context, ns, appID, imageTag string
 	}
 
 	slog.Info("k8s.buildImage: kaniko build complete", "app_id", appID, "image", imageTag)
+	return nil
+}
+
+// kanikoContextArg returns the kaniko --context flag: a git:// context for
+// source=git, or the legacy tar context for tarball/http builds.
+func kanikoContextArg(useGit bool, gitContext string) string {
+	if useGit {
+		return "--context=" + gitContext
+	}
+	return "--context=tar:///workspace/context.tar.gz"
+}
+
+// kanikoGitEnv returns the GIT_USERNAME/GIT_PASSWORD env kaniko reads to clone a
+// PRIVATE git context. Empty for non-git builds or public repos (no secret).
+// GIT_USERNAME is a constant placeholder — GitHub/GitLab token auth ignores the
+// username and authenticates on the token in GIT_PASSWORD.
+func kanikoGitEnv(useGit bool, gitAuthSecret string) []corev1.EnvVar {
+	if !useGit || gitAuthSecret == "" {
+		return nil
+	}
+	return []corev1.EnvVar{
+		{Name: "GIT_USERNAME", Value: "x-access-token"},
+		{Name: "GIT_PASSWORD", ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: gitAuthSecret},
+				Key:                  "token",
+			},
+		}},
+	}
+}
+
+// gitCloneContext converts a validated https clone URL + optional ref into the
+// kaniko git context string: git://host/path[#ref]. The handler already
+// validated the URL is http(s) with a host and no embedded creds.
+func gitCloneContext(gitURL, gitRef string) string {
+	ctxURL := gitURL
+	if i := strings.Index(ctxURL, "://"); i >= 0 {
+		ctxURL = ctxURL[i+3:] // strip scheme; kaniko prepends git://
+	}
+	ctxURL = "git://" + ctxURL
+	if gitRef != "" {
+		ctxURL += "#" + gitRef
+	}
+	return ctxURL
+}
+
+// buildImageFromGit builds imageTag from a git repo (source=git, P3) using
+// kaniko's native git context — no tarball upload. It mirrors buildImage's
+// namespace + build-NetworkPolicy + registry-auth prep (deliberately inline
+// rather than refactored out of the proven tarball path), then runs a kaniko
+// Job whose context is the repo. A private repo's token is written to a
+// short-lived git-auth Secret consumed via GIT_PASSWORD.
+func (p *K8sProvider) buildImageFromGit(ctx context.Context, ns, appID, imageTag, gitURL, gitRef, gitAuth string) error {
+	jobName := "build-" + sanitizeName(appID)
+	authSecret := "ghcr-pull"
+
+	slog.Info("k8s.buildImageFromGit: starting kaniko git build",
+		"app_id", appID, "image", imageTag, "namespace", ns, "git_url", gitURL, "git_ref", gitRef)
+
+	// 0. Ensure the namespace exists with PSS labels (mirrors buildImage step 0).
+	nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name: ns,
+		Labels: map[string]string{
+			"managed-by":            "instant.dev",
+			"instant.dev/component": "build-staging",
+			pssEnforceLabel:         pssBaseline,
+			pssWarnLabel:            pssRestricted,
+		},
+	}}
+	if _, err := p.clientset.CoreV1().Namespaces().Create(ctx, nsObj, metav1.CreateOptions{}); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("k8s.buildImageFromGit: ensure namespace %q: %w", ns, err)
+		}
+		if uerr := p.upgradeNamespaceLabels(ctx, ns, nsObj.Labels); uerr != nil {
+			return fmt.Errorf("k8s.buildImageFromGit: upgrade namespace labels %q: %w", ns, uerr)
+		}
+	}
+
+	// 0b. Build-scoped default-deny NetworkPolicy before the Job (kaniko still
+	//     needs the git host + registry egress, which the build NP allows).
+	if err := p.createBuildNetworkPolicy(ctx, ns); err != nil {
+		return fmt.Errorf("k8s.buildImageFromGit: %w", err)
+	}
+
+	// 1. Registry auth for pushing the built image (copied from instant ns).
+	if err := p.ensureRegistryAuthInNS(ctx, ns, authSecret); err != nil {
+		return fmt.Errorf("k8s.buildImageFromGit: registry auth: %w", err)
+	}
+
+	// 2. Optional private-repo token → short-lived git-auth Secret, deleted with
+	//    the build regardless of outcome.
+	gitAuthSecret := ""
+	if gitAuth != "" {
+		gitAuthSecret = "git-auth-" + sanitizeName(appID)
+		sec := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: gitAuthSecret},
+			Data:       map[string][]byte{"token": []byte(gitAuth)},
+		}
+		if _, err := p.clientset.CoreV1().Secrets(ns).Create(ctx, sec, metav1.CreateOptions{}); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return fmt.Errorf("k8s.buildImageFromGit: git auth secret: %w", err)
+			}
+			if _, uerr := p.clientset.CoreV1().Secrets(ns).Update(ctx, sec, metav1.UpdateOptions{}); uerr != nil {
+				return fmt.Errorf("k8s.buildImageFromGit: git auth secret update: %w", uerr)
+			}
+		}
+		defer func() {
+			delCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if delErr := p.clientset.CoreV1().Secrets(ns).Delete(delCtx, gitAuthSecret, metav1.DeleteOptions{}); delErr != nil && !apierrors.IsNotFound(delErr) {
+				slog.Warn("k8s.buildImageFromGit.cleanup_secret_failed", "namespace", ns, "name", gitAuthSecret, "error", delErr)
+			}
+		}()
+	}
+
+	// 3. Create the kaniko git-context Job (delete any stale prior attempt).
+	prop := metav1.DeletePropagationBackground
+	_ = p.clientset.BatchV1().Jobs(ns).Delete(ctx, jobName, metav1.DeleteOptions{PropagationPolicy: &prop})
+	gitContext := gitCloneContext(gitURL, gitRef)
+	if err := p.createKanikoJob(ctx, ns, jobName, "", authSecret, imageTag, "", gitContext, gitAuthSecret); err != nil {
+		return fmt.Errorf("k8s.buildImageFromGit: create kaniko job: %w", err)
+	}
+
+	// 4. Wait for completion; snapshot logs on failure for the autopsy.
+	if err := p.waitForJobComplete(ctx, ns, jobName, 10*time.Minute); err != nil {
+		p.snapshotBuildLogs(ctx, ns, appID, jobName)
+		return fmt.Errorf("k8s.buildImageFromGit: kaniko job: %w", err)
+	}
+
+	slog.Info("k8s.buildImageFromGit: kaniko git build complete", "app_id", appID, "image", imageTag)
 	return nil
 }
 
@@ -1639,11 +1797,16 @@ func (p *K8sProvider) ensureImagePullSecret(ctx context.Context, ns, registryAut
 // Why not --context=https://: MinIO is plaintext HTTP in-cluster, kaniko's
 // HTTP context list does not include http://. The init-container sidesteps
 // both — we control the fetch, kaniko sees a local tar volume.
-func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecret, authSecret, imageTag, httpContextURL string) error {
+func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecret, authSecret, imageTag, httpContextURL, gitContext, gitAuthSecret string) error {
 	backoff := int32(0)
 	ttl := int32(300)
 
-	useHTTP := httpContextURL != ""
+	// source=git (P3): kaniko clones the repo itself via its git context, so
+	// there is NO build-context volume, init-container, or context Secret —
+	// only the registry-auth mount (to push the built image) and optional GIT_*
+	// env for a private repo. useHTTP/Secret paths are mutually exclusive with it.
+	useGit := gitContext != ""
+	useHTTP := !useGit && httpContextURL != ""
 
 	volumes := []corev1.Volume{{
 		Name: "registry-auth",
@@ -1661,7 +1824,10 @@ func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecre
 	}
 
 	var initContainers []corev1.Container
-	if useHTTP {
+	switch {
+	case useGit:
+		// No build-context volume: kaniko fetches the repo into its own workdir.
+	case useHTTP:
 		// Shared emptyDir between init-container (curl) and main kaniko container.
 		volumes = append(volumes, corev1.Volume{
 			Name:         "build-context",
@@ -1692,7 +1858,7 @@ func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecre
 				},
 			},
 		}}
-	} else {
+	default:
 		// Legacy Secret path (≤1 MiB).
 		volumes = append(volumes, corev1.Volume{
 			Name: "build-context",
@@ -1734,8 +1900,13 @@ func (p *K8sProvider) createKanikoJob(ctx context.Context, ns, jobName, ctxSecre
 					Containers: []corev1.Container{{
 						Name:  "kaniko",
 						Image: "gcr.io/kaniko-project/executor:v1.23.2",
+						// source=git: kaniko clones gitContext (git://host/path#ref)
+						// and reads GIT_USERNAME/GIT_PASSWORD (kanikoGitEnv) for a
+						// private repo. Otherwise it reads the tar context at
+						// /workspace/context.tar.gz from the build-context volume.
+						Env: kanikoGitEnv(useGit, gitAuthSecret),
 						Args: []string{
-							"--context=tar:///workspace/context.tar.gz",
+							kanikoContextArg(useGit, gitContext),
 							"--destination=" + imageTag,
 							"--snapshot-mode=redo",
 							"--cache=false",

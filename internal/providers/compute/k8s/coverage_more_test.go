@@ -817,7 +817,7 @@ func TestCreateKanikoJob_CreateError(t *testing.T) {
 		return true, nil, errors.New("boom")
 	})
 	p := &K8sProvider{clientset: cs}
-	if err := p.createKanikoJob(context.Background(), "ns", "j", "ctx", "auth", "img:latest", ""); err == nil {
+	if err := p.createKanikoJob(context.Background(), "ns", "j", "ctx", "auth", "img:latest", "", "", ""); err == nil {
 		t.Error("expected error")
 	}
 }

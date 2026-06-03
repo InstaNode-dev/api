@@ -23,7 +23,7 @@ func TestKanikoJobHasExplicitResources(t *testing.T) {
 	p := &K8sProvider{clientset: cs}
 
 	const ns, jobName = "instant-deploy-test", "build-test"
-	if err := p.createKanikoJob(context.Background(), ns, jobName, "ctx-sec", "auth-sec", "ghcr.io/x/y:latest", ""); err != nil {
+	if err := p.createKanikoJob(context.Background(), ns, jobName, "ctx-sec", "auth-sec", "ghcr.io/x/y:latest", "", "", ""); err != nil {
 		t.Fatalf("createKanikoJob: %v", err)
 	}
 
@@ -81,7 +81,7 @@ func TestKanikoJobUsesInitContainerWhenHTTPURLSet(t *testing.T) {
 
 	const ns, jobName = "instant-deploy-test", "build-test"
 	httpURL := "http://minio.test:9000/instant-build-contexts/abc/20260511T000000Z.tar.gz?X-Amz-Signature=fake"
-	if err := p.createKanikoJob(context.Background(), ns, jobName, "ctx-sec", "auth-sec", "ghcr.io/x/y:latest", httpURL); err != nil {
+	if err := p.createKanikoJob(context.Background(), ns, jobName, "ctx-sec", "auth-sec", "ghcr.io/x/y:latest", httpURL, "", ""); err != nil {
 		t.Fatalf("createKanikoJob: %v", err)
 	}
 
@@ -803,7 +803,7 @@ func TestBuildJobHasActiveDeadlineSeconds(t *testing.T) {
 	p := &K8sProvider{clientset: cs}
 
 	const ns, jobName = "instant-deploy-deadline-test", "build-deadline"
-	if err := p.createKanikoJob(context.Background(), ns, jobName, "ctx-sec", "auth-sec", "ghcr.io/x/y:latest", ""); err != nil {
+	if err := p.createKanikoJob(context.Background(), ns, jobName, "ctx-sec", "auth-sec", "ghcr.io/x/y:latest", "", "", ""); err != nil {
 		t.Fatalf("createKanikoJob: %v", err)
 	}
 
@@ -843,7 +843,7 @@ func TestBuildJobActiveDeadlineSeconds_TableDriven(t *testing.T) {
 			ns := "instant-deploy-dl-" + tc.name
 			jobName := "build-dl-" + tc.name
 
-			if err := p.createKanikoJob(context.Background(), ns, jobName, "ctx-sec", "auth-sec", "ghcr.io/x/y:latest", tc.httpContextURL); err != nil {
+			if err := p.createKanikoJob(context.Background(), ns, jobName, "ctx-sec", "auth-sec", "ghcr.io/x/y:latest", tc.httpContextURL, "", ""); err != nil {
 				t.Fatalf("createKanikoJob: %v", err)
 			}
 

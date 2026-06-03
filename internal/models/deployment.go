@@ -50,6 +50,10 @@ type Deployment struct {
 	Source           string // 'tarball' (default) | 'image' | 'git'
 	ImageRef         string // prebuilt image ref when Source=='image'; '' otherwise
 	RegistryCredsEnc string // AES-256-GCM ciphertext of pull creds; '' when public / platform secret
+	// Git source deploys (migration 065).
+	GitURL      string // clone URL when Source=='git'; '' otherwise
+	GitRef      string // branch/tag/SHA to build; '' = provider default branch
+	GitTokenEnc string // AES-256-GCM ciphertext of read-only token for a private repo; '' when public
 	// TTL fields (Wave FIX-J — migration 045).
 	//
 	// ExpiresAt: when the deploy auto-expires. Zero (sql NULL) means
@@ -102,6 +106,10 @@ type CreateDeploymentParams struct {
 	Source           string // 'tarball' | 'image' | 'git'
 	ImageRef         string // prebuilt image ref when Source=='image'
 	RegistryCredsEnc string // AES-256-GCM ciphertext of pull creds; '' when public
+	// Git source deploys (migration 065).
+	GitURL      string // clone URL when Source=='git'
+	GitRef      string // branch/tag/SHA; '' = default branch
+	GitTokenEnc string // AES-256-GCM ciphertext of private-repo token; '' when public
 	// TTLPolicy chooses the lifecycle for this deploy. Valid values are
 	// "auto_24h" (default — expires_at set to now()+24h), "permanent"
 	// (expires_at = NULL, never auto-expires), or "custom" (caller sets
@@ -144,7 +152,8 @@ const deploymentColumns = `id, team_id, resource_id, app_id, provider_id, status
        env_vars, port, tier, env, private, allowed_ips, error_message, created_at, updated_at,
        notify_webhook, notify_webhook_secret, notify_state, notify_attempts,
        expires_at, ttl_policy, reminders_sent, last_reminder_at,
-       source, image_ref, registry_creds_enc`
+       source, image_ref, registry_creds_enc,
+       git_url, git_ref, git_token_enc`
 
 // scanDeployment reads a single deployments row into a Deployment struct.
 // env_vars is stored as JSONB; error_message, provider_id, and app_url are nullable.
@@ -177,6 +186,9 @@ func scanDeployment(row interface {
 		// migration 064: multi-source deploys. NOT NULL DEFAULT '' / 'tarball'
 		// so plain string scan targets are safe (no NullString needed).
 		&d.Source, &d.ImageRef, &d.RegistryCredsEnc,
+		// migration 065: git source deploys. NOT NULL DEFAULT '' — plain string
+		// scan targets are safe.
+		&d.GitURL, &d.GitRef, &d.GitTokenEnc,
 	); err != nil {
 		return nil, err
 	}
@@ -313,14 +325,16 @@ func CreateDeployment(ctx context.Context, db dbExecutor, p CreateDeploymentPara
 			(team_id, resource_id, app_id, port, tier, env, env_vars, private, allowed_ips,
 			 notify_webhook, notify_webhook_secret, notify_state,
 			 expires_at, ttl_policy,
-			 source, image_ref, registry_creds_enc)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+			 source, image_ref, registry_creds_enc,
+			 git_url, git_ref, git_token_enc)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		RETURNING `+deploymentColumns,
 		p.TeamID, resourceID, p.AppID, port, p.Tier, env, envVarsJSON,
 		p.Private, allowedIPs,
 		notifyWebhook, notifyWebhookSecret, notifyState,
 		expiresAt, ttlPolicy,
-		source, p.ImageRef, p.RegistryCredsEnc)
+		source, p.ImageRef, p.RegistryCredsEnc,
+		p.GitURL, p.GitRef, p.GitTokenEnc)
 
 	d, err := scanDeployment(row)
 	if err != nil {

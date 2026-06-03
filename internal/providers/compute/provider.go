@@ -39,6 +39,14 @@ type DeployOptions struct {
 	// RegistryAuth is an optional docker config JSON for pulling a private
 	// ImageRef. Empty → the namespace's default ghcr-pull secret is used.
 	RegistryAuth string
+	// GitURL is the clone URL built directly by Kaniko's git context when
+	// Source=="git" (no tarball upload). Ignored otherwise.
+	GitURL string
+	// GitRef is the branch/tag/commit Kaniko checks out; empty → default branch.
+	GitRef string
+	// GitAuth is an optional read-only token for a private GitURL, injected as
+	// Kaniko's GIT_PASSWORD. Empty → the repo is treated as public.
+	GitAuth string
 }
 
 // AppDeployment represents the live state of a deployed app.

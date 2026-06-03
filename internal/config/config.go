@@ -10,32 +10,32 @@ import (
 
 // Config holds all runtime configuration for the platform.
 type Config struct {
-	Port                     string
-	DatabaseURL              string // platform DB: teams, users, resources
-	CustomerDatabaseURL      string // customer DB: provisioned db_{token} databases (Phase 2+)
-	RedisURL                 string
-	JWTSecret                string
-	AESKey                   string
-	MaxMindLicenseKey        string
-	GeoLite2DBPath           string
-	RazorpayKeyID            string // RAZORPAY_KEY_ID — API key ID (used server-side)
-	RazorpayKeySecret        string // RAZORPAY_KEY_SECRET — API key secret
-	RazorpayWebhookSecret    string // RAZORPAY_WEBHOOK_SECRET — webhook signature verification
-	RazorpayPlanIDHobby      string // RAZORPAY_PLAN_ID_HOBBY — plan_id for hobby tier (monthly)
+	Port                  string
+	DatabaseURL           string // platform DB: teams, users, resources
+	CustomerDatabaseURL   string // customer DB: provisioned db_{token} databases (Phase 2+)
+	RedisURL              string
+	JWTSecret             string
+	AESKey                string
+	MaxMindLicenseKey     string
+	GeoLite2DBPath        string
+	RazorpayKeyID         string // RAZORPAY_KEY_ID — API key ID (used server-side)
+	RazorpayKeySecret     string // RAZORPAY_KEY_SECRET — API key secret
+	RazorpayWebhookSecret string // RAZORPAY_WEBHOOK_SECRET — webhook signature verification
+	RazorpayPlanIDHobby   string // RAZORPAY_PLAN_ID_HOBBY — plan_id for hobby tier (monthly)
 	// RazorpayPlanIDHobbyPlus — plan_id for the W11 hobby_plus tier
 	// ($19/mo, monthly). When unset, /api/v1/billing/checkout with
 	// plan="hobby_plus" returns 503 billing_not_configured. The operator
 	// must create the corresponding Razorpay subscription plan in the
 	// dashboard and set this env var before checkout will work.
-	RazorpayPlanIDHobbyPlus  string // RAZORPAY_PLAN_ID_HOBBY_PLUS — plan_id for hobby_plus tier (monthly)
-	RazorpayPlanIDPro        string // RAZORPAY_PLAN_ID_PRO — plan_id for pro tier (monthly)
+	RazorpayPlanIDHobbyPlus string // RAZORPAY_PLAN_ID_HOBBY_PLUS — plan_id for hobby_plus tier (monthly)
+	RazorpayPlanIDPro       string // RAZORPAY_PLAN_ID_PRO — plan_id for pro tier (monthly)
 	// RazorpayPlanIDGrowth — plan_id for the W12 growth tier ($99/mo,
 	// monthly). When unset, /api/v1/billing/checkout with plan="growth"
 	// returns 503 billing_not_configured; the reconciler also logs
 	// `billing.plan_id_to_tier.unrecognised` for any incoming Growth
 	// webhook so the operator notices the gap. D28 F3 (2026-05-21).
-	RazorpayPlanIDGrowth     string // RAZORPAY_PLAN_ID_GROWTH — plan_id for growth tier (monthly)
-	RazorpayPlanIDTeam       string // RAZORPAY_PLAN_ID_TEAM — plan_id for team tier (monthly)
+	RazorpayPlanIDGrowth string // RAZORPAY_PLAN_ID_GROWTH — plan_id for growth tier (monthly)
+	RazorpayPlanIDTeam   string // RAZORPAY_PLAN_ID_TEAM — plan_id for team tier (monthly)
 	// Yearly billing variants. When unset, the corresponding yearly checkout
 	// returns 503 billing_not_configured so partial rollout (monthly already
 	// live, yearly plans not yet created in Razorpay dashboard) is safe.
@@ -44,23 +44,23 @@ type Config struct {
 	RazorpayPlanIDProYearly       string // RAZORPAY_PLAN_ID_PRO_YEARLY — plan_id for pro tier (yearly)
 	RazorpayPlanIDGrowthYearly    string // RAZORPAY_PLAN_ID_GROWTH_ANNUAL — plan_id for growth tier (yearly)
 	RazorpayPlanIDTeamYearly      string // RAZORPAY_PLAN_ID_TEAM_YEARLY — plan_id for team tier (yearly)
-	ResendAPIKey             string
+	ResendAPIKey                  string
 	// EmailProvider explicitly selects the outbound email backend. Accepted
 	// values: "brevo" | "resend" | "noop". When empty, internal/email
 	// auto-detects: BREVO_API_KEY > RESEND_API_KEY (≠ "CHANGE_ME") > noop.
 	// Added 2026-05-14 to recover from the live RESEND_API_KEY="CHANGE_ME"
 	// outage by routing through the already-provisioned BREVO_API_KEY.
-	EmailProvider    string
-	BrevoAPIKey      string // BREVO_API_KEY — Brevo Transactional Email API key
-	EmailFromName    string // EMAIL_FROM_NAME — verified-sender display name (default "InstaNode")
-	EmailFromAddress string // EMAIL_FROM_ADDRESS — verified-sender email (default "noreply@instanode.dev")
-	GitHubClientID           string
-	GitHubClientSecret       string
-	GoogleClientID           string
-	GoogleClientSecret       string
-	GoogleRedirectURI        string // optional default redirect_uri for GET /auth/google/url
-	EnabledServices          string
-	Environment              string
+	EmailProvider      string
+	BrevoAPIKey        string // BREVO_API_KEY — Brevo Transactional Email API key
+	EmailFromName      string // EMAIL_FROM_NAME — verified-sender display name (default "InstaNode")
+	EmailFromAddress   string // EMAIL_FROM_ADDRESS — verified-sender email (default "noreply@instanode.dev")
+	GitHubClientID     string
+	GitHubClientSecret string
+	GoogleClientID     string
+	GoogleClientSecret string
+	GoogleRedirectURI  string // optional default redirect_uri for GET /auth/google/url
+	EnabledServices    string
+	Environment        string
 	// TrustedProxyCIDRs is the comma-separated list of CIDR ranges that the
 	// API will trust the X-Forwarded-For header from. Set this to the
 	// load-balancer egress CIDRs (e.g. DOKS NodePool subnet) so that XFF is
@@ -102,9 +102,9 @@ type Config struct {
 	NATSOperatorSeed     string // NATS_OPERATOR_SEED — operator NKey seed; empty = legacy_open fallback
 	NATSSystemAccountKey string // NATS_SYSTEM_ACCOUNT_PUBLIC_KEY — system account public key
 	NATSUseTLS           bool   // NATS_USE_TLS — true → tls:// URLs
-	R2Endpoint               string // R2_ENDPOINT — R2 endpoint hostname (default: r2.instant.dev)
-	R2BucketName             string // R2_BUCKET_NAME — shared R2 bucket name (default: instant-shared)
-	R2APIToken               string // R2_API_TOKEN — Cloudflare API token; if empty, R2 is not used
+	R2Endpoint           string // R2_ENDPOINT — R2 endpoint hostname (default: r2.instant.dev)
+	R2BucketName         string // R2_BUCKET_NAME — shared R2 bucket name (default: instant-shared)
+	R2APIToken           string // R2_API_TOKEN — Cloudflare API token; if empty, R2 is not used
 	// Object storage backend for /storage/new (provider-agnostic).
 	//
 	// ObjectStoreBackend selects the credential-issuance strategy:
@@ -115,15 +115,15 @@ type Config struct {
 	//                   prefix to every customer (trust-based isolation).
 	// Defaults to "minio-admin" when ObjectStoreBackend is empty AND the
 	// legacy MINIO_* env vars are set; otherwise "shared-key".
-	ObjectStoreMode       string // OBJECT_STORE_MODE — "admin" (default) or "shared_key"; alias of ObjectStoreBackend
-	ObjectStoreBackend    string // OBJECT_STORE_BACKEND — "minio-admin" or "shared-key" (legacy alias of OBJECT_STORE_MODE)
-	ObjectStoreEndpoint   string // OBJECT_STORE_ENDPOINT — host:port for admin/bucket ops
-	ObjectStorePublicURL  string // OBJECT_STORE_PUBLIC_URL — customer-facing base, e.g. "https://s3.instanode.dev"
-	ObjectStoreAccessKey  string // OBJECT_STORE_ACCESS_KEY — master access key
-	ObjectStoreSecretKey  string // OBJECT_STORE_SECRET_KEY — master secret key
-	ObjectStoreBucket     string // OBJECT_STORE_BUCKET — shared bucket (default: instant-shared)
-	ObjectStoreRegion     string // OBJECT_STORE_REGION — e.g. "nyc3" for DO Spaces, "us-east-1" for AWS S3
-	ObjectStoreSecure     bool   // OBJECT_STORE_SECURE — true for TLS-terminated endpoints (DO Spaces, AWS S3); default false for in-cluster MinIO
+	ObjectStoreMode      string // OBJECT_STORE_MODE — "admin" (default) or "shared_key"; alias of ObjectStoreBackend
+	ObjectStoreBackend   string // OBJECT_STORE_BACKEND — "minio-admin" or "shared-key" (legacy alias of OBJECT_STORE_MODE)
+	ObjectStoreEndpoint  string // OBJECT_STORE_ENDPOINT — host:port for admin/bucket ops
+	ObjectStorePublicURL string // OBJECT_STORE_PUBLIC_URL — customer-facing base, e.g. "https://s3.instanode.dev"
+	ObjectStoreAccessKey string // OBJECT_STORE_ACCESS_KEY — master access key
+	ObjectStoreSecretKey string // OBJECT_STORE_SECRET_KEY — master secret key
+	ObjectStoreBucket    string // OBJECT_STORE_BUCKET — shared bucket (default: instant-shared)
+	ObjectStoreRegion    string // OBJECT_STORE_REGION — e.g. "nyc3" for DO Spaces, "us-east-1" for AWS S3
+	ObjectStoreSecure    bool   // OBJECT_STORE_SECURE — true for TLS-terminated endpoints (DO Spaces, AWS S3); default false for in-cluster MinIO
 
 	// ObjectStoreAllowSharedKey is the explicit operator escape hatch that
 	// permits shared-key mode in production. Without this flag, the router
@@ -141,7 +141,7 @@ type Config struct {
 	MinioRootUser       string // MINIO_ROOT_USER — legacy alias for OBJECT_STORE_ACCESS_KEY
 	MinioRootPassword   string // MINIO_ROOT_PASSWORD — legacy alias for OBJECT_STORE_SECRET_KEY
 	MinioBucketName     string // MINIO_BUCKET_NAME — legacy alias for OBJECT_STORE_BUCKET
-	DeployDomain      string // DEPLOY_DOMAIN — base domain for container deployments (default: instant.dev)
+	DeployDomain        string // DEPLOY_DOMAIN — base domain for container deployments (default: instant.dev)
 
 	// Compute provider for app hosting (Phase 6)
 	ComputeProvider   string // COMPUTE_PROVIDER — "noop" or "k8s" (default: "noop")
@@ -182,15 +182,21 @@ type Config struct {
 	// rejects source=image with 501; tarball deploys are unaffected.
 	DeploySourceImageEnabled bool
 
+	// DeploySourceGitEnabled gates the source=git deploy path (P3): the
+	// platform points Kaniko at a git repo URL (shallow clone, optional
+	// encrypted token for private repos) instead of an uploaded tarball.
+	// Off → /deploy/new rejects source=git with 501; tarball/image unaffected.
+	DeploySourceGitEnabled bool
+
 	// Email-feedback webhook secrets. Each provider authenticates its
 	// callbacks differently — these env vars give the handler the shared
 	// secret (Brevo, SendGrid) or topic ARN (SES via SNS) it needs to
 	// reject unsigned traffic. All three may be empty in local dev; the
 	// handlers then 401 every request, which is the correct fail-closed
 	// behavior for an unauthenticated public endpoint.
-	BrevoWebhookSecret   string // BREVO_WEBHOOK_SECRET — shared secret for HMAC-SHA256 verification
-	SESSNSTopicARN       string // SES_SNS_SUBSCRIPTION_ARN — expected SNS TopicArn on inbound notifications
-	SendGridWebhookKey   string // SENDGRID_WEBHOOK_PUBLIC_KEY — ECDSA public key (reserved; SendGrid is stubbed today)
+	BrevoWebhookSecret string // BREVO_WEBHOOK_SECRET — shared secret for HMAC-SHA256 verification
+	SESSNSTopicARN     string // SES_SNS_SUBSCRIPTION_ARN — expected SNS TopicArn on inbound notifications
+	SendGridWebhookKey string // SENDGRID_WEBHOOK_PUBLIC_KEY — ECDSA public key (reserved; SendGrid is stubbed today)
 
 	// AdminPathPrefix is the unguessable URL segment under which the
 	// founder-only customer-management endpoints register. When set,
@@ -263,25 +269,25 @@ func require(key string) string {
 // Load reads configuration from environment variables. Panics on missing required fields.
 func Load() *Config {
 	cfg := &Config{
-		Port:                     getenv("PORT", "8080"),
-		DatabaseURL:              require("DATABASE_URL"),
-		CustomerDatabaseURL:      getenv("CUSTOMER_DATABASE_URL", ""),
-		RedisURL:                 getenv("REDIS_URL", "redis://localhost:6379"),
-		JWTSecret:                strings.TrimSpace(require("JWT_SECRET")),
-		AESKey:                   strings.TrimSpace(require("AES_KEY")),
-		MaxMindLicenseKey:        os.Getenv("MAXMIND_LICENSE_KEY"),
-		GeoLite2DBPath:           getenv("GEOLITE2_DB_PATH", "./GeoLite2-City.mmdb"),
-		RazorpayKeyID:            os.Getenv("RAZORPAY_KEY_ID"),
-		RazorpayKeySecret:        os.Getenv("RAZORPAY_KEY_SECRET"),
-		RazorpayWebhookSecret:    os.Getenv("RAZORPAY_WEBHOOK_SECRET"),
-		RazorpayPlanIDHobby:           os.Getenv("RAZORPAY_PLAN_ID_HOBBY"),
-		RazorpayPlanIDHobbyPlus:       os.Getenv("RAZORPAY_PLAN_ID_HOBBY_PLUS"),
-		RazorpayPlanIDPro:             os.Getenv("RAZORPAY_PLAN_ID_PRO"),
+		Port:                    getenv("PORT", "8080"),
+		DatabaseURL:             require("DATABASE_URL"),
+		CustomerDatabaseURL:     getenv("CUSTOMER_DATABASE_URL", ""),
+		RedisURL:                getenv("REDIS_URL", "redis://localhost:6379"),
+		JWTSecret:               strings.TrimSpace(require("JWT_SECRET")),
+		AESKey:                  strings.TrimSpace(require("AES_KEY")),
+		MaxMindLicenseKey:       os.Getenv("MAXMIND_LICENSE_KEY"),
+		GeoLite2DBPath:          getenv("GEOLITE2_DB_PATH", "./GeoLite2-City.mmdb"),
+		RazorpayKeyID:           os.Getenv("RAZORPAY_KEY_ID"),
+		RazorpayKeySecret:       os.Getenv("RAZORPAY_KEY_SECRET"),
+		RazorpayWebhookSecret:   os.Getenv("RAZORPAY_WEBHOOK_SECRET"),
+		RazorpayPlanIDHobby:     os.Getenv("RAZORPAY_PLAN_ID_HOBBY"),
+		RazorpayPlanIDHobbyPlus: os.Getenv("RAZORPAY_PLAN_ID_HOBBY_PLUS"),
+		RazorpayPlanIDPro:       os.Getenv("RAZORPAY_PLAN_ID_PRO"),
 		// D28 F3 (2026-05-21): Growth tier — was previously missing from
 		// the env-mapping, causing every subscription.charged webhook for
 		// a Growth customer to fall back to "hobby" and silently downgrade.
-		RazorpayPlanIDGrowth:          os.Getenv("RAZORPAY_PLAN_ID_GROWTH"),
-		RazorpayPlanIDTeam:            os.Getenv("RAZORPAY_PLAN_ID_TEAM"),
+		RazorpayPlanIDGrowth: os.Getenv("RAZORPAY_PLAN_ID_GROWTH"),
+		RazorpayPlanIDTeam:   os.Getenv("RAZORPAY_PLAN_ID_TEAM"),
 		// 2026-05-15: the live instant-secrets uses the `_ANNUAL` suffix
 		// for every yearly plan id. config.go previously read `_YEARLY`
 		// for Hobby + Pro (only HobbyPlus read `_ANNUAL`), so os.Getenv
@@ -296,27 +302,27 @@ func Load() *Config {
 		RazorpayPlanIDProYearly:       os.Getenv("RAZORPAY_PLAN_ID_PRO_ANNUAL"),
 		RazorpayPlanIDGrowthYearly:    os.Getenv("RAZORPAY_PLAN_ID_GROWTH_ANNUAL"),
 		RazorpayPlanIDTeamYearly:      os.Getenv("RAZORPAY_PLAN_ID_TEAM_ANNUAL"),
-		ResendAPIKey:             os.Getenv("RESEND_API_KEY"),
-		EmailProvider:            os.Getenv("EMAIL_PROVIDER"),
-		BrevoAPIKey:              os.Getenv("BREVO_API_KEY"),
-		EmailFromName:            os.Getenv("EMAIL_FROM_NAME"),
-		EmailFromAddress:         os.Getenv("EMAIL_FROM_ADDRESS"),
-		GitHubClientID:           os.Getenv("GITHUB_CLIENT_ID"),
-		GitHubClientSecret:       os.Getenv("GITHUB_CLIENT_SECRET"),
-		GoogleClientID:           os.Getenv("GOOGLE_CLIENT_ID"),
-		GoogleClientSecret:       os.Getenv("GOOGLE_CLIENT_SECRET"),
-		GoogleRedirectURI:        os.Getenv("GOOGLE_REDIRECT_URI"),
-		EnabledServices:          getenv("INSTANT_ENABLED_SERVICES", "redis,postgres,mongodb,queue"),
-		Environment:              getenv("ENVIRONMENT", "development"),
-		TrustedProxyCIDRs:        os.Getenv("TRUSTED_PROXY_CIDRS"),
-		RedisProvisionBackend:    getenv("REDIS_PROVISION_BACKEND", "local"),
-		RedisProvisionHost:       getenv("REDIS_PROVISION_HOST", "localhost"),
-		MongoAdminURI:            getenv("MONGO_ADMIN_URI", "mongodb://root:root@localhost:27017"),
-		MongoHost:                getenv("MONGO_HOST", "localhost:27017"),
-		PostgresProvisionBackend: getenv("POSTGRES_PROVISION_BACKEND", "local"),
-		NeonAPIKey:               os.Getenv("NEON_API_KEY"),
-		NeonRegionID:             getenv("NEON_REGION_ID", "aws-us-east-1"),
-		PostgresCustomersURL:     getenv("POSTGRES_CUSTOMERS_URL", "postgres://postgres:postgres@postgres-customers:5432/postgres"),
+		ResendAPIKey:                  os.Getenv("RESEND_API_KEY"),
+		EmailProvider:                 os.Getenv("EMAIL_PROVIDER"),
+		BrevoAPIKey:                   os.Getenv("BREVO_API_KEY"),
+		EmailFromName:                 os.Getenv("EMAIL_FROM_NAME"),
+		EmailFromAddress:              os.Getenv("EMAIL_FROM_ADDRESS"),
+		GitHubClientID:                os.Getenv("GITHUB_CLIENT_ID"),
+		GitHubClientSecret:            os.Getenv("GITHUB_CLIENT_SECRET"),
+		GoogleClientID:                os.Getenv("GOOGLE_CLIENT_ID"),
+		GoogleClientSecret:            os.Getenv("GOOGLE_CLIENT_SECRET"),
+		GoogleRedirectURI:             os.Getenv("GOOGLE_REDIRECT_URI"),
+		EnabledServices:               getenv("INSTANT_ENABLED_SERVICES", "redis,postgres,mongodb,queue"),
+		Environment:                   getenv("ENVIRONMENT", "development"),
+		TrustedProxyCIDRs:             os.Getenv("TRUSTED_PROXY_CIDRS"),
+		RedisProvisionBackend:         getenv("REDIS_PROVISION_BACKEND", "local"),
+		RedisProvisionHost:            getenv("REDIS_PROVISION_HOST", "localhost"),
+		MongoAdminURI:                 getenv("MONGO_ADMIN_URI", "mongodb://root:root@localhost:27017"),
+		MongoHost:                     getenv("MONGO_HOST", "localhost:27017"),
+		PostgresProvisionBackend:      getenv("POSTGRES_PROVISION_BACKEND", "local"),
+		NeonAPIKey:                    os.Getenv("NEON_API_KEY"),
+		NeonRegionID:                  getenv("NEON_REGION_ID", "aws-us-east-1"),
+		PostgresCustomersURL:          getenv("POSTGRES_CUSTOMERS_URL", "postgres://postgres:postgres@postgres-customers:5432/postgres"),
 	}
 	cfg.ProvisionerAddr = os.Getenv("PROVISIONER_ADDR") // intentionally empty = use local providers
 	cfg.ProvisionerSecret = os.Getenv("PROVISIONER_SECRET")
@@ -435,6 +441,14 @@ func Load() *Config {
 		cfg.DeploySourceImageEnabled = true
 	default:
 		cfg.DeploySourceImageEnabled = false
+	}
+
+	// DEPLOY_SOURCE_GIT_ENABLED: default FALSE (off until operator canary).
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DEPLOY_SOURCE_GIT_ENABLED"))) {
+	case "true", "1", "yes":
+		cfg.DeploySourceGitEnabled = true
+	default:
+		cfg.DeploySourceGitEnabled = false
 	}
 
 	if len(cfg.JWTSecret) < 32 {
