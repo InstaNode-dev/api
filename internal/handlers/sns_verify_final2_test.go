@@ -25,6 +25,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"math/big"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -181,5 +183,49 @@ func TestSNSVerifyFinal2_GetCert_CacheHitAndMiss(t *testing.T) {
 	v.fetchCert = func(_ string, _ string) (*x509.Certificate, error) { return nil, errors.New("x") }
 	if _, err := v.getCert("https://sns.us-east-1.amazonaws.com/other-final2.pem"); err == nil {
 		t.Error("getCert must propagate fetch error")
+	}
+}
+
+// TestSNSVerifyFinal2_GetCert_SingleflightCollapsesConcurrentMisses proves the
+// bug-bash #1/#9 fix: a burst of concurrent cache-miss getCert calls for the
+// same certURL collapses into exactly ONE fetchCert call (no thundering herd
+// against the AWS cert endpoint). The fetch is held open on a channel so every
+// goroutine joins the same in-flight singleflight call before it completes.
+func TestSNSVerifyFinal2_GetCert_SingleflightCollapsesConcurrentMisses(t *testing.T) {
+	cert, _ := final2GenCertKey(t)
+	v := newSNSVerifier()
+
+	var calls int32
+	proceed := make(chan struct{})
+	v.fetchCert = func(_ string, _ string) (*x509.Certificate, error) {
+		atomic.AddInt32(&calls, 1)
+		<-proceed // hold the flight open so concurrent callers collapse into it
+		return cert, nil
+	}
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = v.getCert(final2AWSCertURL)
+		}(i)
+	}
+
+	// Give all goroutines time to enter the singleflight Do and collapse onto
+	// the leader's still-open flight, then release the fetch.
+	time.Sleep(50 * time.Millisecond)
+	close(proceed)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("getCert[%d] returned error: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("singleflight should collapse %d concurrent misses into 1 fetch, got %d", n, got)
 	}
 }
