@@ -26,7 +26,7 @@ type Stack struct {
 	Name          string
 	Slug          string
 	Namespace     string
-	Status        string     // building|deploying|healthy|failed|stopped|deleting
+	Status        string // building|deploying|healthy|failed|stopped|deleting
 	Tier          string
 	Env           string     // production|staging|dev|... (default 'production')
 	ParentStackID *uuid.UUID // nil for the root stack; set on promoted copies
@@ -106,8 +106,10 @@ func GenerateStackSlug() (string, error) {
 // scanStack reads a single stacks row into a Stack struct.
 //
 // Column order is fixed to:
-//   id, team_id, name, slug, namespace, status, tier, env, parent_stack_id,
-//   expires_at, fingerprint, created_at, updated_at
+//
+//	id, team_id, name, slug, namespace, status, tier, env, parent_stack_id,
+//	expires_at, fingerprint, created_at, updated_at
+//
 // — every query in this file must SELECT in this order.
 func scanStack(row interface {
 	Scan(dest ...any) error
@@ -147,8 +149,10 @@ func scanStack(row interface {
 // scanStackService reads a single stack_services row into a StackService struct.
 //
 // Column order is fixed to:
-//   id, stack_id, name, image_tag, image_ref, status, expose, port, app_url,
-//   error_msg, created_at
+//
+//	id, stack_id, name, image_tag, image_ref, status, expose, port, app_url,
+//	error_msg, created_at
+//
 // — every query in this file must SELECT in this order so the scan offsets
 // stay aligned.
 func scanStackService(row interface {
@@ -667,4 +671,84 @@ func UpdateStackEnvVars(ctx context.Context, db *sql.DB, stackID uuid.UUID, envV
 		return &ErrStackNotFound{Slug: stackID.String()}
 	}
 	return nil
+}
+
+// MergeStackEnvVars applies a PATCH-style env delta to a stack ATOMICALLY.
+//
+// patch semantics: a non-empty value upserts the key; an empty-string value
+// ("") deletes the key. The whole load-merge-save runs inside ONE transaction
+// that takes a row lock (SELECT ... FOR UPDATE) on the stack row, so two
+// concurrent PATCHes serialize — the second blocks on the lock until the first
+// commits, then reads the FIRST's committed env_vars instead of a stale
+// pre-merge snapshot. This is the fix for the lost-update bug: the previous
+// GetStackEnvVars → merge-in-Go → UpdateStackEnvVars sequence let two PATCHes
+// both read {} and blind-overwrite each other, silently dropping a key.
+//
+// Returns (merged map, #deleted, err). A delete is counted ONLY when the key
+// was actually present in the pre-merge set — matching the handler's old
+// in-Go loop, so the audit metadata keys_set = len(patch) - deleted math is
+// preserved.
+//
+// Errors mirror UpdateStackEnvVars: *ErrStackNotFound when the row is gone,
+// ErrStackEnvVarsTooLarge when the merged payload exceeds maxStackEnvVarsBytes
+// (checked inside the tx BEFORE the write, so an over-cap PATCH rolls back and
+// leaves the row untouched).
+func MergeStackEnvVars(ctx context.Context, db *sql.DB, stackID uuid.UUID, patch map[string]string) (map[string]string, int, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("models.MergeStackEnvVars: begin: %w", err)
+	}
+	// No-op after a successful Commit; rolls back on any early return (over-cap,
+	// marshal error, scan error) so the row is never left half-updated.
+	defer func() { _ = tx.Rollback() }()
+
+	var raw []byte
+	err = tx.QueryRowContext(ctx, `
+		SELECT COALESCE(env_vars, '{}'::jsonb) FROM stacks WHERE id = $1 FOR UPDATE
+	`, stackID).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return nil, 0, &ErrStackNotFound{Slug: stackID.String()}
+	}
+	if err != nil {
+		return nil, 0, fmt.Errorf("models.MergeStackEnvVars: select: %w", err)
+	}
+
+	merged := map[string]string{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &merged); err != nil {
+			return nil, 0, fmt.Errorf("models.MergeStackEnvVars: unmarshal: %w", err)
+		}
+	}
+
+	deletes := 0
+	for k, v := range patch {
+		if v == "" {
+			if _, present := merged[k]; present {
+				delete(merged, k)
+				deletes++
+			}
+			continue
+		}
+		merged[k] = v
+	}
+
+	// json.Marshal of a map[string]string never errors (no unmarshalable
+	// types), so the error is intentionally dropped — adding an unreachable
+	// `if err != nil` branch would be untestable dead code under the 100%
+	// patch-coverage gate. Same rationale as the cap check below.
+	envVarsJSON, _ := json.Marshal(merged)
+	if len(envVarsJSON) > maxStackEnvVarsBytes {
+		return nil, 0, ErrStackEnvVarsTooLarge
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE stacks SET env_vars = $1, updated_at = now() WHERE id = $2
+	`, envVarsJSON, stackID); err != nil {
+		return nil, 0, fmt.Errorf("models.MergeStackEnvVars: update: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, 0, fmt.Errorf("models.MergeStackEnvVars: commit: %w", err)
+	}
+	return merged, deletes, nil
 }

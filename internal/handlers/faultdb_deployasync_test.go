@@ -31,7 +31,7 @@ var errFaultInjected = errors.New("faultdb: injected failure")
 // successful Query/Exec calls allowed before injection begins; -1 disables
 // injection (pass-through).
 type faultConfig struct {
-	calls    atomic.Int64
+	calls     atomic.Int64
 	failAfter int64
 }
 
@@ -87,6 +87,14 @@ func (c *faultConn) ExecContext(ctx context.Context, query string, args []driver
 	return nil, driver.ErrSkip
 }
 
+// BeginTx returns the inner (unwrapped) driver.Tx and does NOT itself consume
+// the failAfter budget. Note this does NOT exempt in-transaction queries from
+// fault injection: lib/pq's driver.Tx implements neither driver.QueryerContext
+// nor driver.ExecerContext, so database/sql routes sql.Tx.QueryContext /
+// ExecContext back through this conn's QueryContext / ExecContext — which DO
+// honor shouldFail(). That's why models.MergeStackEnvVars' tx-internal
+// SELECT ... FOR UPDATE and UPDATE are still fault-injectable (see
+// stack_final2_test.go).
 func (c *faultConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	if bt, ok := c.inner.(driver.ConnBeginTx); ok {
 		return bt.BeginTx(ctx, opts)
