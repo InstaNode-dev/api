@@ -687,6 +687,13 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	githubReceiveH := handlers.NewGitHubDeployHandler(db, cfg, planRegistry)
 	app.Post("/webhooks/github/:webhook_id", githubReceiveH.Receive)
 
+	// GitHub App install flow (P4.1), gated by cfg.GitHubAppEnabled. Install
+	// requires auth (binds the install to the team); Callback is state-
+	// authenticated (GitHub presents no session, only the signed state).
+	githubAppH := handlers.NewGitHubAppHandler(db, cfg, planRegistry)
+	app.Get("/integrations/github/install", middleware.RequireAuth(cfg), githubAppH.Install)
+	app.Get("/integrations/github/callback", githubAppH.Callback)
+
 	// Deploy — Phase 6 (auth required on all endpoints).
 	// POST /deploy/new is gated by RequireEnvAccess(ActionDeploy) — the
 	// env scope arrives as a multipart form field (not JSON or query), so
