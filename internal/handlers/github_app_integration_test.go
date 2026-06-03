@@ -140,6 +140,45 @@ func TestGitHubAppCallback_InvalidInstallationID_400(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
+// state carries a team_id that isn't a UUID → parseTeamID fails → 400.
+func TestGitHubAppCallback_InvalidTeamUUID_400(t *testing.T) {
+	daDeployNeedsDB(t)
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
+	defer cleanRedis()
+
+	app, clean := testhelpers.NewTestAppWithServices(t, db, rdb, "deploy", appEnabled)
+	defer clean()
+
+	state := signInstallState(t, "not-a-uuid")
+	req := httptest.NewRequest(http.MethodGet, "/integrations/github/callback?installation_id=12&state="+state, nil)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+// state's team_id is a valid UUID but no such team exists → the upsert hits the
+// team_id FK and fails → 503 install_persist_failed.
+func TestGitHubAppCallback_PersistError_503(t *testing.T) {
+	daDeployNeedsDB(t)
+	db, cleanDB := testhelpers.SetupTestDB(t)
+	defer cleanDB()
+	rdb, cleanRedis := testhelpers.SetupTestRedis(t)
+	defer cleanRedis()
+
+	app, clean := testhelpers.NewTestAppWithServices(t, db, rdb, "deploy", appEnabled)
+	defer clean()
+
+	state := signInstallState(t, uuid.NewString()) // valid UUID, not in teams
+	req := httptest.NewRequest(http.MethodGet, "/integrations/github/callback?installation_id=34&state="+state, nil)
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
+
 func TestGitHubAppCallback_PersistsAndRedirects(t *testing.T) {
 	daDeployNeedsDB(t)
 	db, cleanDB := testhelpers.SetupTestDB(t)

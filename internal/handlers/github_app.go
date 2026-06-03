@@ -40,6 +40,11 @@ const githubAppStatePurpose = "gh_app_install"
 // githubAppStateTTL bounds the install→callback round-trip.
 const githubAppStateTTL = 10 * time.Minute
 
+// signInstallStateFn is the state signer the Install handler uses — a package
+// var so a test can force the (otherwise unreachable, HS256-never-fails) sign
+// error path.
+var signInstallStateFn = signGitHubAppState
+
 // GitHubAppHandler serves the install/callback flow.
 type GitHubAppHandler struct {
 	db   *sql.DB
@@ -77,7 +82,7 @@ func (h *GitHubAppHandler) Install(c *fiber.Ctx) error {
 	if teamID == "" {
 		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "A session token is required")
 	}
-	state, err := signGitHubAppState(h.cfg.JWTSecret, teamID, time.Now())
+	state, err := signInstallStateFn(h.cfg.JWTSecret, teamID, time.Now())
 	if err != nil {
 		slog.Error("github_app.install.state_sign_failed", "error", err)
 		return respondError(c, fiber.StatusServiceUnavailable, "state_unavailable",
