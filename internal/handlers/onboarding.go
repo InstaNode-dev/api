@@ -96,11 +96,10 @@ func (h *OnboardingHandler) ClaimPreview(c *fiber.Ctx) error {
 	if err != nil {
 		var notFound *models.ErrOnboardingNotFound
 		if errors.As(err, &notFound) {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"ok":    false,
-				"error": "invalid_token",
-				"msg":   "Token not recognized",
-			})
+			// Canonical envelope: respondError adds request_id and uses the
+			// standard "message" key (this branch previously emitted a bespoke
+			// "msg" field with no request_id — agents couldn't correlate it).
+			return respondError(c, fiber.StatusBadRequest, "invalid_token", "Token not recognized")
 		}
 		slog.Error("onboarding.claim_preview.db_error", "error", err, "request_id", requestID)
 		return respondError(c, fiber.StatusServiceUnavailable, "lookup_failed", "Failed to verify token")
