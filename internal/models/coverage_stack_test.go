@@ -327,3 +327,90 @@ func TestUpdateStackEnvVars_Branches(t *testing.T) {
 	mock3.ExpectExec(`UPDATE stacks SET env_vars`).WillReturnError(errors.New("boom"))
 	require.ErrorContains(t, UpdateStackEnvVars(ctx, db3, uuid.New(), map[string]string{"a": "b"}), "boom")
 }
+
+// TestMergeStackEnvVars_Branches exercises every error/return arm of the atomic
+// PATCH merge with sqlmock: BeginTx error, select→NotFound, select error,
+// unmarshal error, over-cap rollback, update error, commit error, and the happy
+// path (upsert + present-key delete counting). The real-DB serialization proof
+// lives in handlers' TestMergeStackEnvVars_ConcurrentPatchesNoLostUpdate.
+func TestMergeStackEnvVars_Branches(t *testing.T) {
+	ctx := context.Background()
+	id := uuid.New()
+	patch := map[string]string{"A": "1"}
+
+	// 1) BeginTx error.
+	dbB, mockB := newMock(t)
+	mockB.ExpectBegin().WillReturnError(errors.New("begin-boom"))
+	_, _, err := MergeStackEnvVars(ctx, dbB, id, patch)
+	require.ErrorContains(t, err, "begin-boom")
+
+	// 2) SELECT ... FOR UPDATE → no rows → ErrStackNotFound (rolls back).
+	dbNF, mockNF := newMock(t)
+	mockNF.ExpectBegin()
+	mockNF.ExpectQuery(`SELECT COALESCE\(env_vars.*FOR UPDATE`).WillReturnError(errNoRows())
+	mockNF.ExpectRollback()
+	var nf *ErrStackNotFound
+	_, _, err = MergeStackEnvVars(ctx, dbNF, id, patch)
+	require.ErrorAs(t, err, &nf)
+
+	// 3) SELECT error (non-NoRows).
+	dbSE, mockSE := newMock(t)
+	mockSE.ExpectBegin()
+	mockSE.ExpectQuery(`SELECT COALESCE\(env_vars.*FOR UPDATE`).WillReturnError(errors.New("sel-boom"))
+	mockSE.ExpectRollback()
+	_, _, err = MergeStackEnvVars(ctx, dbSE, id, patch)
+	require.ErrorContains(t, err, "sel-boom")
+
+	// 4) unmarshal error (malformed jsonb).
+	dbUM, mockUM := newMock(t)
+	mockUM.ExpectBegin()
+	mockUM.ExpectQuery(`SELECT COALESCE\(env_vars.*FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"env_vars"}).AddRow([]byte(`not json`)))
+	mockUM.ExpectRollback()
+	_, _, err = MergeStackEnvVars(ctx, dbUM, id, patch)
+	require.ErrorContains(t, err, "unmarshal")
+
+	// 5) over-cap → ErrStackEnvVarsTooLarge, checked BEFORE the UPDATE (rolls back).
+	dbTL, mockTL := newMock(t)
+	mockTL.ExpectBegin()
+	mockTL.ExpectQuery(`SELECT COALESCE\(env_vars.*FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"env_vars"}).AddRow([]byte(`{}`)))
+	mockTL.ExpectRollback()
+	big := map[string]string{"K": strings.Repeat("x", maxStackEnvVarsBytes+1)}
+	_, _, err = MergeStackEnvVars(ctx, dbTL, id, big)
+	require.ErrorIs(t, err, ErrStackEnvVarsTooLarge)
+
+	// 6) UPDATE error.
+	dbUE, mockUE := newMock(t)
+	mockUE.ExpectBegin()
+	mockUE.ExpectQuery(`SELECT COALESCE\(env_vars.*FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"env_vars"}).AddRow([]byte(`{}`)))
+	mockUE.ExpectExec(`UPDATE stacks SET env_vars`).WillReturnError(errors.New("upd-boom"))
+	mockUE.ExpectRollback()
+	_, _, err = MergeStackEnvVars(ctx, dbUE, id, patch)
+	require.ErrorContains(t, err, "upd-boom")
+
+	// 7) Commit error.
+	dbCE, mockCE := newMock(t)
+	mockCE.ExpectBegin()
+	mockCE.ExpectQuery(`SELECT COALESCE\(env_vars.*FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"env_vars"}).AddRow([]byte(`{}`)))
+	mockCE.ExpectExec(`UPDATE stacks SET env_vars`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mockCE.ExpectCommit().WillReturnError(errors.New("commit-boom"))
+	_, _, err = MergeStackEnvVars(ctx, dbCE, id, patch)
+	require.ErrorContains(t, err, "commit-boom")
+
+	// 8) Happy path: existing {A:old, B:keep}; patch upserts A, adds C, deletes B
+	//    (present → counted) and deletes MISSING (absent → NOT counted).
+	dbOK, mockOK := newMock(t)
+	mockOK.ExpectBegin()
+	mockOK.ExpectQuery(`SELECT COALESCE\(env_vars.*FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"env_vars"}).AddRow([]byte(`{"A":"old","B":"keep"}`)))
+	mockOK.ExpectExec(`UPDATE stacks SET env_vars`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mockOK.ExpectCommit()
+	merged, deletes, err := MergeStackEnvVars(ctx, dbOK, id,
+		map[string]string{"A": "new", "C": "3", "B": "", "MISSING": ""})
+	require.NoError(t, err)
+	require.Equal(t, 1, deletes, "only the present key B counts as a delete")
+	require.Equal(t, map[string]string{"A": "new", "C": "3"}, merged)
+}
