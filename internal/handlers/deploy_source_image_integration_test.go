@@ -230,8 +230,11 @@ func TestDeployNew_SourceImage_FlagOn_Accepted(t *testing.T) {
 	// runDeploy is async — poll the row until the (noop) compute provider has
 	// stamped it healthy with a provider id. This deterministically waits for
 	// the applyImageSourceOpts → compute.Deploy path to execute.
-	// Generous deadline: the async runDeploy goroutine does DB writes that can
-	// be slow under `-race -p 1` with the full suite loaded (was 5s → flaked).
+	//
+	// Poll on the TERMINAL status (runDeploy writes provider_id BEFORE status in
+	// two separate UPDATEs — breaking on provider_id races the status write and
+	// reads a transient "building"). 30s ceiling for slow `-race -p 1` runs;
+	// early-breaks the instant a terminal status appears.
 	deadline := time.Now().Add(30 * time.Second)
 	var status, providerID string
 	var imageRef sql.NullString
@@ -240,7 +243,7 @@ func TestDeployNew_SourceImage_FlagOn_Accepted(t *testing.T) {
 			`SELECT status, COALESCE(provider_id,''), image_ref FROM deployments WHERE id = $1`,
 			env.Item.ID)
 		require.NoError(t, row.Scan(&status, &providerID, &imageRef))
-		if providerID != "" {
+		if status == "healthy" || status == "failed" {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
