@@ -162,7 +162,9 @@ func TestSetDeploymentTTL_SetsCustomExpiryAndResetsReminders(t *testing.T) {
 	`, d.ID)
 	require.NoError(t, err)
 
-	require.NoError(t, models.SetDeploymentTTL(ctx, db, d.ID, 72))
+	appliedTTL, err := models.SetDeploymentTTL(ctx, db, d.ID, 72)
+	require.NoError(t, err)
+	require.True(t, appliedTTL, "healthy deploy → TTL applied")
 
 	refreshed, err := models.GetDeploymentByID(ctx, db, d.ID)
 	require.NoError(t, err)

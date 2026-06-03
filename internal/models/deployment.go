@@ -738,13 +738,20 @@ func ElevateDeploymentTiersByTeam(ctx context.Context, db *sql.DB, teamID uuid.U
 // (1..8760) BEFORE invoking this — the model trusts its input. Resets
 // reminders_sent so a freshly-extended deploy gets the full 6-email
 // warning cycle again instead of skipping reminders that fired earlier.
-func SetDeploymentTTL(ctx context.Context, db *sql.DB, id uuid.UUID, hours int) error {
+func SetDeploymentTTL(ctx context.Context, db *sql.DB, id uuid.UUID, hours int) (bool, error) {
 	expiresAt := time.Now().UTC().Add(time.Duration(hours) * time.Hour)
-	// `ttl_policy != 'permanent'` is defense-in-depth (the handler already
-	// rejects a permanent deploy with 409): if a concurrent MakePermanent races
-	// this UPDATE, the WHERE clause prevents silently un-permanenting the deploy
-	// — the row simply isn't touched (bug-bash #6).
-	_, err := db.ExecContext(ctx, `
+	// The WHERE clause is the AUTHORITATIVE guard, closing the handler's
+	// check-then-act TOCTOU (bug-bash #6, hardened post-review):
+	//   - `ttl_policy != 'permanent'` — a concurrent MakePermanent must not be
+	//     silently un-permanented.
+	//   - `status NOT IN <lifecycleTerminalStatusesSQL>` — a deploy reaped to
+	//     expired/deleted/stopped between the handler's status read and this
+	//     UPDATE must NOT get a re-armed expires_at + reminders_sent=0 reset
+	//     (which would re-enter the reminder-email cycle for a gone deploy).
+	// Returns whether a row was actually updated so the handler can surface a
+	// 409 when the deploy changed underneath it rather than reporting a phantom
+	// success for a write that never happened.
+	res, err := db.ExecContext(ctx, `
 		UPDATE deployments
 		SET expires_at = $1,
 		    ttl_policy = 'custom',
@@ -752,11 +759,13 @@ func SetDeploymentTTL(ctx context.Context, db *sql.DB, id uuid.UUID, hours int) 
 		    last_reminder_at = NULL,
 		    updated_at = now()
 		WHERE id = $2 AND ttl_policy != 'permanent'
+		  AND status NOT IN `+lifecycleTerminalStatusesSQL+`
 	`, expiresAt, id)
 	if err != nil {
-		return fmt.Errorf("models.SetDeploymentTTL: %w", err)
+		return false, fmt.Errorf("models.SetDeploymentTTL: %w", err)
 	}
-	return nil
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 // GetDeploymentsExpiringSoon returns deployments whose expires_at falls
@@ -954,6 +963,17 @@ const activeDeploymentStatusesSQL = `('building', 'deploying', 'healthy')`
 // dashboard lists. This constant is the single source of truth for the
 // "user-visible deployments" row set — see deploymentVisibleClause.
 const terminalDeploymentStatusesSQL = `('deleted', 'expired')`
+
+// lifecycleTerminalStatusesSQL is the IN-list for "this deploy has reached an
+// end state — reject lifecycle MUTATIONS on it." It deliberately DIFFERS from
+// terminalDeploymentStatusesSQL: that one answers "hide from the user's list /
+// usage count" (a 'stopped' deploy is still VISIBLE — paused, not gone — so
+// it's excluded there). This one answers "may we re-arm a TTL on it", where
+// 'stopped' IS terminal — matching IsDeploymentTerminal. The two lists encode
+// different questions; keeping them separate is intentional, not drift. Used
+// by SetDeploymentTTL's UPDATE guard so a deploy reaped between the handler's
+// status read and the UPDATE cannot get a re-armed TTL + reminder-cycle reset.
+const lifecycleTerminalStatusesSQL = `('deleted', 'expired', 'stopped')`
 
 // deploymentVisibleClause is the shared WHERE predicate for "deployments the
 // user sees" — i.e. every non-terminal row. GET /api/v1/deployments (the list)
