@@ -492,6 +492,18 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"missing_tarball": {
 		AgentAction: "Tell the user the deployment tarball is missing. POST a multipart form with 'tarball' (.tar.gz, <=50 MiB) — see https://instanode.dev/docs/deploy.",
 	},
+	"invalid_source": {
+		AgentAction: "Tell the user the 'source' field is invalid. Use source=tarball (default — upload a .tar.gz) or source=image (deploy a prebuilt image_ref) — see https://instanode.dev/docs/deploy.",
+	},
+	"source_image_disabled": {
+		AgentAction: "Tell the user deploying from a prebuilt image (source=image) is still rolling out and not yet enabled. Upload source as a tarball (<=10 MiB) for now — see https://instanode.dev/docs/deploy.",
+	},
+	"invalid_image_ref": {
+		AgentAction: "Tell the user the image_ref is malformed. Pass a fully-qualified reference including the registry host, e.g. ghcr.io/owner/app:tag — see https://instanode.dev/docs/deploy.",
+	},
+	"encrypt_failed": {
+		AgentAction: "Tell the user the platform could not securely store the supplied registry credentials. This is a transient/server-side condition — retry shortly, or omit registry_creds for a public image — see https://instanode.dev/status.",
+	},
 	"missing_manifest": {
 		AgentAction: "Tell the user the stack manifest is missing. POST a multipart form with 'manifest' (YAML) — see https://instanode.dev/docs/stacks.",
 	},

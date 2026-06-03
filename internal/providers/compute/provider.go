@@ -22,12 +22,23 @@ type DeployOptions struct {
 	AppID      string            // short slug, used as k8s Deployment name and subdomain
 	Token      string            // instant.dev resource token (for env var injection)
 	TeamID     string            // owning team UUID — used to scope the NetworkPolicy DB-port egress rule to the team's own customer-resource namespaces (pentest fix 2026-05-16)
-	Tarball    []byte            // gzipped tar archive of the source directory (must contain Dockerfile)
+	Tarball    []byte            // gzipped tar archive of the source directory (must contain Dockerfile). Empty when Source=="image".
 	EnvVars    map[string]string // merged: infra resource URLs + user-defined vars
 	Port       int               // port the app listens on (default 8080)
 	Tier       string            // hobby|pro|team → resource requests/limits
 	Private    bool              // true → Ingress carries whitelist-source-range annotation
 	AllowedIPs []string          // CIDRs / IPs allowed when Private=true; ignored otherwise
+
+	// Source selects how the app image is obtained: "tarball" (default — build
+	// the uploaded Tarball with Kaniko) or "image" (BYO — deploy ImageRef
+	// directly, no build pod). Empty is treated as "tarball" for back-compat.
+	Source string
+	// ImageRef is the fully-qualified prebuilt image (host/path[:tag][@digest])
+	// deployed directly when Source=="image". Ignored otherwise.
+	ImageRef string
+	// RegistryAuth is an optional docker config JSON for pulling a private
+	// ImageRef. Empty → the namespace's default ghcr-pull secret is used.
+	RegistryAuth string
 }
 
 // AppDeployment represents the live state of a deployed app.

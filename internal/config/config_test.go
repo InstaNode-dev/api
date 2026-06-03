@@ -62,6 +62,7 @@ func allKeys() []string {
 		"DEPLOY_DOMAIN", "COMPUTE_PROVIDER", "KUBE_NAMESPACE_APPS",
 		"METRICS_TOKEN", "DASHBOARD_BASE_URL", "API_PUBLIC_URL",
 		"DELETION_CONFIRMATION_TTL_MINUTES", "FAMILY_BINDINGS_ENABLED",
+		"DEPLOY_SOURCE_IMAGE_ENABLED",
 		"BREVO_WEBHOOK_SECRET", "SES_SNS_SUBSCRIPTION_ARN",
 		"SENDGRID_WEBHOOK_PUBLIC_KEY",
 		"WORKER_INTERNAL_JWT_SECRET", "ADMIN_PATH_PREFIX",
@@ -241,6 +242,9 @@ func TestLoad_HappyPath_AppliesDefaults(t *testing.T) {
 	if !cfg.FamilyBindingsEnabled {
 		t.Error("FamilyBindingsEnabled default must be true")
 	}
+	if cfg.DeploySourceImageEnabled {
+		t.Error("DeploySourceImageEnabled default must be false (off until operator canary)")
+	}
 	// Object store mode resolution: with everything empty → "admin" / "minio-admin"
 	if cfg.ObjectStoreMode != "admin" || cfg.ObjectStoreBackend != "minio-admin" {
 		t.Errorf("ObjectStoreMode/Backend defaults: %q/%q", cfg.ObjectStoreMode, cfg.ObjectStoreBackend)
@@ -327,6 +331,22 @@ func TestLoad_FamilyBindingsDisabled(t *testing.T) {
 	applyBaselineEnv(t, map[string]string{"FAMILY_BINDINGS_ENABLED": "yes"})
 	if !Load().FamilyBindingsEnabled {
 		t.Error(`FAMILY_BINDINGS_ENABLED="yes" must default to true`)
+	}
+}
+
+func TestLoad_DeploySourceImageEnabled(t *testing.T) {
+	for _, val := range []string{"true", "1", "yes", "TRUE", "  Yes  "} {
+		applyBaselineEnv(t, map[string]string{"DEPLOY_SOURCE_IMAGE_ENABLED": val})
+		if !Load().DeploySourceImageEnabled {
+			t.Errorf("DEPLOY_SOURCE_IMAGE_ENABLED=%q should enable", val)
+		}
+	}
+	// Unrecognized / off values → stays disabled.
+	for _, val := range []string{"false", "0", "no", "maybe", ""} {
+		applyBaselineEnv(t, map[string]string{"DEPLOY_SOURCE_IMAGE_ENABLED": val})
+		if Load().DeploySourceImageEnabled {
+			t.Errorf("DEPLOY_SOURCE_IMAGE_ENABLED=%q should stay disabled", val)
+		}
 	}
 }
 

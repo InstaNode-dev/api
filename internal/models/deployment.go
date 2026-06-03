@@ -46,6 +46,10 @@ type Deployment struct {
 	NotifyState         string   // 'unset' | 'pending' | 'sent' | 'failed'
 	NotifyAttempts      int      // dispatch retry counter (worker bumps on 5xx/network)
 	ErrorMessage        string
+	// Multi-source deploys (migration 064).
+	Source           string // 'tarball' (default) | 'image' | 'git'
+	ImageRef         string // prebuilt image ref when Source=='image'; '' otherwise
+	RegistryCredsEnc string // AES-256-GCM ciphertext of pull creds; '' when public / platform secret
 	// TTL fields (Wave FIX-J — migration 045).
 	//
 	// ExpiresAt: when the deploy auto-expires. Zero (sql NULL) means
@@ -94,6 +98,10 @@ type CreateDeploymentParams struct {
 	AllowedIPs          []string // each entry must already be a valid IP or CIDR
 	NotifyWebhook       string   // empty = no webhook; non-empty = validated https URL
 	NotifyWebhookSecret string   // empty = no HMAC; non-empty = AES ciphertext
+	// Multi-source deploys (migration 064). Source empty → 'tarball'.
+	Source           string // 'tarball' | 'image' | 'git'
+	ImageRef         string // prebuilt image ref when Source=='image'
+	RegistryCredsEnc string // AES-256-GCM ciphertext of pull creds; '' when public
 	// TTLPolicy chooses the lifecycle for this deploy. Valid values are
 	// "auto_24h" (default — expires_at set to now()+24h), "permanent"
 	// (expires_at = NULL, never auto-expires), or "custom" (caller sets
@@ -135,7 +143,8 @@ func (e *ErrDeploymentNotFound) Error() string {
 const deploymentColumns = `id, team_id, resource_id, app_id, provider_id, status, app_url,
        env_vars, port, tier, env, private, allowed_ips, error_message, created_at, updated_at,
        notify_webhook, notify_webhook_secret, notify_state, notify_attempts,
-       expires_at, ttl_policy, reminders_sent, last_reminder_at`
+       expires_at, ttl_policy, reminders_sent, last_reminder_at,
+       source, image_ref, registry_creds_enc`
 
 // scanDeployment reads a single deployments row into a Deployment struct.
 // env_vars is stored as JSONB; error_message, provider_id, and app_url are nullable.
@@ -165,6 +174,9 @@ func scanDeployment(row interface {
 		// NOT NULL ttl_policy + reminders_sent. Order MUST match the trailing
 		// 4 columns appended in deploymentColumns above.
 		&d.ExpiresAt, &d.TTLPolicy, &d.RemindersSent, &d.LastReminderAt,
+		// migration 064: multi-source deploys. NOT NULL DEFAULT '' / 'tarball'
+		// so plain string scan targets are safe (no NullString needed).
+		&d.Source, &d.ImageRef, &d.RegistryCredsEnc,
 	); err != nil {
 		return nil, err
 	}
@@ -290,17 +302,25 @@ func CreateDeployment(ctx context.Context, db dbExecutor, p CreateDeploymentPara
 		expiresAt = time.Now().UTC().Add(24 * time.Hour)
 	}
 
+	// migration 064: default empty source to 'tarball' for back-compat.
+	source := p.Source
+	if source == "" {
+		source = "tarball"
+	}
+
 	row := db.QueryRowContext(ctx, `
 		INSERT INTO deployments
 			(team_id, resource_id, app_id, port, tier, env, env_vars, private, allowed_ips,
 			 notify_webhook, notify_webhook_secret, notify_state,
-			 expires_at, ttl_policy)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			 expires_at, ttl_policy,
+			 source, image_ref, registry_creds_enc)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		RETURNING `+deploymentColumns,
 		p.TeamID, resourceID, p.AppID, port, p.Tier, env, envVarsJSON,
 		p.Private, allowedIPs,
 		notifyWebhook, notifyWebhookSecret, notifyState,
-		expiresAt, ttlPolicy)
+		expiresAt, ttlPolicy,
+		source, p.ImageRef, p.RegistryCredsEnc)
 
 	d, err := scanDeployment(row)
 	if err != nil {

@@ -1047,19 +1047,36 @@ func (p *K8sProvider) Deploy(ctx context.Context, opts compute.DeployOptions) (*
 		opts.Port = 8080
 	}
 
-	imageTag := imageName(opts.AppID)
 	ns := deployNamespace(opts.AppID)
+	var imageTag string
 
-	// Step 1: Build the Docker image from the tarball.
-	if err := p.buildImage(ctx, deployNamespace(opts.AppID), opts.AppID, imageTag, opts.Tarball); err != nil {
-		return nil, fmt.Errorf("k8s.Deploy: build image: %w", err)
-	}
-
-	// Step 2: Create per-deployment namespace with all security primitives.
-	// opts.TeamID scopes the NetworkPolicy DB-egress rule to this team's
-	// customer-resource namespaces — preventing cross-tenant DB access.
-	if err := p.setupTenantNamespace(ctx, ns, opts.AppID, opts.TeamID, opts.Tier); err != nil {
-		return nil, fmt.Errorf("k8s.Deploy: setup namespace: %w", err)
+	if opts.Source == "image" {
+		// BYO prebuilt image — skip Kaniko entirely. No build Job, no MinIO
+		// upload, no build NetworkPolicy. We deploy opts.ImageRef directly.
+		imageTag = opts.ImageRef
+		// setupTenantNamespace creates the per-deployment namespace (buildImage
+		// normally does this on the tarball path) + the security primitives.
+		if err := p.setupTenantNamespace(ctx, ns, opts.AppID, opts.TeamID, opts.Tier); err != nil {
+			return nil, fmt.Errorf("k8s.Deploy(image): setup namespace: %w", err)
+		}
+		// Ensure a "ghcr-pull" imagePullSecret exists in the namespace
+		// (applyDeploymentInNS references it). With BYO RegistryAuth we write
+		// the caller's pull creds; otherwise we copy the platform secret.
+		if err := p.ensureImagePullSecret(ctx, ns, opts.RegistryAuth); err != nil {
+			return nil, fmt.Errorf("k8s.Deploy(image): pull secret: %w", err)
+		}
+	} else {
+		imageTag = imageName(opts.AppID)
+		// Step 1: Build the Docker image from the tarball.
+		if err := p.buildImage(ctx, ns, opts.AppID, imageTag, opts.Tarball); err != nil {
+			return nil, fmt.Errorf("k8s.Deploy: build image: %w", err)
+		}
+		// Step 2: Create per-deployment namespace with all security primitives.
+		// opts.TeamID scopes the NetworkPolicy DB-egress rule to this team's
+		// customer-resource namespaces — preventing cross-tenant DB access.
+		if err := p.setupTenantNamespace(ctx, ns, opts.AppID, opts.TeamID, opts.Tier); err != nil {
+			return nil, fmt.Errorf("k8s.Deploy: setup namespace: %w", err)
+		}
 	}
 
 	deployName := deploymentName(opts.AppID)
@@ -1585,6 +1602,30 @@ func (p *K8sProvider) ensureRegistryAuthInNS(ctx context.Context, ns, name strin
 		return err
 	}
 	return nil
+}
+
+// ensureImagePullSecret makes the "ghcr-pull" imagePullSecret available in a
+// source=image deploy namespace (applyDeploymentInNS always references that
+// name). With a non-empty registryAuth (a complete docker config JSON for a
+// PRIVATE registry) it writes those BYO pull creds into the secret; otherwise
+// it copies the platform's shared ghcr-pull secret (covers public images +
+// GHCR-under-platform-token). The namespace is per-deployment and torn down
+// with the deploy, so writing BYO creds into the canonical name is safe — it
+// cannot leak across tenants.
+func (p *K8sProvider) ensureImagePullSecret(ctx context.Context, ns, registryAuth string) error {
+	if registryAuth == "" {
+		return p.ensureRegistryAuthInNS(ctx, ns, "ghcr-pull")
+	}
+	sec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ghcr-pull"},
+		Type:       corev1.SecretTypeDockerConfigJson,
+		Data:       map[string][]byte{corev1.DockerConfigJsonKey: []byte(registryAuth)},
+	}
+	_, err := p.clientset.CoreV1().Secrets(ns).Create(ctx, sec, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		_, err = p.clientset.CoreV1().Secrets(ns).Update(ctx, sec, metav1.UpdateOptions{})
+	}
+	return err
 }
 
 // createKanikoJob spawns a one-shot Job that builds and pushes the image.

@@ -17,6 +17,7 @@ func deploymentMockCols() []string {
 		"env_vars", "port", "tier", "env", "private", "allowed_ips", "error_message", "created_at", "updated_at",
 		"notify_webhook", "notify_webhook_secret", "notify_state", "notify_attempts",
 		"expires_at", "ttl_policy", "reminders_sent", "last_reminder_at",
+		"source", "image_ref", "registry_creds_enc",
 	}
 }
 
@@ -26,6 +27,7 @@ func deploymentMockRow() *sqlmock.Rows {
 		[]byte(`{}`), 8080, "hobby", "production", false, "", nil, time.Now(), time.Now(),
 		nil, nil, "unset", 0,
 		nil, "auto_24h", 0, nil,
+		"tarball", "", "", // source, image_ref, registry_creds_enc (mig 064)
 	)
 }
 

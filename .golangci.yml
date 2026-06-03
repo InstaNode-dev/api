@@ -31,6 +31,16 @@ linters:
         linters:
           - errcheck
           - gocyclo
+      # SA5011 (possible nil pointer dereference) fires in test files on the
+      # idiomatic `got := f(); if got == nil { t.Fatalf/Errorf(...) }; got.X`
+      # pattern — a nil deref in a test panics and fails the test loudly, so
+      # this is benign test noise, not a production-safety signal. Suppressed
+      # by-check (SA5011) in tests only; production SA5011 still fails the build.
+      # Scoped here rather than disabling staticcheck for tests wholesale.
+      - path: _test\.go
+        linters:
+          - staticcheck
+        text: "SA5011"
       # SA1019 (deprecated madmin.New / SetPolicy) in the MinIO provider. MinIO is a
       # local-dev-only object-store backend; the suggested replacements
       # (NewWithOptions / AttachPolicy) have different call shapes and semantics, so a
