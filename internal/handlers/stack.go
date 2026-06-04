@@ -1187,13 +1187,10 @@ func (h *StackHandler) UpdateEnv(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusNotFound, "not_found", "Stack not found")
 	}
 
-	// A stack mid-teardown cannot accept an env change — the teardown
-	// worker will delete the row. 409 so the caller knows the request was
-	// valid but lost the race, not malformed.
-	if stack.Status == stackStatusDeleting {
-		return respondError(c, fiber.StatusConflict, "stack_deleting",
-			"This stack is being deleted and can no longer be modified.")
-	}
+	// Note: the "stack is mid-teardown" guard is NOT a pre-read here — it lives
+	// inside MergeStackEnvVars under the FOR UPDATE lock (returns ErrStackDeleting,
+	// mapped to 409 below). A pre-read would be a TOCTOU: the teardown worker can
+	// flip status between this handler's GetStackBySlug and the merge.
 
 	var body updateStackEnvBody
 	if err := c.BodyParser(&body); err != nil {
@@ -1228,6 +1225,12 @@ func (h *StackHandler) UpdateEnv(c *fiber.Ctx) error {
 			return respondError(c, fiber.StatusRequestEntityTooLarge, "env_too_large",
 				"Total env_vars payload exceeds 64KiB. Trim values or split across services.")
 		}
+		if errors.Is(err, models.ErrStackDeleting) {
+			// Authoritative teardown check (under the FOR UPDATE lock): the stack
+			// is being deleted and can no longer be modified.
+			return respondError(c, fiber.StatusConflict, "stack_deleting",
+				"This stack is being deleted and can no longer be modified.")
+		}
 		var notFound *models.ErrStackNotFound
 		if errors.As(err, &notFound) {
 			// Row vanished between GetStackBySlug and the merge tx. Treat as 404.
@@ -1239,9 +1242,20 @@ func (h *StackHandler) UpdateEnv(c *fiber.Ctx) error {
 			"Failed to persist env vars")
 	}
 
+	// keys_set counts only actual upserts (non-empty values). The old
+	// `len(body.Env) - deletes` over-counted when a PATCH sent an empty value
+	// for a key that wasn't present (a no-op delete: not counted in `deletes`,
+	// yet not a "set" either) — making the rule-12 audit surface lie.
+	keysSet := 0
+	for _, v := range body.Env {
+		if v != "" {
+			keysSet++
+		}
+	}
+
 	// Best-effort audit emit — never block the response on this.
 	auditMeta, _ := json.Marshal(map[string]any{
-		"keys_set":     len(body.Env) - deletes,
+		"keys_set":     keysSet,
 		"keys_deleted": deletes,
 		"total_after":  len(merged),
 	})
@@ -1267,7 +1281,7 @@ func (h *StackHandler) UpdateEnv(c *fiber.Ctx) error {
 
 	slog.Info("stack.env.updated",
 		"slug", slug, "team_id", team.ID, "stack_id", stack.ID,
-		"keys_set", len(body.Env)-deletes, "keys_deleted", deletes, "total_after", len(merged))
+		"keys_set", keysSet, "keys_deleted", deletes, "total_after", len(merged))
 
 	return c.JSON(fiber.Map{
 		"ok": true,
