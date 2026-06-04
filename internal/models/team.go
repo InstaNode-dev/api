@@ -43,15 +43,7 @@ type Team struct {
 	// Per-request ttl_policy in the deploy body always overrides this.
 	// Only owner/admin can mutate via PATCH /api/v1/team/settings.
 	DefaultDeploymentTTLPolicy string
-	// IsTestCohort marks a team as part of the synthetic-monitoring test
-	// cohort (migration 067, W0 / PR-1). Inert by default (every real team is
-	// false). Seeder-set true on the durable per-tier test teams so that
-	// charge-initiation / conversion-funnel / background-email paths can no-op
-	// or exclude them — keeping synthetic traffic out of the real
-	// funnel/billing/email surfaces. See
-	// docs/sessions/2026-06-04/TEST-ACCOUNTS-AND-NR-SYNTHETICS-PLAN.md §1.6.
-	IsTestCohort bool
-	CreatedAt    time.Time
+	CreatedAt                  time.Time
 }
 
 // User represents an authenticated user belonging to a team.
@@ -103,10 +95,10 @@ func CreateTeam(ctx context.Context, db *sql.DB, name string) (*Team, error) {
 	err := db.QueryRowContext(ctx, `
 		INSERT INTO teams (name, plan_tier) VALUES ($1, 'free')
 		RETURNING id, name, plan_tier, stripe_customer_id, created_at,
-		          COALESCE(default_deployment_ttl_policy, 'auto_24h'), is_test_cohort
+		          COALESCE(default_deployment_ttl_policy, 'auto_24h')
 	`, name).Scan(
 		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.CreatedAt,
-		&t.DefaultDeploymentTTLPolicy, &t.IsTestCohort,
+		&t.DefaultDeploymentTTLPolicy,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("models.CreateTeam: %w", err)
@@ -119,11 +111,11 @@ func GetTeamByID(ctx context.Context, db *sql.DB, id uuid.UUID) (*Team, error) {
 	t := &Team{}
 	err := db.QueryRowContext(ctx, `
 		SELECT id, name, plan_tier, stripe_customer_id, created_at,
-		       COALESCE(default_deployment_ttl_policy, 'auto_24h'), is_test_cohort
+		       COALESCE(default_deployment_ttl_policy, 'auto_24h')
 		FROM teams WHERE id = $1
 	`, id).Scan(
 		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.CreatedAt,
-		&t.DefaultDeploymentTTLPolicy, &t.IsTestCohort,
+		&t.DefaultDeploymentTTLPolicy,
 	)
 	if err == sql.ErrNoRows {
 		return nil, &ErrTeamNotFound{ID: id}
@@ -537,11 +529,11 @@ func GetTeamByRazorpaySubscriptionID(ctx context.Context, db *sql.DB, subscripti
 	t := &Team{}
 	err := db.QueryRowContext(ctx, `
 		SELECT id, name, plan_tier, stripe_customer_id, created_at,
-		       COALESCE(default_deployment_ttl_policy, 'auto_24h'), is_test_cohort
+		       COALESCE(default_deployment_ttl_policy, 'auto_24h')
 		FROM teams WHERE stripe_customer_id = $1
 	`, subscriptionID).Scan(
 		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.CreatedAt,
-		&t.DefaultDeploymentTTLPolicy, &t.IsTestCohort,
+		&t.DefaultDeploymentTTLPolicy,
 	)
 	if err == sql.ErrNoRows {
 		return nil, &ErrTeamNotFound{}

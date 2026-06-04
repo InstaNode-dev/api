@@ -27,27 +27,25 @@ func TestIsTestCohort_MigrationSmokeAndRoundTrip(t *testing.T) {
 	defer clean()
 
 	// A freshly-created team defaults to is_test_cohort = false (inert by
-	// default — behaviour unchanged for every real team).
+	// default — behaviour unchanged for every real team). The dedicated
+	// IsTestCohort lookup is the single read path: the column is intentionally
+	// NOT scanned into the main Team struct, to keep the cohort flag off the
+	// widely-mocked GetTeamByID/CreateTeam/GetTeamByRazorpaySubscriptionID
+	// SELECTs (which would otherwise force a 16-file sqlmock resync).
 	team, err := models.CreateTeam(ctx, db, "cohort-smoke")
 	require.NoError(t, err)
-	require.False(t, team.IsTestCohort, "new team must default to is_test_cohort=false")
 
-	// IsTestCohort helper agrees on the default.
+	// IsTestCohort helper reports the default.
 	isTest, err := models.IsTestCohort(ctx, db, team.ID)
 	require.NoError(t, err)
 	require.False(t, isTest)
 
-	// Flip it via the seeder setter and confirm both the helper and the
-	// GetTeamByID scan path observe the new value.
+	// Flip it via the seeder setter and confirm the helper observes the new value.
 	require.NoError(t, models.SetTestCohort(ctx, db, team.ID, true))
 
 	isTest, err = models.IsTestCohort(ctx, db, team.ID)
 	require.NoError(t, err)
 	require.True(t, isTest)
-
-	reread, err := models.GetTeamByID(ctx, db, team.ID)
-	require.NoError(t, err)
-	require.True(t, reread.IsTestCohort, "GetTeamByID must scan is_test_cohort")
 
 	// SetTestCohort on a non-existent team returns ErrTeamNotFound.
 	err = models.SetTestCohort(ctx, db, uuid.New(), true)
