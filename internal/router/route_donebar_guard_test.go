@@ -248,6 +248,17 @@ var routeTestMap = map[string]string{
 	"POST /api/v1/team/invitations/:id/accept":              "TestTeamBlock_AcceptInvitationByID",
 	"DELETE /api/v1/teams/:team_id/invitations/:id":         "TestTeamBlock_TeamsAliasRevokeInvitation",
 
+	// ── deploy-approval email link (W4) — DB-backed handler-integration suite
+	// (internal/handlers/approve_block_routes_test.go). The public GET
+	// /approve/:token landing (token IS the credential — no auth) is driven
+	// through the production route wiring (approveBlockApp mirrors
+	// router.go's app.Get("/approve/:token", NewPromoteApprovalHandler(db,
+	// rdb).Approve)) against a real Postgres: happy path (302 → dashboard +
+	// row persisted 'approved'), single-use (second click → 410), expired
+	// (410 + row flipped 'expired'), invalid token (404), and the per-IP
+	// rate limit (429). Moved here from routeCoverageExemptions.
+	"GET /approve/:token": "TestApproveBlock_ValidPendingToken",
+
 	// ── vault: per-team encrypted secret store (W3) — DB-backed handler-
 	// integration suite (internal/handlers/vault_block_routes_test.go). Each
 	// row points at the TestVaultBlock_* test that drives the route through the
@@ -299,8 +310,9 @@ var routeCoverageExemptions = map[string]string{
 	"GET /.well-known/security.txt": "static RFC-9116 security.txt. TODO: matrix W7 content-surface smoke.",
 	"GET /api/v1/incidents":         "status-page incidents feed (read-only). TODO: matrix W7 status-surface smoke.",
 
-	// ── approve link (deploy/quota approval) — no e2e yet.
-	"GET /approve/:token": "approval-link landing — no integration test yet. TODO: matrix W4 deploy-approval flow.",
+	// ── approve link (deploy/quota approval) — MOVED to routeTestMap. Now
+	// covered by the W4 deploy-approval handler-integration suite
+	// (internal/handlers/approve_block_routes_test.go, TestApproveBlock_*).
 
 	// ── auth: account-deletion confirm link — no e2e yet.
 	"GET /auth/email/confirm-deletion": "magic-link account/team deletion confirm — no e2e yet. TODO: matrix W1 deletion-confirm flow.",
