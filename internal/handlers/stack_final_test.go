@@ -136,8 +136,17 @@ func TestStackFinal_ConsumeApproved_LookupError_503(t *testing.T) {
 }
 
 // TestStackFinal_ConsumeApproved_ExecuteError_503 — MarkPromoteApprovalExecuted
-// errors after a fully-valid approved row (stack.go:2425). team(1) + stack(2) +
-// approval-read(3) succeed; the UPDATE(4) errors. failAfter=3.
+// errors on the deferred 'executed' flip, after a fully-valid approved row AND
+// after the entire promote preflight succeeds (markApprovedPromoteExecuted,
+// stack.go ~2520).
+//
+// #11 (sweep 2026-06-04): the flip moved from BEFORE preflight to AFTER it, so
+// the fault must now land on a LATER DB call. The fresh-target preflight runs
+// ~10 reads/writes (source services, family lookup, CreateStackWithCap, vault
+// copy, source+target env_vars, vault resolve) between the approval read and
+// the MarkPromoteApprovalExecuted UPDATE — failAfter=13 lands the injected
+// failure on that UPDATE (verified: 12 → env_load_failed, 13 → execute_failed,
+// 14 → success/202).
 func TestStackFinal_ConsumeApproved_ExecuteError_503(t *testing.T) {
 	seedDB, clean := testhelpers.SetupTestDB(t)
 	defer clean()
@@ -148,7 +157,7 @@ func TestStackFinal_ConsumeApproved_ExecuteError_503(t *testing.T) {
 	slug, _ := seedPromoteSourceStack(t, seedDB, teamIDStr, "staging", "stkfinal-exec")
 	id := mustSeedApprovedPromote(t, seedDB, teamID, "staging", "production")
 
-	faultDB := openFaultDB(t, 3)
+	faultDB := openFaultDB(t, 13)
 	app := stackFaultPromoteApp(t, faultDB)
 	resp := postPromote(t, app, jwt, slug, map[string]any{
 		"from": "staging", "to": "production", "approval_id": id,
