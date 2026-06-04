@@ -143,12 +143,18 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		UpgradeURL:  "https://instanode.dev/claim",
 	},
 	// "tier_unavailable" was removed 2026-05-29 along with the Team-tier
-	// checkout/change-plan guards (CEO BIZ-1). The only emitters of this
-	// code lived in those two billing branches; with both gone, the
-	// codeToAgentAction entry was orphan-flagged by
-	// TestCodeToAgentAction_NoOrphans. If a future feature reintroduces
-	// a "tier is genuinely unavailable" surface, re-add the entry here
-	// and emit it from the new site in the same PR.
+	// checkout/change-plan guards (CEO BIZ-1). It was superseded by
+	// "tier_not_yet_available" below on 2026-06-04 when Team was RE-GATED
+	// out of self-serve checkout + change-plan (CEO directive: Team is not
+	// rolled out until its unlimited-resource delivery is proven built).
+	// Emitted from billing.go CreateCheckoutAPI + ChangePlanAPI. A DISTINCT
+	// code from the generic invalid_plan so the dashboard/agents render the
+	// right "not yet available / contact sales" message. Refs: memory
+	// `project_team_plan_not_rolled_out_no_payment`.
+	"tier_not_yet_available": {
+		AgentAction: "Tell the user the Team plan is not yet available for self-serve purchase. They should contact support@instanode.dev — see https://instanode.dev/pricing.",
+		UpgradeURL:  "https://instanode.dev/pricing",
+	},
 	"events_query_failed": {
 		AgentAction: "Tell the user the deployment-events read is temporarily unavailable. Retry in 30 seconds; the deploy itself isn't affected. Status: https://instanode.dev/status",
 		UpgradeURL:  "",

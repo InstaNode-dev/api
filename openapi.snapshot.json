@@ -3040,24 +3040,24 @@
     },
     "/api/v1/billing/change-plan": {
       "post": {
-        "description": "Hobby ↔ Hobby Plus ↔ Pro ↔ Team on the same Razorpay subscription. Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. Team-tier ChangePlan was enabled 2026-05-29 (CEO BIZ-1) alongside Team checkout.",
+        "description": "Hobby ↔ Hobby Plus ↔ Pro on the same Razorpay subscription (upgrades only — downgrades are support-assisted). Proration is handled by Razorpay; the new plan takes effect at the end of the current billing period. The Team plan is NOT yet available for self-serve plan changes — target_plan=team returns 400 tier_not_yet_available (contact sales: support@instanode.dev).",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
                 "properties": {
-                  "plan": {
+                  "target_plan": {
+                    "description": "Target tier. The Team plan is not yet self-serve purchasable (contact sales) — target_plan=team returns 400 tier_not_yet_available.",
                     "enum": [
                       "hobby",
                       "hobby_plus",
-                      "pro",
-                      "team"
+                      "pro"
                     ],
                     "type": "string"
                   }
                 },
                 "required": [
-                  "plan"
+                  "target_plan"
                 ],
                 "type": "object"
               }
@@ -3070,7 +3070,7 @@
             "description": "Plan change accepted by Razorpay"
           },
           "400": {
-            "description": "Invalid plan"
+            "description": "Invalid plan, downgrade_not_self_serve, or tier_not_yet_available (target_plan=team — the Team plan is not yet self-serve purchasable; contact sales)"
           },
           "401": {
             "description": "Missing or invalid session token"
@@ -3092,18 +3092,18 @@
     },
     "/api/v1/billing/checkout": {
       "post": {
-        "description": "Mints a Razorpay subscription for the requested plan (hobby, hobby_plus, pro, or team) tied to the authenticated team. The dashboard redirects the user to the returned short_url to complete payment; on success Razorpay fires subscription.activated AND subscription.charged to /razorpay/webhook — both trigger the same idempotent tier-elevation path so the team is upgraded as soon as the mandate is authorised, even before the first invoice is collected. Team-tier checkout was enabled 2026-05-29 (CEO BIZ-1) — if RAZORPAY_PLAN_ID_TEAM / _TEAM_ANNUAL is unset on the environment the request returns 503 billing_not_configured (operator signal), not 400 tier_unavailable. plan_frequency selects monthly (default) vs yearly billing — yearly returns 503 billing_not_configured until the operator creates the yearly Razorpay plan and sets RAZORPAY_PLAN_ID_*_YEARLY. promotion_code: admin-issued codes are bookmarked in the subscription notes for future discount wiring (no Razorpay Offer is applied yet — codes are not consumed until a real discount is confirmed). IDEMPOTENT: the endpoint never mints a second subscription for a team that already has a live one — if the team already holds the requested tier (or higher) it returns 400 already_on_plan, and if a prior checkout's subscription is still payable at Razorpay (status created/authenticated/pending) it returns that subscription's short_url with reused:true instead of creating a new one. This prevents a confused re-click from producing two parallel subscriptions that both charge the card.",
+        "description": "Mints a Razorpay subscription for the requested plan (hobby, hobby_plus, or pro) tied to the authenticated team. The dashboard redirects the user to the returned short_url to complete payment; on success Razorpay fires subscription.activated AND subscription.charged to /razorpay/webhook — both trigger the same idempotent tier-elevation path so the team is upgraded as soon as the mandate is authorised, even before the first invoice is collected. The Team plan ($199 unlimited) is NOT yet available for self-serve checkout — requesting plan=team returns 400 tier_not_yet_available (contact sales: support@instanode.dev). plan_frequency selects monthly (default) vs yearly billing — yearly returns 503 billing_not_configured until the operator creates the yearly Razorpay plan and sets RAZORPAY_PLAN_ID_*_YEARLY. promotion_code: admin-issued codes are bookmarked in the subscription notes for future discount wiring (no Razorpay Offer is applied yet — codes are not consumed until a real discount is confirmed). IDEMPOTENT: the endpoint never mints a second subscription for a team that already has a live one — if the team already holds the requested tier (or higher) it returns 400 already_on_plan, and if a prior checkout's subscription is still payable at Razorpay (status created/authenticated/pending) it returns that subscription's short_url with reused:true instead of creating a new one. This prevents a confused re-click from producing two parallel subscriptions that both charge the card.",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
                 "properties": {
                   "plan": {
+                    "description": "Self-serve purchasable plans. The Team plan is NOT yet available for self-serve checkout (contact sales: support@instanode.dev) — plan=team returns 400 tier_not_yet_available.",
                     "enum": [
                       "hobby",
                       "hobby_plus",
-                      "pro",
-                      "team"
+                      "pro"
                     ],
                     "type": "string"
                   },
@@ -3162,7 +3162,7 @@
             "description": "Subscription created (or an existing live one reused) — redirect user to short_url. reused:true means the short_url belongs to a checkout the team started earlier and no new subscription was minted. traffic_env reports whether this deployment talks to the LIVE or TEST Razorpay environment (derived from the RAZORPAY_KEY_ID prefix) — agents and the SPA branch on it without ever seeing the raw key."
           },
           "400": {
-            "description": "Invalid plan, invalid plan_frequency, or already_on_plan (the team already holds the requested tier or higher)"
+            "description": "Invalid plan, invalid plan_frequency, already_on_plan (the team already holds the requested tier or higher), or tier_not_yet_available (plan=team — the Team plan is not yet self-serve purchasable; contact sales)"
           },
           "401": {
             "description": "Missing or invalid session token"

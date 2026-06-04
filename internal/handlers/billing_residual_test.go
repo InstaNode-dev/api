@@ -102,13 +102,13 @@ func TestResidualChangePlan_Downgrade_400(t *testing.T) {
 	assert.Equal(t, "downgrade_not_self_serve", body["error"])
 }
 
-// TestResidualChangePlan_TeamTier_Accepted locks the 2026-05-29 BIZ-1
-// fix at the change-plan surface: a Pro team requesting target_plan=team
-// no longer 400s with tier_unavailable. The dev-lock branch was removed
-// alongside the matching checkout branch, so the request flows to the
-// downstream no_subscription guard (this team has no Razorpay
-// subscription_id on file).
-func TestResidualChangePlan_TeamTier_Accepted(t *testing.T) {
+// TestResidualChangePlan_TeamTier_Rejected locks the 2026-06-04 CEO re-gate
+// at the change-plan surface: a Pro team requesting target_plan=team is
+// rejected with 400 tier_not_yet_available — the Team plan is gated out of
+// self-serve until its unlimited-resource delivery is proven built. This
+// REVERSES the 2026-05-29 (BIZ-1) enablement; the rejection fires before the
+// downstream no_subscription guard and regardless of RAZORPAY_PLAN_ID_TEAM.
+func TestResidualChangePlan_TeamTier_Rejected(t *testing.T) {
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
 	teamID := mkVerifiedTeam(t, db, "pro")
@@ -117,10 +117,8 @@ func TestResidualChangePlan_TeamTier_Accepted(t *testing.T) {
 	app := billingAppNoAuth(t, db, cfg, teamID)
 	status, body := changePlanPost(t, app, `{"target_plan":"team"}`)
 	assert.Equal(t, http.StatusBadRequest, status)
-	assert.NotEqual(t, "tier_unavailable", body["error"],
-		"target_plan=team must no longer return tier_unavailable")
-	assert.Equal(t, "no_subscription", body["error"],
-		"pro team with no Razorpay sub id → expect the downstream no_subscription guard")
+	assert.Equal(t, "tier_not_yet_available", body["error"],
+		"target_plan=team must return tier_not_yet_available — Team is gated out of self-serve (2026-06-04 CEO directive)")
 }
 
 // TestResidualChangePlan_NoSubscription_400 hits no_subscription: a valid

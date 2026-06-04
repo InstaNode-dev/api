@@ -789,19 +789,27 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	}
 
 	switch plan {
-	case "hobby", "hobby_plus", "pro", "team":
+	case "hobby", "hobby_plus", "pro":
 		// fall through — plan_id is resolved by razorpayPlanIDFor below.
-		// Team enabled 2026-05-29 (CEO BIZ-1 ship call): marketing,
-		// dashboard PricingGrid, and llms.txt all sell Team @ $199/mo,
-		// but this handler used to return 400 tier_unavailable on every
-		// team checkout — turning away the highest-AOV prospect mid-funnel.
-		// If RAZORPAY_PLAN_ID_TEAM (or RAZORPAY_PLAN_ID_TEAM_ANNUAL) is
-		// unset in this environment the request now falls through to the
-		// shared 503 billing_not_configured branch below (a clear
-		// operator signal), not 400 tier_unavailable (a customer signal
-		// that the tier itself doesn't exist).
+	case "team":
+		// Team is RE-GATED out of self-serve checkout per the 2026-06-04
+		// CEO directive: the Team plan ($199 "unlimited") is NOT rolled
+		// out and must not be marketable / claimable / chargeable until
+		// its unlimited-resource delivery is PROVEN built. This reverses
+		// the 2026-05-29 (BIZ-1) change that had enabled Team checkout —
+		// do NOT re-enable Team here without explicit, written CEO
+		// confirmation that unlimited-resource delivery is proven.
+		// Refs: memory `project_team_plan_not_rolled_out_no_payment` and
+		// docs/sessions/2026-06-04/TEAM-PLAN-GATE-AND-BUILD.md.
+		//
+		// A DISTINCT code (`tier_not_yet_available`, not the generic
+		// `invalid_plan`) so the dashboard/agents render the correct
+		// "contact sales / not yet available" message instead of telling
+		// the user they made a typo.
+		return respondError(c, fiber.StatusBadRequest, "tier_not_yet_available",
+			"The Team plan is not yet available for self-serve checkout — contact support@instanode.dev.")
 	default:
-		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "plan must be 'hobby', 'hobby_plus', 'pro', or 'team'")
+		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "plan must be 'hobby', 'hobby_plus', or 'pro'")
 	}
 	planID := h.razorpayPlanIDFor(plan, frequency)
 
@@ -3207,9 +3215,24 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 	if strings.EqualFold(strings.TrimSpace(planTier), target) {
 		return respondError(c, fiber.StatusBadRequest, "same_plan", "Already on requested plan")
 	}
+	// Team is RE-GATED out of self-serve plan changes per the 2026-06-04
+	// CEO directive (same gate as CreateCheckoutAPI): a hobby/pro team must
+	// not be able to self-upgrade to Team — that is another chargeable
+	// self-serve path for a tier that is NOT rolled out until its
+	// unlimited-resource delivery is proven built. Reverses the 2026-05-29
+	// (BIZ-1) enablement. Do NOT re-enable without explicit CEO sign-off.
+	// Refs: memory `project_team_plan_not_rolled_out_no_payment` and
+	// docs/sessions/2026-06-04/TEAM-PLAN-GATE-AND-BUILD.md. Checked BEFORE
+	// the razorpayPlanIDs membership test so the response is the distinct
+	// `tier_not_yet_available` regardless of whether RAZORPAY_PLAN_ID_TEAM
+	// happens to be set in this environment.
+	if target == "team" {
+		return respondError(c, fiber.StatusBadRequest, "tier_not_yet_available",
+			"The Team plan is not yet available for self-serve plan changes — contact support@instanode.dev.")
+	}
 	planIDs := h.razorpayPlanIDs()
 	if _, ok := planIDs[target]; !ok {
-		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "target_plan must be hobby, hobby_plus, pro, or team")
+		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "target_plan must be hobby, hobby_plus, or pro")
 	}
 	// No self-serve downgrade — see project memory
 	// project_no_self_serve_cancel_downgrade.md. A target whose plan rank is
@@ -3225,13 +3248,8 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 			"Tell the user that downgrading to a lower plan is support-assisted. Have them email support@instanode.dev with their team and the target plan.",
 			"mailto:support@instanode.dev")
 	}
-	// Team-tier ChangePlan is now allowed for the same reason Team
-	// checkout is: marketing + dashboard + llms.txt sell Team @ $199/mo
-	// as a self-serve upgrade path. If the operator hasn't created the
-	// Razorpay plan_id yet, razorpayPlanIDFor / portal.ChangePlan
-	// surfaces the configuration error downstream — never 400
-	// tier_unavailable from this layer. (Enabled 2026-05-29 alongside
-	// the checkout-creation team guard removal.)
+	// (Target=team is rejected above with tier_not_yet_available — the
+	// 2026-06-04 CEO re-gate. Only hobby/hobby_plus/pro upgrades reach here.)
 	portal := h.billingPortal()
 	if _, err := portal.SubscriptionID(c.Context(), teamID); err != nil {
 		return respondError(c, fiber.StatusBadRequest, "no_subscription", "no active subscription to change")

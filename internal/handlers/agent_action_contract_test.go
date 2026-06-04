@@ -27,33 +27,33 @@ import (
 func agentActionContractCases() map[string]string {
 	cases := map[string]string{
 		// Static constants.
-		"AgentActionMultiEnvUpgradeRequired":           AgentActionMultiEnvUpgradeRequired,
-		"AgentActionStackPromoteMissingImageRef":       AgentActionStackPromoteMissingImageRef,
-		"AgentActionBindingFamilyDisabled":             AgentActionBindingFamilyDisabled,
-		"AgentActionBindingLookupFailed":               AgentActionBindingLookupFailed,
-		"RecycleGateAgentAction":                       RecycleGateAgentAction,
-		"AgentActionPrivateDeployRequiresPro":          AgentActionPrivateDeployRequiresPro,
-		"AgentActionPrivateDeployRequiresAllowedIPs":   AgentActionPrivateDeployRequiresAllowedIPs,
-		"AgentActionAdminRequired":                     AgentActionAdminRequired,
-		"AgentActionPromotionInvalid":                  AgentActionPromotionInvalid,
-		"AgentActionPromotionAlreadyUsed":              AgentActionPromotionAlreadyUsed,
-		"AgentActionPromotionExpired":                  AgentActionPromotionExpired,
-		"AgentActionPromoteTokenExpired":               AgentActionPromoteTokenExpired,
-		"AgentActionReadOnlySession":                   AgentActionReadOnlySession,
-		"AgentActionNotifyWebhookInvalid":              AgentActionNotifyWebhookInvalid,
-		"AgentActionPauseRequiresPro":                  AgentActionPauseRequiresPro,
-		"AgentActionResourceAlreadyPaused":             AgentActionResourceAlreadyPaused,
-		"AgentActionResourceNotPaused":                 AgentActionResourceNotPaused,
-		"AgentActionBackupRequiresClaim":               AgentActionBackupRequiresClaim,
-		"AgentActionRestoreRequiresPro":                AgentActionRestoreRequiresPro,
-		"AgentActionRestoreRequiresHobbyPlus":          AgentActionRestoreRequiresHobbyPlus,
-		"AgentActionRestoreBackupNotReady":             AgentActionRestoreBackupNotReady,
-		"AgentActionRestoreInflight":                   AgentActionRestoreInflight,
-		"AgentActionRestoreDestructiveAckRequired":     AgentActionRestoreDestructiveAckRequired,
-		"AgentActionRestoreTargetCrossTeam":            AgentActionRestoreTargetCrossTeam,
-		"AgentActionBackupIntegrityFailed":             AgentActionBackupIntegrityFailed,
-		"AgentActionMetricsRequiresUpgrade":            AgentActionMetricsRequiresUpgrade,
-		"AgentActionEmailNotVerified":                  AgentActionEmailNotVerified,
+		"AgentActionMultiEnvUpgradeRequired":         AgentActionMultiEnvUpgradeRequired,
+		"AgentActionStackPromoteMissingImageRef":     AgentActionStackPromoteMissingImageRef,
+		"AgentActionBindingFamilyDisabled":           AgentActionBindingFamilyDisabled,
+		"AgentActionBindingLookupFailed":             AgentActionBindingLookupFailed,
+		"RecycleGateAgentAction":                     RecycleGateAgentAction,
+		"AgentActionPrivateDeployRequiresPro":        AgentActionPrivateDeployRequiresPro,
+		"AgentActionPrivateDeployRequiresAllowedIPs": AgentActionPrivateDeployRequiresAllowedIPs,
+		"AgentActionAdminRequired":                   AgentActionAdminRequired,
+		"AgentActionPromotionInvalid":                AgentActionPromotionInvalid,
+		"AgentActionPromotionAlreadyUsed":            AgentActionPromotionAlreadyUsed,
+		"AgentActionPromotionExpired":                AgentActionPromotionExpired,
+		"AgentActionPromoteTokenExpired":             AgentActionPromoteTokenExpired,
+		"AgentActionReadOnlySession":                 AgentActionReadOnlySession,
+		"AgentActionNotifyWebhookInvalid":            AgentActionNotifyWebhookInvalid,
+		"AgentActionPauseRequiresPro":                AgentActionPauseRequiresPro,
+		"AgentActionResourceAlreadyPaused":           AgentActionResourceAlreadyPaused,
+		"AgentActionResourceNotPaused":               AgentActionResourceNotPaused,
+		"AgentActionBackupRequiresClaim":             AgentActionBackupRequiresClaim,
+		"AgentActionRestoreRequiresPro":              AgentActionRestoreRequiresPro,
+		"AgentActionRestoreRequiresHobbyPlus":        AgentActionRestoreRequiresHobbyPlus,
+		"AgentActionRestoreBackupNotReady":           AgentActionRestoreBackupNotReady,
+		"AgentActionRestoreInflight":                 AgentActionRestoreInflight,
+		"AgentActionRestoreDestructiveAckRequired":   AgentActionRestoreDestructiveAckRequired,
+		"AgentActionRestoreTargetCrossTeam":          AgentActionRestoreTargetCrossTeam,
+		"AgentActionBackupIntegrityFailed":           AgentActionBackupIntegrityFailed,
+		"AgentActionMetricsRequiresUpgrade":          AgentActionMetricsRequiresUpgrade,
+		"AgentActionEmailNotVerified":                AgentActionEmailNotVerified,
 		// Wave FIX-J deploy TTL walls. The long-form success-path
 		// newAgentActionDeployAutoExpire24h is documented in
 		// agent_action.go as the canonical exception to the 280-char
@@ -61,26 +61,26 @@ func agentActionContractCases() map[string]string {
 		// is intentionally NOT exercised by this contract gate —
 		// covered instead by deploy_ttl_test.go which spot-checks the
 		// imperative opening + URL inclusion.
-		"AgentActionDeployMakePermanentAnonymous":     AgentActionDeployMakePermanentAnonymous,
-		"AgentActionDeployTTLHoursOutOfRange":         AgentActionDeployTTLHoursOutOfRange,
-		"AgentActionTeamSettingsInvalidTTLPolicy":     AgentActionTeamSettingsInvalidTTLPolicy,
+		"AgentActionDeployMakePermanentAnonymous": AgentActionDeployMakePermanentAnonymous,
+		"AgentActionDeployTTLHoursOutOfRange":     AgentActionDeployTTLHoursOutOfRange,
+		"AgentActionTeamSettingsInvalidTTLPolicy": AgentActionTeamSettingsInvalidTTLPolicy,
 
 		// Builders — representative inputs covering tier/env/role/limit
 		// interpolation.
-		"newAgentActionDeploymentLimitReached(hobby,1)":  newAgentActionDeploymentLimitReached("hobby", 1),
-		"newAgentActionBackupRateLimited(hobby,1)":       newAgentActionBackupRateLimited("hobby", 1),
-		"newAgentActionMetricsWindowTooLarge(hobby,1h)":  newAgentActionMetricsWindowTooLarge("hobby", "1h"),
-		"newAgentActionPromoteApprovalSent(prod,email)":  newAgentActionPromoteApprovalSent("production", "owner@example.com"),
-		"newAgentActionStorageLimitReached(hobby,500)":   newAgentActionStorageLimitReached("hobby", 500),
-		"newAgentActionVaultQuotaExceeded(hobby,50)":     newAgentActionVaultQuotaExceeded("hobby", 50),
-		"newAgentActionEnvPolicyDenied(prod,deploy)":     newAgentActionEnvPolicyDenied("production", "deploy", "owner", "developer"),
-		"newAgentActionOwnerRequired(developer)":         newAgentActionOwnerRequired("developer"),
-		"newAgentActionBindingInvalidUUID(KEY)":          newAgentActionBindingInvalidUUID("DATABASE_URL", "not-a-uuid"),
-		"newAgentActionBindingNotFound(KEY)":             newAgentActionBindingNotFound("DATABASE_URL"),
-		"newAgentActionBindingCrossTeam(KEY)":            newAgentActionBindingCrossTeam("DATABASE_URL"),
-		"newAgentActionBindingNoEnvTwin(uuid,name,env)":  newAgentActionBindingNoEnvTwin("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "owner-db", "staging"),
-		"newAgentActionAdminTierChanged(team,pro)":       newAgentActionAdminTierChanged("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "pro"),
-		"newAgentActionAdminPromoIssued(team,code)":      newAgentActionAdminPromoIssued("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "01H8XGZJ"),
+		"newAgentActionDeploymentLimitReached(hobby,1)": newAgentActionDeploymentLimitReached("hobby", 1),
+		"newAgentActionBackupRateLimited(hobby,1)":      newAgentActionBackupRateLimited("hobby", 1),
+		"newAgentActionMetricsWindowTooLarge(hobby,1h)": newAgentActionMetricsWindowTooLarge("hobby", "1h"),
+		"newAgentActionPromoteApprovalSent(prod,email)": newAgentActionPromoteApprovalSent("production", "owner@example.com"),
+		"newAgentActionStorageLimitReached(hobby,500)":  newAgentActionStorageLimitReached("hobby", 500),
+		"newAgentActionVaultQuotaExceeded(hobby,50)":    newAgentActionVaultQuotaExceeded("hobby", 50),
+		"newAgentActionEnvPolicyDenied(prod,deploy)":    newAgentActionEnvPolicyDenied("production", "deploy", "owner", "developer"),
+		"newAgentActionOwnerRequired(developer)":        newAgentActionOwnerRequired("developer"),
+		"newAgentActionBindingInvalidUUID(KEY)":         newAgentActionBindingInvalidUUID("DATABASE_URL", "not-a-uuid"),
+		"newAgentActionBindingNotFound(KEY)":            newAgentActionBindingNotFound("DATABASE_URL"),
+		"newAgentActionBindingCrossTeam(KEY)":           newAgentActionBindingCrossTeam("DATABASE_URL"),
+		"newAgentActionBindingNoEnvTwin(uuid,name,env)": newAgentActionBindingNoEnvTwin("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "owner-db", "staging"),
+		"newAgentActionAdminTierChanged(team,pro)":      newAgentActionAdminTierChanged("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "pro"),
+		"newAgentActionAdminPromoIssued(team,code)":     newAgentActionAdminPromoIssued("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "01H8XGZJ"),
 	}
 
 	// codeToAgentAction registry — every entry must also pass the contract.
@@ -161,8 +161,8 @@ func assertContract(t *testing.T, name, s string) {
 		"Re-issue", "re-issue", // approval-link expired → re-issue from app
 		"Re-enter", "re-enter", // invalid_email → re-enter address
 		"Refresh", "refresh", // stale slug/state → refresh from app
-		"POST ", // multipart endpoints — POST is the action
-		"GET ", // list endpoints — GET is the action
+		"POST ",              // multipart endpoints — POST is the action
+		"GET ",               // list endpoints — GET is the action
 		"Request", "request", // magic-link not found → request new one
 		"Add ", "add ", // missing_email / missing_env etc → add the field
 		"Trim ", "trim ", // env_too_large / tarball_too_large
@@ -287,11 +287,14 @@ func TestAgentActionContract_RegistryCoverage(t *testing.T) {
 		// Quota walls.
 		"quota_exceeded", "storage_limit_reached", "vault_quota_exceeded",
 		"vault_not_available", "vault_env_not_allowed", "member_limit",
-		// "tier_unavailable" was dropped 2026-05-29 alongside the Team-tier
-		// checkout/change-plan guards (CEO BIZ-1). It was the only code in
-		// this registry that no handler emitted; the orphan-coverage gate
-		// flagged it. If a future feature reintroduces a "tier is genuinely
-		// unavailable" surface, re-add the code + its emitter in one PR.
+		// "tier_unavailable" was dropped 2026-05-29 (CEO BIZ-1) and
+		// superseded 2026-06-04 by "tier_not_yet_available" when Team was
+		// RE-GATED out of self-serve checkout + change-plan (CEO directive:
+		// Team not rolled out until unlimited-resource delivery is proven
+		// built). A drop of "tier_not_yet_available" without migrating its
+		// emitters is a contract regression — agents branching on the code
+		// would lose the "contact sales" remediation.
+		"tier_not_yet_available",
 		"upgrade_required", "rate_limit_exceeded",
 		// B7-P1-7 (BugBash 2026-05-20): `claim_required` is the honest
 		// 402 for anonymous-tier walls whose remediation is a FREE claim

@@ -386,6 +386,14 @@ plans:
       custom_domains: true
       sla: false
 
+  # GATED FOR ROLLOUT (2026-06-04 CEO directive): the Team plan ($199
+  # "unlimited") is NOT yet self-serve purchasable. POST /api/v1/billing/checkout
+  # and /change-plan reject plan=team with 400 tier_not_yet_available until Team's
+  # unlimited-resource delivery is PROVEN built. These limits are kept here as the
+  # eventual contract — do NOT market/claim/charge Team without explicit CEO
+  # sign-off. Refs: memory `project_team_plan_not_rolled_out_no_payment`,
+  # docs/sessions/2026-06-04/TEAM-PLAN-GATE-AND-BUILD.md. (Comment only — no limit
+  # numbers changed in this PR.)
   team:
     display_name: "Team"
     price_monthly_cents: 19900
