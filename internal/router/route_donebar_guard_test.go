@@ -186,6 +186,21 @@ var routeTestMap = map[string]string{
 	"DELETE /api/v1/deployments/:id/confirm-deletion": "TestE2E_DeleteDeploy_PaidTeam_TwoStepContract",
 	"POST /api/v1/deployments/:id/confirm-deletion":   "TestE2E_DeleteDeploy_PaidTeam_TwoStepContract",
 
+	// ── deploy lifecycle (W4 §D5–D10) — DB-backed handler-integration suite
+	// (internal/handlers/deploy_lifecycle_block_integration_test.go). Each row
+	// points at the TestDeployLifecycle_* test that drives the route through the
+	// production RequireAuth chain (NewTestAppWithServices mirrors router.New)
+	// against a real Postgres: state-change contract + cross-team 404 + tier-gate
+	// 402 + redeploy CAS guard. Heavy Kaniko-build legs assert the
+	// accepted/contract surface (noop compute), not a live build — deferred to
+	// the W4 e2e specs. Moved here from routeCoverageExemptions.
+	"PATCH /deploy/:id/env":                       "TestDeployLifecycle_UpdateEnv_MergesAndRedacts",
+	"POST /deploy/:id/redeploy":                   "TestDeployLifecycle_Redeploy_HealthyRow_Accepts202",
+	"PATCH /api/v1/deployments/:id":               "TestDeployLifecycle_Patch_Pro_SetsPrivate",
+	"POST /api/v1/deployments/:id/make-permanent": "TestDeployLifecycle_MakePermanent_HappyPath",
+	"POST /api/v1/deployments/:id/ttl":            "TestDeployLifecycle_SetTTL_HappyPath",
+	"GET /api/v1/deployments/:id/events":          "TestDeployLifecycle_Events_Timeline_OwnerReadsDescOrder",
+
 	// ── teams / invitations: public-but-404 contract (merged surfaces) ───────
 	"POST /api/v1/invitations/:token/accept":  "TestMerged_Teams_AcceptInvitation_PublicWith404",
 	"GET /api/v1/teams/:team_id/invitations":  "TestMerged_Teams_InvitationsRequireAuth",
@@ -281,16 +296,15 @@ var routeCoverageExemptions = map[string]string{
 	"POST /api/v1/resources/:id/restore":        "restore from backup. TODO: matrix W5 backup/restore lifecycle.",
 	"GET /api/v1/resources/:id/restores":        "restore-job list. TODO: matrix W5 backup/restore lifecycle.",
 
-	// ── deployments: env / patch / ttl / make-permanent / events / github.
-	"PATCH /deploy/:id/env":                       "deploy env merge. TODO: matrix W4 deploy-env flow.",
-	"POST /deploy/:id/redeploy":                   "deploy redeploy. TODO: matrix W4 deploy-redeploy flow.",
-	"PATCH /api/v1/deployments/:id":               "deployment patch. TODO: matrix W4 deploy-patch flow.",
-	"POST /api/v1/deployments/:id/make-permanent": "promote TTL deploy to permanent. TODO: matrix W4 deploy-ttl flow.",
-	"POST /api/v1/deployments/:id/ttl":            "set deploy TTL. TODO: matrix W4 deploy-ttl flow.",
-	"GET /api/v1/deployments/:id/events":          "failure-timeline read surface (#200). TODO: matrix W4 deploy-events flow.",
-	"GET /api/v1/deployments/:id/github":          "deploy GitHub link read. TODO: matrix W4 deploy-github flow.",
-	"POST /api/v1/deployments/:id/github":         "deploy GitHub link write. TODO: matrix W4 deploy-github flow.",
-	"DELETE /api/v1/deployments/:id/github":       "deploy GitHub unlink. TODO: matrix W4 deploy-github flow.",
+	// ── deployments: env / patch / ttl / make-permanent / events — MOVED to
+	// routeTestMap. Now covered by the W4 deploy-lifecycle handler-integration
+	// suite (internal/handlers/deploy_lifecycle_block_integration_test.go,
+	// TestDeployLifecycle_*). The GitHub-link rows below stay exempt (D17/W6).
+
+	// ── deploy GitHub link (D17 / W6 github-app flow) — no integration cover yet.
+	"GET /api/v1/deployments/:id/github":    "deploy GitHub link read. TODO: matrix W6 deploy-github flow.",
+	"POST /api/v1/deployments/:id/github":   "deploy GitHub link write. TODO: matrix W6 deploy-github flow.",
+	"DELETE /api/v1/deployments/:id/github": "deploy GitHub unlink. TODO: matrix W6 deploy-github flow.",
 
 	// ── github app integration (install / callback / webhooks).
 	"GET /integrations/github/install":  "GitHub App install redirect. TODO: matrix W6 github-app flow.",
