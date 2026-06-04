@@ -31,12 +31,13 @@ package router_test
 //      must correspond to a route that is actually in the live tree. A stale
 //      row (route renamed/removed) is itself drift and REDs.
 //
-//   4. TestDoneBar_TestMapPointsAtRealTests parses the e2e package's *_test.go
-//      via go/ast and asserts every test name referenced by routeTestMap
-//      actually EXISTS. Without this, the map could rot: a row could point at a
-//      deleted test and TestDoneBar_EveryRouteCovered would still pass (it only
-//      checks the key is present). This closes that loophole — same intent as
-//      cli's TestDoneBar_TestMapPointsAtRealTests.
+//   4. TestDoneBar_TestMapPointsAtRealTests parses every *_test.go in
+//      mappedTestDirs (api/e2e + api/internal/handlers) via go/ast and asserts
+//      every test name referenced by routeTestMap actually EXISTS. Without
+//      this, the map could rot: a row could point at a deleted test and
+//      TestDoneBar_EveryRouteCovered would still pass (it only checks the key
+//      is present). This closes that loophole — same intent as cli's
+//      TestDoneBar_TestMapPointsAtRealTests.
 //
 // WHY A MAP, NOT "any test mentions the path": a substring match over test
 // source is a false-positive magnet (every resource test mentions "/db/new").
@@ -44,13 +45,17 @@ package router_test
 // exercises its handler + auth chain + response/error contract.
 //
 // COVERING-TEST LAYER. routeTestMap points at the REAL-backend integration
-// suite in api/e2e (//go:build e2e) — the matrix's W1–W4 "UI action -> backend
-// state -> UI reflects it" surface. A few routes whose only integration cover
-// lives at the handler-integration layer (e.g. /storage/:token/presign in
-// package handlers) are EXEMPTED here with a justification citing that test +
-// a TODO to add the e2e round-trip in the named wave; they are not silently
-// "covered". The e2e directory is the single AST-scanned source of truth so
-// the integrity check (§4) stays a one-directory parse.
+// suites in mappedTestDirs:
+//   - api/e2e (//go:build e2e) — the matrix's W1–W4 black-box "UI action ->
+//     backend state -> UI reflects it" round-trips; and
+//   - api/internal/handlers — the DB-backed handler-integration suites
+//     (testhelpers.SetupTestDB + the production RequireAuth/RequireRole chain),
+//     where the W3 team/member-management block is exercised against a real
+//     Postgres.
+// A route whose authz + state-change contract is proven at the handler-
+// integration layer is genuinely covered, so its row points there rather than
+// carrying an exemption. Routes with no integration cover at all stay in
+// routeCoverageExemptions with a justification + TODO matrix-wave pointer.
 //
 // This is a pure descriptor + source-scan test: it builds the router in-memory
 // (no DB/Redis/network — route registration issues no queries) and parses files
@@ -75,16 +80,31 @@ import (
 	"instant.dev/internal/router"
 )
 
-// e2eTestDir is the directory (relative to this package) holding the real-
-// backend integration suite whose Test funcs routeTestMap references. The
-// integrity check (TestDoneBar_TestMapPointsAtRealTests) AST-parses it.
-const e2eTestDir = "../../e2e"
+// mappedTestDirs are the directories (relative to this package) holding the
+// integration suites whose Test funcs routeTestMap references. The integrity
+// check (TestDoneBar_TestMapPointsAtRealTests) AST-parses every one.
+//
+//   - ../../e2e            — the black-box real-backend HTTP suite (W1–W4
+//     liveness/provision/onboarding/deploy round-trips). Build-tagged
+//     //go:build e2e; go/parser ignores build tags so it parses fine here.
+//   - ../handlers          — the DB-backed handler-integration suites
+//     (testhelpers.SetupTestDB + the production middleware chain). The W3
+//     billing-block and team-block suites live here: a route whose authz +
+//     state-change contract is exercised against a real Postgres through
+//     RequireAuth/RequireRole is genuinely covered, so its routeTestMap row
+//     points at the handler test, not a black-box probe.
+//
+// Both directories are AST-scanned into one defined-test set, so a row may
+// point at a test in either suite. This keeps the guard honest about coverage
+// that lives at the handler-integration layer (W3 team/member management)
+// without forcing a black-box e2e round-trip to exist first.
+var mappedTestDirs = []string{"../../e2e", "../handlers"}
 
 // routeTestMap maps a live route key ("POST /db/new") to the name of the
-// integration Test function (in package e2e) that provides its contract
-// coverage. EVERY route in the live tree must appear here OR in
-// routeCoverageExemptions. Adding a route without an entry in one of the two
-// fails TestDoneBar_EveryRouteCovered.
+// integration Test function (in one of the mappedTestDirs suites — package
+// e2e or package handlers) that provides its contract coverage. EVERY route in
+// the live tree must appear here OR in routeCoverageExemptions. Adding a route
+// without an entry in one of the two fails TestDoneBar_EveryRouteCovered.
 var routeTestMap = map[string]string{
 	// ── liveness / health / discovery (public, unauth) ───────────────────────
 	"GET /livez":               "TestE2E_Healthz_ReturnsOK",
@@ -170,6 +190,32 @@ var routeTestMap = map[string]string{
 	"POST /api/v1/invitations/:token/accept":  "TestMerged_Teams_AcceptInvitation_PublicWith404",
 	"GET /api/v1/teams/:team_id/invitations":  "TestMerged_Teams_InvitationsRequireAuth",
 	"POST /api/v1/teams/:team_id/invitations": "TestMerged_Teams_InvitationsRequireAuth",
+
+	// ── team & member management (W3 §F) — DB-backed handler-integration suite
+	// (internal/handlers/team_block_routes_test.go). Each row points at the
+	// TestTeamBlock_* test that drives the route through the production RBAC
+	// middleware chain (RequireRole/PopulateTeamRole/RequireWritable) against a
+	// real Postgres: happy path + owner/member/non-member authz + cross-team
+	// isolation + contract shape. Moved here from routeCoverageExemptions.
+	"GET /api/v1/team":                                      "TestTeamBlock_GetTeam",
+	"PATCH /api/v1/team":                                    "TestTeamBlock_PatchTeam",
+	"DELETE /api/v1/team":                                   "TestTeamBlock_DeleteAndRestoreTeam",
+	"POST /api/v1/team/restore":                             "TestTeamBlock_DeleteAndRestoreTeam",
+	"GET /api/v1/team/summary":                              "TestTeamBlock_GetTeamSummary",
+	"GET /api/v1/team/settings":                             "TestTeamBlock_TeamSettings",
+	"PATCH /api/v1/team/settings":                           "TestTeamBlock_TeamSettings",
+	"GET /api/v1/team/env-policy":                           "TestTeamBlock_EnvPolicy",
+	"PUT /api/v1/team/env-policy":                           "TestTeamBlock_EnvPolicy",
+	"GET /api/v1/team/members":                              "TestTeamBlock_ListMembers",
+	"POST /api/v1/team/members/invite":                      "TestTeamBlock_InviteMember",
+	"POST /api/v1/team/members/leave":                       "TestTeamBlock_LeaveTeam",
+	"DELETE /api/v1/team/members/:user_id":                  "TestTeamBlock_RemoveMember",
+	"PATCH /api/v1/team/members/:user_id":                   "TestTeamBlock_UpdateMemberRole",
+	"POST /api/v1/team/members/:user_id/promote-to-primary": "TestTeamBlock_PromoteToPrimary",
+	"GET /api/v1/team/invitations":                          "TestTeamBlock_Invitations",
+	"DELETE /api/v1/team/invitations/:id":                   "TestTeamBlock_Invitations",
+	"POST /api/v1/team/invitations/:id/accept":              "TestTeamBlock_AcceptInvitationByID",
+	"DELETE /api/v1/teams/:team_id/invitations/:id":         "TestTeamBlock_TeamsAliasRevokeInvitation",
 
 	// ── vault: requires-auth contract (merged surfaces) ──────────────────────
 	"GET /api/v1/vault/:env":      "TestMerged_Vault_RequiresAuth",
@@ -263,26 +309,10 @@ var routeCoverageExemptions = map[string]string{
 	"POST /api/v1/stacks/:slug/domains/:id/verify": "custom-domain verify. TODO: matrix W4 custom-domain flow.",
 	"DELETE /api/v1/stacks/:slug/domains/:id":      "custom-domain delete. TODO: matrix W4 custom-domain flow.",
 
-	// ── team management (members / invitations / env-policy / settings).
-	"GET /api/v1/team":                                      "team detail. TODO: matrix W3 team-management flow.",
-	"PATCH /api/v1/team":                                    "team rename/update. TODO: matrix W3 team-management flow.",
-	"DELETE /api/v1/team":                                   "team self-delete (two-step). TODO: matrix W3 team-deletion flow.",
-	"POST /api/v1/team/restore":                             "team undelete. TODO: matrix W3 team-deletion flow.",
-	"GET /api/v1/team/summary":                              "team dashboard summary (aggregation). TODO: matrix W3 team-summary flow.",
-	"GET /api/v1/team/settings":                             "team settings read. TODO: matrix W3 team-settings flow.",
-	"PATCH /api/v1/team/settings":                           "team settings write. TODO: matrix W3 team-settings flow.",
-	"GET /api/v1/team/env-policy":                           "team env-policy read. TODO: matrix W3 env-policy flow.",
-	"PUT /api/v1/team/env-policy":                           "team env-policy write. TODO: matrix W3 env-policy flow.",
-	"GET /api/v1/team/members":                              "team member list. TODO: matrix W3 team-members flow.",
-	"POST /api/v1/team/members/invite":                      "invite member. TODO: matrix W3 team-members flow.",
-	"POST /api/v1/team/members/leave":                       "leave team. TODO: matrix W3 team-members flow.",
-	"DELETE /api/v1/team/members/:user_id":                  "remove member. TODO: matrix W3 team-members flow.",
-	"PATCH /api/v1/team/members/:user_id":                   "change member role. TODO: matrix W3 team-members flow.",
-	"POST /api/v1/team/members/:user_id/promote-to-primary": "promote member to primary owner. TODO: matrix W3 team-members flow.",
-	"GET /api/v1/team/invitations":                          "pending invitation list. TODO: matrix W3 team-invitations flow.",
-	"DELETE /api/v1/team/invitations/:id":                   "revoke invitation. TODO: matrix W3 team-invitations flow.",
-	"POST /api/v1/team/invitations/:id/accept":              "accept invitation (authed). TODO: matrix W3 team-invitations flow.",
-	"DELETE /api/v1/teams/:team_id/invitations/:id":         "revoke team invitation (plural-teams alias). TODO: matrix W3 team-invitations flow.",
+	// ── team & member management (members / invitations / env-policy /
+	// settings / deletion) — MOVED to routeTestMap. Now covered by the
+	// W3 team-block handler-integration suite
+	// (internal/handlers/team_block_routes_test.go, TestTeamBlock_*).
 
 	// ── billing: invoices / update-payment / change-plan / promotion / usage.
 	"GET /api/v1/billing/invoices":            "invoice list. TODO: matrix W3 billing-invoices flow.",
@@ -440,7 +470,7 @@ func TestDoneBar_EveryRouteCovered(t *testing.T) {
 // TestDoneBar_TestMapPointsAtRealTests. go/parser ignores build tags, so the
 // //go:build e2e files parse fine here even in the -short gate.
 func TestDoneBar_TestMapPointsAtRealTests(t *testing.T) {
-	defined := definedE2ETestFuncs(t)
+	defined := definedMappedTestFuncs(t)
 
 	refs := map[string]bool{}
 	for _, name := range routeTestMap {
@@ -454,46 +484,49 @@ func TestDoneBar_TestMapPointsAtRealTests(t *testing.T) {
 
 	for _, name := range names {
 		if !defined[name] {
-			t.Errorf("routeTestMap references test %q which is not defined in package e2e (%s) — it was renamed or deleted. Point the row at the real covering test.", name, e2eTestDir)
+			t.Errorf("routeTestMap references test %q which is not defined in any mapped-test dir %v — it was renamed or deleted. Point the row at the real covering test.", name, mappedTestDirs)
 		}
 	}
 }
 
-// definedE2ETestFuncs parses every *_test.go in the e2e directory and returns
-// the set of top-level `func TestXxx(...)` names. Source-driven (not
-// reflection) because Go test functions aren't reflectable, and because the e2e
-// package is build-tagged out of this binary.
-func definedE2ETestFuncs(t *testing.T) map[string]bool {
+// definedMappedTestFuncs parses every *_test.go in each mappedTestDirs entry
+// and returns the set of top-level `func TestXxx(...)` names across all of
+// them. Source-driven (not reflection) because Go test functions aren't
+// reflectable, and because the e2e package is build-tagged out of this binary.
+func definedMappedTestFuncs(t *testing.T) map[string]bool {
 	t.Helper()
 	out := map[string]bool{}
-
-	entries, err := os.ReadDir(e2eTestDir)
-	if err != nil {
-		t.Fatalf("read e2e dir %q: %v", e2eTestDir, err)
-	}
 	fset := token.NewFileSet()
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), "_test.go") {
-			continue
-		}
-		path := filepath.Join(e2eTestDir, e.Name())
-		f, err := parser.ParseFile(fset, path, nil, 0)
+
+	for _, dir := range mappedTestDirs {
+		entries, err := os.ReadDir(dir)
 		if err != nil {
-			t.Fatalf("parse %s: %v", path, err)
+			t.Fatalf("read mapped-test dir %q: %v", dir, err)
 		}
-		for _, decl := range f.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Recv != nil {
+		before := len(out)
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), "_test.go") {
 				continue
 			}
-			name := fn.Name.Name
-			if strings.HasPrefix(name, "Test") {
-				out[name] = true
+			path := filepath.Join(dir, e.Name())
+			f, err := parser.ParseFile(fset, path, nil, 0)
+			if err != nil {
+				t.Fatalf("parse %s: %v", path, err)
+			}
+			for _, decl := range f.Decls {
+				fn, ok := decl.(*ast.FuncDecl)
+				if !ok || fn.Recv != nil {
+					continue
+				}
+				name := fn.Name.Name
+				if strings.HasPrefix(name, "Test") {
+					out[name] = true
+				}
 			}
 		}
-	}
-	if len(out) == 0 {
-		t.Fatalf("found zero Test functions in %q — parser/path misconfigured", e2eTestDir)
+		if len(out) == before {
+			t.Fatalf("found zero Test functions in %q — parser/path misconfigured", dir)
+		}
 	}
 	return out
 }
