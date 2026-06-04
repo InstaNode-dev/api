@@ -330,11 +330,13 @@ func TestDeployNew_Redeploy_UpdateStatusError_StillAccepts(t *testing.T) {
 			"", "", "", // git_url, git_ref, git_token_enc (mig 065)
 		))
 
-	// UPDATE deployments SET status = $1 ... → driver error. The handler
-	// must slog.Warn and CONTINUE (NOT return 5xx) — the redeploy itself
-	// is still useful because runRedeployAsync will flip the row later.
-	mock.ExpectExec(`UPDATE deployments\s+SET status = \$1, error_message = \$2, updated_at = now\(\)`).
-		WithArgs("building", nil, rowID).
+	// MarkDeploymentBuilding (guarded CAS) → driver error. The handler must
+	// slog.Warn and CONTINUE (NOT return 5xx) — a driver error is
+	// non-determinate (we can't tell whether the flip landed), and
+	// runRedeployAsync will reconcile the row later. Only an explicit 0-row
+	// CAS miss means "reaped concurrently, return 409".
+	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
+		WithArgs(rowID).
 		WillReturnError(errMockRedeployDriver)
 
 	// MatchExpectationsInOrder=false because the audit goroutine
@@ -446,6 +448,282 @@ func TestDeployNew_Redeploy_EmptyProviderID_Returns409(t *testing.T) {
 		"empty-provider_id response code MUST be 'not_ready' so agents can retry without re-listing")
 
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestDeployNew_Redeploy_CASMiss_Returns409 pins the #14 TOCTOU hardening on
+// the in-place path. FindActiveDeploymentByTeamEnvName returns a redeployable
+// row (status=healthy, provider_id set), but between that lookup and the
+// 'building' flip the reaper advanced the row to a terminal status. The
+// guarded CAS therefore matches 0 rows. The handler MUST 409
+// deployment_not_redeployable (NOT re-arm the dead workload as 'building').
+func TestDeployNew_Redeploy_CASMiss_Returns409(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	app, teamID, _ := redeployMockApp(t, db)
+	rowID := uuid.New()
+
+	expectTeamLookupOK(mock, teamID, "pro")
+
+	envVarsJSON, _ := json.Marshal(map[string]string{"_name": "raced-reaper"})
+	mock.ExpectQuery(`FROM deployments\s+WHERE team_id = \$1\s+AND env = \$2\s+AND env_vars->>'_name' = \$3`).
+		WithArgs(teamID, "development", "raced-reaper").
+		WillReturnRows(sqlmock.NewRows(deploymentColumnsList).AddRow(
+			rowID,
+			teamID,
+			uuid.NullUUID{},
+			"racedrpr",
+			"app-racedrpr", // non-empty provider_id → passes the not_ready guard
+			"healthy",
+			"https://racedrpr.deploy.",
+			envVarsJSON,
+			8080, "pro", "development",
+			false, "",
+			sql.NullString{},
+			time.Now(), time.Now(),
+			sql.NullString{}, sql.NullString{}, "unset", 0,
+			sql.NullTime{}, "permanent", 0, sql.NullTime{},
+			"tarball", "", "", // source, image_ref, registry_creds_enc (mig 064)
+			"", "", "", // git_url, git_ref, git_token_enc (mig 065)
+		))
+
+	// Guarded CAS matches 0 rows — the reaper won the race. Handler 409s.
+	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
+		WithArgs(rowID).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	body, ct := multipartRedeployMockBody(t, map[string]string{
+		"name":     "raced-reaper",
+		"redeploy": "true",
+		"port":     "8080",
+		"env":      "development",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/deploy/new", body)
+	req.Header.Set("Content-Type", ct)
+
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusConflict, resp.StatusCode,
+		"a CAS miss (row reaped concurrently) must 409, not resurrect; body: %s", string(respBody))
+
+	var errBody struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(respBody, &errBody))
+	assert.False(t, errBody.OK)
+	assert.Equal(t, errCodeDeploymentNotRedeployable, errBody.Error,
+		"CAS-miss response code must be deployment_not_redeployable")
+
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// redeployByIDMockApp wires a Fiber app exposing POST /deploy/:id/redeploy
+// against a sqlmock-backed DB, with the same Locals-fake auth as
+// redeployMockApp. Used to exercise Redeploy's guarded-CAS branch
+// deterministically (the real-DB test in deploy_async_deployasync_test.go
+// can't interpose a reaper between GetDeploymentByAppID and the CAS flip).
+func redeployByIDMockApp(t *testing.T, db *sql.DB) (*fiber.App, uuid.UUID) {
+	t.Helper()
+	teamID := uuid.New()
+
+	cfg := &config.Config{
+		JWTSecret:       "test-secret-that-is-at-least-32-bytes-long!!",
+		AESKey:          "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+		EnabledServices: "deploy",
+		Environment:     "test",
+	}
+	h := &DeployHandler{db: db, cfg: cfg, compute: noop.New(), planRegistry: plans.Default()}
+
+	app := fiber.New(fiber.Config{
+		BodyLimit: 50 * 1024 * 1024,
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			if errors.Is(err, ErrResponseWritten) {
+				return nil
+			}
+			code := fiber.StatusInternalServerError
+			if e, ok := err.(*fiber.Error); ok {
+				code = e.Code
+			}
+			return c.Status(code).JSON(fiber.Map{"ok": false, "error": "internal_error", "message": err.Error()})
+		},
+	})
+	app.Use(func(c *fiber.Ctx) error {
+		c.Locals(middleware.LocalKeyTeamID, teamID.String())
+		c.Locals(middleware.LocalKeyUserID, uuid.NewString())
+		return c.Next()
+	})
+	app.Post("/deploy/:id/redeploy", h.Redeploy)
+	return app, teamID
+}
+
+// TestDeployRedeploy_ByID_CASMiss_Returns409 pins the #14 TOCTOU hardening on
+// the POST /deploy/:id/redeploy path. GetDeploymentByAppID returns a
+// non-terminal row (status=healthy, provider_id set) so the IsDeploymentTerminal
+// gate passes, but the reaper advances the row to a terminal status before the
+// 'building' flip. The guarded CAS matches 0 rows, and the handler must 409
+// deployment_not_redeployable rather than resurrecting the reaped workload.
+func TestDeployRedeploy_ByID_CASMiss_Returns409(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	app, teamID := redeployByIDMockApp(t, db)
+	rowID := uuid.New()
+	appID := "racedbyid"
+
+	expectTeamLookupOK(mock, teamID, "pro")
+
+	envVarsJSON, _ := json.Marshal(map[string]string{"_name": "raced-by-id"})
+	mock.ExpectQuery(`SELECT .* FROM deployments WHERE app_id = \$1`).
+		WithArgs(appID).
+		WillReturnRows(sqlmock.NewRows(deploymentColumnsList).AddRow(
+			rowID,
+			teamID,
+			uuid.NullUUID{},
+			appID,
+			"app-racedbyid", // non-empty provider_id → passes the not_ready guard
+			"healthy",       // non-terminal → passes IsDeploymentTerminal gate
+			"https://racedbyid.deploy.",
+			envVarsJSON,
+			8080, "pro", "development",
+			false, "",
+			sql.NullString{},
+			time.Now(), time.Now(),
+			sql.NullString{}, sql.NullString{}, "unset", 0,
+			sql.NullTime{}, "permanent", 0, sql.NullTime{},
+			"tarball", "", "",
+			"", "", "",
+		))
+
+	// Guarded CAS matches 0 rows — the reaper won the race after the read.
+	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
+		WithArgs(rowID).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	body, ct := multipartRedeployMockBody(t, map[string]string{"port": "8080"})
+	req := httptest.NewRequest(http.MethodPost, "/deploy/"+appID+"/redeploy", body)
+	req.Header.Set("Content-Type", ct)
+
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusConflict, resp.StatusCode,
+		"a CAS miss on the :id redeploy path must 409, not resurrect; body: %s", string(respBody))
+
+	var errBody struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(respBody, &errBody))
+	assert.False(t, errBody.OK)
+	assert.Equal(t, errCodeDeploymentNotRedeployable, errBody.Error)
+
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestDeployRedeploy_ByID_CASSuccess_Returns202 is the happy-path partner: the
+// guarded CAS matches 1 row (the deploy was still redeployable), so the
+// handler proceeds to 202 and launches the async build. Pins that the CAS
+// guard does NOT break the normal redeploy.
+func TestDeployRedeploy_ByID_CASSuccess_Returns202(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	app, teamID := redeployByIDMockApp(t, db)
+	rowID := uuid.New()
+	appID := "happybyid"
+
+	expectTeamLookupOK(mock, teamID, "pro")
+
+	envVarsJSON, _ := json.Marshal(map[string]string{"_name": "happy-by-id"})
+	mock.ExpectQuery(`SELECT .* FROM deployments WHERE app_id = \$1`).
+		WithArgs(appID).
+		WillReturnRows(sqlmock.NewRows(deploymentColumnsList).AddRow(
+			rowID, teamID, uuid.NullUUID{}, appID, "app-happybyid", "healthy",
+			"https://happybyid.deploy.", envVarsJSON,
+			8080, "pro", "development", false, "", sql.NullString{},
+			time.Now(), time.Now(),
+			sql.NullString{}, sql.NullString{}, "unset", 0,
+			sql.NullTime{}, "permanent", 0, sql.NullTime{},
+			"tarball", "", "", "", "", "",
+		))
+
+	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
+		WithArgs(rowID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// emitDeployAudit + runRedeployAsync race the response; don't pin further.
+	mock.MatchExpectationsInOrder(false)
+
+	body, ct := multipartRedeployMockBody(t, map[string]string{"port": "8080"})
+	req := httptest.NewRequest(http.MethodPost, "/deploy/"+appID+"/redeploy", body)
+	req.Header.Set("Content-Type", ct)
+
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusAccepted, resp.StatusCode,
+		"a successful CAS (1 row) must 202 and launch the async build; body: %s", string(respBody))
+
+	time.Sleep(50 * time.Millisecond) // let the async goroutines drain
+}
+
+// TestDeployRedeploy_ByID_CASDriverError_StillAccepts pins the :id redeploy
+// driver-error arm of the guarded CAS. A driver error on MarkDeploymentBuilding
+// is non-determinate (we can't tell whether the flip landed), so the handler
+// must slog.Warn and CONTINUE to 202 — runRedeployAsync reconciles the status
+// later. Only an explicit 0-row CAS miss means "reaped, 409".
+func TestDeployRedeploy_ByID_CASDriverError_StillAccepts(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	app, teamID := redeployByIDMockApp(t, db)
+	rowID := uuid.New()
+	appID := "drvbyid"
+
+	expectTeamLookupOK(mock, teamID, "pro")
+
+	envVarsJSON, _ := json.Marshal(map[string]string{"_name": "drv-by-id"})
+	mock.ExpectQuery(`SELECT .* FROM deployments WHERE app_id = \$1`).
+		WithArgs(appID).
+		WillReturnRows(sqlmock.NewRows(deploymentColumnsList).AddRow(
+			rowID, teamID, uuid.NullUUID{}, appID, "app-drvbyid", "healthy",
+			"https://drvbyid.deploy.", envVarsJSON,
+			8080, "pro", "development", false, "", sql.NullString{},
+			time.Now(), time.Now(),
+			sql.NullString{}, sql.NullString{}, "unset", 0,
+			sql.NullTime{}, "permanent", 0, sql.NullTime{},
+			"tarball", "", "", "", "", "",
+		))
+
+	// Guarded CAS → driver error (non-determinate). Handler logs + continues.
+	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
+		WithArgs(rowID).
+		WillReturnError(errMockRedeployDriver)
+
+	// emitDeployAudit + runRedeployAsync race the response; don't pin further.
+	mock.MatchExpectationsInOrder(false)
+
+	body, ct := multipartRedeployMockBody(t, map[string]string{"port": "8080"})
+	req := httptest.NewRequest(http.MethodPost, "/deploy/"+appID+"/redeploy", body)
+	req.Header.Set("Content-Type", ct)
+
+	resp, err := app.Test(req, 5000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusAccepted, resp.StatusCode,
+		"a CAS driver error must NOT block the 202 accept; body: %s", string(respBody))
+
+	time.Sleep(50 * time.Millisecond) // let the async goroutines drain
 }
 
 // TestDeployNew_Redeploy_MissingName_AfterValidation pins deploy.go:655-661.

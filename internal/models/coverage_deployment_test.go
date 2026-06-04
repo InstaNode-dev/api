@@ -340,6 +340,38 @@ func TestMarkDeploymentTornDown_Branches(t *testing.T) {
 	require.ErrorContains(t, err, "boom")
 }
 
+// TestMarkDeploymentBuilding_Branches pins the guarded-CAS behaviour of the
+// redeploy 'building' flip (#14, sweep 2026-06-04):
+//   - 1 row affected  → the row was redeployable, swap landed (caller proceeds)
+//   - 0 rows affected → the row was reaped to a terminal status in the TOCTOU
+//     window; the swap was a no-op (caller must 409)
+//   - driver error    → wrapped, non-determinate (caller logs + continues)
+func TestMarkDeploymentBuilding_Branches(t *testing.T) {
+	ctx := context.Background()
+
+	// 1 row matched — redeployable status flipped to building.
+	db, mock := newMock(t)
+	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	n, err := MarkDeploymentBuilding(ctx, db, uuid.New())
+	require.NoError(t, err)
+	require.Equal(t, int64(1), n)
+
+	// 0 rows matched — the row was reaped to a terminal status; CAS no-op.
+	db2, mock2 := newMock(t)
+	mock2.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	n, err = MarkDeploymentBuilding(ctx, db2, uuid.New())
+	require.NoError(t, err)
+	require.Equal(t, int64(0), n)
+
+	// driver error — wrapped.
+	db3, mock3 := newMock(t)
+	mock3.ExpectExec(`UPDATE deployments\s+SET status = 'building'`).WillReturnError(errors.New("boom"))
+	_, err = MarkDeploymentBuilding(ctx, db3, uuid.New())
+	require.ErrorContains(t, err, "boom")
+}
+
 func TestCountDeploymentsByTeam_Branches(t *testing.T) {
 	ctx := context.Background()
 
