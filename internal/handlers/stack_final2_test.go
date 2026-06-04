@@ -113,8 +113,10 @@ func TestStackFinal2_UpdateEnv_MergeSelectFailed(t *testing.T) {
 	_, slug := seedStack(t, seedDB, &teamID, "healthy")
 	jwt := testhelpers.MustSignSessionJWT(t, uuid.NewString(), teamIDStr, "stkf2@example.com")
 
-	// team(1)+GetStackBySlug(2) ok, merge tx SELECT ... FOR UPDATE(3) errors.
-	app := stackFaultApp(t, openFaultDB(t, 2))
+	// team(1)+GetStackBySlug(2) ok, merge tx SET LOCAL lock_timeout(3) ok, then the
+	// SELECT ... FOR UPDATE(4) errors → persist_failed. (failAfter bumped 2→3 when
+	// the in-tx SET LOCAL lock_timeout exec was added — panel #7 hardening.)
+	app := stackFaultApp(t, openFaultDB(t, 3))
 	status, body := patchStackEnvF2(t, app, slug, jwt, `{"env":{"FOO":"bar"}}`)
 	assert.Equal(t, http.StatusServiceUnavailable, status)
 	assert.Contains(t, body, "persist_failed")
@@ -132,8 +134,9 @@ func TestStackFinal2_UpdateEnv_PersistFailed(t *testing.T) {
 	_, slug := seedStack(t, seedDB, &teamID, "healthy")
 	jwt := testhelpers.MustSignSessionJWT(t, uuid.NewString(), teamIDStr, "stkf2@example.com")
 
-	// team(1)+slug(2)+merge SELECT FOR UPDATE(3) ok, merge UPDATE(4) errors.
-	app := stackFaultApp(t, openFaultDB(t, 3))
+	// team(1)+slug(2)+SET LOCAL(3)+SELECT FOR UPDATE(4) ok, merge UPDATE(5) errors.
+	// (failAfter bumped 3→4 for the in-tx SET LOCAL lock_timeout exec — panel #7.)
+	app := stackFaultApp(t, openFaultDB(t, 4))
 	status, body := patchStackEnvF2(t, app, slug, jwt, `{"env":{"FOO":"bar"}}`)
 	assert.Equal(t, http.StatusServiceUnavailable, status)
 	assert.Contains(t, body, "persist_failed")

@@ -636,6 +636,19 @@ func GetStackEnvVars(ctx context.Context, db *sql.DB, stackID uuid.UUID) (map[st
 // pairs at ~64 bytes each).
 var ErrStackEnvVarsTooLarge = errors.New("stack env_vars payload exceeds 64KiB")
 
+// StackStatusDeleting is the status of a stack mid-teardown. Lifecycle
+// mutations (env merge) must be rejected for it. Single source of truth shared
+// by the model guard and the handler.
+const StackStatusDeleting = "deleting"
+
+// ErrStackDeleting is returned by MergeStackEnvVars when the row is mid-teardown
+// (status='deleting') at the moment the FOR UPDATE lock is taken. Checking this
+// INSIDE the locked transaction — rather than via a pre-read in the handler —
+// closes the TOCTOU where the teardown worker flips the row between the
+// handler's GetStackBySlug and the merge, which would otherwise commit an env
+// change onto a stack that's being deleted.
+var ErrStackDeleting = errors.New("stack is being deleted")
+
 // maxStackEnvVarsBytes is the serialized-JSON byte cap on env_vars.
 // 64*1024 = 65536. See ErrStackEnvVarsTooLarge for rationale.
 const maxStackEnvVarsBytes = 64 * 1024
@@ -699,18 +712,33 @@ func MergeStackEnvVars(ctx context.Context, db *sql.DB, stackID uuid.UUID, patch
 		return nil, 0, fmt.Errorf("models.MergeStackEnvVars: begin: %w", err)
 	}
 	// No-op after a successful Commit; rolls back on any early return (over-cap,
-	// marshal error, scan error) so the row is never left half-updated.
+	// marshal error, scan error, deleting) so the row is never left half-updated.
 	defer func() { _ = tx.Rollback() }()
 
+	// Bound the time we'll wait for the row lock. Without this a PATCH that
+	// races a long-held lock (another in-flight merge, or a teardown holding the
+	// row) would block the request goroutine indefinitely; 3s fails fast to a
+	// 503 the caller can retry. SET LOCAL is scoped to this transaction.
+	if _, err := tx.ExecContext(ctx, `SET LOCAL lock_timeout = '3s'`); err != nil {
+		return nil, 0, fmt.Errorf("models.MergeStackEnvVars: set lock_timeout: %w", err)
+	}
+
+	// Fetch status under the same FOR UPDATE lock so the teardown check is
+	// race-free: a stack flipped to 'deleting' between the handler's
+	// GetStackBySlug and here is caught authoritatively, not via a stale pre-read.
 	var raw []byte
+	var status string
 	err = tx.QueryRowContext(ctx, `
-		SELECT COALESCE(env_vars, '{}'::jsonb) FROM stacks WHERE id = $1 FOR UPDATE
-	`, stackID).Scan(&raw)
+		SELECT status, COALESCE(env_vars, '{}'::jsonb) FROM stacks WHERE id = $1 FOR UPDATE
+	`, stackID).Scan(&status, &raw)
 	if err == sql.ErrNoRows {
 		return nil, 0, &ErrStackNotFound{Slug: stackID.String()}
 	}
 	if err != nil {
 		return nil, 0, fmt.Errorf("models.MergeStackEnvVars: select: %w", err)
+	}
+	if status == StackStatusDeleting {
+		return nil, 0, ErrStackDeleting
 	}
 
 	merged := map[string]string{}
