@@ -2010,10 +2010,19 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 	// row for THIS team, with matching from/to/kind. The worker (when it
 	// lands) will short-circuit this branch and run the promote on its
 	// own poll cadence; until then this path is the manual trigger.
+	//
+	// #11 (sweep 2026-06-04): we only VALIDATE here. The single-use
+	// 'executed' flip is deferred to markApprovedPromoteExecuted, called
+	// just before runStackDeploy below — so a preflight failure (412/503/
+	// 400/402 in Steps A–C) leaves the approval 'approved' and retryable
+	// instead of burning it on a promote that never ran.
+	var approvalRow *models.PromoteApproval
 	if body.ApprovalID != "" {
-		if err := h.consumeApprovedPromote(c, team, body, from, to, models.PromoteApprovalKindStack); err != nil {
-			return err
+		row, vErr := h.validateApprovedPromote(c, team, body, from, to, models.PromoteApprovalKindStack)
+		if vErr != nil {
+			return vErr
 		}
+		approvalRow = row
 	}
 
 	// Step A: Pull the source's services. If ANY service is missing
@@ -2307,6 +2316,20 @@ func (h *StackHandler) Promote(c *fiber.Ctx) error {
 		})
 	}
 
+	// #11 (sweep 2026-06-04): preflight (Steps A–C above) has fully
+	// succeeded — every failure path before this point returns early, so
+	// reaching here means the promote WILL launch. Burn the single-use
+	// approval to 'executed' now, immediately before the deploy launch.
+	// A failure here (503 execute_failed / 409 already_executed) returns
+	// before the launch; the target stack rows are already written but the
+	// approval state is the authoritative single-use gate, so re-calling
+	// with the same approval is the operator's retry path.
+	if approvalRow != nil {
+		if execErr := h.markApprovedPromoteExecuted(c, approvalRow, from, to); execErr != nil {
+			return execErr
+		}
+	}
+
 	// Step D: Hand off to the goroutine that calls the provider with
 	// SkipBuild=true. The dashboard's EnvironmentsGrid polls /family so it
 	// picks up the building → healthy transition automatically.
@@ -2408,51 +2431,60 @@ func (h *StackHandler) beginPromoteApproval(
 	return row, nil
 }
 
-// consumeApprovedPromote verifies that an explicit approval_id supplied
-// by the caller matches an APPROVED but NOT-YET-EXECUTED row for the
-// same team / from / to / kind, and atomically flips the row to
-// 'executed'. Used by the manual-trigger fallback path until the
-// worker-side polling lands.
+// validateApprovedPromote verifies that an explicit approval_id supplied by
+// the caller matches an APPROVED, NOT-YET-EXECUTED, non-expired row for the
+// same team / from / to / kind. It returns the approval row on success but
+// does NOT mutate it — the actual 'executed' flip is deferred to
+// markApprovedPromoteExecuted, which the handler calls only AFTER the promote
+// preflight (source-services, image_ref, target create/update, vault, env
+// load) has succeeded.
+//
+// #11 (sweep 2026-06-04): the flip used to happen here, BEFORE preflight. A
+// preflight failure (412 missing_image_ref / no_services, 503 lookup, 400
+// vault, 402 cap) therefore burned the single-use approval to 'executed'
+// while the promote never ran — leaving the operator with a non-retryable
+// approval and forcing a fresh email round-trip. Splitting validate/execute
+// keeps the approval 'approved' (retryable) on any preflight failure.
 //
 // Why we check from/to/kind in addition to the id: the approval row's
 // payload is what the worker would replay. If a caller passes an
 // approval_id for env=preprod but the request is to=production, we
 // refuse — the row's authority covers the env pair it was issued for,
 // not whatever the caller is asking for now.
-func (h *StackHandler) consumeApprovedPromote(
+func (h *StackHandler) validateApprovedPromote(
 	c *fiber.Ctx,
 	team *models.Team,
 	body promoteBody,
 	from, to, kind string,
-) error {
+) (*models.PromoteApproval, error) {
 	id, err := uuid.Parse(body.ApprovalID)
 	if err != nil {
-		return respondError(c, fiber.StatusBadRequest, "invalid_approval_id",
+		return nil, respondError(c, fiber.StatusBadRequest, "invalid_approval_id",
 			"approval_id must be a valid UUID")
 	}
 	row, err := models.GetPromoteApprovalByID(c.Context(), h.db, id)
 	if errors.Is(err, models.ErrPromoteApprovalNotFound) {
-		return respondError(c, fiber.StatusNotFound, "approval_not_found",
+		return nil, respondError(c, fiber.StatusNotFound, "approval_not_found",
 			"approval_id does not match any approval row")
 	}
 	if err != nil {
 		slog.Error("stack.promote.approval_lookup_failed",
 			"error", err, "approval_id", id,
 			"request_id", middleware.GetRequestID(c))
-		return respondError(c, fiber.StatusServiceUnavailable, "lookup_failed",
+		return nil, respondError(c, fiber.StatusServiceUnavailable, "lookup_failed",
 			"Failed to look up approval")
 	}
 	if row.TeamID != team.ID {
 		// Cross-team — same posture as stack ownership: 404 not 403.
-		return respondError(c, fiber.StatusNotFound, "approval_not_found",
+		return nil, respondError(c, fiber.StatusNotFound, "approval_not_found",
 			"approval_id does not match any approval row for this team")
 	}
 	if row.Status != models.PromoteApprovalStatusApproved {
-		return respondError(c, fiber.StatusConflict, "approval_not_approved",
+		return nil, respondError(c, fiber.StatusConflict, "approval_not_approved",
 			"approval row is in status="+row.Status+" — must be 'approved' to consume")
 	}
 	if row.PromoteKind != kind || row.FromEnv != from || row.ToEnv != to {
-		return respondError(c, fiber.StatusBadRequest, "approval_mismatch",
+		return nil, respondError(c, fiber.StatusBadRequest, "approval_mismatch",
 			"approval_id's recorded (kind,from,to) does not match this request")
 	}
 	if row.ExpiresAt.Before(time.Now().UTC()) {
@@ -2460,13 +2492,30 @@ func (h *StackHandler) consumeApprovedPromote(
 		// has fully passed since the original request we refuse to
 		// execute. This is belt-and-suspenders defence; the worker
 		// repo's polling job would refuse for the same reason.
-		return respondError(c, fiber.StatusGone, "approval_expired",
+		return nil, respondError(c, fiber.StatusGone, "approval_expired",
 			"approval window has fully expired")
 	}
-	ok, err := models.MarkPromoteApprovalExecuted(c.Context(), h.db, id)
+	return row, nil
+}
+
+// markApprovedPromoteExecuted atomically flips a validated approval row to
+// 'executed' and audits the transition. It is called by Promote ONLY after
+// the entire promote preflight has succeeded and immediately before the
+// runStackDeploy launch, so a preflight failure leaves the row 'approved'
+// (retryable). See validateApprovedPromote for the #11 rationale.
+//
+// The CAS inside MarkPromoteApprovalExecuted still guards against a concurrent
+// double-consume: if a second request raced through validate + preflight and
+// flipped the row first, this returns 0 rows and we 409 approval_already_executed.
+func (h *StackHandler) markApprovedPromoteExecuted(
+	c *fiber.Ctx,
+	row *models.PromoteApproval,
+	from, to string,
+) error {
+	ok, err := models.MarkPromoteApprovalExecuted(c.Context(), h.db, row.ID)
 	if err != nil {
 		slog.Error("stack.promote.approval_execute_failed",
-			"error", err, "approval_id", id,
+			"error", err, "approval_id", row.ID,
 			"request_id", middleware.GetRequestID(c))
 		return respondError(c, fiber.StatusServiceUnavailable, "execute_failed",
 			"Failed to mark approval executed")

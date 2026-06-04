@@ -43,6 +43,15 @@ func (h *StackHandler) CheckStackDeployLimitForTest(ctx context.Context, fp stri
 	return h.checkStackDeployLimit(ctx, fp)
 }
 
+// MarkApprovedPromoteExecutedForTest re-exports the package-private
+// markApprovedPromoteExecuted so the approval_already_executed CAS-miss arm
+// (an approval flipped to 'executed' between validate and execute — only
+// reachable under a concurrent double-consume in prod) can be driven
+// deterministically by pre-seeding the row as already executed.
+func (h *StackHandler) MarkApprovedPromoteExecutedForTest(c *fiber.Ctx, row *models.PromoteApproval, from, to string) error {
+	return h.markApprovedPromoteExecuted(c, row, from, to)
+}
+
 // ── agent_action.go empty-arg default-branch coverage ────────────────────────
 // These re-exports drive the `if x == "" { x = "..." }` default branches that
 // the happy-path callers (always passing a non-empty value) leave open.
