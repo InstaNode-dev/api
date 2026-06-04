@@ -244,10 +244,13 @@ var (
 	// DeployRedeployInPlaceTotal counts the POST /deploy/new in-place
 	// redeploy outcomes (redeploy=true form field). Labels:
 	//
-	//   outcome = "success"      — match found, redeploy compute path invoked
-	//             "not_found"    — no live deployment for (team, env, name)
-	//             "wrong_team"   — name exists on a different team (404 is
-	//                              still returned — we never confirm existence)
+	//   outcome = "success"          — match found, redeploy compute path invoked
+	//             "not_found"        — no live deployment for (team, env, name)
+	//             "wrong_team"       — name exists on a different team (404 is
+	//                                  still returned — we never confirm existence)
+	//             "not_redeployable" — row was reaped (expired/deleted) in the
+	//                                  TOCTOU window between lookup and the
+	//                                  guarded 'building' CAS → 409 (#14)
 	//
 	// Closes the agent-UX gap surfaced 2026-05-30 (duplicate-URL incident):
 	// agents previously called /deploy/new repeatedly, minting a fresh
