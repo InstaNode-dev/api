@@ -1087,10 +1087,20 @@ func (h *DeployHandler) New(c *fiber.Ctx) error {
 				"Existing deployment has no provider ID yet — initial build may still be running. Try again in a few seconds.")
 		}
 
-		// Flip the row to 'building' (mirrors POST /deploy/:id/redeploy).
-		if err := models.UpdateDeploymentStatus(c.Context(), h.db, existing.ID, "building", ""); err != nil {
+		// Flip the row to 'building' as a guarded CAS (mirrors POST
+		// /deploy/:id/redeploy). FindActiveDeploymentByTeamEnvName already
+		// filters to redeployable statuses, but the reaper can flip this row
+		// to expired/deleted in the TOCTOU window between that lookup and
+		// here — the CAS reports 0 rows in that case and we 409 rather than
+		// resurrecting a dead workload. A driver error is non-determinate;
+		// log and continue (runRedeployAsync reconciles the status later).
+		if n, err := models.MarkDeploymentBuilding(c.Context(), h.db, existing.ID); err != nil {
 			slog.Warn("deploy.new.redeploy_status_update_failed",
 				"app_id", existing.AppID, "error", err)
+		} else if n == 0 {
+			metrics.DeployRedeployInPlaceTotal.WithLabelValues("not_redeployable").Inc()
+			return respondError(c, fiber.StatusConflict, errCodeDeploymentNotRedeployable,
+				"This deployment is no longer in a redeployable state (it was reaped concurrently). Create a new deployment instead.")
 		}
 
 		// Audit BEFORE the async build (source="deploy_new_in_place" so the
@@ -1905,9 +1915,19 @@ func (h *DeployHandler) Redeploy(c *fiber.Ctx) error {
 			"Failed to read tarball bytes")
 	}
 
-	// Update status to "building" while the redeploy runs.
-	if err := models.UpdateDeploymentStatus(c.Context(), h.db, d.ID, "building", ""); err != nil {
+	// Flip the row to "building" as a guarded CAS. The IsDeploymentTerminal
+	// gate above is a check-then-act with a TOCTOU window: the reaper can
+	// flip this row to expired/deleted between that read and here. The CAS
+	// only matches a redeployable status, so a row reaped in that window
+	// reports 0 rows and we 409 rather than resurrecting a dead workload.
+	// A driver error is non-determinate (we can't tell whether the flip
+	// landed) — log and continue, since runRedeployAsync will reconcile the
+	// status; only the explicit 0-row CAS miss means "reaped, do not re-arm".
+	if n, err := models.MarkDeploymentBuilding(c.Context(), h.db, d.ID); err != nil {
 		slog.Warn("deploy.redeploy.status_update_failed", "app_id", appID, "error", err)
+	} else if n == 0 {
+		return respondError(c, fiber.StatusConflict, errCodeDeploymentNotRedeployable,
+			"This deployment is no longer in a redeployable state (it was reaped concurrently). Create a new deployment instead.")
 	}
 
 	// Emit audit trail BEFORE the async build runs — same shape as

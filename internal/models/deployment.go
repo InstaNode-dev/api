@@ -503,6 +503,43 @@ func UpdateDeploymentStatus(ctx context.Context, db *sql.DB, id uuid.UUID, statu
 	return nil
 }
 
+// redeployableStatusesSQL is the SQL IN-list of statuses from which a
+// deployment may be flipped back to 'building' by a redeploy. It is the exact
+// inverse of IsDeploymentTerminal (expired/deleted/stopped are excluded) plus
+// 'failed' (a failed build is retryable). Kept in lockstep with
+// FindActiveDeploymentByTeamEnvName's WHERE clause and IsDeploymentTerminal —
+// the redeploy-guard test pins the classification.
+const redeployableStatusesSQL = `('building', 'deploying', 'healthy', 'failed')`
+
+// MarkDeploymentBuilding flips a deployment back to 'building' as a guarded
+// compare-and-swap: the UPDATE only matches a row whose current status is
+// redeployable (building/deploying/healthy/failed). RowsAffected reports
+// whether the swap happened.
+//
+// TOCTOU hardening (#14, sweep 2026-06-04): both redeploy entry points
+// (POST /deploy/:id/redeploy and POST /deploy/new redeploy=true) read the row,
+// assert it is non-terminal, then flip it to 'building'. Between the read and
+// the flip the DeploymentExpirer / teardown reconciler can reap the row to
+// 'expired'/'deleted'. An unconditional UPDATE would resurrect that reaped
+// workload back to 'building'. The guarded WHERE makes a reaped row report
+// 0 rows so the handler can return 409 instead of re-arming it — mirroring
+// the CAS guards already on MarkDeploymentTornDown and SetDeploymentTTL.
+//
+// updated_at is set to now() by the database. error_message is cleared (a
+// fresh build supersedes any prior failure message).
+func MarkDeploymentBuilding(ctx context.Context, db *sql.DB, id uuid.UUID) (int64, error) {
+	res, err := db.ExecContext(ctx, `
+		UPDATE deployments
+		SET status = 'building', error_message = NULL, updated_at = now()
+		WHERE id = $1 AND status IN `+redeployableStatusesSQL+`
+	`, id)
+	if err != nil {
+		return 0, fmt.Errorf("models.MarkDeploymentBuilding: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // UpdateDeploymentProviderID records the k8s Deployment name and the resolved app URL
 // after the k8s Deployment object has been successfully created.
 // updated_at is set to now() by the database.
