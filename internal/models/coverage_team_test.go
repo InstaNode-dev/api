@@ -21,11 +21,11 @@ func TestNormalizeEmail(t *testing.T) {
 }
 
 func teamCols() []string {
-	return []string{"id", "name", "plan_tier", "stripe_customer_id", "created_at", "default_deployment_ttl_policy"}
+	return []string{"id", "name", "plan_tier", "stripe_customer_id", "created_at", "default_deployment_ttl_policy", "is_test_cohort"}
 }
 
 func teamRow() *sqlmock.Rows {
-	return sqlmock.NewRows(teamCols()).AddRow(uuid.New(), nil, "free", nil, time.Now(), "auto_24h")
+	return sqlmock.NewRows(teamCols()).AddRow(uuid.New(), nil, "free", nil, time.Now(), "auto_24h", false)
 }
 
 func userCols() []string {

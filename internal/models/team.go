@@ -43,7 +43,15 @@ type Team struct {
 	// Per-request ttl_policy in the deploy body always overrides this.
 	// Only owner/admin can mutate via PATCH /api/v1/team/settings.
 	DefaultDeploymentTTLPolicy string
-	CreatedAt                  time.Time
+	// IsTestCohort marks a team as part of the synthetic-monitoring test
+	// cohort (migration 067, W0 / PR-1). Inert by default (every real team is
+	// false). Seeder-set true on the durable per-tier test teams so that
+	// charge-initiation / conversion-funnel / background-email paths can no-op
+	// or exclude them — keeping synthetic traffic out of the real
+	// funnel/billing/email surfaces. See
+	// docs/sessions/2026-06-04/TEST-ACCOUNTS-AND-NR-SYNTHETICS-PLAN.md §1.6.
+	IsTestCohort bool
+	CreatedAt    time.Time
 }
 
 // User represents an authenticated user belonging to a team.
@@ -95,10 +103,10 @@ func CreateTeam(ctx context.Context, db *sql.DB, name string) (*Team, error) {
 	err := db.QueryRowContext(ctx, `
 		INSERT INTO teams (name, plan_tier) VALUES ($1, 'free')
 		RETURNING id, name, plan_tier, stripe_customer_id, created_at,
-		          COALESCE(default_deployment_ttl_policy, 'auto_24h')
+		          COALESCE(default_deployment_ttl_policy, 'auto_24h'), is_test_cohort
 	`, name).Scan(
 		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.CreatedAt,
-		&t.DefaultDeploymentTTLPolicy,
+		&t.DefaultDeploymentTTLPolicy, &t.IsTestCohort,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("models.CreateTeam: %w", err)
@@ -111,11 +119,11 @@ func GetTeamByID(ctx context.Context, db *sql.DB, id uuid.UUID) (*Team, error) {
 	t := &Team{}
 	err := db.QueryRowContext(ctx, `
 		SELECT id, name, plan_tier, stripe_customer_id, created_at,
-		       COALESCE(default_deployment_ttl_policy, 'auto_24h')
+		       COALESCE(default_deployment_ttl_policy, 'auto_24h'), is_test_cohort
 		FROM teams WHERE id = $1
 	`, id).Scan(
 		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.CreatedAt,
-		&t.DefaultDeploymentTTLPolicy,
+		&t.DefaultDeploymentTTLPolicy, &t.IsTestCohort,
 	)
 	if err == sql.ErrNoRows {
 		return nil, &ErrTeamNotFound{ID: id}
@@ -339,6 +347,54 @@ func UpdatePlanTier(ctx context.Context, db *sql.DB, teamID uuid.UUID, tier stri
 	return nil
 }
 
+// IsTestCohort reports whether a team is part of the synthetic-monitoring test
+// cohort (migration 067). It is the single lookup every api-side charge /
+// conversion path keys off to no-op for a synthetic team so that continuous
+// synthetic traffic never pollutes the real funnel / billing / email surfaces
+// (W0 / PR-1 — see TEST-ACCOUNTS-AND-NR-SYNTHETICS-PLAN.md §1.6).
+//
+// A missing team is treated as NOT a test cohort: callers reach this only with
+// an already-authenticated team id, and a stricter ErrNoRows surface here would
+// just turn a 404 into a 500 on the chargeable path. The flag is inert by
+// default — every real team is false until a seeder sets it true via
+// SetTestCohort — so the common case returns false with one indexed lookup.
+func IsTestCohort(ctx context.Context, db *sql.DB, teamID uuid.UUID) (bool, error) {
+	var isTest bool
+	err := db.QueryRowContext(ctx, `
+		SELECT is_test_cohort FROM teams WHERE id = $1
+	`, teamID).Scan(&isTest)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("models.IsTestCohort: %w", err)
+	}
+	return isTest, nil
+}
+
+// SetTestCohort flips teams.is_test_cohort for a single team. It is the only
+// writer of the cohort flag and is intended for the worker-side synthetic
+// seeder job (flow_synthetic_seed) — there is deliberately NO public HTTP
+// surface that mutates it (a self-serve "mark my team as test" would let any
+// caller opt out of billing/quota). Idempotent: setting the same value twice
+// is a harmless no-op UPDATE.
+func SetTestCohort(ctx context.Context, db *sql.DB, teamID uuid.UUID, isTest bool) error {
+	res, err := db.ExecContext(ctx, `
+		UPDATE teams SET is_test_cohort = $1 WHERE id = $2
+	`, isTest, teamID)
+	if err != nil {
+		return fmt.Errorf("models.SetTestCohort: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("models.SetTestCohort rows: %w", err)
+	}
+	if rows == 0 {
+		return &ErrTeamNotFound{ID: teamID}
+	}
+	return nil
+}
+
 // UpgradeTeamAllTiers atomically upgrades the team tier and promotes every
 // active resource, deployment, and stack owned by that team. All four updates
 // run inside a single transaction so a partial failure (e.g. ElevateDeployments
@@ -481,11 +537,11 @@ func GetTeamByRazorpaySubscriptionID(ctx context.Context, db *sql.DB, subscripti
 	t := &Team{}
 	err := db.QueryRowContext(ctx, `
 		SELECT id, name, plan_tier, stripe_customer_id, created_at,
-		       COALESCE(default_deployment_ttl_policy, 'auto_24h')
+		       COALESCE(default_deployment_ttl_policy, 'auto_24h'), is_test_cohort
 		FROM teams WHERE stripe_customer_id = $1
 	`, subscriptionID).Scan(
 		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.CreatedAt,
-		&t.DefaultDeploymentTTLPolicy,
+		&t.DefaultDeploymentTTLPolicy, &t.IsTestCohort,
 	)
 	if err == sql.ErrNoRows {
 		return nil, &ErrTeamNotFound{}

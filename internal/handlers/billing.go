@@ -51,6 +51,17 @@ const checkoutInflightTTL = 60 * time.Second
 // the same team also bounces — the subscription belongs to the team.
 const checkoutInflightKeyPrefix = "team_checkout_inflight:"
 
+// errCodeSyntheticTestCohort is returned by the self-serve charge-initiation
+// handlers (CreateCheckoutAPI, ChangePlanAPI) when the authenticated team is a
+// synthetic-monitoring test cohort (teams.is_test_cohort, migration 067). A
+// synthetic team must NEVER reach the real Razorpay subscription-create /
+// change-plan call — that would create a live charge for a test identity. The
+// guard returns a deterministic 403 with this distinct code BEFORE the Redis
+// dedup slot or any Razorpay call, so the synthetic runner gets a stable,
+// non-charging response it can assert on. See
+// docs/sessions/2026-06-04/TEST-ACCOUNTS-AND-NR-SYNTHETICS-PLAN.md §1.6.
+const errCodeSyntheticTestCohort = "synthetic_test_cohort"
+
 // monthlyOngoingTotalCount / yearlyOngoingTotalCount are the Razorpay
 // subscription `total_count` values for an ONGOING (effectively indefinite)
 // plan. Razorpay's create-subscription API requires a finite total_count, so
@@ -659,6 +670,38 @@ func (h *BillingHandler) requireVerifiedEmail(c *fiber.Ctx, action string) (bool
 		AgentActionEmailNotVerified, "")
 }
 
+// rejectIfTestCohort is the api-side synthetic-cohort skip-guard for the
+// self-serve charge-initiation handlers. It looks up teams.is_test_cohort
+// (migration 067) and, when true, writes a deterministic 403
+// synthetic_test_cohort response and returns ok=false so the caller returns
+// immediately WITHOUT reaching Razorpay. A lookup error fails CLOSED (treated
+// as "not a test cohort" → proceed) so a transient DB blip never blocks a real
+// paying customer's checkout — the worst case is one synthetic call slipping
+// through to the inflight dedup, which the seeded test teams have no real
+// subscription to complete anyway.
+//
+// ok=true means "not a test cohort, proceed". On ok=false the returned error is
+// the already-written fiber response (or ErrResponseWritten) and the caller must
+// return it unchanged.
+func (h *BillingHandler) rejectIfTestCohort(c *fiber.Ctx, teamID uuid.UUID, action string) (ok bool, resp error) {
+	isTest, err := models.IsTestCohort(c.Context(), h.db, teamID)
+	if err != nil {
+		// Fail open: a real customer's charge must not be blocked by a DB blip.
+		slog.Warn("billing.test_cohort_check_failed_open",
+			"error", err, "team_id", teamID, "action", action,
+			"request_id", middleware.GetRequestID(c))
+		return true, nil
+	}
+	if !isTest {
+		return true, nil
+	}
+	slog.Info("billing.test_cohort_skip",
+		"team_id", teamID, "action", action,
+		"request_id", middleware.GetRequestID(c))
+	return false, respondError(c, fiber.StatusForbidden, errCodeSyntheticTestCohort,
+		"This is a synthetic test-cohort team and cannot start a real billing charge.")
+}
+
 // CreateCheckoutAPI handles POST /api/v1/billing/checkout (and the legacy
 // alias POST /billing/checkout). Creates a Razorpay subscription and returns
 // the hosted payment short_url plus the subscription_id.
@@ -688,6 +731,13 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	teamID, err := uuid.Parse(teamIDStr)
 	if err != nil {
 		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Valid session token required")
+	}
+
+	// Synthetic-cohort skip-guard (migration 067): a test-cohort team must
+	// never reach the real Razorpay subscription-create call. Checked before
+	// the email gate / Redis dedup so a synthetic call consumes nothing.
+	if ok, errResp := h.rejectIfTestCohort(c, teamID, "checkout"); !ok {
+		return errResp
 	}
 
 	// Email-verified gate (migration 052): a /claim-created account must
@@ -3172,6 +3222,11 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 	teamID, err := uuid.Parse(teamIDStr)
 	if err != nil {
 		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Valid session token required")
+	}
+	// Synthetic-cohort skip-guard (migration 067) — same as checkout: a
+	// test-cohort team must never reach the real Razorpay change-plan call.
+	if ok, errResp := h.rejectIfTestCohort(c, teamID, "change_plan"); !ok {
+		return errResp
 	}
 	// Email-verified gate (migration 052) — same gate as checkout: a
 	// /claim-created account must verify its email before changing plans.

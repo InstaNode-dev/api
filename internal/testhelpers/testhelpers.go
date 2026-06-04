@@ -325,6 +325,10 @@ func runMigrations(t *testing.T, db *sql.DB) {
 		`ALTER TABLE deployments ADD COLUMN IF NOT EXISTS git_token_enc TEXT NOT NULL DEFAULT ''`,
 		// teams.default_deployment_ttl_policy — Wave FIX-J team preference.
 		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS default_deployment_ttl_policy TEXT NOT NULL DEFAULT 'auto_24h'`,
+		// teams.is_test_cohort — migration 067 (W0 synthetic-monitoring cohort
+		// isolation). Inert by default; seeder-set true on durable test teams so
+		// charge/funnel/email paths can exclude them.
+		`ALTER TABLE teams ADD COLUMN IF NOT EXISTS is_test_cohort BOOLEAN NOT NULL DEFAULT false`,
 		// 012_audit_log — per-team event stream consumed by the dashboard's
 		// Recent Activity feed AND by the admin customer-detail endpoint.
 		`CREATE TABLE IF NOT EXISTS audit_log (
