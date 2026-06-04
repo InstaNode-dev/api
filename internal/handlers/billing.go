@@ -189,8 +189,8 @@ func detectBillingMisconfiguration(cfgEnvironment, razorpayKeyID string) (code, 
 
 // BillingHandler handles billing and Razorpay webhook endpoints.
 type BillingHandler struct {
-	db    *sql.DB
-	cfg   *config.Config
+	db  *sql.DB
+	cfg *config.Config
 	// email is the Mailer used for all webhook-triggered sends (payment
 	// receipts, payment-failed dunning, etc.). The interface lets main.go
 	// wrap the underlying *email.Client in a *email.BreakingClient — a
@@ -1115,12 +1115,12 @@ type rzpSubscriptionEntity struct {
 }
 
 type rzpPaymentEntity struct {
-	ID               string            `json:"id"`
-	Amount           int64             `json:"amount"`
-	Currency         string            `json:"currency"`
-	Email            string            `json:"email"`
-	AttemptCount     int               `json:"attempt_count"`
-	ErrorDescription string            `json:"error_description"`
+	ID               string `json:"id"`
+	Amount           int64  `json:"amount"`
+	Currency         string `json:"currency"`
+	Email            string `json:"email"`
+	AttemptCount     int    `json:"attempt_count"`
+	ErrorDescription string `json:"error_description"`
 	// SubscriptionID + OrderID + Notes (B11-P1, 2026-05-20): used to
 	// resolve the team server-side instead of trusting payload.email
 	// verbatim. A payment.failed entity carries `subscription_id` for
@@ -2100,11 +2100,48 @@ func (h *BillingHandler) handleSubscriptionCancelled(ctx context.Context, c *fib
 		return fmt.Errorf("subscription.cancelled team resolve: %w", err)
 	}
 
-	// Snapshot the prior tier so the audit row can capture from→to. Failure
-	// to read it is non-fatal — we just emit with from_tier="".
+	// Snapshot the prior tier so the audit row can capture from→to, and the
+	// team's CURRENT live subscription id so we can reject a stale/superseded
+	// cancellation (see the guard below). Failure to read the team is non-fatal
+	// — we just emit with from_tier="" and an empty live sub id (which falls
+	// through to the historical always-downgrade behaviour).
 	fromTier := ""
+	liveSubID := ""
 	if team, lookupErr := models.GetTeamByID(ctx, h.db, teamID); lookupErr == nil && team != nil {
 		fromTier = team.PlanTier
+		if team.RazorpaySubscriptionID.Valid {
+			liveSubID = strings.TrimSpace(team.RazorpaySubscriptionID.String)
+		}
+	}
+
+	// STALE-SUB GUARD (MONEY-SENSITIVE, 2026-06-04): a cancel/halt/deauth
+	// webhook carries notes.team_id verbatim from WHATEVER subscription fired
+	// it — including a SUPERSEDED one. After a hobby→pro plan change the old
+	// hobby subscription stays alive in Razorpay carrying the same notes.team_id;
+	// its eventual cancellation (or a halt/deauth) would otherwise downgrade the
+	// team that is now actively paying on a DIFFERENT live Pro subscription.
+	//
+	// Mirror the charged-path lower_tier guard (handleSubscriptionCharged): if
+	// the webhook's sub.ID does NOT match the team's stored live subscription id
+	// AND that live id is non-empty, this is a stale event for an old
+	// subscription. Skip the downgrade entirely, log a loud WARN + a
+	// billing.charge_undeliverable audit row for operator reconciliation, and
+	// keep the higher tier. An empty live id (never stored a sub id, or a
+	// lookup miss above) falls through to the historical behaviour — we cannot
+	// prove the event is stale, and a never-paid team should still downgrade.
+	if liveSubID != "" && sub.ID != "" && sub.ID != liveSubID {
+		slog.Warn("billing.subscription.cancelled.stale_subscription_skip",
+			"team_id", teamID,
+			"event_subscription_id", sub.ID,
+			"live_subscription_id", liveSubID,
+			"current_tier", fromTier,
+			"action", "cancel/halt/deauth carried a subscription_id that is NOT the team's live subscription — "+
+				"NOT downgrading (likely a superseded subscription from a prior plan change). Operator: verify "+
+				"the team's live subscription is healthy; if this WAS the live sub, reconcile manually",
+		)
+		emitChargeUndeliverableAudit(ctx, h.db, teamID, sub, event,
+			chargeUndeliverableReasonStaleSubscriptionCancel, fromTier)
+		return nil
 	}
 
 	// Downgrade behaviour: a cancellation with zero paid invoices means the
@@ -3236,6 +3273,13 @@ const (
 	// downgrades flow through cancellation/plan-change), so the tier was kept
 	// and the charge flagged for operator reconciliation.
 	chargeUndeliverableReasonLowerTierCharge = "lower_tier_charge"
+	// chargeUndeliverableReasonStaleSubscriptionCancel — 2026-06-04: a
+	// subscription.cancelled/halted/deauthenticated webhook carried a
+	// subscription_id that does NOT match the team's stored live subscription.
+	// The event is for a superseded subscription (e.g. the old sub left alive
+	// after a hobby→pro plan change), so the downgrade was SKIPPED to protect an
+	// actively-paying customer. Flagged for operator reconciliation.
+	chargeUndeliverableReasonStaleSubscriptionCancel = "stale_subscription_cancel"
 )
 
 // F11 (billing-trust audit 2026-05-19) — cancellation copy.
