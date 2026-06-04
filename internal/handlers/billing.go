@@ -684,6 +684,12 @@ func (h *BillingHandler) requireVerifiedEmail(c *fiber.Ctx, action string) (bool
 // the already-written fiber response (or ErrResponseWritten) and the caller must
 // return it unchanged.
 func (h *BillingHandler) rejectIfTestCohort(c *fiber.Ctx, teamID uuid.UUID, action string) (ok bool, resp error) {
+	// No DB wired: only happens on db-independent handler paths exercised in
+	// tests (e.g. the Redis SETNX dedup guard, which short-circuits before any
+	// DB use). In prod h.db is always set. Nothing to check — proceed.
+	if h.db == nil {
+		return true, nil
+	}
 	isTest, err := models.IsTestCohort(c.Context(), h.db, teamID)
 	if err != nil {
 		// Fail open: a real customer's charge must not be blocked by a DB blip.
