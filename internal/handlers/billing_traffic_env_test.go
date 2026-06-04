@@ -184,26 +184,29 @@ func TestBillingCheckout_DetectsLiveKeyInDevEnv(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := &config.Config{
-				JWTSecret:                 "test-secret-that-is-at-least-32-bytes-long!!",
-				Environment:               tc.environment,
-				RazorpayKeyID:             tc.key,
-				RazorpayKeySecret:         "secret-fixture", // non-empty so the not_configured branch doesn't shadow
-				RazorpayPlanIDPro:         "plan_monthly_pro",
-				RazorpayPlanIDProYearly:   "plan_yearly_pro",
-				RazorpayPlanIDHobby:       "plan_monthly_hobby",
-				// RazorpayPlanIDTeam intentionally LEFT EMPTY. The test
-				// requests plan="team" — a valid plan name in the switch
-				// (passes the 400 invalid_plan branch) but with no plan_id
-				// configured, so a guard-cleared request falls through to
-				// the 503 billing_not_configured branch. This cleanly
-				// distinguishes:
+				JWTSecret:               "test-secret-that-is-at-least-32-bytes-long!!",
+				Environment:             tc.environment,
+				RazorpayKeyID:           tc.key,
+				RazorpayKeySecret:       "secret-fixture", // non-empty so the not_configured branch doesn't shadow
+				RazorpayPlanIDPro:       "plan_monthly_pro",
+				RazorpayPlanIDProYearly: "plan_yearly_pro",
+				RazorpayPlanIDHobby:     "plan_monthly_hobby",
+				// RazorpayPlanIDHobbyPlus intentionally LEFT EMPTY. The test
+				// requests plan="hobby_plus" — a self-serve-purchasable plan
+				// name in the switch (passes the 400 invalid_plan branch and is
+				// NOT the re-gated team tier) but with no plan_id configured, so
+				// a guard-cleared request falls through to the 503
+				// billing_not_configured branch. This cleanly distinguishes:
 				//   - guard fired              → 503 billing_misconfigured
 				//   - guard let through        → 503 billing_not_configured
 				// without depending on a DB for the email-verify gate.
+				// (Was plan="team" before the 2026-06-04 Team re-gate, which
+				// now short-circuits team with 400 tier_not_yet_available
+				// before these branches.)
 			}
 			app := checkoutAppNoDB(t, cfg)
 			status, body := postCheckout(t, app, map[string]any{
-				"plan": "team",
+				"plan": "hobby_plus",
 			})
 			assert.Equal(t, tc.wantStatus, status, "body=%v", body)
 			assert.Equal(t, tc.wantErrorCode, body["error"], "body=%v", body)
@@ -220,10 +223,10 @@ func TestBillingCheckout_DetectsLiveKeyInDevEnv(t *testing.T) {
 // Fiber harness above. Tests the package-internal exported helpers
 // by re-deriving them from the surface contract:
 //
-//   trafficEnv("rzp_live_X")  -> ("production", true)
-//   trafficEnv("rzp_test_X")  -> ("test", true)
-//   trafficEnv("")            -> ("test", false)
-//   trafficEnv("garbage")     -> ("test", false)
+//	trafficEnv("rzp_live_X")  -> ("production", true)
+//	trafficEnv("rzp_test_X")  -> ("test", true)
+//	trafficEnv("")            -> ("test", false)
+//	trafficEnv("garbage")     -> ("test", false)
 //
 // We assert through the public CreateCheckoutAPI surface because the
 // helpers are package-private. The matrix above already exercises every
@@ -243,11 +246,11 @@ func TestBillingCheckout_TrafficEnvDerivation_OnlyProductionOrTest(t *testing.T)
 		tc := tc
 		t.Run(tc.want+"_"+tc.key, func(t *testing.T) {
 			cfg := &config.Config{
-				JWTSecret:                 "test-secret-that-is-at-least-32-bytes-long!!",
-				Environment:               envForKey(tc.key), // production iff live
-				RazorpayKeyID:             tc.key,
-				RazorpayKeySecret:         "secret-fixture",
-				RazorpayPlanIDPro:         "plan_monthly_pro",
+				JWTSecret:         "test-secret-that-is-at-least-32-bytes-long!!",
+				Environment:       envForKey(tc.key), // production iff live
+				RazorpayKeyID:     tc.key,
+				RazorpayKeySecret: "secret-fixture",
+				RazorpayPlanIDPro: "plan_monthly_pro",
 			}
 			// Invalid plan body forces 400 — but the error envelope
 			// doesn't carry traffic_env, so we can't observe the derivation
@@ -284,7 +287,7 @@ func TestBillingCheckout_ResponseIncludesTrafficEnv(t *testing.T) {
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
 	cfg := &config.Config{
-		JWTSecret:         "test-secret-that-is-at-least-32-bytes-long!!",
+		JWTSecret: "test-secret-that-is-at-least-32-bytes-long!!",
 		// production deployment + live key is the intended pairing
 		// — guard does not fire; happy path proceeds to the
 		// fake CreateSubscription.

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"instant.dev/internal/handlers"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/models"
+	"instant.dev/internal/plans"
 	"instant.dev/internal/razorpaybilling"
 	"instant.dev/internal/testhelpers"
 )
@@ -941,11 +943,11 @@ func postCheckout(t *testing.T, app *fiber.App, body map[string]any) (int, map[s
 // contacted — a typo can't silently fall back to monthly.
 func TestCheckout_PlanFrequency_InvalidValue_Returns400(t *testing.T) {
 	cfg := &config.Config{
-		JWTSecret:                 "test-secret-that-is-at-least-32-bytes-long!!",
-		RazorpayKeyID:             "rzp_test_key",
-		RazorpayKeySecret:         "rzp_test_secret",
-		RazorpayPlanIDPro:         "plan_monthly_pro",
-		RazorpayPlanIDProYearly:   "plan_yearly_pro",
+		JWTSecret:               "test-secret-that-is-at-least-32-bytes-long!!",
+		RazorpayKeyID:           "rzp_test_key",
+		RazorpayKeySecret:       "rzp_test_secret",
+		RazorpayPlanIDPro:       "plan_monthly_pro",
+		RazorpayPlanIDProYearly: "plan_yearly_pro",
 	}
 	app := checkoutAppNoDB(t, cfg)
 	status, body := postCheckout(t, app, map[string]any{
@@ -998,18 +1000,101 @@ func TestCheckout_PlanFrequency_MonthlyDefault_NoFrequency(t *testing.T) {
 	assert.Equal(t, "billing_not_configured", body["error"])
 }
 
-// Note: the full positive-path Team-tier checkout regression lives in
-// billing_coverage2_test.go (TestCov2_Checkout_TeamTierAccepted /
-// _TeamTierYearlyAccepted / _TeamTierNotConfigured) — those need a
-// real test DB to clear the post-validation email-verify gate, so they
-// can't run in the no-DB harness this file uses for input-validation
-// branches. The no-DB-friendly negative case (typo'd plan still 400s)
-// stays here.
+// Note: the Team-tier checkout/change-plan REJECTION regressions that need
+// a real test DB (to clear the post-validation email-verify gate) live in
+// billing_coverage2_test.go (TestCov2_Checkout_TeamTierRejected /
+// _TeamTierYearlyRejected, TestCov2_ChangePlan_TeamTierRejected). The
+// no-DB-friendly Team rejection + the typo'd-plan negative case stay here —
+// the email-verify gate fails open when no user_id is on the request, so the
+// plan switch is reachable without a DB.
 
-// TestCheckout_RejectsUnknownPlan locks the negative side of the
-// 2026-05-29 BIZ-1 fix: a typo'd plan name still returns 400
-// invalid_plan, and the error message now lists team as an accepted
-// plan since the dedicated tier_unavailable branch is gone.
+// TestCreateCheckout_TeamPlan_Rejected is the 2026-06-04 CEO re-gate guard:
+// POST /api/v1/billing/checkout with plan=team returns 400 with the DISTINCT
+// code tier_not_yet_available (NOT the generic invalid_plan) even when the
+// Team Razorpay plan_id is fully configured. This REVERSES the 2026-05-29
+// (BIZ-1) enablement — the Team plan ($199 "unlimited") must not be
+// chargeable until its unlimited-resource delivery is proven built. Do not
+// "re-fix" by re-allowing team.
+func TestCreateCheckout_TeamPlan_Rejected(t *testing.T) {
+	cfg := &config.Config{
+		JWTSecret:                "test-secret-that-is-at-least-32-bytes-long!!",
+		RazorpayKeyID:            "rzp_test_key",
+		RazorpayKeySecret:        "rzp_test_secret",
+		RazorpayPlanIDTeam:       "plan_monthly_team",
+		RazorpayPlanIDTeamYearly: "plan_yearly_team",
+	}
+	app := checkoutAppNoDB(t, cfg)
+	status, resp := postCheckout(t, app, map[string]any{"plan": "team"})
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, "tier_not_yet_available", resp["error"],
+		"plan=team must return the distinct tier_not_yet_available code, not invalid_plan")
+}
+
+// TestCheckout_SelfServePurchasablePlans_AreExactlyHobbyHobbyPlusPro is the
+// rule-18 registry-iterating guard for the 2026-06-04 CEO re-gate. It walks
+// the LIVE plans registry (not a hand-typed list) and asserts the set of
+// tiers that POST /api/v1/billing/checkout accepts into the subscription-mint
+// path is EXACTLY {hobby, hobby_plus, pro}. team is gated with the distinct
+// tier_not_yet_available code; every other tier (free/anonymous/growth, plus
+// any future tier added to plans.yaml) is rejected with invalid_plan. If a
+// future engineer re-adds team to the checkout accept-case — or adds a new
+// purchasable tier without filing it here — this test goes RED.
+//
+// Classification is by error code with NO plan_id configured for the accepted
+// tiers, so an accepted tier lands on 503 billing_not_configured (it cleared
+// the plan switch) rather than minting a real subscription:
+//   - accepted (hobby/hobby_plus/pro) → 503 billing_not_configured
+//   - team                            → 400 tier_not_yet_available
+//   - anything else                   → 400 invalid_plan
+func TestCheckout_SelfServePurchasablePlans_AreExactlyHobbyHobbyPlusPro(t *testing.T) {
+	selfServe := map[string]bool{"hobby": true, "hobby_plus": true, "pro": true}
+
+	// Test/empty-env key + secret so the BUG-P112 live-key-in-dev guard never
+	// fires and we always reach the post-plan-switch billing_not_configured
+	// branch for accepted tiers. No plan_ids set on purpose.
+	cfg := &config.Config{
+		JWTSecret:         "test-secret-that-is-at-least-32-bytes-long!!",
+		RazorpayKeyID:     "rzp_test_key",
+		RazorpayKeySecret: "rzp_test_secret",
+	}
+	app := checkoutAppNoDB(t, cfg)
+
+	all := plans.Default().All()
+	require.NotEmpty(t, all, "plans registry empty — cannot validate purchasable set")
+
+	for tier := range all {
+		// Yearly variants are not checkout `plan` names — the cycle is
+		// selected via plan_frequency, not the plan field — so skip them.
+		if strings.HasSuffix(tier, "_yearly") {
+			continue
+		}
+		tier := tier
+		t.Run(tier, func(t *testing.T) {
+			status, body := postCheckout(t, app, map[string]any{"plan": tier})
+			code, _ := body["error"].(string)
+			switch {
+			case selfServe[tier]:
+				assert.Equal(t, http.StatusServiceUnavailable, status,
+					"%q is a self-serve plan and must clear the plan switch (→ billing_not_configured here), body=%v", tier, body)
+				assert.Equal(t, "billing_not_configured", code,
+					"%q must reach the post-switch config branch, not a plan-rejection code", tier)
+			case tier == "team":
+				assert.Equal(t, http.StatusBadRequest, status, "body=%v", body)
+				assert.Equal(t, "tier_not_yet_available", code,
+					"team must be gated with the distinct tier_not_yet_available code (2026-06-04 CEO re-gate)")
+			default:
+				assert.Equal(t, http.StatusBadRequest, status, "body=%v", body)
+				assert.Equal(t, "invalid_plan", code,
+					"%q is not self-serve purchasable and must be rejected with invalid_plan", tier)
+			}
+		})
+	}
+}
+
+// TestCheckout_RejectsUnknownPlan locks the negative side: a typo'd plan name
+// still returns 400 invalid_plan, and the error message lists the three
+// self-serve-purchasable plans (team is no longer among them — re-gated
+// 2026-06-04).
 func TestCheckout_RejectsUnknownPlan(t *testing.T) {
 	cfg := &config.Config{
 		JWTSecret:                "test-secret-that-is-at-least-32-bytes-long!!",
@@ -1023,8 +1108,8 @@ func TestCheckout_RejectsUnknownPlan(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, status)
 	assert.Equal(t, "invalid_plan", resp["error"])
 	if msg, ok := resp["message"].(string); ok {
-		assert.Contains(t, msg, "team",
-			"invalid_plan message should list team as an accepted plan now that the guard is gone")
+		assert.NotContains(t, msg, "team",
+			"invalid_plan message must not list team now that Team is re-gated out of self-serve")
 	}
 }
 
@@ -1056,7 +1141,7 @@ func TestPlanIDToTier_MapsYearlyPlanIDsToCanonicalTier(t *testing.T) {
 		// "hobby" (lowest paid tier), NOT "pro". An env-var typo grants $9
 		// Hobby instead of $49 Pro — 5× smaller blast radius; the reconciler
 		// corrects upward within 15 min once the env var is fixed.
-		{"", handlers.PlanIDToTierFallbackForTest},               // empty → safe fallback
+		{"", handlers.PlanIDToTierFallbackForTest},                // empty → safe fallback
 		{"plan_unknown_xx", handlers.PlanIDToTierFallbackForTest}, // unrecognised → safe fallback
 	}
 	for _, c := range cases {
@@ -1248,7 +1333,7 @@ func TestBillingWebhook_SubscriptionCharged_PromoCode_NotConsumed(t *testing.T) 
 
 	// Build a subscription.charged event that references the promo code in notes.
 	notes := map[string]any{
-		"team_id":            teamID,
+		"team_id":             teamID,
 		"admin_promo_code_id": codeID.String(),
 	}
 	subEntity, _ := json.Marshal(map[string]any{
