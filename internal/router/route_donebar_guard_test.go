@@ -248,10 +248,21 @@ var routeTestMap = map[string]string{
 	"POST /api/v1/team/invitations/:id/accept":              "TestTeamBlock_AcceptInvitationByID",
 	"DELETE /api/v1/teams/:team_id/invitations/:id":         "TestTeamBlock_TeamsAliasRevokeInvitation",
 
-	// ── vault: requires-auth contract (merged surfaces) ──────────────────────
-	"GET /api/v1/vault/:env":      "TestMerged_Vault_RequiresAuth",
-	"GET /api/v1/vault/:env/:key": "TestMerged_Vault_RequiresAuth",
-	"PUT /api/v1/vault/:env/:key": "TestMerged_Vault_RequiresAuth",
+	// ── vault: per-team encrypted secret store (W3) — DB-backed handler-
+	// integration suite (internal/handlers/vault_block_routes_test.go). Each
+	// row points at the TestVaultBlock_* test that drives the route through the
+	// production RequireAuth + PopulateTeamRole + RequireEnvAccess(VaultWrite)
+	// chain (vaultBlockApp mirrors router.New) against a real Postgres: happy
+	// path + tier/env-policy authz (403/402) + cross-team isolation (404, never
+	// 403) + the encrypt/decrypt-at-rest contract + rotate/copy semantics +
+	// input validation. Moved here from the shallow TestMerged_Vault_RequiresAuth
+	// probe (GET/GET/PUT) and from routeCoverageExemptions (rotate/delete/copy).
+	"GET /api/v1/vault/:env":              "TestVaultBlock_ListKeys",
+	"GET /api/v1/vault/:env/:key":         "TestVaultBlock_GetSecret",
+	"PUT /api/v1/vault/:env/:key":         "TestVaultBlock_PutSecret",
+	"POST /api/v1/vault/:env/:key/rotate": "TestVaultBlock_RotateSecret",
+	"DELETE /api/v1/vault/:env/:key":      "TestVaultBlock_DeleteSecret",
+	"POST /api/v1/vault/copy":             "TestVaultBlock_CopySecrets",
 }
 
 // routeCoverageExemptions lists routes that have NO mapped e2e integration test
@@ -396,10 +407,11 @@ var routeCoverageExemptions = map[string]string{
 	"GET /api/v1/admin/promos/audit":                    "admin promo audit. TODO: matrix W10 admin-console flow.",
 	"GET /api/v1/admin/promos/stats":                    "admin promo stats. TODO: matrix W10 admin-console flow.",
 
-	// ── vault rotate / copy (vault read/write contract is mapped).
-	"POST /api/v1/vault/:env/:key/rotate": "vault secret rotate (read/write contract mapped via TestMerged_Vault_RequiresAuth). TODO: matrix W3 vault-rotate flow.",
-	"DELETE /api/v1/vault/:env/:key":      "vault secret delete. TODO: matrix W3 vault-delete flow.",
-	"POST /api/v1/vault/copy":             "vault cross-env copy. TODO: matrix W3 vault-copy flow.",
+	// ── vault rotate / delete / copy — MOVED to routeTestMap. Now covered by
+	// the W3 vault-block handler-integration suite
+	// (internal/handlers/vault_block_routes_test.go, TestVaultBlock_*), which
+	// also upgraded the GET/GET/PUT rows off the shallow
+	// TestMerged_Vault_RequiresAuth probe to full contract coverage.
 }
 
 // buildLiveRouter constructs the production router in-memory. Route
