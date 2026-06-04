@@ -696,14 +696,19 @@ func UpdateProviderResourceID(ctx context.Context, db *sql.DB, resourceID uuid.U
 	return nil
 }
 
-// ElevateResourceTiersByTeam sets the tier of every active or paused team-owned
-// resource to newTier and clears its TTL (expires_at = NULL).
+// ElevateResourceTiersByTeam sets the tier of every active, paused, or
+// quota-suspended team-owned resource to newTier and clears its TTL
+// (expires_at = NULL).
 //
-// Called from the Razorpay subscription.charged webhook. Picks up two cases:
+// Called from the Razorpay subscription.charged webhook. Picks up three cases:
 //  1. Resources that are already permanent (expires_at IS NULL) — a hobby
 //     user upgrading to pro: lift their existing resources to the new tier.
 //  2. Resources still on anonymous TTL (expires_at > now()) — a freshly
 //     claimed user paying for the first time: clear the TTL + set tier.
+//  3. Resources the worker's storage-quota enforcer SUSPENDED for exceeding
+//     their tier cap — an upgrade must raise the cap on the very row that
+//     tripped it, otherwise "upgrade to restore access" is a no-op for the
+//     suspended resource and it stays below the new cap's reach.
 //
 // This is the second half of "pay from day one": claim transfers team
 // ownership but does NOT clear the TTL or change tier. Only payment does.
@@ -714,6 +719,19 @@ func UpdateProviderResourceID(ctx context.Context, db *sql.DB, resourceID uuid.U
 // re-subscribed would have their resources stuck at the wrong tier, blocking
 // the resume flow which re-derives access rights from the resource tier.
 //
+// Suspended rows are included (added 2026-06-04) for the same reason: a
+// quota-suspended resource must carry the higher tier so it is now UNDER the
+// new cap. NOTE: this raises the cap only — it does NOT flip status back to
+// 'active' or reverse the provider-side CONNECT/ACL REVOKE. That unsuspend
+// transition (re-measure usage against the new cap → status='active' +
+// provider re-grant + resource.quota_unsuspended audit) lives in the WORKER's
+// storage-quota enforcer (sweep finding #3); without that follow-up the row
+// here carries the right tier but stays status='suspended' until the worker's
+// next scan re-evaluates it. CAVEAT: for postgres/mongo the REVOKE-while-
+// suspended can also block the customer from deleting data to get under cap,
+// so for those backends the worker's tier-aware re-measure (which an elevated
+// tier now satisfies) is the recovery path, not customer self-service delete.
+//
 // expires_at > now() guards a race with the reaper — we don't resurrect a
 // resource whose TTL already elapsed.
 // Applies across all environments — one upgrade lifts dev, staging, and prod.
@@ -722,7 +740,7 @@ func ElevateResourceTiersByTeam(ctx context.Context, db *sql.DB, teamID uuid.UUI
 		UPDATE resources
 		SET tier = $1, expires_at = NULL
 		WHERE team_id = $2
-		  AND status IN ('active', 'paused')
+		  AND status IN ('active', 'paused', 'suspended')
 		  AND (expires_at IS NULL OR expires_at > now())
 	`, newTier, teamID)
 	if err != nil {
