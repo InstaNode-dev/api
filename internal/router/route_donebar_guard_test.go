@@ -201,6 +201,22 @@ var routeTestMap = map[string]string{
 	"POST /api/v1/deployments/:id/ttl":            "TestDeployLifecycle_SetTTL_HappyPath",
 	"GET /api/v1/deployments/:id/events":          "TestDeployLifecycle_Events_Timeline_OwnerReadsDescOrder",
 
+	// ── deploy ↔ GitHub link (D17 / W6) — DB-backed handler-integration suite
+	// (internal/handlers/github_deploy_block_integration_test.go). Each row
+	// points at the TestGitHubDeployBlock_* test that drives the route through
+	// the production RequireAuth + RequireWritable chain (NewTestAppWithServices
+	// mirrors router.New) against a real Postgres: connect/get/disconnect
+	// state-change + secret-once + already-connected 409 + invalid-repo 400 +
+	// tier gate (hobby-allowed / anonymous-402) + authz (owner+member 2xx,
+	// non-member cross-team 404, unauth 401) + cross-team isolation. Moved here
+	// from routeCoverageExemptions. The PUBLIC receive endpoint
+	// (/webhooks/github/:webhook_id) has no session-auth chain to drive and
+	// stays exempt (its HMAC/rate-limit internals are covered by the whitebox
+	// suites github_deploy_test.go + github_deploy_receive_arms_coverage_test.go).
+	"POST /api/v1/deployments/:id/github":   "TestGitHubDeployBlock_Connect_OwnerHappyPath",
+	"GET /api/v1/deployments/:id/github":    "TestGitHubDeployBlock_Get_ConnectedShape",
+	"DELETE /api/v1/deployments/:id/github": "TestGitHubDeployBlock_Disconnect_RemovesConnection",
+
 	// ── teams / invitations: public-but-404 contract (merged surfaces) ───────
 	"POST /api/v1/invitations/:token/accept":  "TestMerged_Teams_AcceptInvitation_PublicWith404",
 	"GET /api/v1/teams/:team_id/invitations":  "TestMerged_Teams_InvitationsRequireAuth",
@@ -301,16 +317,23 @@ var routeCoverageExemptions = map[string]string{
 	// suite (internal/handlers/deploy_lifecycle_block_integration_test.go,
 	// TestDeployLifecycle_*). The GitHub-link rows below stay exempt (D17/W6).
 
-	// ── deploy GitHub link (D17 / W6 github-app flow) — no integration cover yet.
-	"GET /api/v1/deployments/:id/github":    "deploy GitHub link read. TODO: matrix W6 deploy-github flow.",
-	"POST /api/v1/deployments/:id/github":   "deploy GitHub link write. TODO: matrix W6 deploy-github flow.",
-	"DELETE /api/v1/deployments/:id/github": "deploy GitHub unlink. TODO: matrix W6 deploy-github flow.",
+	// ── deploy ↔ GitHub link (D17 / W6) — MOVED to routeTestMap. Now covered by
+	// the W6 github-deploy-link handler-integration suite
+	// (internal/handlers/github_deploy_block_integration_test.go,
+	// TestGitHubDeployBlock_*).
 
-	// ── github app integration (install / callback / webhooks).
-	"GET /integrations/github/install":  "GitHub App install redirect. TODO: matrix W6 github-app flow.",
-	"GET /integrations/github/callback": "GitHub App OAuth callback. TODO: matrix W6 github-app flow.",
-	"POST /webhooks/github":             "GitHub App webhook (no id). TODO: matrix W6 github-app webhook flow.",
-	"POST /webhooks/github/:webhook_id": "GitHub App webhook (per-install). TODO: matrix W6 github-app webhook flow.",
+	// ── github app integration (install / callback / webhooks) — kept exempt:
+	// these need a real GitHub App (OAuth install redirect, signed-with-the-App-
+	// secret callback/webhook) that this hermetic DB-backed suite cannot stand
+	// in for. The per-connection PUBLIC receive endpoint
+	// (POST /webhooks/github/:webhook_id) is auth'd by HMAC, not a session JWT,
+	// so it has no RequireAuth chain to drive here; its signature / branch-match
+	// / rate-limit / idempotency internals are covered by the whitebox suites
+	// github_deploy_test.go + github_deploy_receive_arms_coverage_test.go.
+	"GET /integrations/github/install":  "GitHub App install redirect (real GitHub OAuth). TODO: matrix W6 github-app flow (staging/e2e with a real App).",
+	"GET /integrations/github/callback": "GitHub App OAuth callback (real GitHub OAuth). TODO: matrix W6 github-app flow (staging/e2e with a real App).",
+	"POST /webhooks/github":             "GitHub App webhook, no id (HMAC-auth'd by the App secret, no session chain). TODO: matrix W6 github-app webhook flow.",
+	"POST /webhooks/github/:webhook_id": "per-connection push receiver (HMAC-auth'd, no session chain; signature/branch/rate-limit/idempotency covered by whitebox github_deploy_test.go + github_deploy_receive_arms_coverage_test.go). TODO: matrix W6 github-app webhook e2e.",
 
 	// ── stacks: confirm-deletion / promote / family / domains (W4 advanced).
 	"PATCH /stacks/:slug/env":                      "stack env merge (mig 062). TODO: matrix W4 stack-env flow.",
