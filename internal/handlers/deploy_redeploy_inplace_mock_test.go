@@ -163,8 +163,8 @@ func expectTeamLookupOK(mock sqlmock.Sqlmock, teamID uuid.UUID, tier string) {
 		WithArgs(teamID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "name", "plan_tier", "stripe_customer_id", "created_at",
-			"default_deployment_ttl_policy",
-		}).AddRow(teamID, "mock-team", tier, sql.NullString{}, time.Now(), "auto_24h"))
+			"default_deployment_ttl_policy", "is_test_cohort",
+		}).AddRow(teamID, "mock-team", tier, sql.NullString{}, time.Now(), "auto_24h", false))
 }
 
 // TestDeployNew_Redeploy_LookupDriverError_Returns503 pins deploy.go:678-683.
