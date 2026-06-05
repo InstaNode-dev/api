@@ -263,6 +263,29 @@ type Config struct {
 	// WORKER_INTERNAL_JWT_SECRET in BOTH the api and the worker
 	// (same value, generated via `openssl rand -hex 32`).
 	WorkerInternalJWTSecret string
+
+	// E2EAccountToken is the shared secret that guards the CI-only
+	// ephemeral-test-account surface (POST/DELETE /internal/e2e/account).
+	// CI mints real test-cohort accounts against PRODUCTION to run
+	// integration tests, then reaps them — that is the only thing this
+	// token authorizes.
+	//
+	// INERT BY DEFAULT (flag-protection): when this is empty, BOTH e2e
+	// routes return 404 for every request, hiding the endpoint's
+	// existence entirely. The endpoint cannot mint or reap a single
+	// account until an operator sets E2E_ACCOUNT_TOKEN — so the surface
+	// ships safe-by-default and is only "armed" in the environments
+	// (CI/prod) where the secret is wired. The caller authenticates by
+	// sending the exact value in the X-E2E-Token request header; the
+	// handler does a crypto/subtle constant-time compare and 404s on any
+	// mismatch (never 401/403 — a distinguishable status would leak that
+	// the route exists).
+	//
+	// Distinct secret from JWTSecret and WorkerInternalJWTSecret: this
+	// one authorizes account *creation/destruction*, a strictly more
+	// dangerous capability than session-signing, so it gets its own key
+	// and its own k8s Secret entry (generate via `openssl rand -hex 32`).
+	E2EAccountToken string
 }
 
 // ErrMissingConfig is returned when a required env var is absent.
@@ -427,6 +450,9 @@ func Load() *Config {
 	cfg.SendGridWebhookKey = os.Getenv("SENDGRID_WEBHOOK_PUBLIC_KEY")
 
 	cfg.WorkerInternalJWTSecret = strings.TrimSpace(os.Getenv("WORKER_INTERNAL_JWT_SECRET"))
+	// E2E_ACCOUNT_TOKEN: empty = the /internal/e2e/* surface is inert
+	// (every call 404s). See Config.E2EAccountToken for the full posture.
+	cfg.E2EAccountToken = strings.TrimSpace(os.Getenv("E2E_ACCOUNT_TOKEN"))
 	cfg.DeployDomain = getenv("DEPLOY_DOMAIN", "instant.dev")
 	cfg.ComputeProvider = getenv("COMPUTE_PROVIDER", "noop")
 	cfg.KubeNamespaceApps = getenv("KUBE_NAMESPACE_APPS", "instant-apps")

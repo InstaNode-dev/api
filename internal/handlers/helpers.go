@@ -1198,6 +1198,18 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"reauth_required": {
 		AgentAction: "Tell the user this action requires a fresh session (admin-scope PAT mints need re-auth). Sign in again at https://instanode.dev/login — see https://instanode.dev/docs/auth.",
 	},
+
+	// NOTE: the CI-only ephemeral-test-account error codes (not_test_cohort,
+	// team_create_failed, user_create_failed, tier_not_allowed, tier_set_failed,
+	// rand_failed) are deliberately NOT registered here. codeToAgentAction holds
+	// CUSTOMER-facing agent guidance — the contract test (TestAgentActionContract)
+	// requires every entry to start "Tell the user …" and carry a customer
+	// recovery URL. The /internal/e2e/account surface is operator/CI-only and
+	// inert by default (404 unless E2E_ACCOUNT_TOKEN is set), so its codes never
+	// reach a customer agent: the 503 arms already get the generic
+	// AgentActionContactSupport via respondError's status>=500 fallback, and the
+	// 4xx arms (400/403/429) carry a self-explanatory message with no
+	// agent_action — correct for a machine-to-machine CI caller.
 }
 
 // ErrorResponse is the canonical JSON shape for every 4xx/5xx response.

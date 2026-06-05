@@ -298,6 +298,22 @@ const (
 	// alert. Metadata: {orphan_kind, identifier, error}.
 	AuditKindOrphanSweepFailed = "team.orphan_sweep_failed"
 
+	// AuditKindE2EAccountCreated fires on every successful mint via the
+	// CI-only POST /internal/e2e/account surface. The created team is
+	// always is_test_cohort=true. Metadata: {tier, env, user_id, email}
+	// (email is the synthetic e2e-cohort+<random>@instanode.dev address —
+	// not customer PII). Operator-internal signal: a spike means CI is
+	// minting more test accounts than expected, which would point at a
+	// reaper that is failing to clean up. NOT a customer email event.
+	AuditKindE2EAccountCreated = "e2e.account.created"
+
+	// AuditKindE2EAccountReaped fires on every successful reap via the
+	// CI-only DELETE /internal/e2e/account/:team_id surface. Only ever
+	// emitted for an is_test_cohort team — the handler 403s before this
+	// row is written if the target is a real team. Metadata:
+	// {resources_marked_for_reaper}. Operator-internal signal only.
+	AuditKindE2EAccountReaped = "e2e.account.reaped"
+
 	// AuditKindResourceMetricsQueried fires when a caller successfully fetches
 	// GET /api/v1/resources/:id/metrics. The audit row's metadata records the
 	// resolved window_seconds + samples_count so the Loops forwarder /

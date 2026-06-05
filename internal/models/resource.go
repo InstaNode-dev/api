@@ -553,6 +553,46 @@ func PauseAllTeamResources(ctx context.Context, db *sql.DB, teamID uuid.UUID) (i
 	return n, nil
 }
 
+// MarkTeamResourcesForReaper makes every non-terminal resource owned by a team
+// eligible for the worker's TTL reaper, returning how many rows were marked.
+// It sets tier='free' and expires_at=now() on each row, leaving status alone.
+//
+// Why this exact shape: the live reaper (worker/internal/jobs/expire.go) only
+// deprovisions rows matching
+//
+//	((team_id IS NULL AND tier='anonymous') OR tier='free')
+//	  AND status IN (<reapable>) AND expires_at IS NOT NULL AND expires_at < now()
+//	  AND (team_id IS NULL OR teams.status='active')
+//
+// The e2e-reap path DELETEs the team immediately after calling this, which
+// (via ON DELETE SET NULL on resources.team_id) leaves these rows with
+// team_id=NULL. Forcing tier='free' guarantees the reaper picks them up
+// regardless of which tier the test account was minted at (hobby/pro rows
+// would otherwise never match the reaper's tier filter and the backing
+// customer DB/cache/mongo would leak). status='active' is already reapable,
+// so we don't touch it. This reuses the single live deprovisioning path
+// rather than reimplementing gRPC teardown synchronously in the request.
+//
+// Scope: only this team's rows; only rows not already in a terminal status
+// (deleted) — re-marking a deleted row would be pointless and could resurrect
+// a row the reaper already finished. Idempotent: re-running over already-marked
+// rows just re-stamps expires_at to a fresh now().
+func MarkTeamResourcesForReaper(ctx context.Context, db *sql.DB, teamID uuid.UUID) (int64, error) {
+	res, err := db.ExecContext(ctx, `
+		UPDATE resources
+		   SET tier = 'free', expires_at = now()
+		 WHERE team_id = $1 AND status != 'deleted'
+	`, teamID)
+	if err != nil {
+		return 0, fmt.Errorf("models.MarkTeamResourcesForReaper: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("models.MarkTeamResourcesForReaper rows_affected: %w", err)
+	}
+	return n, nil
+}
+
 // ResumeResource flips status from 'paused' → 'active' and clears paused_at.
 // Returns ErrResourceNotPaused when the row is missing or not currently paused
 // (mirror of PauseResource). The connection_url is preserved unchanged — the

@@ -464,6 +464,33 @@ var (
 		Name: "instant_analytics_emit_failed_total",
 		Help: "Behavioral-intelligence custom events dropped before reaching the analytics sink, by reason.",
 	}, []string{"reason"})
+
+	// E2EAccountTotal counts ephemeral-test-account operations on the
+	// CI-only guarded /internal/e2e/account surface.
+	//
+	//   op     = "create" | "reap"
+	//   result = "ok"             — account minted / reaped
+	//            "unauthorized"   — token unset or X-E2E-Token mismatch (404)
+	//            "bad_request"    — invalid tier (e.g. team/growth) → 400
+	//            "not_test_cohort"— reap refused on a real (non-cohort) team → 403
+	//            "rate_limited"   — per-token rate limit tripped
+	//            "error"          — internal failure (DB, JWT sign, etc.)
+	//
+	// Lazy *Vec: not visible at /metrics until the first labelled
+	// observation. In a prod deploy with E2E_ACCOUNT_TOKEN unset this
+	// stays at zero-cardinality forever (no call ever authenticates),
+	// which is the expected steady state.
+	//
+	// MONITORING (rule 25): the user-visible safety invariant is
+	// op="reap",result="not_test_cohort" — a CI bug that tried to reap a
+	// real team. The infra-repo follow-up wires a P1 NR alert on any
+	// nonzero rate of that series + a reliability-dashboard tile, plus a
+	// METRICS-CATALOG.md row (infra is a separate repo with its own
+	// deploy, so it cannot land in this api PR).
+	E2EAccountTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_e2e_account_total",
+		Help: "Ephemeral-test-account operations on the CI-only /internal/e2e/account surface, by op and result.",
+	}, []string{"op", "result"})
 )
 
 // ReadyzCheckStatus updates the gauge for one check in this service.

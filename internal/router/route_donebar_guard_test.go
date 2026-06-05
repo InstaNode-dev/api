@@ -418,6 +418,21 @@ var routeTestMap = map[string]string{
 	"GET /api/v1/usage/wall":               "TestMiscBlock_UsageWall_RealDBContract",
 	"GET /api/v1/webhooks/:token/requests": "TestMiscBlock_WebhookInspector_TokenScopedAndIsolated",
 	"POST /api/v1/experiments/converted":   "TestExperimentsConverted_WritesAuditRow",
+
+	// ── CI-only ephemeral-test-account surface (guarded; inert by default) —
+	// DB-backed handler-integration suite
+	// (internal/handlers/internal_e2e_account_test.go). The create row points at
+	// the mint happy-path test (is_test_cohort team + email-verified primary +
+	// a session JWT that authenticates through the production RequireAuth chain);
+	// the reap row points at the happy-path purge test (an is_test_cohort team's
+	// resources marked for the reaper + the team tombstoned). The CRITICAL safety
+	// arm (a non-test-cohort real team can NEVER be reaped → 403 not_test_cohort),
+	// the 404-when-inert / wrong-token guard, tier=team/growth 400, paid-tier,
+	// idempotent reap, and per-token rate-limit/fail-open arms are covered in the
+	// same suite (+ internal_e2e_account_errpaths_test.go for the DB/redis/sign
+	// failure arms).
+	"POST /internal/e2e/account":            "TestE2EAccount_Create_FreeTier_MintsTestCohortAndAuthenticatingJWT",
+	"DELETE /internal/e2e/account/:team_id": "TestE2EAccount_Reap_TestCohortTeam_Purged",
 }
 
 // routeCoverageExemptions lists routes that have NO mapped e2e integration test

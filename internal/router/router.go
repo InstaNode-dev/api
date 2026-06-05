@@ -909,6 +909,22 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	internalRefundH := handlers.NewInternalBackupRefundHandler(db, rdb, cfg)
 	app.Post("/internal/teams/:id/backup-quota/refund", internalRefundH.Refund)
 
+	// CI-only ephemeral-test-account surface. Registered UNCONDITIONALLY
+	// (not behind the development-env gate) because CI mints+reaps real
+	// test-cohort accounts against PRODUCTION. It is safe to register in
+	// prod because it is INERT BY DEFAULT: both routes return 404 for every
+	// request until E2E_ACCOUNT_TOKEN is set, and even when set they require
+	// a constant-time X-E2E-Token header match (404 on mismatch — the route's
+	// existence is hidden). The reap path can NEVER delete a real team
+	// (403 not_test_cohort on any non-is_test_cohort team). Lives next to the
+	// other /internal/* machine-to-machine routes — NOT under /api/v1 (no
+	// customer session auth applies) and NOT in the public OpenAPI spec
+	// (deliberately omitted; see handlers/openapi.go header). See
+	// handlers/internal_e2e_account.go for the full guard rationale.
+	e2eAccountH := handlers.NewE2EAccountHandler(db, rdb, cfg)
+	app.Post("/internal/e2e/account", e2eAccountH.CreateAccount)
+	app.Delete("/internal/e2e/account/:team_id", e2eAccountH.ReapAccount)
+
 	// §10.20 cached-aggregation endpoints. Separate handlers from BillingHandler
 	// so the caching contract (Redis + singleflight + Cache-Control headers)
 	// is visible at the route + handler boundary, not buried inside the billing
