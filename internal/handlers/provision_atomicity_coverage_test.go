@@ -90,7 +90,17 @@ func TestEveryCreateResourceCallSiteIsFollowedByFinalizeProvision(t *testing.T) 
 	// finalizeProvision. Empty today — add an entry only with a justifying
 	// comment naming the alternate persistence path the file uses. Any new
 	// entry here is a code-review trigger by itself.
-	allowList := map[string]string{}
+	allowList := map[string]string{
+		// internal_e2e_account.go seeds row-only test resources (webhook/cache)
+		// for the CI with_resources factory. There is NO backend provision and
+		// NO credential to persist — the orphan-generator shape finalizeProvision
+		// guards against cannot occur. The alternate persistence path is the
+		// explicit CreateResource (pending) → MarkResourceActive two-phase
+		// lifecycle in seedFastResources; a failure of either arm returns an
+		// error the caller turns into a 503, never a half-populated 200.
+		"internal_e2e_account.go": "CI-only row-only test-seed; no backend RPC/credentials — " +
+			"finalize is CreateResource→MarkResourceActive in seedFastResources",
+	}
 
 	type violation struct {
 		file   string

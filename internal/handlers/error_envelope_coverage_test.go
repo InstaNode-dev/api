@@ -60,6 +60,7 @@ var coverageAllowlist = map[string]string{
 	"tier_not_allowed":   "CI-only /internal/e2e/account gated-tier 400 (machine-to-machine; not customer-facing)",
 	"tier_set_failed":    "CI-only /internal/e2e/account mint 503 (machine-to-machine; not customer-facing)",
 	"rand_failed":        "CI-only /internal/e2e/account mint 503 (machine-to-machine; not customer-facing)",
+	"seed_failed":        "CI-only /internal/e2e/account with_resources mint 503 (machine-to-machine; not customer-facing)",
 }
 
 // TestErrorCode_HasAgentAction is the registry-iterating coverage gate.
