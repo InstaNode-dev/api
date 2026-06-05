@@ -175,6 +175,35 @@ var routeTestMap = map[string]string{
 	"GET /api/v1/stacks":          "TestStack_List",
 	"GET /api/v1/stacks/:slug":    "TestStack_GetWrongTeam",
 
+	// ── stacks advanced (W4) — confirm-deletion / promote / family / domains.
+	// DB-backed handler-integration suite
+	// (internal/handlers/stacks_advanced_block_integration_test.go). Each row
+	// points at the TestStacksAdvancedBlock_* test that drives the route through
+	// the production RequireAuth + /api/v1 group (newStacksAdvancedApp mirrors
+	// router.go) against a real Postgres: the route's real contract + authz
+	// (owner+member 2xx, non-member cross-team 404 never 403, unauth 401) + tier
+	// gate (402) + cross-team isolation. Specifically:
+	//   - confirm-deletion (POST/DELETE) is the tokenized two-step delete:
+	//     POST ?token CASes a pending_deletions row to 'confirmed' + tears the
+	//     stack down (single-use → 410 replay; cross-team token → 410); DELETE
+	//     cancels (no token; session is auth) → 'cancelled'.
+	//   - promote validates env + short-circuits a NON-dev target to 202
+	//     pending_approval + a promote_approvals row BEFORE any compute.
+	//   - family is the Pro-gated env-family read (+ Cache-Control header).
+	//   - domains create/list/verify/delete persist+read custom_domains rows;
+	//     verify advances pending_verification→verified via the TXT seam. The
+	//     ingress/cert legs need a live k8s and are deferred to the W4 e2e spec
+	//     (asserted only up to the verified state, k8s nil). Moved here from
+	//     routeCoverageExemptions.
+	"POST /api/v1/stacks/:slug/confirm-deletion":   "TestStacksAdvancedBlock_ConfirmDelete_TokenizedTwoStep",
+	"DELETE /api/v1/stacks/:slug/confirm-deletion": "TestStacksAdvancedBlock_ConfirmDelete_MissingTokenAndCancel",
+	"POST /api/v1/stacks/:slug/promote":            "TestStacksAdvancedBlock_Promote_ApprovalGateAndAuthz",
+	"GET /api/v1/stacks/:slug/family":              "TestStacksAdvancedBlock_Family_HappyAuthzAndCache",
+	"POST /api/v1/stacks/:slug/domains":            "TestStacksAdvancedBlock_Domains_FullLifecycle",
+	"GET /api/v1/stacks/:slug/domains":             "TestStacksAdvancedBlock_Domains_FullLifecycle",
+	"POST /api/v1/stacks/:slug/domains/:id/verify": "TestStacksAdvancedBlock_Domains_FullLifecycle",
+	"DELETE /api/v1/stacks/:slug/domains/:id":      "TestStacksAdvancedBlock_Domains_TierGateAndCrossTeamRow",
+
 	// ── deploy single-app (W4 / deploy wedge) ────────────────────────────────
 	"POST /deploy/new":                                "TestE2E_Deploy_RequiresAuth",
 	"GET /deploy/:id":                                 "TestE2E_Deploy_RequiresAuth",
@@ -358,16 +387,12 @@ var routeCoverageExemptions = map[string]string{
 	"POST /webhooks/github":             "GitHub App webhook, no id (HMAC-auth'd by the App secret, no session chain). TODO: matrix W6 github-app webhook flow.",
 	"POST /webhooks/github/:webhook_id": "per-connection push receiver (HMAC-auth'd, no session chain; signature/branch/rate-limit/idempotency covered by whitebox github_deploy_test.go + github_deploy_receive_arms_coverage_test.go). TODO: matrix W6 github-app webhook e2e.",
 
-	// ── stacks: confirm-deletion / promote / family / domains (W4 advanced).
-	"PATCH /stacks/:slug/env":                      "stack env merge (mig 062). TODO: matrix W4 stack-env flow.",
-	"POST /api/v1/stacks/:slug/confirm-deletion":   "stack two-step delete (confirm). TODO: matrix W4 stack-delete-twostep.",
-	"DELETE /api/v1/stacks/:slug/confirm-deletion": "stack two-step delete (cancel). TODO: matrix W4 stack-delete-twostep.",
-	"POST /api/v1/stacks/:slug/promote":            "stack env promote. TODO: matrix W4 stack-promote flow.",
-	"GET /api/v1/stacks/:slug/family":              "stack family view. TODO: matrix W4 stack-family flow.",
-	"POST /api/v1/stacks/:slug/domains":            "stack custom-domain add (Pro+). TODO: matrix W4 custom-domain flow.",
-	"GET /api/v1/stacks/:slug/domains":             "stack custom-domain list. TODO: matrix W4 custom-domain flow.",
-	"POST /api/v1/stacks/:slug/domains/:id/verify": "custom-domain verify. TODO: matrix W4 custom-domain flow.",
-	"DELETE /api/v1/stacks/:slug/domains/:id":      "custom-domain delete. TODO: matrix W4 custom-domain flow.",
+	// ── stacks: env-merge (W4 advanced). The eight other advanced surfaces
+	// (confirm-deletion ×2 / promote / family / domains ×4) — MOVED to
+	// routeTestMap. Now covered by the W4 stacks-advanced handler-integration
+	// suite (internal/handlers/stacks_advanced_block_integration_test.go,
+	// TestStacksAdvancedBlock_*).
+	"PATCH /stacks/:slug/env": "stack env merge (mig 062). TODO: matrix W4 stack-env flow.",
 
 	// ── team & member management (members / invitations / env-policy /
 	// settings / deletion) — MOVED to routeTestMap. Now covered by the
