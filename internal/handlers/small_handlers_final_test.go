@@ -64,16 +64,16 @@ func TestWhoamiFinal_Enrichment(t *testing.T) {
 	assert.Equal(t, email, m["email"])
 }
 
-// usage_wall.GetWall: the usage query errors → db_failed (usage_wall.go:118).
-// team-tier check(1) errors-or-misses, then the usage query(2) errors. Use a
-// non-team tier so the early-return is skipped; failAfter=1 makes the usage
-// query error.
+// usage_wall.GetWall: the audit-row query errors → db_failed.
+// strict-80%-margin redesign (2026-06-05): the team-tier early-return was
+// removed, so the audit-row query is now the FIRST DB call in GetWall for
+// every tier — failAfter=0 makes that first query error.
 func TestUsageWallFinal_DBError_503(t *testing.T) {
 	seedDB, clean := testhelpers.SetupTestDB(t)
 	defer clean()
 	teamID := uuid.MustParse(testhelpers.MustCreateTeamDB(t, seedDB, "pro"))
 
-	app := newUsageWallApp(t, openFaultDB(t, 1), teamID)
+	app := newUsageWallApp(t, openFaultDB(t, 0), teamID)
 	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/api/v1/usage/wall", nil), 5000)
 	require.NoError(t, err)
 	defer resp.Body.Close()

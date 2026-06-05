@@ -6,8 +6,9 @@ package handlers_test
 //   - GetUsage with no team local → 401 unauthorized.
 //   - computeUsage tier-lookup error → 500 usage_failed (propagated through
 //     the cache GetOrSet loader).
-//   - mbToBytes unlimited (-1) path via the team tier whose storage limit is
-//     unlimited.
+//   - mbToBytes unlimited (-1) + finite paths: exercised directly in
+//     mb_to_bytes_internal_test.go (no real tier carries -1 post strict-margin
+//     redesign).
 
 import (
 	"database/sql"
@@ -27,7 +28,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"instant.dev/internal/handlers"
-	"instant.dev/internal/middleware"
 	"instant.dev/internal/plans"
 )
 
@@ -112,55 +112,9 @@ func TestBillingUsage_StorageSumError_Returns500(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 }
 
-// TestBillingUsage_UnlimitedTier_MbToBytesNegative covers mbToBytes(-1) → -1:
-// the team tier has unlimited storage, so each storage metric's limit_bytes
-// must render as -1 (the dashboard's "∞").
-func TestBillingUsage_UnlimitedTier_MbToBytesNegative(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	require.NoError(t, err)
-	defer db.Close()
-	mr, err := miniredis.Run()
-	require.NoError(t, err)
-	defer mr.Close()
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	teamID := uuid.New()
-	// team tier → unlimited storage (-1) → mbToBytes(-1) path.
-	mock.ExpectQuery(`SELECT.*FROM teams WHERE id`).
-		WithArgs(teamID).
-		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "name", "plan_tier", "stripe_customer_id", "created_at", "default_deployment_ttl_policy",
-		}).AddRow(teamID, sql.NullString{}, "team", sql.NullString{}, time.Now(), "auto_24h"))
-	for range []string{"postgres", "redis", "mongodb"} {
-		mock.ExpectQuery(`SELECT COALESCE\(SUM\(storage_bytes\)`).
-			WillReturnRows(sqlmock.NewRows([]string{"sum"}).AddRow(int64(0)))
-	}
-	mock.ExpectQuery(`(?i)SELECT count\(\*\)\s+FROM deployments`).
-		WithArgs(teamID).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
-	mock.ExpectQuery(`SELECT COUNT\(\*\)\s+FROM resources`).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
-	mock.ExpectQuery(`SELECT COUNT\(DISTINCT key\) FROM vault_secrets`).
-		WithArgs(teamID).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM users WHERE team_id`).
-		WithArgs(teamID).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-
-	app := newUsageApp(t, db, rdb, teamID)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/billing/usage", nil)
-	resp, err := app.Test(req, 5000)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var body struct {
-		Usage map[string]struct {
-			LimitBytes int64 `json:"limit_bytes"`
-		} `json:"usage"`
-	}
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-	assert.Equal(t, int64(-1), body.Usage["postgres"].LimitBytes, "unlimited tier storage limit must serialise as -1")
-	_ = middleware.LocalKeyTeamID
-}
+// NOTE: the unlimited (mbToBytes(-1) → -1) path is exercised directly with
+// synthetic inputs in mb_to_bytes_internal_test.go (package handlers). Post
+// strict-80%-margin redesign no real tier carries an unlimited (-1) storage
+// limit, so the -1 path can no longer be reached via the team tier through
+// the HTTP usage handler; testing the helper directly keeps the defensive
+// "-1 → ∞" rendering covered.
