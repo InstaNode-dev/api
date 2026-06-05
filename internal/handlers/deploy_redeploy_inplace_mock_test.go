@@ -77,6 +77,7 @@ var deploymentColumnsList = []string{
 	"expires_at", "ttl_policy", "reminders_sent", "last_reminder_at",
 	"source", "image_ref", "registry_creds_enc",
 	"git_url", "git_ref", "git_token_enc",
+	"last_activity_at", "scaled_to_zero", "always_on",
 }
 
 // redeployMockApp wires a minimal Fiber app that drives DeployHandler.New
@@ -256,6 +257,7 @@ func TestDeployNew_Redeploy_WrongTeam_DefenceInDepth(t *testing.T) {
 			sql.NullTime{}, "permanent", 0, sql.NullTime{}, // ttl_*
 			"tarball", "", "", // source, image_ref, registry_creds_enc (mig 064)
 			"", "", "", // git_url, git_ref, git_token_enc (mig 065)
+			sql.NullTime{}, false, false, // last_activity_at, scaled_to_zero, always_on (mig 068)
 		))
 
 	body, ct := multipartRedeployMockBody(t, map[string]string{
@@ -328,6 +330,7 @@ func TestDeployNew_Redeploy_UpdateStatusError_StillAccepts(t *testing.T) {
 			sql.NullTime{}, "permanent", 0, sql.NullTime{},
 			"tarball", "", "", // source, image_ref, registry_creds_enc (mig 064)
 			"", "", "", // git_url, git_ref, git_token_enc (mig 065)
+			sql.NullTime{}, false, false, // last_activity_at, scaled_to_zero, always_on (mig 068)
 		))
 
 	// MarkDeploymentBuilding (guarded CAS) → driver error. The handler must
@@ -420,6 +423,7 @@ func TestDeployNew_Redeploy_EmptyProviderID_Returns409(t *testing.T) {
 			sql.NullTime{}, "permanent", 0, sql.NullTime{},
 			"tarball", "", "", // source, image_ref, registry_creds_enc (mig 064)
 			"", "", "", // git_url, git_ref, git_token_enc (mig 065)
+			sql.NullTime{}, false, false, // last_activity_at, scaled_to_zero, always_on (mig 068)
 		))
 
 	body, ct := multipartRedeployMockBody(t, map[string]string{
@@ -486,6 +490,7 @@ func TestDeployNew_Redeploy_CASMiss_Returns409(t *testing.T) {
 			sql.NullTime{}, "permanent", 0, sql.NullTime{},
 			"tarball", "", "", // source, image_ref, registry_creds_enc (mig 064)
 			"", "", "", // git_url, git_ref, git_token_enc (mig 065)
+			sql.NullTime{}, false, false, // last_activity_at, scaled_to_zero, always_on (mig 068)
 		))
 
 	// Guarded CAS matches 0 rows — the reaper won the race. Handler 409s.
@@ -597,6 +602,7 @@ func TestDeployRedeploy_ByID_CASMiss_Returns409(t *testing.T) {
 			sql.NullTime{}, "permanent", 0, sql.NullTime{},
 			"tarball", "", "",
 			"", "", "",
+			sql.NullTime{}, false, false,
 		))
 
 	// Guarded CAS matches 0 rows — the reaper won the race after the read.
@@ -652,6 +658,7 @@ func TestDeployRedeploy_ByID_CASSuccess_Returns202(t *testing.T) {
 			sql.NullString{}, sql.NullString{}, "unset", 0,
 			sql.NullTime{}, "permanent", 0, sql.NullTime{},
 			"tarball", "", "", "", "", "",
+			sql.NullTime{}, false, false,
 		))
 
 	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
@@ -702,6 +709,7 @@ func TestDeployRedeploy_ByID_CASDriverError_StillAccepts(t *testing.T) {
 			sql.NullString{}, sql.NullString{}, "unset", 0,
 			sql.NullTime{}, "permanent", 0, sql.NullTime{},
 			"tarball", "", "", "", "", "",
+			sql.NullTime{}, false, false,
 		))
 
 	// Guarded CAS → driver error (non-determinate). Handler logs + continues.
