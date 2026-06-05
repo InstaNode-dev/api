@@ -8887,6 +8887,52 @@
         "summary": "Redeploy with the latest stored env vars"
       }
     },
+    "/deploy/{id}/wake": {
+      "post": {
+        "description": "Scale-to-zero (Task #54). Scales an idle, descheduled app back to one replica and clears its sleeping state. The app becomes reachable once its pod is Ready (a one-time cold start — a request that races the wake gets the ingress's upstream-down response until the pod is up). Idempotent: waking an already-awake app just refreshes its last-activity marker so the idle-scaler won't immediately re-deschedule it. Returns 501 when scale-to-zero is not enabled on the platform (the default). Cross-tenant requests return 404.",
+        "parameters": [
+          {
+            "description": "Deployment id (UUID or short app_id slug).",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeployResponse"
+                }
+              }
+            },
+            "description": "Deployment woken"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Not found (or owned by another team)"
+          },
+          "501": {
+            "description": "scale_to_zero_disabled — scale-to-zero is not enabled on this platform (default)."
+          },
+          "503": {
+            "description": "wake_failed — transient failure scaling the app; retry."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Wake a scaled-to-zero (sleeping) deployment"
+      }
+    },
     "/healthz": {
       "get": {
         "description": "Process-level liveness — returns 200 if the api binary is up and can ping its primary platform DB. Wired to Kubernetes livenessProbe. Use /readyz for deep upstream-reachability checks.",

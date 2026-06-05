@@ -64,6 +64,9 @@ func (covPanicProvider) Redeploy(context.Context, string, []byte, map[string]str
 func (covPanicProvider) UpdateAccessControl(context.Context, string, bool, []string) error {
 	panic("covPanicProvider.UpdateAccessControl: not expected")
 }
+func (covPanicProvider) Scale(context.Context, string, int32) error {
+	panic("covPanicProvider.Scale: not expected")
+}
 
 // covFailProvider's Deploy/Redeploy return a configurable error. It does NOT
 // implement BuildLogFetcher, so fetchBuildLogsForAutopsy returns nil

@@ -351,7 +351,7 @@ func TestMarkDeploymentBuilding_Branches(t *testing.T) {
 
 	// 1 row matched — redeployable status flipped to building.
 	db, mock := newMock(t)
-	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
+	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL,\s+scaled_to_zero = false, last_activity_at = now\(\),\s+updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	n, err := MarkDeploymentBuilding(ctx, db, uuid.New())
 	require.NoError(t, err)
@@ -359,7 +359,7 @@ func TestMarkDeploymentBuilding_Branches(t *testing.T) {
 
 	// 0 rows matched — the row was reaped to a terminal status; CAS no-op.
 	db2, mock2 := newMock(t)
-	mock2.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
+	mock2.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL,\s+scaled_to_zero = false, last_activity_at = now\(\),\s+updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	n, err = MarkDeploymentBuilding(ctx, db2, uuid.New())
 	require.NoError(t, err)

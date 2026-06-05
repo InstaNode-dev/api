@@ -76,6 +76,18 @@ type Provider interface {
 	// Redeploy rebuilds the image from a new tarball and rolls out.
 	Redeploy(ctx context.Context, providerID string, tarball []byte, envVars map[string]string) (*AppDeployment, error)
 
+	// Scale patches the app's k8s Deployment replica count in place — no
+	// image rebuild, no namespace change. Backs scale-to-zero (Task #54):
+	// the worker idle-scaler calls Scale(appID, 0) to deschedule an idle app
+	// (~$0 compute), and the wake path calls Scale(appID, 1) to bring it back.
+	// Implementations on backends without a real Deployment concept (noop,
+	// local-dev without a cluster) should return nil after a slog.Warn — the
+	// DB-only state flip (deployments.scaled_to_zero) is the user-visible
+	// change. A NotFound Deployment is NOT an error: an app whose namespace
+	// was already torn down is treated as a no-op so a stale idle row can't
+	// wedge the scaler.
+	Scale(ctx context.Context, appID string, replicas int32) error
+
 	// UpdateAccessControl patches the access-control annotations on an
 	// existing deploy's Ingress in place — no image rebuild, no pod restart.
 	// Backs PATCH /api/v1/deployments/:id for the private + allowed_ips

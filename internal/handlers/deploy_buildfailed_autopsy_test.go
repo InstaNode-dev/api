@@ -56,6 +56,9 @@ func (m *mockProvider) Redeploy(_ context.Context, _ string, _ []byte, _ map[str
 func (m *mockProvider) UpdateAccessControl(_ context.Context, _ string, _ bool, _ []string) error {
 	panic("mockProvider.UpdateAccessControl: not expected in this test")
 }
+func (m *mockProvider) Scale(_ context.Context, _ string, _ int32) error {
+	panic("mockProvider.Scale: not expected in this test")
+}
 
 // mockBuildLogFetcher wraps mockProvider and adds FetchBuildLogs so the handler
 // code can type-assert to compute.BuildLogFetcher.

@@ -759,6 +759,9 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	deployGroup.Patch("/:id/env", deployH.UpdateEnv)
 	deployGroup.Delete("/:id", deployH.Delete)
 	deployGroup.Post("/:id/redeploy", deployH.Redeploy)
+	// Scale-to-zero explicit wake (Task #54). Gated by
+	// DEPLOY_SCALE_TO_ZERO_ENABLED inside the handler → 501 when off.
+	deployGroup.Post("/:id/wake", deployH.Wake)
 
 	// Stacks — Phase 6 multi-service.
 	// New/Get/Logs/Delete are anonymous-capable (same model as /db/new etc.).

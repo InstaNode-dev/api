@@ -77,6 +77,16 @@ func (n *NoopProvider) Redeploy(_ context.Context, providerID string, _ []byte, 
 	}, nil
 }
 
+// Scale logs a warning and returns nil. The DB-only scaled_to_zero flip is the
+// user-visible change on a backend with no real Deployment.
+func (n *NoopProvider) Scale(_ context.Context, appID string, replicas int32) error {
+	slog.Warn("compute.noop: Scale called but compute is disabled",
+		"app_id", appID,
+		"replicas", replicas,
+	)
+	return nil
+}
+
 // UpdateAccessControl logs a warning and returns nil. Tests use this — the
 // DB-only update is the user-visible change.
 func (n *NoopProvider) UpdateAccessControl(_ context.Context, appID string, private bool, allowedIPs []string) error {

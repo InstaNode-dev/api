@@ -77,6 +77,20 @@ type Deployment struct {
 	TTLPolicy      string
 	RemindersSent  int
 	LastReminderAt sql.NullTime
+	// Scale-to-zero state (migration 068). Inert unless the worker
+	// DEPLOY_SCALE_TO_ZERO_ENABLED flag is on.
+	//
+	// LastActivityAt is the floor "last known activity" marker — set at
+	// create-time, bumped on every wake + redeploy. The idle-scaler
+	// descheduals a Deployment only when now()-LastActivityAt exceeds the
+	// idle threshold. v1 captures deploy/redeploy/wake events, not per-HTTP
+	// traffic (see migration 068 + the worker job header).
+	//
+	// ScaledToZero is true while the app is currently descheduled (replicas=0).
+	// AlwaysOn opts an app out of scale-to-zero entirely (pinned, no cold start).
+	LastActivityAt sql.NullTime
+	ScaledToZero   bool
+	AlwaysOn       bool
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
@@ -153,7 +167,8 @@ const deploymentColumns = `id, team_id, resource_id, app_id, provider_id, status
        notify_webhook, notify_webhook_secret, notify_state, notify_attempts,
        expires_at, ttl_policy, reminders_sent, last_reminder_at,
        source, image_ref, registry_creds_enc,
-       git_url, git_ref, git_token_enc`
+       git_url, git_ref, git_token_enc,
+       last_activity_at, scaled_to_zero, always_on`
 
 // scanDeployment reads a single deployments row into a Deployment struct.
 // env_vars is stored as JSONB; error_message, provider_id, and app_url are nullable.
@@ -189,6 +204,10 @@ func scanDeployment(row interface {
 		// migration 065: git source deploys. NOT NULL DEFAULT '' — plain string
 		// scan targets are safe.
 		&d.GitURL, &d.GitRef, &d.GitTokenEnc,
+		// migration 068: scale-to-zero state. last_activity_at is nullable
+		// (legacy rows backfilled from updated_at); scaled_to_zero / always_on
+		// are NOT NULL DEFAULT false → plain bool scan targets are safe.
+		&d.LastActivityAt, &d.ScaledToZero, &d.AlwaysOn,
 	); err != nil {
 		return nil, err
 	}
@@ -326,8 +345,9 @@ func CreateDeployment(ctx context.Context, db dbExecutor, p CreateDeploymentPara
 			 notify_webhook, notify_webhook_secret, notify_state,
 			 expires_at, ttl_policy,
 			 source, image_ref, registry_creds_enc,
-			 git_url, git_ref, git_token_enc)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+			 git_url, git_ref, git_token_enc,
+			 last_activity_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, now())
 		RETURNING `+deploymentColumns,
 		p.TeamID, resourceID, p.AppID, port, p.Tier, env, envVarsJSON,
 		p.Private, allowedIPs,
@@ -528,13 +548,82 @@ const redeployableStatusesSQL = `('building', 'deploying', 'healthy', 'failed')`
 // updated_at is set to now() by the database. error_message is cleared (a
 // fresh build supersedes any prior failure message).
 func MarkDeploymentBuilding(ctx context.Context, db *sql.DB, id uuid.UUID) (int64, error) {
+	// A redeploy is genuine activity AND brings replicas back to 1 (the new
+	// rollout starts the app), so it also clears any scaled_to_zero state and
+	// bumps last_activity_at — otherwise the idle-scaler could immediately
+	// re-deschedule a freshly-redeployed app (migration 068).
 	res, err := db.ExecContext(ctx, `
 		UPDATE deployments
-		SET status = 'building', error_message = NULL, updated_at = now()
+		SET status = 'building', error_message = NULL,
+		    scaled_to_zero = false, last_activity_at = now(),
+		    updated_at = now()
 		WHERE id = $1 AND status IN `+redeployableStatusesSQL+`
 	`, id)
 	if err != nil {
 		return 0, fmt.Errorf("models.MarkDeploymentBuilding: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// ── Scale-to-zero state mutators (migration 068, Task #54) ──────────────────
+//
+// These back the idle-scaler (worker) and the explicit-wake endpoint (api).
+// All are inert unless the worker DEPLOY_SCALE_TO_ZERO_ENABLED flag is on —
+// nothing calls them otherwise.
+
+// MarkDeploymentScaledToZero flips scaled_to_zero=true on a row. Called by the
+// api after a successful compute.Scale(appID, 0). The CAS guard keeps the
+// write narrow: only a currently-healthy, not-already-zeroed, not-always-on
+// row is descheduled, so a concurrent wake / redeploy / teardown that changed
+// the row between the scaler's SELECT and this UPDATE reports 0 rows and the
+// scaler treats it as "raced — skip". Returns rows affected.
+func MarkDeploymentScaledToZero(ctx context.Context, db dbExecutor, id uuid.UUID) (int64, error) {
+	res, err := db.ExecContext(ctx, `
+		UPDATE deployments
+		SET scaled_to_zero = true, updated_at = now()
+		WHERE id = $1
+		  AND status = 'healthy'
+		  AND scaled_to_zero = false
+		  AND always_on = false
+	`, id)
+	if err != nil {
+		return 0, fmt.Errorf("models.MarkDeploymentScaledToZero: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// WakeDeployment clears scaled_to_zero and bumps last_activity_at — the DB half
+// of a wake. Called by the api wake endpoint after a successful
+// compute.Scale(appID, 1). Idempotent: a row that is already awake (or never
+// slept) simply has its last_activity_at refreshed, which is the correct
+// "this app was just touched" semantics. Returns rows affected (0 only when
+// the id does not exist).
+func WakeDeployment(ctx context.Context, db dbExecutor, id uuid.UUID) (int64, error) {
+	res, err := db.ExecContext(ctx, `
+		UPDATE deployments
+		SET scaled_to_zero = false, last_activity_at = now(), updated_at = now()
+		WHERE id = $1
+	`, id)
+	if err != nil {
+		return 0, fmt.Errorf("models.WakeDeployment: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// SetDeploymentAlwaysOn toggles the per-app scale-to-zero opt-out. always_on=true
+// pins the app (the idle-scaler never descheduals it); always_on=false re-enables
+// scale-to-zero eligibility. Returns rows affected (0 when the id does not exist).
+func SetDeploymentAlwaysOn(ctx context.Context, db dbExecutor, id uuid.UUID, alwaysOn bool) (int64, error) {
+	res, err := db.ExecContext(ctx, `
+		UPDATE deployments
+		SET always_on = $2, updated_at = now()
+		WHERE id = $1
+	`, id, alwaysOn)
+	if err != nil {
+		return 0, fmt.Errorf("models.SetDeploymentAlwaysOn: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	return n, nil

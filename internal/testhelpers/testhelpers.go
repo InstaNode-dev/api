@@ -1144,6 +1144,7 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	deployGroup.Patch("/:id/env", deployH.UpdateEnv)
 	deployGroup.Delete("/:id", deployH.Delete)
 	deployGroup.Post("/:id/redeploy", deployH.Redeploy)
+	deployGroup.Post("/:id/wake", deployH.Wake)
 
 	// Register role lookup so RequireRole can resolve the caller's role
 	// against the test DB (mirror of the production wiring in router.go).

@@ -304,8 +304,14 @@ var routeTestMap = map[string]string{
 	// 402 + redeploy CAS guard. Heavy Kaniko-build legs assert the
 	// accepted/contract surface (noop compute), not a live build — deferred to
 	// the W4 e2e specs. Moved here from routeCoverageExemptions.
-	"PATCH /deploy/:id/env":                       "TestDeployLifecycle_UpdateEnv_MergesAndRedacts",
-	"POST /deploy/:id/redeploy":                   "TestDeployLifecycle_Redeploy_HealthyRow_Accepts202",
+	"PATCH /deploy/:id/env":     "TestDeployLifecycle_UpdateEnv_MergesAndRedacts",
+	"POST /deploy/:id/redeploy": "TestDeployLifecycle_Redeploy_HealthyRow_Accepts202",
+	// Scale-to-zero explicit wake (mig 068, Task #54). Covered by the flag-ON
+	// sqlmock handler suite (deploy_wake_mock_test.go): happy-path scale+DB
+	// flip+re-read, not-found, cross-team 404, scale-failure 503, DB-error 503,
+	// requireTeam 401, fetch driver-error 503, re-read fallback. Flag-OFF 501 is
+	// in deploy_wake_test.go.
+	"POST /deploy/:id/wake":                       "TestWake_HappyPath",
 	"PATCH /api/v1/deployments/:id":               "TestDeployLifecycle_Patch_Pro_SetsPrivate",
 	"POST /api/v1/deployments/:id/make-permanent": "TestDeployLifecycle_MakePermanent_HappyPath",
 	"POST /api/v1/deployments/:id/ttl":            "TestDeployLifecycle_SetTTL_HappyPath",

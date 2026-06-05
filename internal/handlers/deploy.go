@@ -572,6 +572,11 @@ func deploymentToMapWithDB(d *models.Deployment, db *sql.DB) fiber.Map {
 		// image_ref is echoed (caller-supplied, no secret); registry_creds is
 		// NEVER returned — only registry_creds_set lifecycle metadata.
 		"source": deploymentSourceOrDefault(d.Source),
+		// Scale-to-zero state (migration 068). scaled_to_zero=true → the app is
+		// asleep (replicas=0); the dashboard/agent surfaces "sleeping — wake"
+		// and POSTs /deploy/:id/wake. always_on=true → pinned (never descheduled).
+		"scaled_to_zero": d.ScaledToZero,
+		"always_on":      d.AlwaysOn,
 	}
 	if d.Source == "image" {
 		m["image_ref"] = d.ImageRef
