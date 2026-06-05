@@ -476,6 +476,14 @@ func (h *StorageHandler) newStorageAuthenticated(
 		}
 	}
 
+	// Task #55: per-tier storage *count* cap (flag-gated, default OFF). This is
+	// distinct from the storage-bytes quota above (total bytes across buckets):
+	// it caps the NUMBER of storage resources so a tenant can't open many
+	// prefix-scoped buckets each near the byte cap. Mirrors queue.go.
+	if handled, capErr := h.enforceResourceCountCap(c, teamUUID, team.PlanTier, models.ResourceTypeStorage, requestID); handled {
+		return capErr
+	}
+
 	resource, err := models.CreateResource(ctx, h.db, models.CreateResourceParams{
 		TeamID:           &teamUUID,
 		ResourceType:     "storage",

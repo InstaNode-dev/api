@@ -63,6 +63,7 @@ func allKeys() []string {
 		"METRICS_TOKEN", "DASHBOARD_BASE_URL", "API_PUBLIC_URL",
 		"DELETION_CONFIRMATION_TTL_MINUTES", "FAMILY_BINDINGS_ENABLED",
 		"DEPLOY_SOURCE_IMAGE_ENABLED", "DEPLOY_SOURCE_GIT_ENABLED",
+		"RESOURCE_COUNT_CAPS_ENABLED",
 		"GITHUB_APP_ENABLED", "GITHUB_APP_ID", "GITHUB_APP_SLUG", "GITHUB_APP_PRIVATE_KEY",
 		"GITHUB_APP_WEBHOOK_SECRET", "GITHUB_APP_CLIENT_ID", "GITHUB_APP_CLIENT_SECRET",
 		"BREVO_WEBHOOK_SECRET", "SES_SNS_SUBSCRIPTION_ARN",
@@ -383,6 +384,21 @@ func TestLoad_DeploySourceGitEnabled(t *testing.T) {
 		applyBaselineEnv(t, map[string]string{"DEPLOY_SOURCE_GIT_ENABLED": val})
 		if Load().DeploySourceGitEnabled {
 			t.Errorf("DEPLOY_SOURCE_GIT_ENABLED=%q should stay disabled", val)
+		}
+	}
+}
+
+func TestLoad_ResourceCountCapsEnabled(t *testing.T) {
+	for _, val := range []string{"true", "1", "yes", "TRUE", "  Yes  "} {
+		applyBaselineEnv(t, map[string]string{"RESOURCE_COUNT_CAPS_ENABLED": val})
+		if !Load().ResourceCountCapsEnabled {
+			t.Errorf("RESOURCE_COUNT_CAPS_ENABLED=%q should enable", val)
+		}
+	}
+	for _, val := range []string{"false", "0", "no", "maybe", ""} {
+		applyBaselineEnv(t, map[string]string{"RESOURCE_COUNT_CAPS_ENABLED": val})
+		if Load().ResourceCountCapsEnabled {
+			t.Errorf("RESOURCE_COUNT_CAPS_ENABLED=%q should stay disabled (default OFF)", val)
 		}
 	}
 }

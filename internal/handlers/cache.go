@@ -333,6 +333,12 @@ func (h *CacheHandler) newCacheAuthenticated(
 		tier = "growth"
 	}
 
+	// Task #55: per-tier redis count cap (flag-gated, default OFF). Redis is the
+	// binding COGS constraint ($6.50/GB) so this is the most-conservative cap.
+	if handled, capErr := h.enforceResourceCountCap(c, teamUUID, team.PlanTier, models.ResourceTypeRedis, requestID); handled {
+		return capErr
+	}
+
 	parentRootID, perr := resolveFamilyParent(c, h.db, parentResourceID, teamUUID, models.ResourceTypeRedis, env)
 	if perr != nil {
 		return perr
