@@ -135,11 +135,32 @@ func NewE2EAccountHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config) *E2
 	return &E2EAccountHandler{db: db, rdb: rdb, cfg: cfg}
 }
 
-// e2eCreateRequest is the POST body. Both fields optional.
+// e2eCreateRequest is the POST body. All fields optional.
 type e2eCreateRequest struct {
 	Tier string `json:"tier"`
 	Env  string `json:"env"`
+	// WithResources, when true, pre-seeds a small set of FAST resources on the
+	// minted team so a CI journey can start from a populated account (a list
+	// has rows, a detail page resolves, a delete-then-replace flow has
+	// something to delete) without first having to drive a provision.
+	//
+	// Deliberately minimal + fast: it seeds ONLY row-only resources that need
+	// no backend RPC (a webhook receiver + a cache row), inserted directly as
+	// active rows at the team's tier. It does NOT provision a dedicated
+	// Postgres / Mongo (those are slow and need the provisioner + hot-pool) —
+	// a journey that needs those drives the real provision endpoint with the
+	// forceAnon hot-pool headers. The seeded rows carry the team's tier
+	// snapshot, exactly like a real provision under that tier, and are reaped
+	// with the team (team_id→NULL + marked-for-reaper) by ReapAccount.
+	WithResources bool `json:"with_resources"`
 }
+
+// e2eSeedResourceTypes is the closed set of FAST, row-only resource types the
+// with_resources pre-seed creates. Both need no backend provision RPC, so the
+// seed is synchronous + sub-millisecond — safe inside the mint request.
+// Iterated (not hand-listed at the call site) so adding a type here
+// automatically expands what the seed creates AND what the seed test asserts.
+var e2eSeedResourceTypes = []string{"webhook", "cache"}
 
 // authorize runs the X-E2E-Token guard. It returns true iff the token is
 // configured AND the header matches in constant time. On any failure it has
@@ -263,6 +284,23 @@ func (h *E2EAccountHandler) CreateAccount(c *fiber.Ctx) error {
 		team.PlanTier = tier
 	}
 
+	// 3b. Optionally pre-seed a small set of FAST resources so the journey can
+	//     start from a populated account. Synchronous (row-only inserts, no
+	//     backend RPC) and tier-snapshotted at the team's tier. A seed failure
+	//     is a hard error — CI asked for a populated account and got a partial
+	//     one, which would make the journey flaky; better to fail the mint
+	//     loudly. The rows are reaped with the team.
+	var seededTokens []string
+	if req.WithResources {
+		toks, serr := e2eSeedFastResources(h, ctx, team.ID, tier, env)
+		if serr != nil {
+			metrics.E2EAccountTotal.WithLabelValues(e2eMetricOpCreate, e2eResultError).Inc()
+			slog.Error("internal.e2e.create.seed_failed", "error", serr, "team_id", team.ID.String())
+			return respondError(c, fiber.StatusServiceUnavailable, "seed_failed", "failed to seed resources")
+		}
+		seededTokens = toks
+	}
+
 	// 4. Mint the session JWT with the SAME signer + claim shape the customer
 	//    auth path uses, so it authenticates through ordinary RequireAuth.
 	expiresAt := time.Now().UTC().Add(e2eSessionTTL)
@@ -294,14 +332,60 @@ func (h *E2EAccountHandler) CreateAccount(c *fiber.Ctx) error {
 	metrics.E2EAccountTotal.WithLabelValues(e2eMetricOpCreate, e2eResultOK).Inc()
 	slog.Info("internal.e2e.create.done", "team_id", team.ID.String(), "tier", tier, "env", env)
 
+	// seededTokens is always present in the response (empty array when
+	// with_resources was false) so a CI caller can branch on its length
+	// without a nil check.
+	if seededTokens == nil {
+		seededTokens = []string{}
+	}
 	return c.JSON(fiber.Map{
-		"team_id":     team.ID.String(),
-		"user_id":     user.ID.String(),
-		"email":       email,
-		"tier":        tier,
-		"session_jwt": sessionJWT,
-		"expires_at":  expiresAt.Format(time.RFC3339),
+		"team_id":       team.ID.String(),
+		"user_id":       user.ID.String(),
+		"email":         email,
+		"tier":          tier,
+		"session_jwt":   sessionJWT,
+		"expires_at":    expiresAt.Format(time.RFC3339),
+		"seeded_tokens": seededTokens,
+		"seeded_count":  len(seededTokens),
 	})
+}
+
+// seedFastResources pre-seeds the with_resources set: one active row per
+// e2eSeedResourceTypes entry, owned by teamID, tier-snapshotted at `tier`,
+// scoped to `env` (empty → the model's EnvDefault). Returns the seeded tokens.
+//
+// Each row is created with CreateResource (status=pending) then flipped to
+// active via MarkResourceActive — the SAME two-phase lifecycle a real
+// provision uses — so the seeded rows are indistinguishable from a normal
+// provision under that tier for any read path (list/detail/limits). No backend
+// RPC is issued: these types are row-only (a webhook receiver lives in Redis,
+// a cache row needs no dedicated infra to satisfy a list/detail journey), so
+// the seed is fast and synchronous. Any error aborts (returns it) — the caller
+// turns it into a 503 so CI never receives a half-populated account.
+//
+// A package-var seam (not a direct method call) so a test can force the
+// caller's seed_failed (503) arm without needing to make the real resources
+// table reject an insert mid-request.
+var e2eSeedFastResources = (*E2EAccountHandler).seedFastResources
+
+func (h *E2EAccountHandler) seedFastResources(ctx context.Context, teamID uuid.UUID, tier, env string) ([]string, error) {
+	tokens := make([]string, 0, len(e2eSeedResourceTypes))
+	for _, rt := range e2eSeedResourceTypes {
+		res, err := models.CreateResource(ctx, h.db, models.CreateResourceParams{
+			TeamID:       &teamID,
+			ResourceType: rt,
+			Tier:         tier,
+			Env:          env,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("seed %s: %w", rt, err)
+		}
+		if err := models.MarkResourceActive(ctx, h.db, res.ID); err != nil {
+			return nil, fmt.Errorf("activate seeded %s: %w", rt, err)
+		}
+		tokens = append(tokens, res.Token.String())
+	}
+	return tokens, nil
 }
 
 // ReapAccount handles DELETE /internal/e2e/account/:team_id.
