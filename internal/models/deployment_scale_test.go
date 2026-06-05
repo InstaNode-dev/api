@@ -11,9 +11,11 @@ package models_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,6 +23,60 @@ import (
 	"instant.dev/internal/models"
 	"instant.dev/internal/testhelpers"
 )
+
+// errScaleDriver is the sentinel sqlmock returns for the driver-error arms of
+// the scale-to-zero model writes. Named so the wrapped %w error is searchable.
+var errScaleDriver = errors.New("mock: deployments UPDATE exploded")
+
+// TestMarkDeploymentScaledToZero_DriverError pins the error return (the
+// fmt.Errorf wrap) when the UPDATE itself fails — distinct from a 0-row CAS
+// miss, which is not an error.
+func TestMarkDeploymentScaledToZero_DriverError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	id := uuid.New()
+	mock.ExpectExec(`UPDATE deployments`).WithArgs(id).WillReturnError(errScaleDriver)
+
+	n, err := models.MarkDeploymentScaledToZero(context.Background(), db, id)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errScaleDriver)
+	assert.Equal(t, int64(0), n)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestWakeDeployment_DriverError pins WakeDeployment's error return.
+func TestWakeDeployment_DriverError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	id := uuid.New()
+	mock.ExpectExec(`UPDATE deployments`).WithArgs(id).WillReturnError(errScaleDriver)
+
+	n, err := models.WakeDeployment(context.Background(), db, id)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errScaleDriver)
+	assert.Equal(t, int64(0), n)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestSetDeploymentAlwaysOn_DriverError pins SetDeploymentAlwaysOn's error return.
+func TestSetDeploymentAlwaysOn_DriverError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	id := uuid.New()
+	mock.ExpectExec(`UPDATE deployments`).WithArgs(id, true).WillReturnError(errScaleDriver)
+
+	n, err := models.SetDeploymentAlwaysOn(context.Background(), db, id, true)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errScaleDriver)
+	assert.Equal(t, int64(0), n)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
 
 func TestCreateDeployment_SeedsScaleToZeroDefaults(t *testing.T) {
 	requireDB(t)

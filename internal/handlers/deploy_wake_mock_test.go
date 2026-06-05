@@ -124,6 +124,118 @@ func wakeDeploymentRow(id, teamID uuid.UUID, appID, providerID string, scaledToZ
 	)
 }
 
+// wakeMockAppNoAuth is wakeMockApp without the team-injecting middleware, so
+// requireTeam sees an empty team_id and the handler returns 401. Used to cover
+// the `team, err := h.requireTeam(c); if err != nil { return err }` arm.
+func wakeMockAppNoAuth(t *testing.T, db *sql.DB) *fiber.App {
+	t.Helper()
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	h := &DeployHandler{
+		db:           db,
+		rdb:          rdb,
+		cfg:          &config.Config{DeployScaleToZeroEnabled: true, Environment: "test"},
+		compute:      &wakeRecordingProvider{},
+		planRegistry: plans.Default(),
+	}
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			if errors.Is(err, ErrResponseWritten) {
+				return nil
+			}
+			code := fiber.StatusInternalServerError
+			if e, ok := err.(*fiber.Error); ok {
+				code = e.Code
+			}
+			return c.Status(code).JSON(fiber.Map{"ok": false, "error": "internal_error"})
+		},
+	})
+	app.Post("/deploy/:id/wake", h.Wake)
+	return app
+}
+
+// TestWake_RequireTeamFails covers the requireTeam error arm: no team_id in
+// Locals → 401 before any scale or DB work.
+func TestWake_RequireTeamFails(t *testing.T) {
+	db, _, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	app := wakeMockAppNoAuth(t, db)
+	req := httptest.NewRequest(http.MethodPost, "/deploy/app-noauth/wake", nil)
+	resp, err := app.Test(req, 2000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no-auth wake = %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestWake_FetchDriverError503 covers the generic GetDeploymentByAppID driver
+// error arm (NOT sql.ErrNoRows) → 503 fetch_failed.
+func TestWake_FetchDriverError503(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	app, teamID := wakeMockApp(t, db, &wakeRecordingProvider{})
+	expectTeamLookupOK(mock, teamID, "hobby")
+	mock.ExpectQuery(`FROM deployments WHERE app_id = \$1`).
+		WithArgs("app-drv").
+		WillReturnError(errors.New("deployments table exploded"))
+
+	req := httptest.NewRequest(http.MethodPost, "/deploy/app-drv/wake", nil)
+	resp, err := app.Test(req, 2000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("fetch-driver-error wake = %d, want 503", resp.StatusCode)
+	}
+}
+
+// TestWake_ReReadFailureFallsBack covers the post-write re-read failure arm:
+// scale + WakeDeployment already succeeded, so a failing GetDeploymentByID must
+// NOT fail the wake — the handler falls back to the pre-read row with
+// ScaledToZero cleared and still returns 200.
+func TestWake_ReReadFailureFallsBack(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	prov := &wakeRecordingProvider{}
+	app, teamID := wakeMockApp(t, db, prov)
+	id := uuid.New()
+
+	expectTeamLookupOK(mock, teamID, "hobby")
+	mock.ExpectQuery(`FROM deployments WHERE app_id = \$1`).
+		WithArgs("app-reread").
+		WillReturnRows(wakeDeploymentRow(id, teamID, "app-reread", "app-reread", true))
+	mock.ExpectExec(`UPDATE deployments`).
+		WithArgs(id).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Re-read fails → handler must fall back, NOT 5xx.
+	mock.ExpectQuery(`FROM deployments WHERE id = \$1`).
+		WithArgs(id).
+		WillReturnError(errors.New("re-read exploded"))
+
+	req := httptest.NewRequest(http.MethodPost, "/deploy/app-reread/wake", nil)
+	resp, err := app.Test(req, 2000)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("re-read-failure wake = %d, want 200 (fallback); body: %s", resp.StatusCode, string(body))
+	}
+	if len(prov.scaleCalls) != 1 {
+		t.Errorf("expected one Scale call before re-read, got %v", prov.scaleCalls)
+	}
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestWake_HappyPath(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
