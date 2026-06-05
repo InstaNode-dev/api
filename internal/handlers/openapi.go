@@ -3292,8 +3292,9 @@ const openAPISpec = `{
         "properties": {
           "bytes":       { "type": "integer", "format": "int64", "description": "Current storage usage in bytes. Present on postgres/redis/mongodb." },
           "limit_bytes": { "type": "integer", "format": "int64", "description": "Storage cap in bytes (plans.yaml storage_mb × 1024 × 1024). -1 = unlimited." },
-          "count":       { "type": "integer", "description": "Current count. Present on deployments/webhooks/vault/members." },
-          "limit":       { "type": "integer", "description": "Count cap from plans.yaml. -1 = unlimited." }
+          "count":       { "type": "integer", "description": "Current count. Present on deployments/webhooks/vault/members, and (Task #55) on postgres/redis/mongodb as the active-resource count alongside bytes." },
+          "limit":       { "type": "integer", "description": "Count cap from plans.yaml. -1 = unlimited." },
+          "count_limit": { "type": "integer", "description": "Task #55: per-tier resource-COUNT cap for the byte-metered storage services (postgres/redis/mongodb), where the limit field is unused. -1 = unlimited. Enforcement is flag-gated (RESOURCE_COUNT_CAPS_ENABLED) but the cap is always advertised." }
         }
       },
       "TeamSummaryResponse": {
@@ -3383,6 +3384,7 @@ const openAPISpec = `{
           "paid_from_day_one":       { "type": "boolean", "description": "True iff price_usd_monthly > 0. Mirrors project policy: no trial — paid tiers are paid from signup." },
           "storage_limit_mb":        { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Per-service storage cap in MB. Keys: postgres, redis, mongodb, queue, storage, webhook, vector. -1 sentinel means 'unlimited'." },
           "connections_limit":       { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Per-service concurrent-connection cap. Keys mirror storage_limit_mb. -1 = unlimited." },
+          "resource_count_limit":    { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Task #55: per-service max number of active resources a team may hold. Keys: postgres, vector, redis, mongodb, storage, queue (webhook is request-capped, not count-capped). -1 = unlimited. Enforcement is flag-gated (RESOURCE_COUNT_CAPS_ENABLED) but the cap is always advertised so an agent can plan around it." },
           "deployments_apps":        { "type": "integer", "description": "Max number of /deploy/new apps allowed. -1 = unlimited." },
           "backup_retention_days":   { "type": "integer" },
           "backup_restore_enabled":  { "type": "boolean" },

@@ -469,6 +469,11 @@ func (h *VectorHandler) newVectorAuthenticated(
 		tier = "growth"
 	}
 
+	// Task #55: per-tier vector count cap (flag-gated, default OFF). Mirrors queue.go.
+	if handled, capErr := h.enforceResourceCountCap(c, teamUUID, team.PlanTier, models.ResourceTypeVector, requestID); handled {
+		return capErr
+	}
+
 	parentRootID, perr := resolveFamilyParent(c, h.db, parentResourceID, teamUUID, models.ResourceTypeVector, env)
 	if perr != nil {
 		return perr

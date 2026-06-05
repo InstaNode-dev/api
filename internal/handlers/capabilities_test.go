@@ -34,6 +34,7 @@ type capabilityTier struct {
 	PaidFromDayOne        bool           `json:"paid_from_day_one"`
 	StorageLimitMB        map[string]int `json:"storage_limit_mb"`
 	ConnectionsLimit      map[string]int `json:"connections_limit"`
+	ResourceCountLimit    map[string]int `json:"resource_count_limit"`
 	Deployments           int            `json:"deployments_apps"`
 	BackupRetentionDays   int            `json:"backup_retention_days"`
 	BackupRestoreEnabled  bool           `json:"backup_restore_enabled"`
@@ -212,6 +213,44 @@ func TestCapabilities_LimitsResolveFromRegistry(t *testing.T) {
 	assert.Equal(t, 14, hp.BackupRetentionDays, "hobby_plus backup retention")
 	assert.True(t, hp.BackupRestoreEnabled, "hobby_plus backup restore")
 	assert.Equal(t, 5, hp.ManualBackupsPerDay, "hobby_plus manual backups/day")
+}
+
+// TestCapabilities_SurfacesResourceCountLimit is the Task #55 rule-18 surface
+// guard: GET /api/v1/capabilities must expose resource_count_limit for EVERY
+// count-capped service on every paid tier, with the value matching the live
+// registry. Iterates the registry rather than hand-typing tiers so a new tier or
+// service can't silently ship without the cap appearing on the public matrix.
+func TestCapabilities_SurfacesResourceCountLimit(t *testing.T) {
+	reg := plans.Default()
+	app := newCapabilitiesApp(t, reg)
+	_, body := callCapabilities(t, app)
+	require.NotEmpty(t, body.Tiers)
+
+	countServices := []string{"postgres", "vector", "redis", "mongodb", "storage", "queue"}
+	for _, tier := range body.Tiers {
+		require.NotNil(t, tier.ResourceCountLimit,
+			"tier %q must carry resource_count_limit", tier.Tier)
+		for _, svc := range countServices {
+			got, ok := tier.ResourceCountLimit[svc]
+			require.True(t, ok, "tier %q resource_count_limit must include %q", tier.Tier, svc)
+			assert.Equal(t, reg.ResourceCountLimit(tier.Tier, svc), got,
+				"tier %q %s count limit must match the registry", tier.Tier, svc)
+		}
+		// Webhook is request-capped, not count-capped — must NOT appear.
+		_, hasWebhook := tier.ResourceCountLimit["webhook"]
+		assert.False(t, hasWebhook, "webhook must not appear in resource_count_limit (it is request-capped)")
+	}
+
+	// Spot-pin a couple of binding values so a loosened cap is a visible diff.
+	for _, tier := range body.Tiers {
+		switch tier.Tier {
+		case "pro":
+			assert.Equal(t, 3, tier.ResourceCountLimit["redis"], "pro redis_count")
+			assert.Equal(t, 5, tier.ResourceCountLimit["postgres"], "pro postgres_count")
+		case "team":
+			assert.Equal(t, 4, tier.ResourceCountLimit["redis"], "team redis_count")
+		}
+	}
 }
 
 // TestCapabilities_PlansUnavailable — when the registry pointer is nil

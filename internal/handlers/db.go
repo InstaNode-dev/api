@@ -381,6 +381,12 @@ func (h *DBHandler) newDBAuthenticated(
 		tier = "growth"
 	}
 
+	// Task #55: per-tier postgres count cap (flag-gated, default OFF — inert
+	// unless RESOURCE_COUNT_CAPS_ENABLED). Mirrors queue.go's A6 block.
+	if handled, capErr := h.enforceResourceCountCap(c, teamUUID, team.PlanTier, models.ResourceTypePostgres, requestID); handled {
+		return capErr
+	}
+
 	// Family-link validation runs BEFORE provisioning so a cross-team /
 	// cross-type / duplicate-twin parent_resource_id never causes us to
 	// create-then-fail (which would leak a database we can't link).

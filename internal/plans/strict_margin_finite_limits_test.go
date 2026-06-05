@@ -56,6 +56,14 @@ func TestStrictMargin_NoUnlimitedResourceLimits(t *testing.T) {
 			"mongodb_ops_per_minute":  l.MongoOpsPerMinute,
 			"queue_storage_mb":        l.QueueStorageMB,
 			"queue_count":             l.QueueCount,
+			// Task #55: per-service resource-count caps must also be finite
+			// (>= 0). A -1 here would re-open the unbounded-COGS hole this
+			// task closed for non-queue services.
+			"postgres_count":          l.PostgresCount,
+			"vector_count":            l.VectorCount,
+			"redis_count":             l.RedisCount,
+			"mongodb_count":           l.MongoCount,
+			"storage_count":           l.StorageCount,
 			"storage_storage_mb":      l.StorageStorageMB,
 			"webhook_requests_stored": l.WebhookRequestsStored,
 			"team_members":            l.TeamMembers,

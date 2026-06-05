@@ -209,6 +209,18 @@ var (
 		Help: "Queue provision attempts rejected by per-tier queue_count cap",
 	}, []string{"team_tier"})
 
+	// ResourceCountLimitBlocked counts provision attempts rejected by the
+	// per-tier per-service resource-count cap (Task #55). One CounterVec with a
+	// `service` label (postgres/vector/redis/mongodb/storage) rather than five
+	// near-identical metrics — a single dashboard tile + alert covers them all.
+	// Lazy *Vec: a label pair only appears at /metrics after its first block,
+	// which only happens when RESOURCE_COUNT_CAPS_ENABLED is on and a team is
+	// over-cap; expect zero series until the operator enables the flag.
+	ResourceCountLimitBlocked = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_resource_count_limit_blocked_total",
+		Help: "Provision attempts rejected by per-tier per-service resource-count cap (Task #55, flag-gated)",
+	}, []string{"service", "team_tier"})
+
 	// DeployTeardownMarkFailed counts teardown-reconciler sweeps where the
 	// compute was destroyed but MarkDeploymentTornDown failed to flip the
 	// row to 'deleted'. The row is then retried forever — a persistently

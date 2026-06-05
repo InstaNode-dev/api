@@ -2206,6 +2206,13 @@
             "description": "Monthly price in whole USD (cents/100). 0 for free/anonymous tiers.",
             "type": "integer"
           },
+          "resource_count_limit": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "description": "Task #55: per-service max number of active resources a team may hold. Keys: postgres, vector, redis, mongodb, storage, queue (webhook is request-capped, not count-capped). -1 = unlimited. Enforcement is flag-gated (RESOURCE_COUNT_CAPS_ENABLED) but the cap is always advertised so an agent can plan around it.",
+            "type": "object"
+          },
           "rpo_minutes": {
             "description": "Recovery Point Objective in minutes — the maximum window of data loss a restore can incur. 0 means no backup/RPO guarantee for the tier.",
             "type": "integer"
@@ -2256,7 +2263,11 @@
             "type": "integer"
           },
           "count": {
-            "description": "Current count. Present on deployments/webhooks/vault/members.",
+            "description": "Current count. Present on deployments/webhooks/vault/members, and (Task #55) on postgres/redis/mongodb as the active-resource count alongside bytes.",
+            "type": "integer"
+          },
+          "count_limit": {
+            "description": "Task #55: per-tier resource-COUNT cap for the byte-metered storage services (postgres/redis/mongodb), where the limit field is unused. -1 = unlimited. Enforcement is flag-gated (RESOURCE_COUNT_CAPS_ENABLED) but the cap is always advertised.",
             "type": "integer"
           },
           "limit": {

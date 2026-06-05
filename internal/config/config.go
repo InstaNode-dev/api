@@ -206,6 +206,17 @@ type Config struct {
 	// Enabling it is an operator action (see infra runbook) after a canary.
 	DeployScaleToZeroEnabled bool
 
+	// ResourceCountCapsEnabled gates per-service resource-count enforcement
+	// (Task #55). Default FALSE: when off, the count-check block in every
+	// provision handler (db/vector/cache/nosql/storage) is skipped entirely —
+	// zero behavior change, so shipping the caps cannot surprise-break an
+	// existing heavy tenant with a 402. When on, each handler counts the team's
+	// active resources of that type and rejects over-cap provisions with 402 +
+	// agent_action, mirroring the always-on queue_count cap. Enabling it is an
+	// operator action (kubectl set env RESOURCE_COUNT_CAPS_ENABLED=true) after a
+	// usage audit so no current tenant is over the new per-tier caps.
+	ResourceCountCapsEnabled bool
+
 	// GitHub App (P4) — install-once push-to-deploy + short-lived installation
 	// tokens for private-repo clones. Distinct from the GitHub OAuth *login* app
 	// above (GitHubClientID/Secret). GitHubAppEnabled gates the whole feature:
@@ -518,6 +529,17 @@ func Load() *Config {
 		cfg.DeployScaleToZeroEnabled = true
 	default:
 		cfg.DeployScaleToZeroEnabled = false
+	}
+
+	// RESOURCE_COUNT_CAPS_ENABLED: default FALSE (Task #55). Off → the per-service
+	// count-check block in every provision handler is skipped (zero behavior
+	// change). On → over-cap provisions get 402. Operator action after a usage
+	// audit so no current tenant is retroactively over a new per-tier cap.
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("RESOURCE_COUNT_CAPS_ENABLED"))) {
+	case "true", "1", "yes":
+		cfg.ResourceCountCapsEnabled = true
+	default:
+		cfg.ResourceCountCapsEnabled = false
 	}
 
 	// GITHUB_APP_ENABLED: default FALSE (off until the operator registers the
