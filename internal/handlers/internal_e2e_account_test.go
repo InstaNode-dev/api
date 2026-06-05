@@ -92,13 +92,15 @@ func newE2ETestApp(t *testing.T, db *sql.DB, rdb *redis.Client, token string) *f
 
 // e2eCreateResp is the create-endpoint response shape we assert on.
 type e2eCreateResp struct {
-	TeamID     string `json:"team_id"`
-	UserID     string `json:"user_id"`
-	Email      string `json:"email"`
-	Tier       string `json:"tier"`
-	SessionJWT string `json:"session_jwt"`
-	ExpiresAt  string `json:"expires_at"`
-	Error      string `json:"error"`
+	TeamID       string   `json:"team_id"`
+	UserID       string   `json:"user_id"`
+	Email        string   `json:"email"`
+	Tier         string   `json:"tier"`
+	SessionJWT   string   `json:"session_jwt"`
+	ExpiresAt    string   `json:"expires_at"`
+	SeededTokens []string `json:"seeded_tokens"`
+	SeededCount  int      `json:"seeded_count"`
+	Error        string   `json:"error"`
 }
 
 func postE2ECreate(t *testing.T, app *fiber.App, token, body string) *http.Response {
@@ -276,6 +278,127 @@ func TestE2EAccount_Create_UnknownTier_Rejected400(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	out := decodeE2ECreate(t, resp)
 	require.Equal(t, "invalid_tier", out.Error)
+}
+
+// TestE2EAccount_Create_AllAllowedTiers_RoundTrip is the rule-18 registry-
+// iterating guard: EVERY tier the handler advertises as allowed must mint
+// successfully and the minted team must carry that tier as its plan_tier
+// snapshot. Iterating handlers.E2EAllowedTiersForTest() (not a hand-typed
+// slice) means adding a tier to the allow-set automatically expands this
+// assertion — a new allowed tier can't silently ship un-exercised.
+func TestE2EAccount_Create_AllAllowedTiers_RoundTrip(t *testing.T) {
+	skipUnlessE2EDB(t)
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	app := newE2ETestApp(t, db, nil, testE2EToken)
+
+	for _, tier := range handlers.E2EAllowedTiersForTest() {
+		tier := tier
+		t.Run(tier, func(t *testing.T) {
+			resp := postE2ECreate(t, app, testE2EToken, fmt.Sprintf(`{"tier":%q}`, tier))
+			require.Equal(t, http.StatusOK, resp.StatusCode, "tier %q must mint", tier)
+			out := decodeE2ECreate(t, resp)
+			require.Equal(t, tier, out.Tier, "response tier must echo the requested tier")
+
+			var planTier string
+			require.NoError(t, db.QueryRowContext(context.Background(),
+				`SELECT plan_tier FROM teams WHERE id = $1`, out.TeamID).Scan(&planTier))
+			// The team's persisted plan_tier mirrors the requested tier for every
+			// real team plan. "anonymous" is NOT a team plan — an anonymous
+			// account is a free team row (CreateTestCohortTeam starts at 'free')
+			// with tier="anonymous" echoed on the response for the caller to
+			// drive the anon-path journey. So the persisted plan_tier is 'free'.
+			wantPlanTier := tier
+			if tier == "anonymous" {
+				wantPlanTier = "free"
+			}
+			require.Equal(t, wantPlanTier, planTier,
+				"minted team's plan_tier must reflect the requested tier (snapshot at creation)")
+		})
+	}
+}
+
+// TestE2EAccount_Create_AllBlockedTiers_Rejected is the companion guard: every
+// gated tier (team/growth) must 400 with tier_not_allowed. Iterating the
+// handler's blocked-set keeps the test honest if a tier is added to the gate.
+func TestE2EAccount_Create_AllBlockedTiers_Rejected(t *testing.T) {
+	t.Parallel()
+	app := newE2ETestApp(t, nil, nil, testE2EToken)
+	for _, tier := range handlers.E2EBlockedTiersForTest() {
+		tier := tier
+		t.Run(tier, func(t *testing.T) {
+			resp := postE2ECreate(t, app, testE2EToken, fmt.Sprintf(`{"tier":%q}`, tier))
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+				"gated tier %q must be rejected (never minted)", tier)
+			out := decodeE2ECreate(t, resp)
+			require.Equal(t, "tier_not_allowed", out.Error)
+		})
+	}
+}
+
+// --- create: with_resources pre-seed ----------------------------------------
+
+// TestE2EAccount_Create_WithResources_SeedsFastResources asserts that
+// with_resources=true pre-seeds exactly the handler's seed set, that each seeded
+// row is active + owned by the minted team + tier-snapshotted, and that the
+// response surfaces the seeded tokens. Iterates the handler's seed-type list so
+// adding a seed type auto-expands the assertion.
+func TestE2EAccount_Create_WithResources_SeedsFastResources(t *testing.T) {
+	skipUnlessE2EDB(t)
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	app := newE2ETestApp(t, db, nil, testE2EToken)
+
+	resp := postE2ECreate(t, app, testE2EToken, `{"tier":"pro","with_resources":true}`)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	out := decodeE2ECreate(t, resp)
+
+	wantTypes := handlers.E2ESeedResourceTypesForTest()
+	require.Equal(t, len(wantTypes), out.SeededCount,
+		"seeded_count must equal the handler's seed-type count")
+	require.Len(t, out.SeededTokens, len(wantTypes),
+		"seeded_tokens must carry one token per seed type")
+
+	ctx := context.Background()
+	// Every seeded resource row must be active, owned by the minted team, and
+	// carry the team's tier snapshot.
+	gotTypes := map[string]bool{}
+	for _, tok := range out.SeededTokens {
+		var rtype, status, tier string
+		var teamID string
+		require.NoError(t, db.QueryRowContext(ctx,
+			`SELECT resource_type, status, tier, team_id::text FROM resources WHERE token = $1`, tok).
+			Scan(&rtype, &status, &tier, &teamID))
+		require.Equal(t, "active", status, "seeded resource must be active")
+		require.Equal(t, "pro", tier, "seeded resource must carry the team tier snapshot")
+		require.Equal(t, out.TeamID, teamID, "seeded resource must be owned by the minted team")
+		gotTypes[rtype] = true
+	}
+	for _, want := range wantTypes {
+		require.True(t, gotTypes[want], "seed set must include a %q resource", want)
+	}
+}
+
+// TestE2EAccount_Create_WithoutResources_SeedsNothing pins that the seed is
+// opt-in: omitting with_resources mints an empty account (seeded_count=0) and
+// the response still carries an empty (non-null) seeded_tokens array.
+func TestE2EAccount_Create_WithoutResources_SeedsNothing(t *testing.T) {
+	skipUnlessE2EDB(t)
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	app := newE2ETestApp(t, db, nil, testE2EToken)
+
+	resp := postE2ECreate(t, app, testE2EToken, `{"tier":"free"}`)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	out := decodeE2ECreate(t, resp)
+	require.Equal(t, 0, out.SeededCount)
+	require.NotNil(t, out.SeededTokens, "seeded_tokens must be [] not null when nothing is seeded")
+	require.Empty(t, out.SeededTokens)
+
+	var n int
+	require.NoError(t, db.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM resources WHERE team_id = $1`, out.TeamID).Scan(&n))
+	require.Equal(t, 0, n, "no resources must be seeded when with_resources is omitted")
 }
 
 // --- reap --------------------------------------------------------------------
