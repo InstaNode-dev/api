@@ -206,3 +206,18 @@ jobs:
           echo "Total project coverage: ${total}%"
           awk -v t="$total" 'BEGIN { exit (t+0 >= 95) ? 0 : 1 }' \
             || { echo "::error::Production coverage ${total}% is below the 95% floor"; exit 1; }
+
+      # Wave 5 — record the coverage-gate outcome in New Relic (suite=coverage)
+      # so a coverage red is visible alongside the test red on the CI-health
+      # dashboard. if: always() captures both the patch-gate and floor-gate
+      # failures above. No-ops without the NR secret.
+      - name: Emit coverage result to New Relic
+        if: always()
+        uses: ./.github/actions/nr-ci-event
+        with:
+          license-key: ${{ secrets.NEW_RELIC_LICENSE_KEY }}
+          account-id: ${{ secrets.NEW_RELIC_ACCOUNT_ID }}
+          result: ${{ job.status == 'success' && 'pass' || 'fail' }}
+          suite: coverage
+          pr-number: ${{ github.event.pull_request.number }}
+          failed-step: ${{ job.status != 'success' && 'coverage gate (100% patch / 95% floor)' || '' }}
