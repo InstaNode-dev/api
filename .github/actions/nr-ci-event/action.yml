@@ -22,12 +22,12 @@ inputs:
   license-key:
     description: >-
       NR ingest license key (Insert Key for the Event API). Pass
-      ${{ secrets.NEW_RELIC_LICENSE_KEY }}. Empty => action no-ops (dry-run log).
+      `secrets.NEW_RELIC_LICENSE_KEY`. Empty => action no-ops (dry-run log).
     required: false
     default: ''
   account-id:
     description: >-
-      Numeric NR account id. Pass ${{ secrets.NEW_RELIC_ACCOUNT_ID }}.
+      Numeric NR account id. Pass `secrets.NEW_RELIC_ACCOUNT_ID`.
       Empty => action no-ops (dry-run log).
     required: false
     default: ''
@@ -38,7 +38,7 @@ inputs:
 
   # --- event payload (caller fills from the GitHub context + job result) ---
   result:
-    description: 'pass | fail — usually ${{ job.status == ''success'' && ''pass'' || ''fail'' }}.'
+    description: 'pass | fail — usually `job.status == ''success'' && ''pass'' || ''fail''`.'
     required: true
   suite:
     description: >-
@@ -47,26 +47,26 @@ inputs:
     required: true
   # NOTE: composite actions cannot read the `github` context in their own
   # expressions, so the caller MUST pass these from its `with:` block (e.g.
-  # repo: ${{ github.repository }}). The defaults below only apply when a caller
+  # repo: `github.repository`). The defaults below only apply when a caller
   # omits them entirely.
   repo:
-    description: 'Repository (owner/name). Caller passes ${{ github.repository }}.'
+    description: 'Repository (owner/name). Caller passes `github.repository`.'
     required: false
     default: ''
   workflow:
-    description: 'Workflow name. Caller passes ${{ github.workflow }}.'
+    description: 'Workflow name. Caller passes `github.workflow`.'
     required: false
     default: ''
   branch:
-    description: 'Branch ref name. Caller passes ${{ github.ref_name }}.'
+    description: 'Branch ref name. Caller passes `github.ref_name`.'
     required: false
     default: ''
   commit-sha:
-    description: 'Commit SHA under test. Caller passes ${{ github.sha }}.'
+    description: 'Commit SHA under test. Caller passes `github.sha`.'
     required: false
     default: ''
   pr-number:
-    description: 'PR number (empty on push). Caller passes ${{ github.event.pull_request.number }}.'
+    description: 'PR number (empty on push). Caller passes `github.event.pull_request.number`.'
     required: false
     default: ''
   duration-ms:
@@ -82,11 +82,11 @@ inputs:
     required: false
     default: ''
   event-name:
-    description: 'GitHub event name. Caller passes ${{ github.event_name }}.'
+    description: 'GitHub event name. Caller passes `github.event_name`.'
     required: false
     default: ''
   actor:
-    description: 'GitHub actor. Caller passes ${{ github.actor }}.'
+    description: 'GitHub actor. Caller passes `github.actor`.'
     required: false
     default: ''
 
