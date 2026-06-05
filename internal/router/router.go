@@ -17,10 +17,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/valyala/fasthttp/fasthttpadaptor"
+	"instant.dev/common/analyticsevent"
+	"instant.dev/common/analyticsevent/nr"
 	"instant.dev/common/buildinfo"
 	"instant.dev/internal/config"
 	"instant.dev/internal/email"
 	"instant.dev/internal/handlers"
+	"instant.dev/internal/metrics"
 	"instant.dev/internal/middleware"
 	"instant.dev/internal/migrations"
 	"instant.dev/internal/plans"
@@ -225,6 +228,18 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// extraction reads from the request, not from OTel context, but
 	// keeping both before user middleware is the safe order).
 	app.Use(middleware.NewRelic(nrApp))
+
+	// WS4 behavioral-intelligence funnel events. Build the process-wide
+	// analyticsevent.Emitter ONCE here and install it for the handler funnel
+	// emit sites (db/cache/nosql/vector/queue/storage/webhook provision,
+	// onboarding claim, billing paid). It reuses the SAME *newrelic.Application
+	// the middleware above uses — no second NR connection. ANALYTICS_BACKEND
+	// defaults to "noop", so this is INERT until New Relic is configured; the
+	// emitter is fail-open (the wrapper swallows any sink panic), so funnel
+	// emission can never block or error a request. A nil nrApp degrades the
+	// "newrelic" backend to noop inside the nr sink (nil-app drop).
+	wireAnalyticsEmitter(cfg, nrApp)
+
 	// Telemetry must come before Recover so that panic-induced 500s are recorded.
 	app.Use(middleware.Telemetry())
 	app.Use(fiberRecover.New(fiberRecover.Config{
@@ -1459,4 +1474,41 @@ func parseTrustedProxyCIDRs(s string) []string {
 		return nil
 	}
 	return out
+}
+
+// wireAnalyticsEmitter builds the process-wide behavioral-intelligence emitter
+// from ANALYTICS_BACKEND and installs it for the handler funnel emit sites via
+// handlers.SetAnalyticsEmitter. It reuses the api's existing
+// *newrelic.Application (the one the NewRelic middleware uses) for the
+// "newrelic" backend so there is no second NR connection.
+//
+// Selection (all fail-open — Factory always returns a usable emitter):
+//   - ANALYTICS_BACKEND=newrelic  -> the nr sink over nrApp (nrApp may be nil:
+//     the sink then drops every event and fires the failure hook with nil_app).
+//   - anything else / unset       -> noop (the inert default).
+//
+// A non-nil advisory error from Factory is logged (analytics degraded to noop)
+// but never blocks boot — analytics is best-effort. Returns the installed
+// emitter (the boot caller ignores it; tests drive it to exercise the wiring).
+func wireAnalyticsEmitter(cfg *config.Config, nrApp *newrelic.Application) analyticsevent.Emitter {
+	acfg := analyticsevent.Config{Backend: cfg.AnalyticsBackend}
+
+	// For the New Relic backend we inject the already-constructed app via
+	// Config.Override so the root analyticsevent package never imports the NR
+	// agent. The failure hook bridges a dropped emit to the api's Prometheus
+	// counter (CLAUDE.md rule 25: a metric needs its alert/dashboard; the
+	// catalog row + Prom rule ship in this PR).
+	if analyticsevent.NormalizeBackend(cfg.AnalyticsBackend) == analyticsevent.BackendNewRelic {
+		acfg.Override = nr.New(nrApp, nr.WithFailureHook(func(reason string) {
+			metrics.AnalyticsEmitFailed.WithLabelValues(reason).Inc()
+		}))
+	}
+
+	emitter, err := analyticsevent.Factory(acfg)
+	if err != nil {
+		slog.Warn("analytics: degraded to noop", "backend", cfg.AnalyticsBackend, "error", err)
+	}
+	slog.Info("analytics: emitter wired", "backend", emitter.Name())
+	handlers.SetAnalyticsEmitter(emitter)
+	return emitter
 }

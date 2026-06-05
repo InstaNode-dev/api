@@ -449,6 +449,21 @@ var (
 		Name: "instant_pg_pool_wait_duration_seconds",
 		Help: "Cumulative time spent waiting for a connection since process start, in seconds (sql.DBStats.WaitDuration). Pairs with instant_pg_pool_wait_count.",
 	}, []string{"pool"})
+
+	// AnalyticsEmitFailed counts behavioral-intelligence custom events
+	// (common/analyticsevent — InstantFunnel etc.) that were DROPPED rather than
+	// reaching the analytics sink. The dominant reason today is "nil_app": the
+	// New Relic sink had no *newrelic.Application (NR not configured) — which is
+	// the expected steady state until ANALYTICS_BACKEND=newrelic + a license key
+	// are wired, so this counter sitting at a flat non-zero is benign in that
+	// configuration. A SUDDEN climb after NR is configured means the bridge is
+	// dropping real funnel events. Lazy *Vec: not visible at /metrics until the
+	// first label is observed (a dropped emit). Labelled by reason so the alert
+	// can distinguish "misconfigured" (nil_app) from a sink-side reject.
+	AnalyticsEmitFailed = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_analytics_emit_failed_total",
+		Help: "Behavioral-intelligence custom events dropped before reaching the analytics sink, by reason.",
+	}, []string{"reason"})
 )
 
 // ReadyzCheckStatus updates the gauge for one check in this service.

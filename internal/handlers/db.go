@@ -307,6 +307,8 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 	metrics.ProvisionsTotal.WithLabelValues("postgres", "anonymous").Inc()
 	middleware.RecordProvisionSuccess("postgres")
 	metrics.ConversionFunnel.WithLabelValues("provision").Inc()
+	// WS4: per-entity funnel custom event alongside the aggregate counter.
+	recordFunnelEvent(ctx, funnelStepProvision, funnelAttrs{Tier: "anonymous", Env: env, Fingerprint: fp})
 
 	// Record this fingerprint as having had at least one anonymous touch.
 	// The next anonymous POST after this resource expires will hit the
