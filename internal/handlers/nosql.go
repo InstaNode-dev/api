@@ -326,6 +326,11 @@ func (h *NoSQLHandler) newNoSQLAuthenticated(
 		tier = "growth"
 	}
 
+	// Task #55: per-tier mongodb count cap (flag-gated, default OFF). Mirrors queue.go.
+	if handled, capErr := h.enforceResourceCountCap(c, teamUUID, team.PlanTier, models.ResourceTypeMongoDB, requestID); handled {
+		return capErr
+	}
+
 	parentRootID, perr := resolveFamilyParent(c, h.db, parentResourceID, teamUUID, models.ResourceTypeMongoDB, env)
 	if perr != nil {
 		return perr

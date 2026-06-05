@@ -32,23 +32,30 @@ func NewCapabilitiesHandler(p *plans.Registry) *CapabilitiesHandler {
 }
 
 type tierCapabilities struct {
-	Tier                  string         `json:"tier"`
-	DisplayName           string         `json:"display_name"`
-	PriceUSDMonthly       int            `json:"price_usd_monthly"`
-	PaidFromDayOne        bool           `json:"paid_from_day_one"`
-	StorageLimitMB        map[string]int `json:"storage_limit_mb"`
-	ConnectionsLimit      map[string]int `json:"connections_limit"`
-	Deployments           int            `json:"deployments_apps"`
-	BackupRetentionDays   int            `json:"backup_retention_days"`
-	BackupRestoreEnabled  bool           `json:"backup_restore_enabled"`
-	ManualBackupsPerDay   int            `json:"manual_backups_per_day"`
+	Tier             string         `json:"tier"`
+	DisplayName      string         `json:"display_name"`
+	PriceUSDMonthly  int            `json:"price_usd_monthly"`
+	PaidFromDayOne   bool           `json:"paid_from_day_one"`
+	StorageLimitMB   map[string]int `json:"storage_limit_mb"`
+	ConnectionsLimit map[string]int `json:"connections_limit"`
+	// ResourceCountLimit is the per-service max number of active resources a
+	// team may hold (Task #55). Keyed by the same service strings as
+	// StorageLimitMB. -1 means unlimited; a positive value is the hard cap.
+	// Enforcement is flag-gated (RESOURCE_COUNT_CAPS_ENABLED) — this surface
+	// always advertises the cap so an agent can plan around it even while the
+	// operator hasn't yet flipped enforcement on.
+	ResourceCountLimit   map[string]int `json:"resource_count_limit"`
+	Deployments          int            `json:"deployments_apps"`
+	BackupRetentionDays  int            `json:"backup_retention_days"`
+	BackupRestoreEnabled bool           `json:"backup_restore_enabled"`
+	ManualBackupsPerDay  int            `json:"manual_backups_per_day"`
 	// RPOMinutes / RTOMinutes — FIX-H #Q50 (B36). 0 means
 	// "not promised" (no scheduled backups / no self-serve restore on
 	// the tier). Lets an agent reason about durability requirements
 	// per-tier without a second round-trip.
-	RPOMinutes            int            `json:"rpo_minutes"`
-	RTOMinutes            int            `json:"rto_minutes"`
-	AnnualDiscountPercent int            `json:"annual_discount_percent"`
+	RPOMinutes            int `json:"rpo_minutes"`
+	RTOMinutes            int `json:"rto_minutes"`
+	AnnualDiscountPercent int `json:"annual_discount_percent"`
 	// UpgradeURL — pointer so the terminal tier (Team — there is nothing
 	// to upgrade to) emits an explicit JSON `null` instead of the pricing
 	// URL. DOG-26 (QA 2026-05-29): every tier including Team used to
@@ -56,12 +63,12 @@ type tierCapabilities struct {
 	// rendering an "Upgrade" CTA on the Team plan with no destination.
 	// `null` is the contract-stable terminal-tier marker; a non-null
 	// string is the "click here to upgrade" signal.
-	UpgradeURL            *string        `json:"upgrade_url"`
+	UpgradeURL *string `json:"upgrade_url"`
 	// IsTerminalTier — explicit boolean so clients don't have to encode
 	// the "is upgrade_url null" check at every render site. True for the
 	// top tier (Team today), false for everything below. Pairs with
 	// UpgradeURL — when IsTerminalTier=true, UpgradeURL is null.
-	IsTerminalTier        bool           `json:"is_terminal_tier"`
+	IsTerminalTier bool `json:"is_terminal_tier"`
 }
 
 // capabilityResourceTypes is the list of service types the /capabilities
@@ -69,6 +76,13 @@ type tierCapabilities struct {
 // stable — frontends iterate the response and key by this string set.
 var capabilityResourceTypes = []string{
 	"postgres", "redis", "mongodb", "queue", "storage", "webhook", "vector",
+}
+
+// countCapResourceTypes is the set of services that carry a per-tier
+// resource-COUNT cap (Task #55). Webhook is omitted — it is byte/request-capped
+// via webhook_requests_stored, not count-capped. Order is contract-stable.
+var countCapResourceTypes = []string{
+	"postgres", "vector", "redis", "mongodb", "storage", "queue",
 }
 
 // upgradeURL is the marketing pricing page that every tier row in the
@@ -158,9 +172,16 @@ func (h *CapabilitiesHandler) Get(c *fiber.Ctx) error {
 	for _, e := range entries {
 		storage := map[string]int{}
 		conns := map[string]int{}
+		counts := map[string]int{}
 		for _, rt := range capabilityResourceTypes {
 			storage[rt] = h.plans.StorageLimitMB(e.name, rt)
 			conns[rt] = h.plans.ConnectionsLimit(e.name, rt)
+		}
+		// Task #55: per-service resource-count caps. Only the count-capped
+		// services appear (webhook is byte-capped via webhook_requests_stored,
+		// not count-capped). ResourceCountLimit returns -1 for unlimited.
+		for _, rt := range countCapResourceTypes {
+			counts[rt] = h.plans.ResourceCountLimit(e.name, rt)
 		}
 		priceUSD := e.plan.PriceMonthly / 100 // cents → dollars
 		// DOG-26: terminal tier marker — top of the rank ladder has
@@ -179,6 +200,7 @@ func (h *CapabilitiesHandler) Get(c *fiber.Ctx) error {
 			PaidFromDayOne:        priceUSD > 0,
 			StorageLimitMB:        storage,
 			ConnectionsLimit:      conns,
+			ResourceCountLimit:    counts,
 			Deployments:           h.plans.DeploymentsAppsLimit(e.name),
 			BackupRetentionDays:   h.plans.BackupRetentionDays(e.name),
 			BackupRestoreEnabled:  h.plans.BackupRestoreEnabled(e.name),

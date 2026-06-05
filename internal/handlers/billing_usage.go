@@ -68,6 +68,13 @@ type usageMetric struct {
 	LimitBytes int64 `json:"limit_bytes,omitempty"`
 	Count      int   `json:"count,omitempty"`
 	Limit      int   `json:"limit,omitempty"`
+	// CountLimit is the per-tier resource-COUNT cap (Task #55) for the
+	// byte-metered storage services (postgres/redis/mongodb), where `Limit`
+	// already carries no value (those use LimitBytes). It lets the dashboard
+	// show "3 / 5 databases" alongside "120 MB / 1024 MB". For the
+	// count-metered services (deployments/webhooks/vault/members) the existing
+	// Count/Limit pair is unchanged. -1 means unlimited.
+	CountLimit int `json:"count_limit,omitempty"`
 }
 
 // GetUsage handles GET /api/v1/billing/usage.
@@ -152,9 +159,15 @@ func (h *BillingUsageHandler) computeUsage(ctx context.Context, teamID uuid.UUID
 			return usageSummary{}, sumErr
 		}
 		limitMB := h.plans.StorageLimitMB(tier, svc)
+		// Task #55: also surface the active-resource COUNT + per-tier count cap
+		// so the dashboard can render "3 / 5 databases" next to the byte gauge.
+		// Best-effort: a count error must not fail the byte rows.
+		count, _ := models.CountActiveResourcesByTeamAndType(ctx, h.db, teamID, svc)
 		usage[svc] = usageMetric{
 			Bytes:      bytes,
 			LimitBytes: mbToBytes(limitMB),
+			Count:      count,
+			CountLimit: h.plans.ResourceCountLimit(tier, svc),
 		}
 	}
 

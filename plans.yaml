@@ -30,6 +30,14 @@ plans:
       # mean "none" — anon/free get exactly 1 queue, bounded by the 64 MB slice.
       # Hard-cap-only; no metered overage.
       queue_count: 1
+      # Task #55 resource-count caps (flag-gated, default OFF via
+      # RESOURCE_COUNT_CAPS_ENABLED). anonymous/free are also fingerprint-dedup-
+      # gated; 1 each keeps the saturated-COGS bound. Mirror common defaultYAML.
+      postgres_count: 1
+      vector_count: 1
+      redis_count: 1
+      mongodb_count: 1
+      storage_count: 1
       storage_storage_mb: 10
       webhook_requests_stored: 100
       team_members: 1
@@ -77,6 +85,14 @@ plans:
       queue_storage_mb: 64
       # queue_count 1 (was -1) — mirrors anonymous. 0 means unlimited, so 1.
       queue_count: 1
+      # Task #55 resource-count caps (flag-gated, default OFF via
+      # RESOURCE_COUNT_CAPS_ENABLED). anonymous/free are also fingerprint-dedup-
+      # gated; 1 each keeps the saturated-COGS bound. Mirror common defaultYAML.
+      postgres_count: 1
+      vector_count: 1
+      redis_count: 1
+      mongodb_count: 1
+      storage_count: 1
       storage_storage_mb: 10
       webhook_requests_stored: 100
       team_members: 1
@@ -117,6 +133,13 @@ plans:
       # strict-80% margin redesign (2026-06-05): queue trimmed 5120 → 2048 MB.
       queue_storage_mb: 2048
       queue_count: 3
+      # Task #55 resource-count caps. hobby budget=$1.80 (20% of $9); redis
+      # 2×50MB×$6.50/GB=$0.65 — well within budget, redis kept conservative.
+      postgres_count: 2
+      vector_count: 2
+      redis_count: 2
+      mongodb_count: 2
+      storage_count: 2
       storage_storage_mb: 512
       webhook_requests_stored: 1000
       team_members: 1
@@ -188,6 +211,13 @@ plans:
       mongodb_ops_per_minute: 1000
       queue_storage_mb: 5120
       queue_count: 5
+      # Task #55 resource-count caps. hobby_plus budget=$3.80; redis
+      # 3×50MB×$6.50/GB=$0.98 — conservative; every service ≤ its budget max.
+      postgres_count: 3
+      vector_count: 3
+      redis_count: 3
+      mongodb_count: 3
+      storage_count: 3
       storage_storage_mb: 5120
       webhook_requests_stored: 5000
       team_members: 1
@@ -241,6 +271,13 @@ plans:
       mongodb_ops_per_minute: 1000
       queue_storage_mb: 5120
       queue_count: 5
+      # Task #55 resource-count caps. hobby_plus budget=$3.80; redis
+      # 3×50MB×$6.50/GB=$0.98 — conservative; every service ≤ its budget max.
+      postgres_count: 3
+      vector_count: 3
+      redis_count: 3
+      mongodb_count: 3
+      storage_count: 3
       storage_storage_mb: 5120
       webhook_requests_stored: 5000
       team_members: 1
@@ -285,6 +322,13 @@ plans:
       # strict-80% margin redesign (2026-06-05): queue trimmed 5120 → 2048 MB (mirror hobby).
       queue_storage_mb: 2048
       queue_count: 3
+      # Task #55 resource-count caps. hobby budget=$1.80 (20% of $9); redis
+      # 2×50MB×$6.50/GB=$0.65 — well within budget, redis kept conservative.
+      postgres_count: 2
+      vector_count: 2
+      redis_count: 2
+      mongodb_count: 2
+      storage_count: 2
       storage_storage_mb: 512
       webhook_requests_stored: 1000
       team_members: 1
@@ -331,6 +375,14 @@ plans:
       # strict-80% margin redesign (2026-06-05): queue trimmed 10240 → 5120 MB.
       queue_storage_mb: 5120
       queue_count: 20
+      # Task #55 resource-count caps. pro budget=$9.80; redis is binding:
+      # 512MB×$6.50/GB=$3.25/res → max 3 in budget, so redis_count=3. pg/vec
+      # 10GB×$0.15=$1.50/res → 5 ≤ 6.5 budget-max. storage 50GB×$0.02=$1/res → 5.
+      postgres_count: 5
+      vector_count: 5
+      redis_count: 3
+      mongodb_count: 5
+      storage_count: 5
       storage_storage_mb: 51200
       webhook_requests_stored: 10000
       team_members: 5
@@ -376,6 +428,14 @@ plans:
       # strict-80% margin redesign (2026-06-05): queue trimmed 10240 → 5120 MB (mirror pro).
       queue_storage_mb: 5120
       queue_count: 20
+      # Task #55 resource-count caps. pro budget=$9.80; redis is binding:
+      # 512MB×$6.50/GB=$3.25/res → max 3 in budget, so redis_count=3. pg/vec
+      # 10GB×$0.15=$1.50/res → 5 ≤ 6.5 budget-max. storage 50GB×$0.02=$1/res → 5.
+      postgres_count: 5
+      vector_count: 5
+      redis_count: 3
+      mongodb_count: 5
+      storage_count: 5
       storage_storage_mb: 51200
       webhook_requests_stored: 10000
       team_members: 5
@@ -426,6 +486,15 @@ plans:
       mongodb_ops_per_minute: 50000
       queue_storage_mb: 40960
       queue_count: 100
+      # Task #55 resource-count caps. team budget=$39.80; redis binding:
+      # 1.5GB×$6.50/GB=$9.75/res → max 4 in budget, redis_count=4. pg 50GB×
+      # $0.15=$7.50/res → 5 ≤ 5.3 budget-max; mongo 40GB×$0.15=$6 → 6 ≤ 6.6;
+      # storage 300GB×$0.02=$6 → 6 ≤ 6.6; vector 30GB×$0.15=$4.5 → 8 ≤ 8.8.
+      postgres_count: 5
+      vector_count: 8
+      redis_count: 4
+      mongodb_count: 6
+      storage_count: 6
       storage_storage_mb: 307200
       webhook_requests_stored: 100000
       team_members: 25
@@ -474,6 +543,15 @@ plans:
       mongodb_ops_per_minute: 50000
       queue_storage_mb: 40960
       queue_count: 100
+      # Task #55 resource-count caps. team budget=$39.80; redis binding:
+      # 1.5GB×$6.50/GB=$9.75/res → max 4 in budget, redis_count=4. pg 50GB×
+      # $0.15=$7.50/res → 5 ≤ 5.3 budget-max; mongo 40GB×$0.15=$6 → 6 ≤ 6.6;
+      # storage 300GB×$0.02=$6 → 6 ≤ 6.6; vector 30GB×$0.15=$4.5 → 8 ≤ 8.8.
+      postgres_count: 5
+      vector_count: 8
+      redis_count: 4
+      mongodb_count: 6
+      storage_count: 6
       storage_storage_mb: 307200
       webhook_requests_stored: 100000
       team_members: 25
@@ -540,6 +618,15 @@ plans:
       mongodb_ops_per_minute: 50000
       queue_storage_mb: 20480
       queue_count: 50
+      # Task #55 resource-count caps. growth budget=$19.80; redis binding:
+      # 1GB×$6.50/GB=$6.50/res → max 3 in budget, redis_count=3. pg 20GB×
+      # $0.15=$3/res → 6 ≤ 6.6 budget-max; mongo 20GB×$0.15=$3 → 6 ≤ 6.6;
+      # storage 150GB×$0.02=$3 → 6 ≤ 6.6; vector 10GB×$0.15=$1.5 → 6 ≤ 13.2.
+      postgres_count: 6
+      vector_count: 6
+      redis_count: 3
+      mongodb_count: 6
+      storage_count: 6
       storage_storage_mb: 153600
       webhook_requests_stored: 100000
       team_members: 10
