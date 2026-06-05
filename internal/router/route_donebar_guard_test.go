@@ -384,6 +384,40 @@ var routeTestMap = map[string]string{
 	"POST /api/v1/vault/:env/:key/rotate": "TestVaultBlock_RotateSecret",
 	"DELETE /api/v1/vault/:env/:key":      "TestVaultBlock_DeleteSecret",
 	"POST /api/v1/vault/copy":             "TestVaultBlock_CopySecrets",
+
+	// ── misc surfaces (LAST real-flow wave) — DB-backed handler-integration
+	// suite (internal/handlers/misc_routes_block_integration_test.go,
+	// TestMiscBlock_*). Each row points at the TestMiscBlock_* test that drives
+	// the route through the SAME middleware chain router.go wires (RequireAuth
+	// for the /api/v1 session-gated usage-wall; OptionalAuth for the
+	// token-as-credential webhook inspector; bare public registration for the
+	// unauth incidents feed + the confirm-deletion redirect) against a real
+	// migrated Postgres (+ Redis for the inspector's receive→store→inspect
+	// round-trip). Specifically:
+	//   - incidents is the read-only status-page feed ({ok,items,total,
+	//     status_page}; public, no team-scoped data).
+	//   - confirm-deletion is the tokenized email-link redirect (the `t=` token
+	//     IS the credential): present token → 302 to the dashboard with the
+	//     token carried verbatim; missing/blank token → canonical 400
+	//     missing_token envelope.
+	//   - usage/wall is the org usage rollup: 401 unauth, near_wall=true +
+	//     flattened metadata + cache headers for a hobby team with a fresh
+	//     near_quota_wall row, team-tier short-circuit, and team-scoped
+	//     isolation.
+	//   - webhooks/:token/requests is the captured-request inspector:
+	//     token-as-bearer reads only that token's captures (cross-token
+	//     isolation), invalid→400, unknown→404, cross-team session→403.
+	// Moved here from routeCoverageExemptions.
+	//
+	// POST /api/v1/experiments/converted is mapped at the analytics-ingest
+	// row below — its DB-backed, production-router contract was already covered
+	// by experiments_test.go (TestExperimentsConverted_WritesAuditRow), so its
+	// row points there rather than duplicating the audit round-trip.
+	"GET /api/v1/incidents":                "TestMiscBlock_Incidents_PublicFeed",
+	"GET /auth/email/confirm-deletion":     "TestMiscBlock_ConfirmDeletionRedirect_TokenBranches",
+	"GET /api/v1/usage/wall":               "TestMiscBlock_UsageWall_RealDBContract",
+	"GET /api/v1/webhooks/:token/requests": "TestMiscBlock_WebhookInspector_TokenScopedAndIsolated",
+	"POST /api/v1/experiments/converted":   "TestExperimentsConverted_WritesAuditRow",
 }
 
 // routeCoverageExemptions lists routes that have NO mapped e2e integration test
@@ -418,20 +452,17 @@ var routeCoverageExemptions = map[string]string{
 	"GET /llms-full.txt":            "static content redirect (built from content repo). TODO: matrix W7 content-surface smoke.",
 	"GET /security.txt":             "static RFC-9116 security.txt. TODO: matrix W7 content-surface smoke.",
 	"GET /.well-known/security.txt": "static RFC-9116 security.txt. TODO: matrix W7 content-surface smoke.",
-	"GET /api/v1/incidents":         "status-page incidents feed (read-only). TODO: matrix W7 status-surface smoke.",
 
 	// ── approve link (deploy/quota approval) — MOVED to routeTestMap. Now
 	// covered by the W4 deploy-approval handler-integration suite
 	// (internal/handlers/approve_block_routes_test.go, TestApproveBlock_*).
 
-	// ── auth: account-deletion confirm link — no e2e yet.
-	"GET /auth/email/confirm-deletion": "magic-link account/team deletion confirm — no e2e yet. TODO: matrix W1 deletion-confirm flow.",
-
-	// ── experiments / analytics ingest — fire-and-forget.
-	"POST /api/v1/experiments/converted": "client-side experiment conversion ping (analytics). TODO: matrix W8 analytics-surface smoke.",
-
-	// ── usage wall (org-wide usage rollup) — no dedicated e2e.
-	"GET /api/v1/usage/wall": "org usage rollup (aggregation; memory feedback_caching_and_consistency). TODO: matrix W3 usage-surface test.",
+	// ── misc surfaces (incidents / confirm-deletion / usage-wall /
+	// experiments-converted / webhook-inspector) — MOVED to routeTestMap. Now
+	// covered by the misc-routes handler-integration suite
+	// (internal/handlers/misc_routes_block_integration_test.go, TestMiscBlock_*)
+	// plus the pre-existing experiments_test.go round-trip the experiments row
+	// points at.
 
 	// ── resources: family / twin / pause-resume / backup-restore (W5 lifecycle)
 	// — MOVED to routeTestMap. Now covered by the DB-backed handler-integration
@@ -484,8 +515,8 @@ var routeCoverageExemptions = map[string]string{
 	// cross-team / member-authz layer billing_apikeys_audit_block_integration_test.go
 	// (TestBAA*).
 
-	// ── webhook requests inspector.
-	"GET /api/v1/webhooks/:token/requests": "captured webhook-request inspector. TODO: matrix W2 webhook-inspector flow.",
+	// ── webhook requests inspector — MOVED to routeTestMap. Now covered by the
+	// misc-routes handler-integration suite (TestMiscBlock_WebhookInspector_*).
 
 	// ── SES email webhook (Brevo is mapped; SES is the alternate backend).
 	"POST /api/v1/email/webhook/ses":  "SES delivery webhook (alternate backend; Brevo path is mapped). TODO: matrix W7 ses-webhook flow.",
