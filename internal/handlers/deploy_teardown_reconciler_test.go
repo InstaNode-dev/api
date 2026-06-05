@@ -75,6 +75,9 @@ func (f *fakeTeardownProvider) Redeploy(context.Context, string, []byte, map[str
 func (f *fakeTeardownProvider) UpdateAccessControl(context.Context, string, bool, []string) error {
 	return nil
 }
+func (f *fakeTeardownProvider) Scale(context.Context, string, int32) error {
+	return nil
+}
 
 func reconcilerRequireDB(t *testing.T) {
 	t.Helper()

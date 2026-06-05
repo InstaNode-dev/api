@@ -122,6 +122,17 @@ func TestNoop_UpdateAccessControl(t *testing.T) {
 	}
 }
 
+// TestNoop_Scale verifies Scale is a no-op for both scale-down and wake.
+func TestNoop_Scale(t *testing.T) {
+	p := New()
+	if err := p.Scale(context.Background(), "appid", 0); err != nil {
+		t.Errorf("Scale(0): %v", err)
+	}
+	if err := p.Scale(context.Background(), "appid", 1); err != nil {
+		t.Errorf("Scale(1): %v", err)
+	}
+}
+
 // ── Stack provider ──────────────────────────────────────────────────────────
 
 // TestNoop_NewStack verifies the stack constructor.

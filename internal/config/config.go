@@ -197,6 +197,15 @@ type Config struct {
 	// Off → /deploy/new rejects source=git with 501; tarball/image unaffected.
 	DeploySourceGitEnabled bool
 
+	// DeployScaleToZeroEnabled gates scale-to-zero (idle descheduling, Task #54).
+	// Default FALSE: the worker idle-scaler patches idle Deployments to
+	// replicas=0 and the api wake path (POST /deploy/:id/wake) brings them back.
+	// Off → the wake endpoint returns 501 and nothing in the api scales an app;
+	// the worker idle-scaler is independently gated by its own
+	// DEPLOY_SCALE_TO_ZERO_ENABLED env so the two services share the flag name.
+	// Enabling it is an operator action (see infra runbook) after a canary.
+	DeployScaleToZeroEnabled bool
+
 	// GitHub App (P4) — install-once push-to-deploy + short-lived installation
 	// tokens for private-repo clones. Distinct from the GitHub OAuth *login* app
 	// above (GitHubClientID/Secret). GitHubAppEnabled gates the whole feature:
@@ -499,6 +508,16 @@ func Load() *Config {
 		cfg.DeploySourceGitEnabled = true
 	default:
 		cfg.DeploySourceGitEnabled = false
+	}
+
+	// DEPLOY_SCALE_TO_ZERO_ENABLED: default FALSE (off until operator canary).
+	// Shared flag name with the worker idle-scaler; the api half gates the wake
+	// endpoint + any api-initiated scale, the worker half gates the idle sweep.
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DEPLOY_SCALE_TO_ZERO_ENABLED"))) {
+	case "true", "1", "yes":
+		cfg.DeployScaleToZeroEnabled = true
+	default:
+		cfg.DeployScaleToZeroEnabled = false
 	}
 
 	// GITHUB_APP_ENABLED: default FALSE (off until the operator registers the

@@ -586,6 +586,21 @@ const openAPISpec = `{
         }
       }
     },
+    "/deploy/{id}/wake": {
+      "post": {
+        "summary": "Wake a scaled-to-zero (sleeping) deployment",
+        "description": "Scale-to-zero (Task #54). Scales an idle, descheduled app back to one replica and clears its sleeping state. The app becomes reachable once its pod is Ready (a one-time cold start — a request that races the wake gets the ingress's upstream-down response until the pod is up). Idempotent: waking an already-awake app just refreshes its last-activity marker so the idle-scaler won't immediately re-deschedule it. Returns 501 when scale-to-zero is not enabled on the platform (the default). Cross-tenant requests return 404.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Deployment id (UUID or short app_id slug)." }],
+        "responses": {
+          "200": { "description": "Deployment woken", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployResponse" } } } },
+          "401": { "description": "Unauthorized" },
+          "404": { "description": "Not found (or owned by another team)" },
+          "501": { "description": "scale_to_zero_disabled — scale-to-zero is not enabled on this platform (default)." },
+          "503": { "description": "wake_failed — transient failure scaling the app; retry." }
+        }
+      }
+    },
     "/api/v1/deployments/{id}/make-permanent": {
       "post": {
         "summary": "Opt a deployment out of the auto-24h TTL",

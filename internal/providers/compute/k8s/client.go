@@ -2395,6 +2395,47 @@ func (p *K8sProvider) UpdateAccessControl(ctx context.Context, appID string, pri
 	return nil
 }
 
+// Scale patches the app's Deployment replica count in place (scale-to-zero,
+// Task #54). replicas=0 descheduals an idle app to ~$0 compute; replicas=1
+// wakes it. No image rebuild, no namespace change — only the Deployment's
+// spec.replicas is mutated, so the existing image, env, ingress and TLS cert
+// are preserved across a sleep/wake cycle.
+//
+// A NotFound Deployment (namespace already torn down, or the row was never
+// fully deployed) is treated as a no-op success: the idle-scaler must not
+// wedge on a stale row, and a wake on a torn-down app is harmless. Any other
+// k8s error is surfaced so the caller can retry / record a wake_failed metric.
+func (p *K8sProvider) Scale(ctx context.Context, appID string, replicas int32) error {
+	ns := deployNamespace(appID)
+	name := deploymentName(appID)
+
+	deploy, err := p.clientset.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			slog.Warn("k8s.Scale: deployment not found — no-op",
+				"app_id", appID, "namespace", ns, "replicas", replicas)
+			return nil
+		}
+		return fmt.Errorf("k8s.Scale: get deployment %q in %q: %w", name, ns, err)
+	}
+
+	// Idempotent: if already at the target replica count, skip the write so a
+	// repeated scaler tick / concurrent wake doesn't churn the API server.
+	if deploy.Spec.Replicas != nil && *deploy.Spec.Replicas == replicas {
+		slog.Debug("k8s.Scale: already at target replicas — no-op",
+			"app_id", appID, "namespace", ns, "replicas", replicas)
+		return nil
+	}
+
+	deploy.Spec.Replicas = &replicas
+	if _, err := p.clientset.AppsV1().Deployments(ns).Update(ctx, deploy, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("k8s.Scale: update deployment %q in %q to replicas=%d: %w", name, ns, replicas, err)
+	}
+	slog.Info("k8s.Scale: deployment replicas patched",
+		"app_id", appID, "namespace", ns, "replicas", replicas)
+	return nil
+}
+
 // deployIngressURL returns the public Ingress URL for an appID if DEPLOY_DOMAIN
 // is configured. Caller uses this to compute the AppURL during Status/Redeploy
 // without re-querying the k8s API (the value is deterministic from env + appID).
