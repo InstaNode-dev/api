@@ -6,7 +6,9 @@ package handlers_test
 //   1. Latest row inside the 24h window → returns near_wall=true with the
 //      audit metadata flattened into the response.
 //   2. No row (or stale row outside 24h) → returns near_wall=false with 200.
-//   3. team-tier callers always get near_wall=false without an audit query.
+//   3. team-tier callers flow through the same audit query as every other
+//      finite tier (the former unlimited-Team short-circuit was removed by
+//      the 2026-06-05 strict-margin redesign).
 //
 // Uses sqlmock so the tests are hermetic and don't depend on a live DB.
 
@@ -53,18 +55,10 @@ func newUsageWallApp(t *testing.T, db *sql.DB, teamID uuid.UUID) *fiber.App {
 	return app
 }
 
-// expectTeamLookup primes the team-row SELECT used by the tier gate.
-// The lookup runs first inside GetWall — every test (except the team
-// tier one) wants this to return a non-team tier so the audit query
-// proceeds.
-func expectTeamLookup(mock sqlmock.Sqlmock, teamID uuid.UUID, tier string) {
-	// Wave FIX-J: GetTeamByID includes default_deployment_ttl_policy.
-	mock.ExpectQuery(`SELECT.*FROM teams WHERE id`).
-		WithArgs(teamID).
-		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "name", "plan_tier", "stripe_customer_id", "created_at", "default_deployment_ttl_policy",
-		}).AddRow(teamID, sql.NullString{}, tier, sql.NullString{}, time.Now(), "auto_24h"))
-}
+// strict-80% margin redesign (2026-06-05): GetWall no longer does a team
+// lookup / team-tier short-circuit (Team is finite now and has walls like
+// every other tier), so the former expectTeamLookup helper was removed —
+// the handler issues exactly one query (the audit_log SELECT) for all tiers.
 
 // TestUsageWall_ReturnsLatestRowWithMetadata is the headline test: an
 // 87%-storage row written by the worker shows up in the response with
@@ -75,7 +69,6 @@ func TestUsageWall_ReturnsLatestRowWithMetadata(t *testing.T) {
 	defer db.Close()
 
 	teamID := uuid.New()
-	expectTeamLookup(mock, teamID, "hobby")
 
 	createdAt := time.Now().Add(-2 * time.Hour)
 	metadata := `{"tier":"hobby","axis":"storage","service":"postgres","current":471859200,"limit":536870912,"percent_used":87}`
@@ -112,7 +105,6 @@ func TestUsageWall_ReturnsFalseWhenNoRecentRow(t *testing.T) {
 	defer db.Close()
 
 	teamID := uuid.New()
-	expectTeamLookup(mock, teamID, "hobby")
 
 	mock.ExpectQuery(`SELECT metadata, created_at\s+FROM audit_log`).
 		WithArgs(teamID, "near_quota_wall", sqlmock.AnyArg()).
@@ -134,29 +126,37 @@ func TestUsageWall_ReturnsFalseWhenNoRecentRow(t *testing.T) {
 }
 
 // TestUsageWall_CacheHeadersOnEvery200Path is the registry-iterating
-// regression for BUG-API-420. /api/v1/usage/wall has three distinct 200
-// code paths in GetWall (team-tier short-circuit, no-recent-row,
-// row-found-with-metadata) — every one MUST stamp the same Cache-Control
-// and Vary headers, otherwise a dashboard polling the endpoint on every
-// nav re-hits the DB on the busy team-scoped audit_log table. The cases
-// table mirrors the three code paths in usage_wall.go; adding a fourth
-// path without updating this test (which would mean the path skips the
-// cache header) is the bug class rule 18 protects against.
+// regression for BUG-API-420. /api/v1/usage/wall has two distinct 200
+// code paths in GetWall (no-recent-row, row-found-with-metadata) — every
+// one MUST stamp the same Cache-Control and Vary headers, otherwise a
+// dashboard polling the endpoint on every nav re-hits the DB on the busy
+// team-scoped audit_log table. The cases table mirrors the code paths in
+// usage_wall.go; adding a third path without updating this test (which
+// would mean the path skips the cache header) is the bug class rule 18
+// protects against.
+//
+// strict-80% margin redesign (2026-06-05): the former team-tier
+// short-circuit path was removed (Team is finite now), so a "team_tier"
+// case is kept but now asserts Team flows through the SAME audit query as
+// every other finite tier — proving the short-circuit is gone.
 func TestUsageWall_CacheHeadersOnEvery200Path(t *testing.T) {
 	cases := []struct {
 		name  string
 		prime func(mock sqlmock.Sqlmock, teamID uuid.UUID)
 	}{
 		{
-			name: "team_tier_short_circuit",
+			name: "team_tier_now_queries_audit",
 			prime: func(mock sqlmock.Sqlmock, teamID uuid.UUID) {
-				expectTeamLookup(mock, teamID, "team")
+				// Team is finite — it no longer short-circuits; it hits
+				// the audit_log query like any other tier.
+				mock.ExpectQuery(`SELECT metadata, created_at\s+FROM audit_log`).
+					WithArgs(teamID, "near_quota_wall", sqlmock.AnyArg()).
+					WillReturnError(sql.ErrNoRows)
 			},
 		},
 		{
 			name: "no_recent_row",
 			prime: func(mock sqlmock.Sqlmock, teamID uuid.UUID) {
-				expectTeamLookup(mock, teamID, "hobby")
 				mock.ExpectQuery(`SELECT metadata, created_at\s+FROM audit_log`).
 					WithArgs(teamID, "near_quota_wall", sqlmock.AnyArg()).
 					WillReturnError(sql.ErrNoRows)
@@ -165,7 +165,6 @@ func TestUsageWall_CacheHeadersOnEvery200Path(t *testing.T) {
 		{
 			name: "row_found_with_metadata",
 			prime: func(mock sqlmock.Sqlmock, teamID uuid.UUID) {
-				expectTeamLookup(mock, teamID, "hobby")
 				metadata := `{"tier":"hobby","axis":"storage","service":"postgres","current":1,"limit":2,"percent_used":50}`
 				mock.ExpectQuery(`SELECT metadata, created_at\s+FROM audit_log`).
 					WithArgs(teamID, "near_quota_wall", sqlmock.AnyArg()).
@@ -206,19 +205,24 @@ func TestUsageWall_CacheHeadersOnEvery200Path(t *testing.T) {
 	}
 }
 
-// TestUsageWall_TeamTierShortCircuits verifies the team-tier early
-// return: a team-tier caller MUST get near_wall=false without an
-// audit_log query (sqlmock strict mode catches the unexpected query).
-func TestUsageWall_TeamTierShortCircuits(t *testing.T) {
+// TestUsageWall_TeamTierFlowsThroughAuditQuery verifies the strict-80%
+// margin redesign (2026-06-05): Team is no longer unlimited, so the former
+// team-tier short-circuit is GONE — a team-tier caller MUST now hit the
+// audit_log query like every other finite tier. The mock primes exactly
+// the audit query (and no team lookup); sqlmock strict mode would fail if
+// GetWall regressed back to a pre-query short-circuit (unmet audit
+// expectation) or re-added the team lookup (unexpected query).
+func TestUsageWall_TeamTierFlowsThroughAuditQuery(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	require.NoError(t, err)
 	defer db.Close()
 
 	teamID := uuid.New()
-	expectTeamLookup(mock, teamID, "team")
-	// NO audit_log query expected. If GetWall regresses and queries
-	// audit_log for a team-tier caller, sqlmock strict mode fails the
-	// test ("unexpected query").
+	// Team now flows through to the audit_log query. With no recent row it
+	// returns near_wall=false — but via the query, not a short-circuit.
+	mock.ExpectQuery(`SELECT metadata, created_at\s+FROM audit_log`).
+		WithArgs(teamID, "near_quota_wall", sqlmock.AnyArg()).
+		WillReturnError(sql.ErrNoRows)
 
 	app := newUsageWallApp(t, db, teamID)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage/wall", nil)

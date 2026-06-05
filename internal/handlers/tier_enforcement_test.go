@@ -310,13 +310,16 @@ func TestStackProvisionTierCap_UnlimitedTier(t *testing.T) {
 	ensureStackTables(t, db)
 
 	planReg := plans.Default()
-	require.Equal(t, -1, planReg.DeploymentsAppsLimit("team"),
-		"team.deployments_apps must be -1 (unlimited) for this test")
+	// strict-80% margin redesign (2026-06-05): team.deployments_apps is now a
+	// finite 100 (was -1). Seeding 5 stacks stays well under the cap, so the
+	// "must not block at low count" guarantee still holds.
+	require.Greater(t, planReg.DeploymentsAppsLimit("team"), 5,
+		"team.deployments_apps must comfortably exceed the 5 seeded stacks for this test")
 
 	teamID := testhelpers.MustCreateTeamDB(t, db, "team")
 	sessionJWT := testhelpers.MustSignSessionJWT(t, "user-a5-team", teamID, "a5team@example.com")
 
-	// Seed 5 stacks — team tier is unlimited, must not block.
+	// Seed 5 stacks — far under team's finite cap (100), must not block.
 	for i := range 5 {
 		slug := fmt.Sprintf("stk-team-%d-%s", i, teamID[:6])
 		_, err := db.ExecContext(context.Background(), `
@@ -452,17 +455,18 @@ func TestQueueProvisionTierCap_HobbyUnderLimit(t *testing.T) {
 	}
 }
 
-// TestQueueProvisionTierCap_GrowthUnlimited verifies that a growth-tier team
-// (queue_count=-1) is never blocked by the queue cap.
-func TestQueueProvisionTierCap_GrowthUnlimited(t *testing.T) {
+// TestQueueProvisionTierCap_GrowthUnderCap verifies that a growth-tier team
+// is not blocked while under its finite queue cap (50 after the 2026-06-05
+// strict-margin redesign; was -1/unlimited).
+func TestQueueProvisionTierCap_GrowthUnderCap(t *testing.T) {
 	requireTestDB(t)
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	ensureStackTables(t, db)
 
 	planReg := plans.Default()
-	require.Equal(t, -1, planReg.QueueCountLimit("growth"),
-		"growth.queue_count must be -1 (unlimited)")
+	require.Greater(t, planReg.QueueCountLimit("growth"), 20,
+		"growth.queue_count must comfortably exceed the 20 seeded queues for this test")
 
 	app, cleanup := testhelpers.NewTestAppWithServices(t, db, nil, "queue")
 	defer cleanup()
@@ -470,7 +474,7 @@ func TestQueueProvisionTierCap_GrowthUnlimited(t *testing.T) {
 	teamID := testhelpers.MustCreateTeamDB(t, db, "growth")
 	sessionJWT := testhelpers.MustSignSessionJWT(t, "user-a6-growth", teamID, "a6growth@example.com")
 
-	// Seed 20 queues — unlimited tier must not block.
+	// Seed 20 queues — under growth's finite cap (50), must not block.
 	for range 20 {
 		insertActiveQueueForTier(t, db, teamID)
 	}
@@ -482,20 +486,22 @@ func TestQueueProvisionTierCap_GrowthUnlimited(t *testing.T) {
 	if resp.StatusCode == http.StatusPaymentRequired {
 		b := decodeTierErrBody(t, resp)
 		assert.NotEqual(t, "queue_limit_reached", b.Error,
-			"growth tier (unlimited queues) must not hit queue_limit_reached")
+			"growth tier (under finite cap) must not hit queue_limit_reached")
 	}
 }
 
-// TestQueueProvisionTierCap_TeamUnlimited verifies that team-tier teams are also unlimited.
-func TestQueueProvisionTierCap_TeamUnlimited(t *testing.T) {
+// TestQueueProvisionTierCap_TeamUnderCap verifies team-tier teams are not
+// blocked while under their finite queue cap (100 after the 2026-06-05
+// strict-margin redesign; was -1/unlimited).
+func TestQueueProvisionTierCap_TeamUnderCap(t *testing.T) {
 	requireTestDB(t)
 	db, cleanDB := testhelpers.SetupTestDB(t)
 	defer cleanDB()
 	ensureStackTables(t, db)
 
 	planReg := plans.Default()
-	require.Equal(t, -1, planReg.QueueCountLimit("team"),
-		"team.queue_count must be -1 (unlimited)")
+	require.Greater(t, planReg.QueueCountLimit("team"), 1,
+		"team.queue_count must exceed the 1 seeded queue for this test")
 
 	app, cleanup := testhelpers.NewTestAppWithServices(t, db, nil, "queue")
 	defer cleanup()
@@ -511,7 +517,7 @@ func TestQueueProvisionTierCap_TeamUnlimited(t *testing.T) {
 	if resp.StatusCode == http.StatusPaymentRequired {
 		b := decodeTierErrBody(t, resp)
 		assert.NotEqual(t, "queue_limit_reached", b.Error,
-			"team tier (unlimited queues) must not hit queue_limit_reached")
+			"team tier (under finite cap) must not hit queue_limit_reached")
 	}
 }
 
@@ -560,14 +566,14 @@ func TestPlansRegistry_QueueCountLimit(t *testing.T) {
 		want int
 	}
 
+	// strict-80% margin redesign (2026-06-05): every queue_count is now finite
+	// (was -1 on anonymous/free/growth/team). exact values set in plans.yaml.
 	cases := []tc{
-		// unlimited tiers
-		{"anonymous", -1},
-		{"free", -1},
-		{"growth", -1},
-		{"team", -1},
-		{"team_yearly", -1},
-		// capped tiers — exact values set in plans.yaml
+		{"anonymous", 1},
+		{"free", 1},
+		{"growth", 50},
+		{"team", 100},
+		{"team_yearly", 100},
 		{"hobby", 3},
 		{"hobby_yearly", 3},
 		{"hobby_plus", 5},
