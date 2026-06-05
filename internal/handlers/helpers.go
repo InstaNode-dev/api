@@ -1199,30 +1199,17 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user this action requires a fresh session (admin-scope PAT mints need re-auth). Sign in again at https://instanode.dev/login — see https://instanode.dev/docs/auth.",
 	},
 
-	// ── CI-only ephemeral-test-account surface (POST/DELETE /internal/e2e/account) ──
-	// These codes only ever surface to the CI harness driving the guarded
-	// E2E_ACCOUNT_TOKEN endpoint — never to a real customer agent (the route
-	// is inert/404 unless the token is configured). The agent_action is
-	// therefore operator-facing: it points at the token + request shape rather
-	// than a customer recovery URL.
-	"not_test_cohort": {
-		AgentAction: "This is the guarded CI test-account endpoint: the target team is not in the test cohort, so it can never be reaped here. Operators: only is_test_cohort teams minted via POST /internal/e2e/account are reapable — check the team_id in the request.",
-	},
-	"rand_failed": {
-		AgentAction: "This is the guarded CI test-account endpoint: secure random generation failed while minting the account id. Operators: retry; if it persists the host's entropy source is unavailable.",
-	},
-	"team_create_failed": {
-		AgentAction: "This is the guarded CI test-account endpoint: creating the test team failed. Operators: check platform_db connectivity and the E2E_ACCOUNT_TOKEN / request before retrying.",
-	},
-	"tier_not_allowed": {
-		AgentAction: "This is the guarded CI test-account endpoint: the requested tier is not mintable here. Operators: pass an allowed tier (free/hobby/hobby_plus/pro) in the request — see the endpoint's tier allowlist.",
-	},
-	"tier_set_failed": {
-		AgentAction: "This is the guarded CI test-account endpoint: elevating the test team to the requested tier failed. Operators: check platform_db connectivity and the request before retrying.",
-	},
-	"user_create_failed": {
-		AgentAction: "This is the guarded CI test-account endpoint: creating the test primary user failed. Operators: check platform_db connectivity and the E2E_ACCOUNT_TOKEN / request before retrying.",
-	},
+	// NOTE: the CI-only ephemeral-test-account error codes (not_test_cohort,
+	// team_create_failed, user_create_failed, tier_not_allowed, tier_set_failed,
+	// rand_failed) are deliberately NOT registered here. codeToAgentAction holds
+	// CUSTOMER-facing agent guidance — the contract test (TestAgentActionContract)
+	// requires every entry to start "Tell the user …" and carry a customer
+	// recovery URL. The /internal/e2e/account surface is operator/CI-only and
+	// inert by default (404 unless E2E_ACCOUNT_TOKEN is set), so its codes never
+	// reach a customer agent: the 503 arms already get the generic
+	// AgentActionContactSupport via respondError's status>=500 fallback, and the
+	// 4xx arms (400/403/429) carry a self-explanatory message with no
+	// agent_action — correct for a machine-to-machine CI caller.
 }
 
 // ErrorResponse is the canonical JSON shape for every 4xx/5xx response.

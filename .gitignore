@@ -8,3 +8,6 @@ node_modules
 
 # Internal Claude Code skills (per-repo)
 .claude/
+
+# Local Redis dump artifact — never commit
+dump.rdb

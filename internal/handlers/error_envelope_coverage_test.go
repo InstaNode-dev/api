@@ -45,6 +45,21 @@ var coverageAllowlist = map[string]string{
 	// real handler call sites. Filtered by the test (see emitCode).
 	"code": "regex artefact — not a real emit",
 	"x":    "regex artefact — not a real emit",
+
+	// CI-only ephemeral-test-account surface (POST/DELETE /internal/e2e/account).
+	// These codes are emitted only on the operator/CI-guarded endpoint, which is
+	// inert by default (404 unless E2E_ACCOUNT_TOKEN is set) and driven by the
+	// machine-to-machine E2E harness — never a customer agent. A customer-style
+	// "Tell the user … https://instanode.dev/…" agent_action would be wrong for
+	// a CI caller, so they intentionally carry no codeToAgentAction entry: the
+	// 503 arms fall back to AgentActionContactSupport, the 4xx arms to an empty
+	// agent_action with a self-explanatory message.
+	"not_test_cohort":    "CI-only /internal/e2e/account reap-safety 403 (machine-to-machine; not customer-facing)",
+	"team_create_failed": "CI-only /internal/e2e/account mint 503 (machine-to-machine; not customer-facing)",
+	"user_create_failed": "CI-only /internal/e2e/account mint 503 (machine-to-machine; not customer-facing)",
+	"tier_not_allowed":   "CI-only /internal/e2e/account gated-tier 400 (machine-to-machine; not customer-facing)",
+	"tier_set_failed":    "CI-only /internal/e2e/account mint 503 (machine-to-machine; not customer-facing)",
+	"rand_failed":        "CI-only /internal/e2e/account mint 503 (machine-to-machine; not customer-facing)",
 }
 
 // TestErrorCode_HasAgentAction is the registry-iterating coverage gate.
