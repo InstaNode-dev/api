@@ -387,6 +387,62 @@ func SetTestCohort(ctx context.Context, db *sql.DB, teamID uuid.UUID, isTest boo
 	return nil
 }
 
+// CreateTestCohortTeam inserts a new team with is_test_cohort=true in a
+// single INSERT and returns it. This is the ONLY constructor that sets the
+// cohort flag at creation time — it exists exclusively for the CI-only
+// ephemeral-test-account surface (POST /internal/e2e/account). Every other
+// team-creation path (CreateTeam, OAuth upsert, /claim) creates a real
+// (is_test_cohort=false) team; flipping a real team into the cohort is done
+// only via SetTestCohort by the worker-side seeder.
+//
+// Setting the flag in the INSERT (rather than CreateTeam + SetTestCohort)
+// guarantees the team is NEVER observable as a real team — there is no window
+// where a freshly-minted e2e team looks like a chargeable customer to a
+// concurrent billing/quota scan. plan_tier still starts 'free'; the caller
+// elevates via UpgradeTeamAllTiers if a paid tier was requested.
+func CreateTestCohortTeam(ctx context.Context, db *sql.DB, name string) (*Team, error) {
+	t := &Team{}
+	err := db.QueryRowContext(ctx, `
+		INSERT INTO teams (name, plan_tier, is_test_cohort) VALUES ($1, 'free', true)
+		RETURNING id, name, plan_tier, stripe_customer_id, created_at,
+		          COALESCE(default_deployment_ttl_policy, 'auto_24h')
+	`, name).Scan(
+		&t.ID, &t.Name, &t.PlanTier, &t.RazorpaySubscriptionID, &t.CreatedAt,
+		&t.DefaultDeploymentTTLPolicy,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("models.CreateTestCohortTeam: %w", err)
+	}
+	return t, nil
+}
+
+// DeleteTeamHard hard-deletes a team row by primary key and reports whether a
+// row was removed. The schema's ON DELETE CASCADE FKs (audit_log, deployments,
+// stacks, team_members, api_keys, vault, custom_domains, …) clean up the
+// owned rows; resources carry ON DELETE SET NULL (migration 001) so their
+// team_id becomes NULL rather than the row vanishing — callers that need the
+// backing infra deprovisioned MUST first call MarkTeamResourcesForReaper so
+// the worker's TTL reaper picks the now-orphaned rows up.
+//
+// This is intentionally NOT a general-purpose team delete: it is the
+// terminal step of the CI-only e2e-account reap path, which has already
+// verified the target is is_test_cohort. There is deliberately no
+// is_test_cohort guard *inside* this function — the guard lives at the
+// handler boundary so a future caller can't accidentally route a real team
+// here without the explicit cohort check being visible in the call site.
+// Returns (false, nil) when no row matched (idempotent re-reap).
+func DeleteTeamHard(ctx context.Context, db *sql.DB, teamID uuid.UUID) (bool, error) {
+	res, err := db.ExecContext(ctx, `DELETE FROM teams WHERE id = $1`, teamID)
+	if err != nil {
+		return false, fmt.Errorf("models.DeleteTeamHard: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("models.DeleteTeamHard rows_affected: %w", err)
+	}
+	return n > 0, nil
+}
+
 // UpgradeTeamAllTiers atomically upgrades the team tier and promotes every
 // active resource, deployment, and stack owned by that team. All four updates
 // run inside a single transaction so a partial failure (e.g. ElevateDeployments

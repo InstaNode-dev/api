@@ -68,6 +68,7 @@ func allKeys() []string {
 		"BREVO_WEBHOOK_SECRET", "SES_SNS_SUBSCRIPTION_ARN",
 		"SENDGRID_WEBHOOK_PUBLIC_KEY",
 		"WORKER_INTERNAL_JWT_SECRET", "ADMIN_PATH_PREFIX",
+		"E2E_ACCOUNT_TOKEN",
 	}
 }
 
@@ -193,6 +194,19 @@ func TestConfig_IsServiceEnabled(t *testing.T) {
 	// Empty list
 	if (&Config{}).IsServiceEnabled("redis") {
 		t.Error("empty list must not match")
+	}
+}
+
+func TestLoad_E2EAccountToken(t *testing.T) {
+	// Unset → empty (inert-by-default: the /internal/e2e/* surface 404s).
+	applyBaselineEnv(t, nil)
+	if got := Load().E2EAccountToken; got != "" {
+		t.Errorf("E2EAccountToken default: want empty (inert), got %q", got)
+	}
+	// Set (with surrounding whitespace) → trimmed value.
+	applyBaselineEnv(t, map[string]string{"E2E_ACCOUNT_TOKEN": "  secret-token  "})
+	if got := Load().E2EAccountToken; got != "secret-token" {
+		t.Errorf("E2EAccountToken: want trimmed 'secret-token', got %q", got)
 	}
 }
 

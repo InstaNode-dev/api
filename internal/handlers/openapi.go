@@ -1,6 +1,16 @@
 package handlers
 
 // openapi.go — serves GET /openapi.json with an OpenAPI 3.1 description of the live API.
+//
+// Deliberately NOT documented here: the /internal/* machine-to-machine routes
+// (/internal/teams/:id/terminate, /internal/email/resend-magic-link,
+// /internal/teams/:id/backup-quota/refund, and the CI-only e2e surface
+// /internal/e2e/account + /internal/e2e/account/:team_id). These are internal,
+// secret-guarded surfaces with no customer-facing contract. The e2e surface in
+// particular is INERT BY DEFAULT (404s until E2E_ACCOUNT_TOKEN is wired) and is
+// existence-hiding by design — publishing it in the spec would directly
+// undermine that. /internal/set-tier is the sole /internal/* route that ever
+// appears in the spec, and only in development (stripped in prod below).
 
 import (
 	"strings"
