@@ -953,6 +953,16 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"fetch_failed": {
 		AgentAction: "Tell the user the fetch hit a transient backend error. Retry in 30 seconds — see https://instanode.dev/status.",
 	},
+	// Scale-to-zero wake path (deploy_wake.go). `scale_to_zero_disabled` is a
+	// 501 returned when the DEPLOY_SCALE_TO_ZERO_ENABLED flag is off — the wake
+	// route is inert, so there is no agent retry; just inform the user. `wake_failed`
+	// is a transient 503 (k8s scale-up or the post-wake DB write failed) — retry.
+	"scale_to_zero_disabled": {
+		AgentAction: "Tell the user scale-to-zero wake isn't enabled on this deployment. No action needed; the app stays as-is. See https://instanode.dev/status.",
+	},
+	"wake_failed": {
+		AgentAction: "Tell the user waking the sleeping deployment hit a transient error. Retry in 30 seconds; if it persists check https://instanode.dev/status.",
+	},
 	"create_failed": {
 		AgentAction: "Tell the user the resource could not be created right now. Retry in 30 seconds; if it persists check https://instanode.dev/status.",
 	},
