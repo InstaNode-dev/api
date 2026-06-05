@@ -81,6 +81,23 @@ func TestGetAnalyticsEmitter_DefaultsToNoop(t *testing.T) {
 	recordFunnelEvent(context.Background(), funnelStepProvision, funnelAttrs{Tier: "anonymous"})
 }
 
+func TestGetAnalyticsEmitter_NilBoxFallsBackToNoop(t *testing.T) {
+	// A stored box whose emitter is nil must fall through to the noop fallback
+	// (getAnalyticsEmitter's final return), never returning nil. SetAnalyticsEmitter
+	// ignores nil, so store the nil box directly to exercise that branch.
+	prev := getAnalyticsEmitter()
+	t.Cleanup(func() { SetAnalyticsEmitter(prev) })
+
+	analyticsEmitter.Store(emitterBox{e: nil})
+	e := getAnalyticsEmitter()
+	if e == nil {
+		t.Fatal("getAnalyticsEmitter returned nil — must never be nil")
+	}
+	if e.Name() != analyticsevent.BackendNoop {
+		t.Fatalf("nil-box fallback emitter Name = %q, want %q", e.Name(), analyticsevent.BackendNoop)
+	}
+}
+
 func TestSetAnalyticsEmitter_NilIgnored(t *testing.T) {
 	prev := getAnalyticsEmitter()
 	t.Cleanup(func() { SetAnalyticsEmitter(prev) })
