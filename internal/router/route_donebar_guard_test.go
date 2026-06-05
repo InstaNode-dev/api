@@ -191,6 +191,58 @@ var routeTestMap = map[string]string{
 	"POST /razorpay/webhook":        "TestE2E_PlanUpgrade_SubscriptionCharged_UpdatesTier",
 	"GET /api/v1/billing":           "TestE2E_FullCustomerFlow_AnonymousToProToCancelled",
 
+	// ── billing: invoices / usage / update-payment / change-plan / promotion
+	// (W3 §E) — DB-backed handler-integration suites. The three Razorpay-portal
+	// endpoints drive the route through a FAKE handlers.BillingPortal injected
+	// via handlers.SetBillingPortalForTestPortal (never a live Razorpay call —
+	// the external leg is deferred to the live-cluster e2e): each row points at
+	// the success + circuit-open + razorpay-error arms.
+	//   - invoices/update-payment/change-plan → billing_portal_arms_bvwave_test.go
+	//     (TestBilling_*_PortalArms_bvwave). change-plan's success subtest is the
+	//     valid hobby→pro upgrade against a real seeded team row; the
+	//     no-downgrade / same-plan / Team-not-buyable policy is additionally
+	//     pinned by the W3 billing-block suite
+	//     (billing_block_no_cancel_downgrade_test.go,
+	//     TestBillingBlock_ChangePlanRejectsDowngrade).
+	//   - usage → the production-auth-chain integration suite
+	//     billing_apikeys_audit_block_integration_test.go (TestBAAUsage_*: real
+	//     Postgres + RequireAuth, happy path + member authz + cross-team
+	//     isolation); cache-hit / redis-down fail-open / per-team cache scoping
+	//     are covered alongside in billing_usage_test.go.
+	//   - promotion/validate → billing_promotion_test.go
+	//     (TestValidatePromotion_ValidCode_ReturnsDiscount: valid-code discount
+	//     shape; invalid/wrong-plan/expired/rate-limit/401 arms in the same
+	//     suite). Moved here from routeCoverageExemptions.
+	"GET /api/v1/billing/invoices":            "TestBilling_ListInvoicesAPI_PortalArms_bvwave",
+	"POST /api/v1/billing/update-payment":     "TestBilling_UpdatePaymentMethodAPI_PortalArms_bvwave",
+	"POST /api/v1/billing/change-plan":        "TestBilling_ChangePlanAPI_PortalArms_bvwave",
+	"GET /api/v1/billing/usage":               "TestBAAUsage_HappyPath_RealDB",
+	"POST /api/v1/billing/promotion/validate": "TestValidatePromotion_ValidCode_ReturnsDiscount",
+
+	// ── api keys (W3 auth tokens) — DB-backed handler-integration suites driven
+	// through the production middleware.RequireAuth chain with real session JWTs
+	// against a real Postgres. The CRUD round-trip (create returns plaintext
+	// once → list shows metadata-only → revoke flips revoked=true) is
+	// api_keys_coverage_test.go (TestAPIKeys_CreateListRevoke_HappyPath); the
+	// PAT-cannot-mint / scope-subset / admin-reauth arms are
+	// api_keys_authp0_test.go; and the cross-team isolation + non-owner-member +
+	// unauth-401 axes are billing_apikeys_audit_block_integration_test.go
+	// (TestBAAApiKeys_*). Moved here from routeCoverageExemptions.
+	"POST /api/v1/auth/api-keys":       "TestAPIKeys_CreateListRevoke_HappyPath",
+	"GET /api/v1/auth/api-keys":        "TestAPIKeys_CreateListRevoke_HappyPath",
+	"DELETE /api/v1/auth/api-keys/:id": "TestAPIKeys_CreateListRevoke_HappyPath",
+
+	// ── audit log read surfaces (W7-C) — DB-backed handler-integration suite
+	// (audit_export_test.go) driving both endpoints through the production
+	// RequireAuth chain against a real Postgres: happy path + tier-gate 402 +
+	// cursor pagination + kind filter + actor-email redaction + admin.* exclusion
+	// + cross-team isolation, with CSV shape parity. The non-owner-member read +
+	// CSV cross-team axes are additionally pinned in
+	// billing_apikeys_audit_block_integration_test.go (TestBAAAudit*). Moved here
+	// from routeCoverageExemptions.
+	"GET /api/v1/audit":     "TestAudit_HappyPath_ReturnsRowsForTeam",
+	"GET /api/v1/audit.csv": "TestAuditCSV_Shape_HeaderAndRows",
+
 	// ── email delivery webhooks (rule 12 truth surface) ──────────────────────
 	"POST /webhooks/brevo/:secret":     "TestE2E_BrevoWebhook_DeliveredEventUpdatesLedger",
 	"POST /api/v1/email/webhook/brevo": "TestE2E_BrevoWebhook_DeliveredEventUpdatesLedger",
@@ -422,21 +474,15 @@ var routeCoverageExemptions = map[string]string{
 	// W3 team-block handler-integration suite
 	// (internal/handlers/team_block_routes_test.go, TestTeamBlock_*).
 
-	// ── billing: invoices / update-payment / change-plan / promotion / usage.
-	"GET /api/v1/billing/invoices":            "invoice list. TODO: matrix W3 billing-invoices flow.",
-	"GET /api/v1/billing/usage":               "billing usage rollup (aggregation). TODO: matrix W3 billing-usage flow.",
-	"POST /api/v1/billing/update-payment":     "update payment method. TODO: matrix W3 billing-payment flow.",
-	"POST /api/v1/billing/change-plan":        "self-serve plan change (NO downgrade — memory project_no_self_serve_cancel_downgrade). TODO: matrix W3 plan-change flow.",
-	"POST /api/v1/billing/promotion/validate": "promo-code validation. TODO: matrix W3 promo-code flow.",
-
-	// ── api keys (W3 auth tokens).
-	"POST /api/v1/auth/api-keys":       "create API key. TODO: matrix W3 api-keys flow.",
-	"GET /api/v1/auth/api-keys":        "list API keys. TODO: matrix W3 api-keys flow.",
-	"DELETE /api/v1/auth/api-keys/:id": "revoke API key. TODO: matrix W3 api-keys flow.",
-
-	// ── audit log read surfaces.
-	"GET /api/v1/audit":     "audit-log read. TODO: matrix W3 audit-surface flow.",
-	"GET /api/v1/audit.csv": "audit-log CSV export. TODO: matrix W3 audit-surface flow.",
+	// ── billing: invoices / update-payment / change-plan / promotion / usage
+	// + api keys (create/list/revoke) + audit (read + CSV) — MOVED to
+	// routeTestMap. Now covered by the DB-backed handler-integration suites:
+	// billing_portal_arms_bvwave_test.go (portal arms via the fake
+	// BillingPortal), billing_promotion_test.go (promo validate),
+	// api_keys_coverage_test.go + api_keys_authp0_test.go (PAT CRUD + AUTH-P0
+	// arms), audit_export_test.go (audit JSON/CSV), and the production-auth-chain
+	// cross-team / member-authz layer billing_apikeys_audit_block_integration_test.go
+	// (TestBAA*).
 
 	// ── webhook requests inspector.
 	"GET /api/v1/webhooks/:token/requests": "captured webhook-request inspector. TODO: matrix W2 webhook-inspector flow.",
