@@ -292,7 +292,7 @@ func (h *E2EAccountHandler) CreateAccount(c *fiber.Ctx) error {
 	//     loudly. The rows are reaped with the team.
 	var seededTokens []string
 	if req.WithResources {
-		toks, serr := h.seedFastResources(ctx, team.ID, tier, env)
+		toks, serr := e2eSeedFastResources(h, ctx, team.ID, tier, env)
 		if serr != nil {
 			metrics.E2EAccountTotal.WithLabelValues(e2eMetricOpCreate, e2eResultError).Inc()
 			slog.Error("internal.e2e.create.seed_failed", "error", serr, "team_id", team.ID.String())
@@ -362,6 +362,12 @@ func (h *E2EAccountHandler) CreateAccount(c *fiber.Ctx) error {
 // a cache row needs no dedicated infra to satisfy a list/detail journey), so
 // the seed is fast and synchronous. Any error aborts (returns it) — the caller
 // turns it into a 503 so CI never receives a half-populated account.
+//
+// A package-var seam (not a direct method call) so a test can force the
+// caller's seed_failed (503) arm without needing to make the real resources
+// table reject an insert mid-request.
+var e2eSeedFastResources = (*E2EAccountHandler).seedFastResources
+
 func (h *E2EAccountHandler) seedFastResources(ctx context.Context, teamID uuid.UUID, tier, env string) ([]string, error) {
 	tokens := make([]string, 0, len(e2eSeedResourceTypes))
 	for _, rt := range e2eSeedResourceTypes {

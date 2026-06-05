@@ -4,6 +4,7 @@ package handlers
 // internal_e2e_account_*_test.go coverage suite (package handlers_test).
 
 import (
+	"context"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,6 +39,18 @@ func E2ESeedResourceTypesForTest() []string {
 	out := make([]string, len(e2eSeedResourceTypes))
 	copy(out, e2eSeedResourceTypes)
 	return out
+}
+
+// SetE2ESeedFastResourcesForTest overrides the e2eSeedFastResources seam so a
+// test can force CreateAccount's seed_failed (503) arm deterministically,
+// without making the real resources table reject an insert mid-request.
+// Returns a restore func.
+func SetE2ESeedFastResourcesForTest(err error) (restore func()) {
+	prev := e2eSeedFastResources
+	e2eSeedFastResources = func(_ *E2EAccountHandler, _ context.Context, _ uuid.UUID, _, _ string) ([]string, error) {
+		return nil, err
+	}
+	return func() { e2eSeedFastResources = prev }
 }
 
 // SetE2ESignSessionJWTForTest overrides the e2eSignSessionJWT seam so a test

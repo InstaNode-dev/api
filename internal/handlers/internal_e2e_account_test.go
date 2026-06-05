@@ -401,6 +401,25 @@ func TestE2EAccount_Create_WithoutResources_SeedsNothing(t *testing.T) {
 	require.Equal(t, 0, n, "no resources must be seeded when with_resources is omitted")
 }
 
+// TestE2EAccount_Create_WithResources_SeedFailure_Returns503 forces the seed
+// step to fail (via the e2eSeedFastResources seam) and asserts CreateAccount
+// surfaces a 503 seed_failed — CI must never receive a half-populated account.
+func TestE2EAccount_Create_WithResources_SeedFailure_Returns503(t *testing.T) {
+	skipUnlessE2EDB(t)
+	db, cleanup := testhelpers.SetupTestDB(t)
+	defer cleanup()
+	app := newE2ETestApp(t, db, nil, testE2EToken)
+
+	restore := handlers.SetE2ESeedFastResourcesForTest(errors.New("seed exploded"))
+	defer restore()
+
+	resp := postE2ECreate(t, app, testE2EToken, `{"tier":"pro","with_resources":true}`)
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode,
+		"a seed failure must surface as 503, never a half-populated 200")
+	out := decodeE2ECreate(t, resp)
+	require.Equal(t, "seed_failed", out.Error)
+}
+
 // --- reap --------------------------------------------------------------------
 
 func TestE2EAccount_Reap_TestCohortTeam_Purged(t *testing.T) {
