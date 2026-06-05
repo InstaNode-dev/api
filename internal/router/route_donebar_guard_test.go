@@ -156,6 +156,35 @@ var routeTestMap = map[string]string{
 	"POST /api/v1/resources/:id/rotate-credentials": "TestE2E_RotateCredentials_Authenticated",
 	"GET /resources/:token/logs":                    "TestE2E_Logs_GrowthPostgres_ReturnsLines",
 
+	// ── resources: lifecycle (W5) — family / twin / pause-resume / backup-
+	// restore. DB-backed handler-integration suites drive each route through
+	// the production RequireAuth + PopulateTeamRole stack
+	// (testhelpers.NewTestApp / NewTestAppWithServices rebuild the same route
+	// registrations as router.go) against a real Postgres. Each row points at
+	// the happy-path test that asserts the route's real contract (pause flips
+	// status, backup/restore enqueue a 'pending' row for the worker, family
+	// reads group by env). Tier-gate 402 + cross-team 404 + invalid-id 400 +
+	// bad-state 409 are covered alongside in the same per-handler suites
+	// (resource_pause_test.go, backup_test.go, twin_test.go,
+	// family_bulk_twin_test.go, resource_family_test.go); the non-owner-member
+	// role axis + registry-iterating unauth/cross-team sweeps live in
+	// resources_lifecycle_block_integration_test.go (TestResourcesLifecycleBlock_*).
+	// The twin / bulk-twin PROVISIONING leg needs a live postgres-customers
+	// backend — those happy-path tests assert the auth+ownership+tier contract
+	// and skip the provisioned-row assertion when the backend is unreachable
+	// (deferred to the api/e2e live-cluster specs). Moved here from
+	// routeCoverageExemptions.
+	"GET /api/v1/resources/families":            "TestResourceFamilies_ListGroupsCorrectly",
+	"GET /api/v1/resources/:id/family":          "TestResourceFamily_ThreeMembers_ReturnedInOrder",
+	"POST /api/v1/resources/:id/provision-twin": "TestResourceProvisionTwin_Pro_HappyPath_Returns201",
+	"POST /api/v1/families/bulk-twin":           "TestBulkTwin_HappyPath_ThreePostgresParents",
+	"POST /api/v1/resources/:id/pause":          "TestResourcesLifecycleBlock_Member_PauseResume",
+	"POST /api/v1/resources/:id/resume":         "TestResourcesLifecycleBlock_Member_PauseResume",
+	"POST /api/v1/resources/:id/backup":         "TestResourcesLifecycleBlock_Member_BackupAndList",
+	"GET /api/v1/resources/:id/backups":         "TestResourcesLifecycleBlock_Member_BackupAndList",
+	"POST /api/v1/resources/:id/restore":        "TestResourcesLifecycleBlock_Member_RestoreAndList",
+	"GET /api/v1/resources/:id/restores":        "TestResourcesLifecycleBlock_Member_RestoreAndList",
+
 	// ── billing (W3) ─────────────────────────────────────────────────────────
 	"POST /billing/checkout":        "TestE2E_Persona_Security_BillingCheckout_InvalidPlan",
 	"POST /api/v1/billing/checkout": "TestE2E_Persona_Security_BillingCheckout_InvalidPlan",
@@ -352,17 +381,11 @@ var routeCoverageExemptions = map[string]string{
 	// ── usage wall (org-wide usage rollup) — no dedicated e2e.
 	"GET /api/v1/usage/wall": "org usage rollup (aggregation; memory feedback_caching_and_consistency). TODO: matrix W3 usage-surface test.",
 
-	// ── resources: family / twin / pause-resume / backup-restore (W5 lifecycle).
-	"GET /api/v1/resources/families":            "resource-family grouping read. TODO: matrix W5 resource-family lifecycle.",
-	"GET /api/v1/resources/:id/family":          "single-resource family view. TODO: matrix W5 resource-family lifecycle.",
-	"POST /api/v1/resources/:id/provision-twin": "env-twin provisioning. TODO: matrix W5 resource-twin lifecycle.",
-	"POST /api/v1/families/bulk-twin":           "bulk family twin. TODO: matrix W5 resource-twin lifecycle.",
-	"POST /api/v1/resources/:id/pause":          "resource pause. TODO: matrix W5 pause/resume lifecycle.",
-	"POST /api/v1/resources/:id/resume":         "resource resume. TODO: matrix W5 pause/resume lifecycle.",
-	"POST /api/v1/resources/:id/backup":         "on-demand backup. TODO: matrix W5 backup/restore lifecycle (rule 24 drill is separate).",
-	"GET /api/v1/resources/:id/backups":         "backup list. TODO: matrix W5 backup/restore lifecycle.",
-	"POST /api/v1/resources/:id/restore":        "restore from backup. TODO: matrix W5 backup/restore lifecycle.",
-	"GET /api/v1/resources/:id/restores":        "restore-job list. TODO: matrix W5 backup/restore lifecycle.",
+	// ── resources: family / twin / pause-resume / backup-restore (W5 lifecycle)
+	// — MOVED to routeTestMap. Now covered by the DB-backed handler-integration
+	// suites that drive each route through the production RequireAuth +
+	// PopulateTeamRole stack (testhelpers.NewTestApp / NewTestAppWithServices
+	// rebuild the same registrations as router.go) against a real Postgres.
 
 	// ── deployments: env / patch / ttl / make-permanent / events — MOVED to
 	// routeTestMap. Now covered by the W4 deploy-lifecycle handler-integration
