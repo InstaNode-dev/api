@@ -13,3 +13,9 @@ package router
 // can directly cover the closure body without standing up the full
 // router New(...) wiring (which needs Postgres + Redis + gRPC).
 var ExportedMakeSecurityTxtHandler = makeSecurityTxtHandler
+
+// ExportedWireAnalyticsEmitter is the unit-test-facing alias for
+// wireAnalyticsEmitter, so the WS4 emitter-construction logic (backend
+// selection + NR failure-hook wiring) can be covered without standing up the
+// full router New(...) (which needs Postgres + Redis + gRPC).
+var ExportedWireAnalyticsEmitter = wireAnalyticsEmitter

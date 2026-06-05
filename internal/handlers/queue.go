@@ -361,6 +361,8 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 	metrics.ProvisionsTotal.WithLabelValues("queue", "anonymous").Inc()
 	middleware.RecordProvisionSuccess("queue")
 	metrics.ConversionFunnel.WithLabelValues("provision").Inc()
+	// WS4: per-entity funnel custom event alongside the aggregate counter.
+	recordFunnelEvent(ctx, funnelStepProvision, funnelAttrs{Tier: "anonymous", Env: env, Fingerprint: fp})
 
 	if markErr := h.markRecycleSeen(ctx, fp); markErr != nil {
 		slog.Warn("queue.new.mark_recycle_seen_failed",

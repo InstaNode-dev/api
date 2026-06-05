@@ -65,6 +65,10 @@ func (h *OnboardingHandler) StartLanding(c *fiber.Ctx) error {
 	jwtStr := c.Query("t")
 
 	metrics.ConversionFunnel.WithLabelValues("landing_viewed").Inc()
+	// WS4: top-of-funnel landing custom event. No tier/team/fingerprint is known
+	// at /start (an unauthenticated drive-by hit), so only the step + service are
+	// carried — the funnel's denominator for anon->claimed.
+	recordFunnelEvent(c.UserContext(), funnelStepLanding, funnelAttrs{})
 
 	if jwtStr == "" {
 		return c.Redirect(h.cfg.DashboardBaseURL+"/claim", fiber.StatusFound)
@@ -483,6 +487,15 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 	// immediately — if they don't pay within 24h, the resource expires.
 
 	metrics.ConversionFunnel.WithLabelValues("claimed").Inc()
+	// WS4: anonymous->claimed funnel custom event (the >2% KPI). team.PlanTier is
+	// the just-created team's tier; claims.Fingerprint is the already-hashed
+	// anonymous bucket the claim consolidated. Per-entity (teamId) so retention
+	// can be cohorted, alongside the aggregate counter above.
+	recordFunnelEvent(ctx, funnelStepClaim, funnelAttrs{
+		Tier:        team.PlanTier,
+		Fingerprint: claims.Fingerprint,
+		TeamID:      team.ID.String(),
+	})
 
 	// Issue a session JWT so the caller can immediately use authenticated endpoints.
 	sessionToken, jwtErr := signSessionJWT(h.cfg.JWTSecret, newUser, team)

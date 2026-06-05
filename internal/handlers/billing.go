@@ -2046,6 +2046,9 @@ func (h *BillingHandler) handleSubscriptionCharged(ctx context.Context, c *fiber
 	slog.Info("billing.subscription.charged",
 		"team_id", teamID, "plan_tier", tier, "subscription_id", sub.ID)
 	metrics.ConversionFunnel.WithLabelValues("paid").Inc()
+	// WS4: claimed->paid funnel custom event (the >20% KPI). teamId + the paid
+	// tier let the funnel cohort by tier; per-entity alongside the counter.
+	recordFunnelEvent(ctx, funnelStepPaid, funnelAttrs{Tier: tier, TeamID: teamID.String()})
 
 	// Best-effort audit emit for the Loops forwarder. Fail-open: an audit
 	// error must not undo the tier update we already committed.

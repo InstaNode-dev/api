@@ -150,6 +150,15 @@ type Config struct {
 	MetricsToken     string // METRICS_TOKEN — if set, required as Bearer token to access /metrics
 	DashboardBaseURL string // DASHBOARD_BASE_URL — where to redirect onboarding flows (default: http://localhost:5173)
 
+	// AnalyticsBackend selects the behavioral-intelligence custom-event sink
+	// (common/analyticsevent). Read from ANALYTICS_BACKEND. One of "noop"
+	// (default — drops every event, zero deps, never errors) or "newrelic"
+	// (emits InstantFunnel/InstantFlowTest custom events via the existing
+	// *newrelic.Application). Defaulting to "noop" makes funnel emission INERT
+	// in any environment where New Relic is not configured — the safe,
+	// fail-open default, so no separate feature flag is needed.
+	AnalyticsBackend string
+
 	// APIPublicURL is the externally-routable base URL the API runs at
 	// — used to construct fully-qualified links in outbound emails
 	// (deletion-confirm, etc). Empty in local dev where the dashboard
@@ -421,7 +430,8 @@ func Load() *Config {
 	cfg.DeployDomain = getenv("DEPLOY_DOMAIN", "instant.dev")
 	cfg.ComputeProvider = getenv("COMPUTE_PROVIDER", "noop")
 	cfg.KubeNamespaceApps = getenv("KUBE_NAMESPACE_APPS", "instant-apps")
-	cfg.MetricsToken = os.Getenv("METRICS_TOKEN") // empty = open (local dev)
+	cfg.MetricsToken = os.Getenv("METRICS_TOKEN")              // empty = open (local dev)
+	cfg.AnalyticsBackend = getenv("ANALYTICS_BACKEND", "noop") // noop = inert (no NR sink)
 	cfg.DashboardBaseURL = getenv("DASHBOARD_BASE_URL", "http://localhost:5173")
 	cfg.APIPublicURL = strings.TrimRight(getenv("API_PUBLIC_URL", ""), "/")
 	// Parse DELETION_CONFIRMATION_TTL_MINUTES; fall back to 15 on
