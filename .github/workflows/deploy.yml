@@ -338,3 +338,10 @@ jobs:
           result: ${{ job.status == 'success' && 'pass' || 'fail' }}
           suite: deploy
           failed-step: ${{ job.status != 'success' && 'deploy (test gate / build / rollout / healthz SHA gate)' || '' }}
+          repo: ${{ github.repository }}
+          workflow: ${{ github.workflow }}
+          branch: ${{ github.ref_name }}
+          commit-sha: ${{ github.sha }}
+          log-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          event-name: ${{ github.event_name }}
+          actor: ${{ github.actor }}

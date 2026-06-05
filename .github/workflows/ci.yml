@@ -194,6 +194,13 @@ jobs:
           suite: build-and-test
           pr-number: ${{ github.event.pull_request.number }}
           failed-step: ${{ job.status != 'success' && 'go build / vet / test (-short -race -p 1)' || '' }}
+          repo: ${{ github.repository }}
+          workflow: ${{ github.workflow }}
+          branch: ${{ github.ref_name }}
+          commit-sha: ${{ github.sha }}
+          log-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          event-name: ${{ github.event_name }}
+          actor: ${{ github.actor }}
 
   # E2E requires a live Kubernetes stack (see repo CLAUDE.md). This job does not
   # run on push/PR — only on schedule or manual dispatch — so default CI stays fast.

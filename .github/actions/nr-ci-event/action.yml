@@ -45,24 +45,28 @@ inputs:
       Logical suite name, e.g. build-and-test, coverage, playwright, pr-smoke,
       e2e-prod, deploy-gate. The dashboard FACETs on this.
     required: true
+  # NOTE: composite actions cannot read the `github` context in their own
+  # expressions, so the caller MUST pass these from its `with:` block (e.g.
+  # repo: ${{ github.repository }}). The defaults below only apply when a caller
+  # omits them entirely.
   repo:
-    description: 'Repository (owner/name). Default ${{ github.repository }}.'
+    description: 'Repository (owner/name). Caller passes ${{ github.repository }}.'
     required: false
     default: ''
   workflow:
-    description: 'Workflow name. Default ${{ github.workflow }}.'
+    description: 'Workflow name. Caller passes ${{ github.workflow }}.'
     required: false
     default: ''
   branch:
-    description: 'Branch ref name. Default ${{ github.ref_name }}.'
+    description: 'Branch ref name. Caller passes ${{ github.ref_name }}.'
     required: false
     default: ''
   commit-sha:
-    description: 'Commit SHA under test. Default ${{ github.sha }}.'
+    description: 'Commit SHA under test. Caller passes ${{ github.sha }}.'
     required: false
     default: ''
   pr-number:
-    description: 'PR number (empty on push). Default ${{ github.event.pull_request.number }}.'
+    description: 'PR number (empty on push). Caller passes ${{ github.event.pull_request.number }}.'
     required: false
     default: ''
   duration-ms:
@@ -74,8 +78,15 @@ inputs:
     required: false
     default: ''
   log-url:
-    description: >-
-      URL to the run logs for triage. Default the run's GitHub Actions URL.
+    description: 'URL to the run logs for triage. Caller passes the run URL.'
+    required: false
+    default: ''
+  event-name:
+    description: 'GitHub event name. Caller passes ${{ github.event_name }}.'
+    required: false
+    default: ''
+  actor:
+    description: 'GitHub actor. Caller passes ${{ github.actor }}.'
     required: false
     default: ''
 
@@ -85,24 +96,27 @@ runs:
     - name: Emit CI result to New Relic (no-op without secret)
       shell: bash
       env:
-        # All untrusted/free-form values flow through env, never interpolated
-        # into the shell body — same injection-safe posture as ci.yml's
-        # dispatch-auth-contract-e2e job.
+        # Composite actions may reference ONLY `inputs` (+ env/runner/steps) in
+        # their expressions — `secrets`, `job`, and `github` are NOT available
+        # here, so the CALLER resolves those and passes them as inputs. All
+        # untrusted/free-form values flow through env, never interpolated into
+        # the shell body (injection-safe — same posture as ci.yml's
+        # dispatch-auth-contract-e2e job).
         NR_LICENSE_KEY: ${{ inputs.license-key }}
         NR_ACCOUNT_ID: ${{ inputs.account-id }}
         NR_REGION: ${{ inputs.nr-region }}
         EV_RESULT: ${{ inputs.result }}
         EV_SUITE: ${{ inputs.suite }}
-        EV_REPO: ${{ inputs.repo != '' && inputs.repo || github.repository }}
-        EV_WORKFLOW: ${{ inputs.workflow != '' && inputs.workflow || github.workflow }}
-        EV_BRANCH: ${{ inputs.branch != '' && inputs.branch || github.ref_name }}
-        EV_COMMIT: ${{ inputs.commit-sha != '' && inputs.commit-sha || github.sha }}
+        EV_REPO: ${{ inputs.repo }}
+        EV_WORKFLOW: ${{ inputs.workflow }}
+        EV_BRANCH: ${{ inputs.branch }}
+        EV_COMMIT: ${{ inputs.commit-sha }}
         EV_PR: ${{ inputs.pr-number }}
         EV_DURATION_MS: ${{ inputs.duration-ms }}
         EV_FAILED_STEP: ${{ inputs.failed-step }}
-        EV_LOG_URL: ${{ inputs.log-url != '' && inputs.log-url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
-        EV_EVENT_NAME: ${{ github.event_name }}
-        EV_ACTOR: ${{ github.actor }}
+        EV_LOG_URL: ${{ inputs.log-url }}
+        EV_EVENT_NAME: ${{ inputs.event-name }}
+        EV_ACTOR: ${{ inputs.actor }}
       run: |
         set -uo pipefail
 
