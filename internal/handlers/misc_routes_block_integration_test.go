@@ -277,19 +277,21 @@ func TestMiscBlock_UsageWall_RealDBContract(t *testing.T) {
 		assert.Equal(t, float64(87), body["percent_used"])
 	})
 
-	t.Run("team tier short-circuits to near_wall=false even with a wall row", func(t *testing.T) {
+	t.Run("team tier with a wall row returns near_wall=true (no unlimited short-circuit)", func(t *testing.T) {
 		teamID := testhelpers.MustCreateTeamDB(t, db, "team")
 		jwt := miscSeedUser(t, db, teamID)
-		// Even if a row somehow existed, the team-tier gate returns false
-		// before the audit query — assert the gate, not the absence of a row.
+		// strict-80%-margin redesign (2026-06-05): Team is no longer unlimited,
+		// so the prior team-tier early-return was removed. Team now falls through
+		// to the same audit-row query as every other finite tier — a seeded wall
+		// row therefore surfaces as near_wall=true.
 		miscSeedWallRow(t, db, teamID)
 
 		resp := miscBlockReq(t, app, http.MethodGet, "/api/v1/usage/wall", jwt)
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		body := miscDecode(t, resp)
 		assert.Equal(t, true, body["ok"])
-		assert.Equal(t, false, body["near_wall"],
-			"team tier is unlimited — no walls, short-circuit before the audit scan")
+		assert.Equal(t, true, body["near_wall"],
+			"Team is finite post strict-margin redesign — its wall row must surface")
 	})
 
 	t.Run("cross-team isolation: team A session never sees team B's wall", func(t *testing.T) {

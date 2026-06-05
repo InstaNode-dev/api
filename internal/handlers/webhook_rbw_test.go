@@ -29,17 +29,60 @@ func newWebhookHandlerForTest(t *testing.T) (*handlers.WebhookHandler, func()) {
 	return h, func() { dbClean(); rClean() }
 }
 
-// TestWebhookMaxStored covers all three arms: unlimited (-1 → 10000), the
-// configured-positive value, and the safe floor.
+// TestWebhookMaxStored covers the configured-positive value and the
+// anonymous fallback. strict-80% margin redesign (2026-06-05): team's
+// webhook_requests_stored is now a finite 100000 (was -1 unlimited), so the
+// "-1 → 10000 clamp" arm is exercised separately via a synthetic registry in
+// TestWebhookMaxStored_UnlimitedClampArm (no real tier carries -1 anymore).
 func TestWebhookMaxStored(t *testing.T) {
 	h, clean := newWebhookHandlerForTest(t)
 	defer clean()
-	// team tier → unlimited webhook stored → 10000 cap
-	require.Equal(t, int64(10_000), handlers.WebhookMaxStoredForTest(h, "team"))
+	// team tier → finite 100000 per plans.yaml
+	require.Equal(t, int64(100_000), handlers.WebhookMaxStoredForTest(h, "team"))
 	// hobby → a finite positive cap (1000 per plans.yaml)
 	require.Greater(t, handlers.WebhookMaxStoredForTest(h, "hobby"), int64(0))
 	// unknown tier → falls back to anonymous (100) via the int64(n) path
 	require.Equal(t, int64(100), handlers.WebhookMaxStoredForTest(h, "no_such_tier"))
+}
+
+// TestWebhookMaxStored_UnlimitedClampArm covers the -1 → 10000 clamp branch
+// in webhookMaxStored. Since the 2026-06-05 strict-margin redesign retired
+// every -1 webhook limit, the arm is now exercised via a synthetic registry
+// whose tier carries webhook_requests_stored: -1, keeping the defensive
+// clamp branch covered against a future re-introduction.
+func TestWebhookMaxStored_UnlimitedClampArm(t *testing.T) {
+	limits := `
+    limits:
+      provisions_per_day: 5
+      postgres_storage_mb: 10
+      postgres_connections: 2
+      redis_memory_mb: 5
+      mongodb_storage_mb: 5
+      mongodb_connections: 2
+      webhook_requests_stored: -1`
+	yaml := `
+plans:
+  anonymous:
+    display_name: "Anonymous"
+    price_monthly_cents: 0` + limits + `
+  unlimitedhook:
+    display_name: "UnlimitedHook"
+    price_monthly_cents: 0` + limits + `
+`
+	dir := t.TempDir()
+	path := dir + "/plans.yaml"
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o600))
+	reg, err := plans.Load(path)
+	require.NoError(t, err)
+
+	db, dbClean := testhelpers.SetupTestDB(t)
+	defer dbClean()
+	rdb, rClean := testhelpers.SetupTestRedis(t)
+	defer rClean()
+	cfg := &config.Config{Environment: "test", AESKey: testhelpers.TestAESKeyHex}
+	h := handlers.NewWebhookHandler(db, rdb, cfg, reg)
+	require.Equal(t, int64(10_000), handlers.WebhookMaxStoredForTest(h, "unlimitedhook"),
+		"-1 (unlimited) webhook tier must clamp to 10000 for the Redis LTRIM call")
 }
 
 // TestWebhookMaxStored_FloorArm covers the n<=0 safe-floor branch via a custom

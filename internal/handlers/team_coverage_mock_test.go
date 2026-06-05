@@ -230,20 +230,27 @@ func TestTeamMembers_InviteMember_LegacyMemberSuccess(t *testing.T) {
 	mock.ExpectQuery(`SELECT COALESCE\(role, 'member'\) FROM users WHERE id`).
 		WithArgs(userID, teamID).
 		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("owner"))
-	// 5. withinMemberLimit — team tier is unlimited (limit<0) so the model
-	//    skips the count query; but to be robust we allow an optional count.
-	//    The "team" tier member_limit is unlimited (-1) so withinMemberLimit
-	//    returns early without querying. Next is the existing-member COUNT.
+	// 5. withinMemberLimit — post strict-80%-margin redesign the "team" tier
+	//    member limit is FINITE (25, was -1/unlimited), so withinMemberLimit
+	//    now queries teamSeatTotal = CountTeamMembers + CountPendingInvitations.
+	//    1 member + 0 pending = 1 seat < 25 → within limit.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM users WHERE team_id = \$1$`).
+		WithArgs(teamID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM team_invitations WHERE team_id = \$1 AND status = 'pending'`).
+		WithArgs(teamID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	// 6. existing-member COUNT (the email dedup check).
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM users WHERE team_id = \$1 AND lower\(email\)`).
 		WithArgs(teamID, sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
-	// 6. INSERT ... RETURNING the invitation row
+	// 7. INSERT ... RETURNING the invitation row
 	invID := uuid.New()
 	mock.ExpectQuery(`INSERT INTO team_invitations`).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "team_id", "email", "role", "status", "invited_by", "created_at", "expires_at",
 		}).AddRow(invID, teamID, "x@y.com", "member", "pending", userID, time.Now(), time.Now().Add(7*24*time.Hour)))
-	// 7. best-effort audit insert — accept any exec.
+	// 8. best-effort audit insert — accept any exec.
 	mock.ExpectExec(`INSERT INTO audit_log`).WillReturnResult(sqlmock.NewResult(1, 1))
 
 	app := teamCoverageApp(t, db, nil, userID.String(), teamID.String())
