@@ -214,6 +214,16 @@ var auditConsumerSpec = map[string]auditConsumerExpectation{
 	// signature-passed-but-team-unknown signal. No customer email: the
 	// affected "customer" either does not exist or was deleted.
 	"razorpay.webhook.team_not_found": {IntentionallyNoConsumer: true},
+
+	// CI-only ephemeral-test-account surface (guarded; inert by default).
+	// Both fire from the internal POST/DELETE /internal/e2e/account routes
+	// and are operator-internal observability signals — a spike in created
+	// (vs reaped) means CI is leaking test accounts. NEVER customer-facing:
+	// the team is always is_test_cohort and the synthetic email is not PII.
+	// Counterparts to the other operator-only kinds above — audit rows are
+	// dashboard signals, not customer notifications.
+	"e2e.account.created": {IntentionallyNoConsumer: true},
+	"e2e.account.reaped":  {IntentionallyNoConsumer: true},
 }
 
 // ─── Test 1: every constant has a spec entry ──────────────────────────────────

@@ -682,8 +682,16 @@ func TestOpenAPI_CoversAllRegisteredRoutes(t *testing.T) {
 		// when a manual backup fails terminally. Not a customer-facing
 		// surface, so it stays out of the agent-facing OpenAPI spec.
 		"POST /internal/teams/{id}/backup-quota/refund": true,
-		"GET /api/v1/usage/wall":                        true,
-		"POST /api/v1/experiments/converted":            true,
+		// CI-only ephemeral-test-account surface. Guarded by E2E_ACCOUNT_TOKEN
+		// (route registers inert / 404s unless the token is configured) and
+		// only ever driven by the E2E harness against prod — never a
+		// customer-facing agent surface. Documenting it in the agent-facing
+		// OpenAPI would mislead agents into thinking they can mint accounts.
+		// Same rationale as the WORKER_INTERNAL_JWT_SECRET /internal routes above.
+		"POST /internal/e2e/account":             true,
+		"DELETE /internal/e2e/account/{team_id}": true,
+		"GET /api/v1/usage/wall":                 true,
+		"POST /api/v1/experiments/converted":     true,
 		// POST /auth/exchange — browser-only bridge between the magic-link
 		// / OAuth callback and the SPA. The handler reads the transient
 		// instanode_session_exchange cookie (Path=/auth/exchange,
