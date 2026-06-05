@@ -1,0 +1,155 @@
+# OpenAPI breaking-change gate (Wave 1 — UI↔API contract-drift gate).
+# Design ref: docs/ci/01-CI-INTEGRATION-DESIGN.md (Wave 1, HIGHEST ROI).
+#
+# Why this exists: the UI↔API contract lives as three unreconciled hand-
+# maintained copies (api handlers → instanode-web/src/api/types.ts →
+# Playwright mock fixtures). A backend field/enum/status rename passes the
+# api's own unit tests AND the web's tsc+vitest (because the web mirrors the
+# old shape by hand) and then breaks prod at runtime — this is the class that
+# broke login for ~24h (AUTH-004).
+#
+# This gate catches the api half: it diffs the PR's openapi.snapshot.json
+# against the BASE branch's committed snapshot using oasdiff and FAILS the PR
+# on any BREAKING change:
+#   - a removed or renamed response field / schema property
+#   - a narrowed / changed property type
+#   - a removed enum value
+#   - a removed endpoint or response code
+#   - a newly-required request field / parameter
+# Non-breaking ADDITIONS (a new optional field, a new endpoint, a new enum
+# value on a response) pass — the web client tolerates those.
+#
+# The companion gate on the producer side is openapi-snapshot.yml, which
+# guarantees openapi.snapshot.json is regenerated whenever openapi.go changes
+# (so the snapshot diffed here is always faithful to the handlers). The
+# companion gate on the CONSUMER side lives in instanode-web: openapi-typescript
+# codegen makes the same rename fail `tsc` in `npm run gate`. Together they
+# move contract drift from a runtime prod break to a compile/PR-time failure.
+#
+# How to ship an INTENTIONAL breaking change: this gate failing is the signal,
+# not a wall. Land the api change AND update the consumer (instanode-web
+# regenerates src/api/generated.ts from the new snapshot; its tsc will red at
+# every UI site using the removed/renamed field until they're fixed). Per rule
+# 22 (contract-surface checklist) a breaking contract change touches all
+# surfaces in one change. If a break is genuinely intentional and the consumer
+# is updated in lockstep, override is by repo-admin merge with the consumer PR
+# linked — there is deliberately no in-workflow allowlist, so every override is
+# a human decision recorded on the PR.
+#
+# Observability (rule 25): one structured log line per run so the GitHub
+# Actions → NR forwarder can chart the rate at which breaking changes are
+# caught at PR time (instanode-reliability tile: "Breaking contract changes
+# caught at PR time, 30d").
+
+name: openapi-breaking
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'openapi.snapshot.json'
+      - '.github/workflows/openapi-breaking.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: openapi-breaking-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# oasdiff version is PINNED — a floating version could change the breaking-
+# change ruleset under us and either silently let a break through (bad) or
+# start failing on a previously-allowed shape (noise). Bump deliberately.
+env:
+  OASDIFF_VERSION: v1.11.7
+
+jobs:
+  breaking-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base branch snapshot
+        id: base
+        env:
+          # Quoted into an env var (not interpolated into the script body) per
+          # GitHub Actions injection guidance. base.ref is a branch name, but
+          # this keeps the run block free of ${{ }} interpolation.
+          BASE: ${{ github.event.pull_request.base.ref || 'master' }}
+        run: |
+          git fetch origin "${BASE}" --depth=1
+          # Extract the base branch's committed snapshot to a temp file. If the
+          # base has no snapshot yet (first introduction of the file), there is
+          # nothing to break against — treat as a clean pass.
+          if git show "origin/${BASE}:openapi.snapshot.json" > /tmp/base.openapi.snapshot.json 2>/dev/null; then
+            echo "base_has_snapshot=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "base_has_snapshot=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Base branch has no openapi.snapshot.json — nothing to diff against; passing."
+          fi
+
+      - name: Install oasdiff (pinned)
+        if: steps.base.outputs.base_has_snapshot == 'true'
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/oasdiff_${OASDIFF_VERSION#v}_linux_amd64.tar.gz" \
+            | tar -xz -C /tmp oasdiff
+          sudo install /tmp/oasdiff /usr/local/bin/oasdiff
+          oasdiff --version
+
+      - name: Diff for breaking changes (human-readable)
+        if: steps.base.outputs.base_has_snapshot == 'true'
+        run: |
+          echo "### Breaking-change diff (base → PR)"
+          # Non-failing pass first so the full breaking-change report appears in
+          # the log even when the gate fails below.
+          oasdiff breaking /tmp/base.openapi.snapshot.json openapi.snapshot.json || true
+
+      - name: Emit observability line (rule 25)
+        if: steps.base.outputs.base_has_snapshot == 'true'
+        id: detect
+        run: |
+          set +e
+          # --fail-on WARN (NOT ERR). This is deliberate and load-bearing:
+          #
+          # The api emits most response fields as OPTIONAL (no `required` array
+          # on response schemas — see openapi.go). oasdiff classifies REMOVING
+          # an optional RESPONSE property as WARN, not ERR. But removing an
+          # optional response field IS the exact class that broke login: the
+          # UI reads `me.tier` / `r.storage_bytes`, the api drops/renames it,
+          # the UI silently gets `undefined`. `--fail-on ERR` would let that
+          # slip through (verified locally: removing AuthMeResponse.tier is a
+          # WARN). `--fail-on WARN` catches it AND still PASSES pure additions:
+          #   - adding an optional response/request field  → INFO  → pass
+          #   - adding a new endpoint                      → INFO  → pass
+          #   - removing an enum value from a RESPONSE     → INFO  → pass
+          #     (server sends fewer values; the consumer's union still accepts)
+          # while FAILING the genuinely-breaking shapes:
+          #   - removing/renaming a response field         → WARN  → fail
+          #   - adding a new REQUIRED request field         → ERR   → fail
+          #   - removing an endpoint / response code        → ERR   → fail
+          oasdiff breaking /tmp/base.openapi.snapshot.json openapi.snapshot.json --fail-on WARN >/dev/null 2>&1
+          BREAKING=$?
+          set -e
+          if [ "$BREAKING" -ne 0 ]; then DETECTED=true; else DETECTED=false; fi
+          echo "detected=${DETECTED}" >> "$GITHUB_OUTPUT"
+          printf '{"event":"openapi_breaking_change","detected":%s,"repo":"api","pr":"%s","sha":"%s"}\n' \
+            "${DETECTED}" \
+            "${{ github.event.pull_request.number || 'none' }}" \
+            "${GITHUB_SHA:0:7}"
+
+      - name: Fail on breaking change
+        if: steps.base.outputs.base_has_snapshot == 'true' && steps.detect.outputs.detected == 'true'
+        run: |
+          echo "::error::This PR makes a BREAKING change to the OpenAPI contract (removed/renamed/retyped field, removed enum value, removed endpoint, or newly-required request field)."
+          echo "::error::The UI (instanode-web) and SDKs mirror this contract. A breaking change here breaks prod at runtime unless the consumer is updated in lockstep (rule 22)."
+          echo "::error::If this break is INTENTIONAL: update instanode-web (regenerate src/api/generated.ts from the new snapshot; its tsc will red at every UI site using the removed field) in a linked PR, then merge via repo-admin with both PRs cross-referenced."
+          echo ""
+          echo "Breaking changes detected (WARN+ severity):"
+          oasdiff breaking /tmp/base.openapi.snapshot.json openapi.snapshot.json --severity-levels warn,error || true
+          exit 1
+
+      - name: No breaking changes
+        if: steps.base.outputs.base_has_snapshot == 'true' && steps.detect.outputs.detected == 'false'
+        run: echo "No breaking OpenAPI changes vs base branch — additive-only or no contract change. Consumers can regenerate clients safely."
