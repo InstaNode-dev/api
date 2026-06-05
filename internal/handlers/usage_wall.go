@@ -21,12 +21,12 @@ package handlers
 //	  "at":        "2026-05-12T11:02:00Z"
 //	}
 //
-// When there is no row within the last 24h, or the team is on the "team"
-// tier (no walls), the response is `{"ok": true, "near_wall": false}`.
+// When there is no row within the last 24h, the response is
+// `{"ok": true, "near_wall": false}`.
 //
-// Tier gate: "team" tier callers always get near_wall=false without a
-// DB hit. The worker won't have written a row anyway, but the early
-// return saves an audit_log scan for the most-active paid tier.
+// strict-80% margin redesign (2026-06-05): Team is no longer unlimited, so
+// the prior "team tier → near_wall=false" early-return was removed. Every
+// finite tier (now including Team) is served by the same audit-row query.
 //
 // Caching: 60s in Redis is enough — the worker writes at most one row
 // per team per 24h, and the dashboard polls every 5 minutes. We don't
@@ -44,7 +44,6 @@ import (
 	"github.com/google/uuid"
 
 	"instant.dev/internal/middleware"
-	"instant.dev/internal/models"
 )
 
 // usageWallKind is the audit_log.kind value the worker writes and this
@@ -129,13 +128,13 @@ func (h *UsageWallHandler) GetWall(c *fiber.Ctx) error {
 		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Authentication required")
 	}
 
-	// Team-tier early return — team tier is unlimited, so no walls.
-	// Fail-open: if team lookup errors, fall through to the audit
-	// query rather than refusing to serve.
-	if team, terr := models.GetTeamByID(c.Context(), h.db, teamID); terr == nil && team != nil && team.PlanTier == "team" {
-		h.setUsageWallCacheHeaders(c)
-		return c.JSON(fiber.Map{"ok": true, "near_wall": false})
-	}
+	// strict-80% margin redesign (2026-06-05): Team is no longer unlimited —
+	// every Team limit is now finite (plans.yaml), so Team customers DO have
+	// quota walls. The prior team-tier early-return suppressed the upgrade
+	// banner for the top tier; it is removed so Team falls through to the
+	// same audit-row query as every other finite tier. (When Team approaches
+	// a cap the next step is Enterprise/contact-sales, surfaced by the worker
+	// in the wall row's metadata.)
 
 	cutoff := time.Now().Add(-usageWallFreshness)
 

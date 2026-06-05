@@ -11,6 +11,7 @@ package plans_test
 
 import (
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 
@@ -144,4 +145,59 @@ func normaliseUnlimited(v int) int {
 		return 1 << 30
 	}
 	return v
+}
+
+// noUnlimitedExceptProvisionsPerDay is the set of Limits int fields that
+// are permitted to hold the -1 ("unlimited") sentinel after the
+// 2026-06-05 strict-≥80%-margin redesign retired every other unlimited.
+//
+//   - provisions_per_day: -1 stays by design — it's a per-fingerprint/team
+//     RATE limit (resources created per day), not a stored-resource cap, so
+//     it carries no per-GB COGS. (Known separate hardening: there is still
+//     no per-service resource-COUNT cap field, so a tenant could create many
+//     resources; tracked as a follow-up, not retired here.)
+//
+// Every OTHER int limit field on every tier MUST be finite (>= 0). This
+// reflection-driven, registry-iterating test (CLAUDE.md rule 18) means a
+// future YAML edit that reintroduces an "unlimited" on any costed field —
+// or a brand-new int field added with -1 — reds the build instead of
+// silently reopening the unbounded-COGS liability the CEO directive closed.
+var noUnlimitedExceptProvisionsPerDay = map[string]bool{
+	"ProvisionsPerDay": true,
+}
+
+// TestPlansYAML_NoUnlimitedExceptProvisionsPerDay iterates EVERY tier in
+// the live registry and EVERY int field on its Limits via reflection,
+// asserting none holds -1 except the allowlisted provisions_per_day.
+func TestPlansYAML_NoUnlimitedExceptProvisionsPerDay(t *testing.T) {
+	r := loadAPIPlansYAML(t)
+	all := r.All()
+	if len(all) == 0 {
+		t.Fatalf("registry is empty — loadAPIPlansYAML returned no tiers")
+	}
+
+	for tier, p := range all {
+		v := reflect.ValueOf(p.Limits)
+		typ := v.Type()
+		for i := 0; i < v.NumField(); i++ {
+			f := typ.Field(i)
+			// Only int-kinded limit fields carry the -1 sentinel. Bool
+			// (e.g. BackupRestoreEnabled) and slice (VaultEnvsAllowed,
+			// where [] = all-envs, not unlimited) fields are skipped.
+			if v.Field(i).Kind() != reflect.Int {
+				continue
+			}
+			if v.Field(i).Int() != -1 {
+				continue
+			}
+			if noUnlimitedExceptProvisionsPerDay[f.Name] {
+				continue
+			}
+			t.Errorf("tier %q field %s (yaml:%q) is -1 (unlimited) — the strict-80%% "+
+				"margin redesign retired every unlimited except provisions_per_day; "+
+				"set a finite cap or, if a new field legitimately may be unlimited, "+
+				"add it to noUnlimitedExceptProvisionsPerDay with justification",
+				tier, f.Name, f.Tag.Get("yaml"))
+		}
+	}
 }
