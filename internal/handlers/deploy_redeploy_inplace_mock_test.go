@@ -338,7 +338,7 @@ func TestDeployNew_Redeploy_UpdateStatusError_StillAccepts(t *testing.T) {
 	// non-determinate (we can't tell whether the flip landed), and
 	// runRedeployAsync will reconcile the row later. Only an explicit 0-row
 	// CAS miss means "reaped concurrently, return 409".
-	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
+	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL,\s+scaled_to_zero = false, last_activity_at = now\(\),\s+updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
 		WithArgs(rowID).
 		WillReturnError(errMockRedeployDriver)
 
@@ -494,7 +494,7 @@ func TestDeployNew_Redeploy_CASMiss_Returns409(t *testing.T) {
 		))
 
 	// Guarded CAS matches 0 rows — the reaper won the race. Handler 409s.
-	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
+	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL,\s+scaled_to_zero = false, last_activity_at = now\(\),\s+updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
 		WithArgs(rowID).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -606,7 +606,7 @@ func TestDeployRedeploy_ByID_CASMiss_Returns409(t *testing.T) {
 		))
 
 	// Guarded CAS matches 0 rows — the reaper won the race after the read.
-	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
+	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL,\s+scaled_to_zero = false, last_activity_at = now\(\),\s+updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
 		WithArgs(rowID).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -661,7 +661,7 @@ func TestDeployRedeploy_ByID_CASSuccess_Returns202(t *testing.T) {
 			sql.NullTime{}, false, false,
 		))
 
-	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
+	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL,\s+scaled_to_zero = false, last_activity_at = now\(\),\s+updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
 		WithArgs(rowID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -713,7 +713,7 @@ func TestDeployRedeploy_ByID_CASDriverError_StillAccepts(t *testing.T) {
 		))
 
 	// Guarded CAS → driver error (non-determinate). Handler logs + continues.
-	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL, updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
+	mock.ExpectExec(`UPDATE deployments\s+SET status = 'building', error_message = NULL,\s+scaled_to_zero = false, last_activity_at = now\(\),\s+updated_at = now\(\)\s+WHERE id = \$1 AND status IN`).
 		WithArgs(rowID).
 		WillReturnError(errMockRedeployDriver)
 
