@@ -661,7 +661,20 @@ func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
 	h.rdb.Del(ctx, fmt.Sprintf("res:%s", token.String()))
 
 	// Best-effort audit event. Failure must not block the response.
+	//
+	// metadata.resource_id is REQUIRED here (not just the ResourceID column):
+	// the dashboard's per-resource AuditPanel (instanode-web fetchResourceAudit)
+	// filters the team audit window by `metadata.resource_id`, and the JSON
+	// serializer (auditEventToMap) surfaces ONLY the JSONB metadata — the
+	// ResourceID column is never echoed into the wire `metadata`. Omitting it
+	// (as this site did before) made resource.paused rows invisible in the
+	// resource's Audit tab even though the column was set. Mirrors the
+	// resource_id-in-metadata convention of emitResourceReadAudit / backup.
 	safego.Go("resource.bg", func() {
+		metaBlob, _ := json.Marshal(map[string]string{
+			"resource_id":   resource.ID.String(),
+			"resource_type": resource.ResourceType,
+		})
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:       teamID,
 			Actor:        "agent",
@@ -669,6 +682,7 @@ func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
 			ResourceType: resource.ResourceType,
 			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
 			Summary:      "paused <strong>" + resource.ResourceType + "</strong> <code>" + token.String()[:8] + "</code>",
+			Metadata:     metaBlob,
 		})
 	})
 
@@ -779,7 +793,15 @@ func (h *ResourceHandler) Resume(c *fiber.Ctx) error {
 
 	h.rdb.Del(ctx, fmt.Sprintf("res:%s", token.String()))
 
+	// metadata.resource_id REQUIRED — see the matching comment in Pause: the
+	// dashboard AuditPanel filters on metadata.resource_id and the wire
+	// serializer never echoes the ResourceID column, so without this the
+	// resource.resumed row would not appear in the resource's Audit tab.
 	safego.Go("resource.bg", func() {
+		metaBlob, _ := json.Marshal(map[string]string{
+			"resource_id":   resource.ID.String(),
+			"resource_type": resource.ResourceType,
+		})
 		_ = models.InsertAuditEvent(context.Background(), h.db, models.AuditEvent{
 			TeamID:       teamID,
 			Actor:        "agent",
@@ -787,6 +809,7 @@ func (h *ResourceHandler) Resume(c *fiber.Ctx) error {
 			ResourceType: resource.ResourceType,
 			ResourceID:   uuid.NullUUID{UUID: resource.ID, Valid: true},
 			Summary:      "resumed <strong>" + resource.ResourceType + "</strong> <code>" + token.String()[:8] + "</code>",
+			Metadata:     metaBlob,
 		})
 	})
 

@@ -19,10 +19,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -342,4 +344,74 @@ func TestPausedStorageStillCountsTowardQuota(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(500*1024*1024), total,
 		"deleted rows must be excluded from storage sum")
+}
+
+// auditMetadataResourceID polls audit_log for the newest row of `kind` in the
+// team and returns the value of metadata->>'resource_id' (empty string when
+// the key is absent). The audit insert runs in a best-effort goroutine
+// (safego.Go), so callers wrap this in require.Eventually.
+func auditMetadataResourceID(t *testing.T, db *sql.DB, teamID, kind string) (found bool, resourceID string) {
+	t.Helper()
+	var rid sql.NullString
+	err := db.QueryRowContext(context.Background(), `
+		SELECT metadata->>'resource_id'
+		  FROM audit_log
+		 WHERE team_id = $1::uuid AND kind = $2
+		 ORDER BY created_at DESC
+		 LIMIT 1
+	`, teamID, kind).Scan(&rid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ""
+	}
+	require.NoError(t, err)
+	return true, rid.String
+}
+
+// TestPauseResource_EmitsMetadataResourceID is the regression guard for the
+// AuditPanel-invisibility bug (BUGHUNT 2026-06-06): the resource.paused audit
+// row set the ResourceID column but NOT metadata.resource_id. The dashboard's
+// per-resource AuditPanel filters the team audit window by
+// `metadata.resource_id`, and auditEventToMap serialises ONLY the JSONB
+// metadata (the ResourceID column is never echoed onto the wire), so a paused
+// resource's most important state-change event never appeared in its Audit tab.
+//
+// This asserts the row's metadata->>'resource_id' equals the resource UUID, so
+// the row survives the UI's client-side filter. Pairs with the resume guard
+// below; if a future edit drops Metadata from either emit site, one of these
+// fails.
+func TestPauseResource_EmitsMetadataResourceID(t *testing.T) {
+	fix := setupPauseFixture(t, "pro", "postgres")
+
+	resp := doPauseOrResume(t, fix.app, fix.jwt, "pause", fix.resourceToken)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	require.Eventually(t, func() bool {
+		found, rid := auditMetadataResourceID(t, fix.db, fix.teamID, "resource.paused")
+		return found && rid == fix.resourceID
+	}, 3*time.Second, 50*time.Millisecond,
+		"resource.paused audit row must carry metadata.resource_id == resource UUID "+
+			"so the dashboard AuditPanel (filters on metadata.resource_id) shows it")
+}
+
+// TestResumeResource_EmitsMetadataResourceID — the resume-side twin of the
+// guard above.
+func TestResumeResource_EmitsMetadataResourceID(t *testing.T) {
+	fix := setupPauseFixture(t, "pro", "postgres")
+
+	// Pause first to reach a paused state, then resume.
+	resp := doPauseOrResume(t, fix.app, fix.jwt, "pause", fix.resourceToken)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	resp = doPauseOrResume(t, fix.app, fix.jwt, "resume", fix.resourceToken)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	require.Eventually(t, func() bool {
+		found, rid := auditMetadataResourceID(t, fix.db, fix.teamID, "resource.resumed")
+		return found && rid == fix.resourceID
+	}, 3*time.Second, 50*time.Millisecond,
+		"resource.resumed audit row must carry metadata.resource_id == resource UUID "+
+			"so the dashboard AuditPanel shows it")
 }
