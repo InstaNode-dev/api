@@ -153,6 +153,25 @@ type e2eCreateRequest struct {
 	// snapshot, exactly like a real provision under that tier, and are reaped
 	// with the team (team_id→NULL + marked-for-reaper) by ReapAccount.
 	WithResources bool `json:"with_resources"`
+
+	// WithFailedDeploy, when true, pre-seeds ONE deployment row in
+	// status='failed' (with a one-line error_message) plus ONE failure_autopsy
+	// deployment_events row (reason/exit_code/last_lines/hint) on the minted
+	// team — the EXACT shape the worker autopsy writes for a real build
+	// failure. This lets the web wave load /app/deployments/:id and render the
+	// FailureAutopsyPanel against a REAL backend (not a mock), and lets an
+	// agent journey exercise GET /api/v1/deployments/:id/events without first
+	// having to drive (and fail) a real Kaniko build.
+	//
+	// Cohort-only + inert by default (omitted → no deploy seeded). The seeded
+	// deployment is owned by the minted is_test_cohort team, so it is reaped
+	// with the team (DeleteTeamHard cascades deployments + deployment_events)
+	// by ReapAccount. No backend RPC, no k8s namespace — pure DB rows via the
+	// SAME models the production deploy path uses, so the seed is synchronous +
+	// sub-millisecond, safe inside the mint request. The seeded deployment's
+	// app_id is surfaced in the response as failed_deploy_id so the caller can
+	// navigate straight to /app/deployments/<failed_deploy_id>.
+	WithFailedDeploy bool `json:"with_failed_deploy"`
 }
 
 // e2eSeedResourceTypes is the closed set of FAST, row-only resource types the
@@ -161,6 +180,44 @@ type e2eCreateRequest struct {
 // Iterated (not hand-listed at the call site) so adding a type here
 // automatically expands what the seed creates AND what the seed test asserts.
 var e2eSeedResourceTypes = []string{"webhook", "cache"}
+
+// e2eFailedDeploy* constants describe the single seeded failed deployment +
+// its failure_autopsy event. Named (not inline literals) so the seed payload
+// is a single source of truth the seed test asserts against — adding a field
+// here is a one-place change. The shape mirrors what the worker autopsy writes
+// for a real OOMKilled build failure so the web FailureAutopsyPanel renders the
+// same content it would for a genuine failure.
+const (
+	// e2eFailedDeployErrorMessage is the one-line cause stamped on
+	// deployments.error_message (the "<reason>: <hint snippet>" the worker
+	// autopsy writes; surfaced by GET /api/v1/deployments/:id as item.error).
+	e2eFailedDeployErrorMessage = "OOMKilled: Your app exceeded its memory limit and was killed by the kernel."
+
+	// e2eFailedDeployReason is the classified failure reason on the autopsy row
+	// (matches models.FailureReasonOOMKilled — a string literal here keeps this
+	// file free of an api-internal import the worker-mirror constants avoid).
+	e2eFailedDeployReason = "OOMKilled"
+
+	// e2eFailedDeployEvent is the k8s event text on the autopsy row.
+	e2eFailedDeployEvent = "OOMKilling: Memory cgroup out of memory: Killed process 1 (node)"
+
+	// e2eFailedDeployHint is the plain-language remedy on the autopsy row.
+	e2eFailedDeployHint = "Your app exceeded its memory limit and was killed by the kernel. " +
+		"Reduce memory usage or upgrade to a tier with a higher memory cap."
+
+	// e2eFailedDeployExitCode is the container exit code on the autopsy row.
+	e2eFailedDeployExitCode = 137
+)
+
+// e2eFailedDeployLastLines is the build-pod log tail on the autopsy row — the
+// real error output the FailureAutopsyPanel renders and an agent reads to fix
+// the failure. Non-empty so the panel's "diagnostics pending" empty-state is
+// NOT what the web test sees.
+var e2eFailedDeployLastLines = []string{
+	"npm ERR! code ELIFECYCLE",
+	"<--- Last few GCs --->",
+	"FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory",
+}
 
 // authorize runs the X-E2E-Token guard. It returns true iff the token is
 // configured AND the header matches in constant time. On any failure it has
@@ -301,6 +358,23 @@ func (h *E2EAccountHandler) CreateAccount(c *fiber.Ctx) error {
 		seededTokens = toks
 	}
 
+	// 3c. Optionally pre-seed ONE failed deployment + its failure_autopsy event
+	//     so the web wave can render the FailureAutopsyPanel against a real
+	//     backend and an agent journey can exercise GET /deployments/:id/events.
+	//     Synchronous (pure DB rows via the production deploy models, no backend
+	//     RPC / no k8s namespace). A seed failure is a hard error for the same
+	//     reason as with_resources: a partial account makes the journey flaky.
+	var failedDeployID string
+	if req.WithFailedDeploy {
+		appID, derr := e2eSeedFailedDeploy(h, ctx, team.ID, tier, env)
+		if derr != nil {
+			metrics.E2EAccountTotal.WithLabelValues(e2eMetricOpCreate, e2eResultError).Inc()
+			slog.Error("internal.e2e.create.failed_deploy_seed_failed", "error", derr, "team_id", team.ID.String())
+			return respondError(c, fiber.StatusServiceUnavailable, "seed_failed", "failed to seed failed deployment")
+		}
+		failedDeployID = appID
+	}
+
 	// 4. Mint the session JWT with the SAME signer + claim shape the customer
 	//    auth path uses, so it authenticates through ordinary RequireAuth.
 	expiresAt := time.Now().UTC().Add(e2eSessionTTL)
@@ -338,15 +412,20 @@ func (h *E2EAccountHandler) CreateAccount(c *fiber.Ctx) error {
 	if seededTokens == nil {
 		seededTokens = []string{}
 	}
+	// failed_deploy_id is the app_id of the seeded failed deployment when
+	// with_failed_deploy was set, "" otherwise. The caller navigates to
+	// /app/deployments/<failed_deploy_id> (or GETs /api/v1/deployments/<id>)
+	// to drive the FailureAutopsyPanel / events surface against a real backend.
 	return c.JSON(fiber.Map{
-		"team_id":       team.ID.String(),
-		"user_id":       user.ID.String(),
-		"email":         email,
-		"tier":          tier,
-		"session_jwt":   sessionJWT,
-		"expires_at":    expiresAt.Format(time.RFC3339),
-		"seeded_tokens": seededTokens,
-		"seeded_count":  len(seededTokens),
+		"team_id":          team.ID.String(),
+		"user_id":          user.ID.String(),
+		"email":            email,
+		"tier":             tier,
+		"session_jwt":      sessionJWT,
+		"expires_at":       expiresAt.Format(time.RFC3339),
+		"seeded_tokens":    seededTokens,
+		"seeded_count":     len(seededTokens),
+		"failed_deploy_id": failedDeployID,
 	})
 }
 
@@ -386,6 +465,59 @@ func (h *E2EAccountHandler) seedFastResources(ctx context.Context, teamID uuid.U
 		tokens = append(tokens, res.Token.String())
 	}
 	return tokens, nil
+}
+
+// e2eSeedFailedDeploy pre-seeds ONE failed deployment + its failure_autopsy
+// event on teamID, returning the deployment's app_id. It uses the SAME
+// production models the real deploy path uses — CreateDeployment (status
+// 'building') → UpdateDeploymentStatus(...,"failed", error_message) →
+// UpsertDeploymentAutopsy — so the seeded rows are indistinguishable from a
+// genuine OOMKilled build failure for every read path (GET /deployments/:id
+// item.error, GET /deployments/:id/events autopsy row, the web
+// FailureAutopsyPanel). No backend RPC, no k8s namespace: pure DB rows, so the
+// seed is synchronous + sub-millisecond. Any error aborts (returns it) — the
+// caller turns it into a 503 so CI never receives a half-seeded account.
+//
+// The deployment is owned by the cohort team and carries the team's tier
+// snapshot (TTLPolicy=permanent so the deployment_expirer never sweeps it
+// mid-journey); DeleteTeamHard cascades both the deployment and its
+// deployment_events on reap.
+//
+// A package-var seam (not a direct method call) so a test can force the
+// caller's seed_failed (503) arm deterministically.
+var e2eSeedFailedDeploy = (*E2EAccountHandler).seedFailedDeploy
+
+func (h *E2EAccountHandler) seedFailedDeploy(ctx context.Context, teamID uuid.UUID, tier, env string) (string, error) {
+	appID := "e2e-fail-" + uuid.NewString()[:10]
+
+	d, err := models.CreateDeployment(ctx, h.db, models.CreateDeploymentParams{
+		TeamID:    teamID,
+		AppID:     appID,
+		Port:      8080,
+		Tier:      tier,
+		Env:       env,
+		TTLPolicy: models.DeployTTLPolicyPermanent,
+	})
+	if err != nil {
+		return "", fmt.Errorf("seed failed deploy: create: %w", err)
+	}
+
+	if err := models.UpdateDeploymentStatus(ctx, h.db, d.ID, "failed", e2eFailedDeployErrorMessage); err != nil {
+		return "", fmt.Errorf("seed failed deploy: set failed: %w", err)
+	}
+
+	if err := models.UpsertDeploymentAutopsy(ctx, h.db, models.UpsertAutopsyParams{
+		DeploymentID: d.ID,
+		Reason:       e2eFailedDeployReason,
+		ExitCode:     sql.NullInt32{Int32: e2eFailedDeployExitCode, Valid: true},
+		Event:        e2eFailedDeployEvent,
+		LastLines:    e2eFailedDeployLastLines,
+		Hint:         e2eFailedDeployHint,
+	}); err != nil {
+		return "", fmt.Errorf("seed failed deploy: autopsy: %w", err)
+	}
+
+	return appID, nil
 }
 
 // ReapAccount handles DELETE /internal/e2e/account/:team_id.

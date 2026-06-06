@@ -92,15 +92,16 @@ func newE2ETestApp(t *testing.T, db *sql.DB, rdb *redis.Client, token string) *f
 
 // e2eCreateResp is the create-endpoint response shape we assert on.
 type e2eCreateResp struct {
-	TeamID       string   `json:"team_id"`
-	UserID       string   `json:"user_id"`
-	Email        string   `json:"email"`
-	Tier         string   `json:"tier"`
-	SessionJWT   string   `json:"session_jwt"`
-	ExpiresAt    string   `json:"expires_at"`
-	SeededTokens []string `json:"seeded_tokens"`
-	SeededCount  int      `json:"seeded_count"`
-	Error        string   `json:"error"`
+	TeamID         string   `json:"team_id"`
+	UserID         string   `json:"user_id"`
+	Email          string   `json:"email"`
+	Tier           string   `json:"tier"`
+	SessionJWT     string   `json:"session_jwt"`
+	ExpiresAt      string   `json:"expires_at"`
+	SeededTokens   []string `json:"seeded_tokens"`
+	SeededCount    int      `json:"seeded_count"`
+	FailedDeployID string   `json:"failed_deploy_id"`
+	Error          string   `json:"error"`
 }
 
 func postE2ECreate(t *testing.T, app *fiber.App, token, body string) *http.Response {
