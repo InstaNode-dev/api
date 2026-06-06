@@ -213,7 +213,7 @@ jobs:
       # failures above. No-ops without the NR secret.
       - name: Emit coverage result to New Relic
         if: always()
-        uses: ./.github/actions/nr-ci-event
+        uses: ./api/.github/actions/nr-ci-event
         with:
           license-key: ${{ secrets.NEW_RELIC_LICENSE_KEY }}
           account-id: ${{ secrets.NEW_RELIC_ACCOUNT_ID }}
