@@ -38,6 +38,25 @@ func ExportedRazorpayPlanIDFor(h *BillingHandler, tier, freq string) string {
 	return h.razorpayPlanIDFor(tier, freq)
 }
 
+// ── Wave 4b: synthetic test-cohort → rzp_test_* routing exports ───────────────
+
+// SubBodyTestModeKeyForTest exposes the private subBody marker key the checkout
+// handler sets for a cohort test-mode create, so a fake CreateSubscription can
+// assert it is (or is not) present.
+const SubBodyTestModeKeyForTest = subBodyTestModeKey
+
+// ExerciseTestModeConfigured exposes testModeConfigured for the
+// inert-when-unset pure-function proof (no DB).
+func ExerciseTestModeConfigured(h *BillingHandler) bool {
+	return h.testModeConfigured()
+}
+
+// ExerciseRazorpayTestPlanIDFor exposes razorpayTestPlanIDFor for the
+// self-serve-tier-only pure-function proof (no DB).
+func ExerciseRazorpayTestPlanIDFor(h *BillingHandler, tier string) string {
+	return h.razorpayTestPlanIDFor(tier)
+}
+
 // ExportedPlanIDRecognised exposes planIDRecognised for coverage.
 func ExportedPlanIDRecognised(h *BillingHandler, planID string) bool {
 	return h.planIDRecognised(planID)

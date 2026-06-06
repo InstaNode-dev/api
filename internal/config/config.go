@@ -44,7 +44,29 @@ type Config struct {
 	RazorpayPlanIDProYearly       string // RAZORPAY_PLAN_ID_PRO_YEARLY — plan_id for pro tier (yearly)
 	RazorpayPlanIDGrowthYearly    string // RAZORPAY_PLAN_ID_GROWTH_ANNUAL — plan_id for growth tier (yearly)
 	RazorpayPlanIDTeamYearly      string // RAZORPAY_PLAN_ID_TEAM_YEARLY — plan_id for team tier (yearly)
-	ResendAPIKey                  string
+
+	// ── Razorpay TEST-mode credentials (Wave 4b, docs/ci/01-CI-INTEGRATION-DESIGN.md) ──
+	// These are the rzp_test_* keys + their plan_ids used ONLY for the
+	// synthetic test-cohort (teams.is_test_cohort=true, migration 067) so CI can
+	// drive a real test-mode hosted checkout + test-card payment WITHOUT touching
+	// the live Razorpay account and WITHOUT needing the live-recurring approval
+	// (test mode has no recurring gate). Every field defaults to "" (empty) so
+	// the whole test-mode path is INERT in any deployment where the operator has
+	// not configured it — a non-cohort team always uses the live keys above, and
+	// a cohort team falls back to the normal (skip/inert) behaviour when these
+	// are unset. The actual key values MUST NEVER leak in any API response
+	// (same NEVER-leak contract as RazorpayKeyID — see trafficEnv/BUG-P112).
+	RazorpayTestKeyID         string // RAZORPAY_TEST_KEY_ID — rzp_test_* API key ID (test-cohort only)
+	RazorpayTestKeySecret     string // RAZORPAY_TEST_KEY_SECRET — rzp_test_* API key secret (test-cohort only)
+	RazorpayTestWebhookSecret string // RAZORPAY_TEST_WEBHOOK_SECRET — webhook signature secret for test-mode events
+	// Test-mode plan_ids for the self-serve checkout tiers (hobby / hobby_plus /
+	// pro, monthly). Created by the operator in the Razorpay TEST dashboard. When
+	// a tier's test plan_id is unset, a cohort checkout for that tier falls back
+	// to the inert path (no test-mode subscription is minted).
+	RazorpayTestPlanIDHobby     string // RAZORPAY_TEST_PLAN_ID_HOBBY
+	RazorpayTestPlanIDHobbyPlus string // RAZORPAY_TEST_PLAN_ID_HOBBY_PLUS
+	RazorpayTestPlanIDPro       string // RAZORPAY_TEST_PLAN_ID_PRO
+	ResendAPIKey                string
 	// EmailProvider explicitly selects the outbound email backend. Accepted
 	// values: "brevo" | "resend" | "noop". When empty, internal/email
 	// auto-detects: BREVO_API_KEY > RESEND_API_KEY (≠ "CHANGE_ME") > noop.
@@ -368,27 +390,36 @@ func Load() *Config {
 		RazorpayPlanIDProYearly:       os.Getenv("RAZORPAY_PLAN_ID_PRO_ANNUAL"),
 		RazorpayPlanIDGrowthYearly:    os.Getenv("RAZORPAY_PLAN_ID_GROWTH_ANNUAL"),
 		RazorpayPlanIDTeamYearly:      os.Getenv("RAZORPAY_PLAN_ID_TEAM_ANNUAL"),
-		ResendAPIKey:                  os.Getenv("RESEND_API_KEY"),
-		EmailProvider:                 os.Getenv("EMAIL_PROVIDER"),
-		BrevoAPIKey:                   os.Getenv("BREVO_API_KEY"),
-		EmailFromName:                 os.Getenv("EMAIL_FROM_NAME"),
-		EmailFromAddress:              os.Getenv("EMAIL_FROM_ADDRESS"),
-		GitHubClientID:                os.Getenv("GITHUB_CLIENT_ID"),
-		GitHubClientSecret:            os.Getenv("GITHUB_CLIENT_SECRET"),
-		GoogleClientID:                os.Getenv("GOOGLE_CLIENT_ID"),
-		GoogleClientSecret:            os.Getenv("GOOGLE_CLIENT_SECRET"),
-		GoogleRedirectURI:             os.Getenv("GOOGLE_REDIRECT_URI"),
-		EnabledServices:               getenv("INSTANT_ENABLED_SERVICES", "redis,postgres,mongodb,queue"),
-		Environment:                   getenv("ENVIRONMENT", "development"),
-		TrustedProxyCIDRs:             os.Getenv("TRUSTED_PROXY_CIDRS"),
-		RedisProvisionBackend:         getenv("REDIS_PROVISION_BACKEND", "local"),
-		RedisProvisionHost:            getenv("REDIS_PROVISION_HOST", "localhost"),
-		MongoAdminURI:                 getenv("MONGO_ADMIN_URI", "mongodb://root:root@localhost:27017"),
-		MongoHost:                     getenv("MONGO_HOST", "localhost:27017"),
-		PostgresProvisionBackend:      getenv("POSTGRES_PROVISION_BACKEND", "local"),
-		NeonAPIKey:                    os.Getenv("NEON_API_KEY"),
-		NeonRegionID:                  getenv("NEON_REGION_ID", "aws-us-east-1"),
-		PostgresCustomersURL:          getenv("POSTGRES_CUSTOMERS_URL", "postgres://postgres:postgres@postgres-customers:5432/postgres"),
+
+		// Razorpay TEST-mode (rzp_test_*) creds for the synthetic test cohort
+		// only. All default "" (inert) — see the struct doc above (Wave 4b).
+		RazorpayTestKeyID:           os.Getenv("RAZORPAY_TEST_KEY_ID"),
+		RazorpayTestKeySecret:       os.Getenv("RAZORPAY_TEST_KEY_SECRET"),
+		RazorpayTestWebhookSecret:   os.Getenv("RAZORPAY_TEST_WEBHOOK_SECRET"),
+		RazorpayTestPlanIDHobby:     os.Getenv("RAZORPAY_TEST_PLAN_ID_HOBBY"),
+		RazorpayTestPlanIDHobbyPlus: os.Getenv("RAZORPAY_TEST_PLAN_ID_HOBBY_PLUS"),
+		RazorpayTestPlanIDPro:       os.Getenv("RAZORPAY_TEST_PLAN_ID_PRO"),
+		ResendAPIKey:                os.Getenv("RESEND_API_KEY"),
+		EmailProvider:               os.Getenv("EMAIL_PROVIDER"),
+		BrevoAPIKey:                 os.Getenv("BREVO_API_KEY"),
+		EmailFromName:               os.Getenv("EMAIL_FROM_NAME"),
+		EmailFromAddress:            os.Getenv("EMAIL_FROM_ADDRESS"),
+		GitHubClientID:              os.Getenv("GITHUB_CLIENT_ID"),
+		GitHubClientSecret:          os.Getenv("GITHUB_CLIENT_SECRET"),
+		GoogleClientID:              os.Getenv("GOOGLE_CLIENT_ID"),
+		GoogleClientSecret:          os.Getenv("GOOGLE_CLIENT_SECRET"),
+		GoogleRedirectURI:           os.Getenv("GOOGLE_REDIRECT_URI"),
+		EnabledServices:             getenv("INSTANT_ENABLED_SERVICES", "redis,postgres,mongodb,queue"),
+		Environment:                 getenv("ENVIRONMENT", "development"),
+		TrustedProxyCIDRs:           os.Getenv("TRUSTED_PROXY_CIDRS"),
+		RedisProvisionBackend:       getenv("REDIS_PROVISION_BACKEND", "local"),
+		RedisProvisionHost:          getenv("REDIS_PROVISION_HOST", "localhost"),
+		MongoAdminURI:               getenv("MONGO_ADMIN_URI", "mongodb://root:root@localhost:27017"),
+		MongoHost:                   getenv("MONGO_HOST", "localhost:27017"),
+		PostgresProvisionBackend:    getenv("POSTGRES_PROVISION_BACKEND", "local"),
+		NeonAPIKey:                  os.Getenv("NEON_API_KEY"),
+		NeonRegionID:                getenv("NEON_REGION_ID", "aws-us-east-1"),
+		PostgresCustomersURL:        getenv("POSTGRES_CUSTOMERS_URL", "postgres://postgres:postgres@postgres-customers:5432/postgres"),
 	}
 	cfg.ProvisionerAddr = os.Getenv("PROVISIONER_ADDR") // intentionally empty = use local providers
 	cfg.ProvisionerSecret = os.Getenv("PROVISIONER_SECRET")
