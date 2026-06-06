@@ -38,6 +38,43 @@ func ExportedRazorpayPlanIDFor(h *BillingHandler, tier, freq string) string {
 	return h.razorpayPlanIDFor(tier, freq)
 }
 
+// ── Wave 4b: synthetic test-cohort → rzp_test_* routing exports ───────────────
+
+// SubBodyTestModeKeyForTest exposes the private subBody marker key the checkout
+// handler sets for a cohort test-mode create, so a fake CreateSubscription can
+// assert it is (or is not) present.
+const SubBodyTestModeKeyForTest = subBodyTestModeKey
+
+// ExerciseTestModeConfigured exposes testModeConfigured for the
+// inert-when-unset pure-function proof (no DB).
+func ExerciseTestModeConfigured(h *BillingHandler) bool {
+	return h.testModeConfigured()
+}
+
+// ExerciseRazorpayTestPlanIDFor exposes razorpayTestPlanIDFor for the
+// self-serve-tier-only pure-function proof (no DB).
+func ExerciseRazorpayTestPlanIDFor(h *BillingHandler, tier string) string {
+	return h.razorpayTestPlanIDFor(tier)
+}
+
+// ExerciseCreateSubscriptionTestMode invokes the PRODUCTION default
+// CreateSubscription closure WITH the subBodyTestModeKey flag set, so the
+// test-key-swap + flag-strip branch (the rzp_test_* routing) runs. As with
+// ExerciseCreateSubscription the unconfigured creds make the underlying
+// Razorpay call error/panic — recovered here — but the closure body lines
+// (key selection + delete) execute for coverage.
+func ExerciseCreateSubscriptionTestMode(h *BillingHandler) {
+	defer func() { _ = recover() }()
+	_, _ = h.CreateSubscription(map[string]any{"plan_id": "plan_x", subBodyTestModeKey: true})
+}
+
+// ExerciseResolveCheckoutTestMode exposes resolveCheckoutTestMode so the
+// fail-closed (DB error) + not-cohort + no-test-plan branches can be asserted
+// directly without standing up a full checkout request.
+func ExerciseResolveCheckoutTestMode(h *BillingHandler, ctx context.Context, teamID uuid.UUID, tier string) (bool, string) {
+	return h.resolveCheckoutTestMode(ctx, teamID, tier)
+}
+
 // ExportedPlanIDRecognised exposes planIDRecognised for coverage.
 func ExportedPlanIDRecognised(h *BillingHandler, planID string) bool {
 	return h.planIDRecognised(planID)

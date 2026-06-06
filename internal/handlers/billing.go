@@ -38,6 +38,16 @@ import (
 // the checkout side and the webhook side cannot drift.
 const checkoutNoteAdminPromoCodeID = "admin_promo_code_id"
 
+// subBodyTestModeKey is a PRIVATE marker key the checkout handler injects into
+// the Razorpay subscription-create body for synthetic test-cohort teams (Wave
+// 4b). The production CreateSubscription closure reads it to select the
+// rzp_test_* credentials, then deletes it before the body is sent to Razorpay
+// (Razorpay rejects unknown top-level fields). It is never persisted and never
+// surfaced — purely an in-process hint that keeps the CreateSubscription field
+// signature unchanged (so the existing test seam is untouched) while remaining
+// goroutine-safe (the flag is per-call body state, not shared handler state).
+const subBodyTestModeKey = "__instant_test_mode"
+
 // checkoutInflightTTL bounds the server-side dedup window for a team's
 // concurrent /api/v1/billing/checkout calls. ~60s is well within the
 // time it takes a user to read the Razorpay hosted-checkout response,
@@ -228,7 +238,13 @@ type BillingHandler struct {
 	// callers should default the relevant response fields.
 	FetchSubscriptionDetails func(subscriptionID string) (*razorpaybilling.SubscriptionDetails, error)
 
-	// CreateSubscription mints a new Razorpay subscription. Factored into an
+	// CreateSubscription mints a new Razorpay subscription. The subBody MAY
+	// carry the private subBodyTestModeKey flag (Wave 4b): when present and
+	// true, the PRODUCTION default closure routes the create through the
+	// rzp_test_* credentials instead of the live keys, and strips the flag
+	// before it reaches Razorpay. See subBodyTestModeKey + resolveCheckoutTestMode.
+	//
+	// Factored into an
 	// overridable field (not an inline razorpay client call) so the F7
 	// idempotency guard in CreateCheckoutAPI is unit-testable: a test can
 	// assert the function is invoked EXACTLY ONCE across two checkout calls
@@ -279,12 +295,23 @@ func NewBillingHandler(db *sql.DB, cfg *config.Config, emailClient email.Mailer)
 	// CreateSubscription mints a new Razorpay subscription. Wired once here so
 	// CreateCheckoutAPI never mutates the field per-request (see the doc above).
 	h.CreateSubscription = func(subBody map[string]any) (map[string]any, error) {
+		// Wave 4b: a synthetic test-cohort checkout carries subBodyTestModeKey.
+		// When set (and test keys configured) the create goes through the
+		// rzp_test_* credentials so a real TEST-mode subscription/short_url is
+		// minted — accepting test cards, no live-recurring approval needed, and
+		// the live Razorpay account is never touched. Strip the private flag
+		// before it reaches Razorpay (Razorpay rejects unknown top-level keys).
+		keyID, keySecret := h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret
+		if testMode, _ := subBody[subBodyTestModeKey].(bool); testMode {
+			keyID, keySecret = h.cfg.RazorpayTestKeyID, h.cfg.RazorpayTestKeySecret
+		}
+		delete(subBody, subBodyTestModeKey)
 		// P0-2 (CIRCUIT-RETRY-AUDIT-2026-05-20): NewTimeoutClient applies the
 		// audit-mandated 30s HTTP timeout. Never razorpay.NewClient directly —
 		// the SDK default is 10s, below Razorpay's documented p99 for
 		// subscription create, so a brownout would 10s-fail every checkout
 		// without ever flipping the breaker.
-		client := razorpaybilling.NewTimeoutClient(h.cfg.RazorpayKeyID, h.cfg.RazorpayKeySecret)
+		client := razorpaybilling.NewTimeoutClient(keyID, keySecret)
 		return razorpaybilling.CallWithBreaker(func() (map[string]any, error) {
 			return client.Subscription.Create(subBody, nil)
 		})
@@ -515,6 +542,75 @@ func (h *BillingHandler) razorpayPlanIDFor(tier, frequency string) string {
 	return ""
 }
 
+// ── Wave 4b: Razorpay TEST-mode (synthetic test-cohort) routing ──────────────
+//
+// docs/ci/01-CI-INTEGRATION-DESIGN.md §"Razorpay test-card payment E2E".
+// CI mints a synthetic cohort team (teams.is_test_cohort=true, migration 067)
+// and drives a REAL hosted checkout + test-card payment. To do that without
+// touching the live Razorpay account (and without the live-recurring approval
+// that blocks prod), a cohort checkout routes through the rzp_test_* keys.
+
+// testModeConfigured reports whether the operator has wired the minimum
+// rzp_test_* credentials (key id + secret) for the synthetic test-cohort
+// checkout path. When false the whole test-mode path is INERT: a cohort team
+// falls back to the normal skip/inert behaviour (rejectIfTestCohort), and the
+// live path is never affected.
+func (h *BillingHandler) testModeConfigured() bool {
+	return h.cfg.RazorpayTestKeyID != "" && h.cfg.RazorpayTestKeySecret != ""
+}
+
+// razorpayTestPlanIDFor returns the configured rzp_test_* plan_id for a
+// self-serve checkout tier (hobby / hobby_plus / pro, monthly only — yearly and
+// growth/team are out of scope for the cohort test path). Returns "" when the
+// operator has not created the corresponding test plan, in which case the
+// cohort checkout falls back to the inert path rather than minting against the
+// wrong (live) plan.
+func (h *BillingHandler) razorpayTestPlanIDFor(tier string) string {
+	switch tier {
+	case "hobby":
+		return h.cfg.RazorpayTestPlanIDHobby
+	case "hobby_plus":
+		return h.cfg.RazorpayTestPlanIDHobbyPlus
+	case "pro":
+		return h.cfg.RazorpayTestPlanIDPro
+	}
+	return ""
+}
+
+// resolveCheckoutTestMode decides, for a single checkout call, whether to route
+// through the rzp_test_* credentials. It returns useTest=true (with the
+// resolved test plan_id) ONLY when ALL of:
+//   - the team is a synthetic test cohort (teams.is_test_cohort=true), AND
+//   - the operator has configured rzp_test_* key + secret, AND
+//   - the requested tier has a configured test plan_id.
+//
+// In every other case it returns useTest=false (caller keeps the existing
+// behaviour: a non-cohort team uses live keys; a cohort team with test mode
+// unconfigured/partial is handled by the inert rejectIfTestCohort skip-guard).
+// A DB error on the is_test_cohort lookup fails CLOSED to useTest=false so a DB
+// blip can never accidentally route a real customer through the test account.
+func (h *BillingHandler) resolveCheckoutTestMode(ctx context.Context, teamID uuid.UUID, tier string) (useTest bool, testPlanID string) {
+	if h.db == nil || !h.testModeConfigured() {
+		return false, ""
+	}
+	isTest, err := models.IsTestCohort(ctx, h.db, teamID)
+	if err != nil {
+		// Fail closed: never route a real customer through test keys on a blip.
+		slog.Warn("billing.checkout.test_cohort_lookup_failed_closed",
+			"error", err, "team_id", teamID)
+		return false, ""
+	}
+	if !isTest {
+		return false, ""
+	}
+	planID := h.razorpayTestPlanIDFor(tier)
+	if planID == "" {
+		// Test cohort, test keys set, but no test plan for this tier → inert.
+		return false, ""
+	}
+	return true, planID
+}
+
 // planIDToTierFallback is the tier returned when a Razorpay plan_id cannot be
 // mapped to any configured tier. Deliberately the LOWEST paid tier (hobby)
 // rather than "pro": an env-var typo may result in a $9 Hobby grant instead
@@ -740,10 +836,20 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	}
 
 	// Synthetic-cohort skip-guard (migration 067): a test-cohort team must
-	// never reach the real Razorpay subscription-create call. Checked before
-	// the email gate / Redis dedup so a synthetic call consumes nothing.
-	if ok, errResp := h.rejectIfTestCohort(c, teamID, "checkout"); !ok {
-		return errResp
+	// never reach the real (LIVE) Razorpay subscription-create call. Checked
+	// before the email gate / Redis dedup so a synthetic call consumes nothing.
+	//
+	// Wave 4b exception: when the operator has configured rzp_test_* keys
+	// (testModeConfigured), a cohort team is ALLOWED to flow through so it can
+	// mint a real TEST-mode subscription (routed to the test account below).
+	// The post-planID resolution (resolveCheckoutTestMode) decides per-tier
+	// whether a test plan exists; if not, it falls back to the inert reject
+	// path right after the tier is known. When test mode is NOT configured,
+	// behaviour is unchanged: cohort teams are rejected here.
+	if !h.testModeConfigured() {
+		if ok, errResp := h.rejectIfTestCohort(c, teamID, "checkout"); !ok {
+			return errResp
+		}
 	}
 
 	// Email-verified gate (migration 052): a /claim-created account must
@@ -869,6 +975,31 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	}
 	planID := h.razorpayPlanIDFor(plan, frequency)
 
+	// ── Wave 4b: synthetic test-cohort → rzp_test_* routing ─────────────────
+	// Resolve, ONCE per call (goroutine-safe — derived from per-call args), the
+	// test-mode decision for this team+tier. The flow only reaches here for a
+	// cohort team when testModeConfigured()==true (the reject guard above was
+	// skipped). resolveCheckoutTestMode re-confirms is_test_cohort + a configured
+	// test plan_id for the tier:
+	//   - useTest=true  → swap planID to the test plan and route the create
+	//                     through the rzp_test_* keys via subBodyTestModeKey.
+	//                     Skip the live-key / billing_not_configured guards
+	//                     below (they validate the LIVE creds, irrelevant here).
+	//   - useTest=false on a cohort team (test keys set but no test plan for
+	//                     this tier — partial config) → fall back to the inert
+	//                     reject path so a cohort call never mints against the
+	//                     LIVE plan. Non-cohort teams: useTest=false, unchanged.
+	useTest, testPlanID := h.resolveCheckoutTestMode(c.Context(), teamID, plan)
+	if useTest {
+		planID = testPlanID
+	} else if h.testModeConfigured() {
+		// Re-run the cohort skip-guard for the partial-config case: a cohort
+		// team whose tier has no test plan must NOT proceed to the live path.
+		if ok, errResp := h.rejectIfTestCohort(c, teamID, "checkout"); !ok {
+			return errResp
+		}
+	}
+
 	// ── BUG-P112 live-key-in-dev guard ─────────────────────────────────────
 	// A LIVE Razorpay key pointed at a non-prod deployment is the
 	// BUG-P111/P112 root cause: anyone (even unauth, via the BUG-P111 SPA
@@ -881,7 +1012,10 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 	// deployment is dangerous EVEN IF the operator forgot to set
 	// RAZORPAY_PLAN_ID_TEAM — the underlying configuration drift is the
 	// signal we must surface first.
-	if code, message := detectBillingMisconfiguration(h.cfg.Environment, h.cfg.RazorpayKeyID); code != "" {
+	//
+	// Wave 4b: skipped on the test-mode path — the guard validates the LIVE
+	// key, but a test-cohort checkout deliberately uses rzp_test_* creds.
+	if code, message := detectBillingMisconfiguration(h.cfg.Environment, h.cfg.RazorpayKeyID); !useTest && code != "" {
 		// Derive (but DO NOT log) the key class. Logging the actual key value
 		// is a hard no — only the boolean derivation is safe.
 		derivedTrafficEnv, _ := trafficEnv(h.cfg.RazorpayKeyID)
@@ -897,13 +1031,22 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 			"https://instanode.dev/docs/operator/billing-modes")
 	}
 
-	if h.cfg.RazorpayKeyID == "" || h.cfg.RazorpayKeySecret == "" || planID == "" {
+	// Credential presence check. On the test-mode path validate the rzp_test_*
+	// creds (the live keys may legitimately be unset in CI); otherwise validate
+	// the live creds as before. planID is already the resolved (live or test)
+	// plan and must be non-empty either way.
+	keySet, secretSet := h.cfg.RazorpayKeyID != "", h.cfg.RazorpayKeySecret != ""
+	if useTest {
+		keySet, secretSet = h.cfg.RazorpayTestKeyID != "", h.cfg.RazorpayTestKeySecret != ""
+	}
+	if !keySet || !secretSet || planID == "" {
 		slog.Warn("billing.checkout.not_configured",
 			"team_id", teamID,
 			"plan", plan,
 			"plan_frequency", frequency,
-			"key_set", h.cfg.RazorpayKeyID != "",
-			"secret_set", h.cfg.RazorpayKeySecret != "",
+			"test_mode", useTest,
+			"key_set", keySet,
+			"secret_set", secretSet,
 			"plan_id_set", planID != "",
 			"request_id", requestID,
 		)
@@ -1037,6 +1180,15 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 		"quantity":        1,
 		"customer_notify": 1,
 		"notes":           notes,
+	}
+	// Wave 4b: tag the body so the production CreateSubscription closure routes
+	// this synthetic cohort create through the rzp_test_* credentials. The flag
+	// is a PRIVATE key the closure deletes before the body reaches Razorpay.
+	// Test overrides of CreateSubscription that don't care simply ignore it.
+	if useTest {
+		subBody[subBodyTestModeKey] = true
+		slog.Info("billing.checkout.test_mode",
+			"team_id", teamID, "plan", plan, "request_id", requestID)
 	}
 
 	// h.CreateSubscription wraps the outbound Subscription.Create with the
@@ -1203,7 +1355,22 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 	payload := c.Body()
 	sig := c.Get("X-Razorpay-Signature")
 
-	if !verifyRazorpaySignature(payload, sig, h.cfg.RazorpayWebhookSecret) {
+	// Wave 4b: verify against the LIVE webhook secret first, then (only if that
+	// fails) the rzp_test_* webhook secret. This lets a real test-mode
+	// subscription.charged/activated from Razorpay's TEST account upgrade a
+	// synthetic cohort team WITHOUT a separate endpoint, while live webhooks are
+	// unaffected (live secret matches first, test branch never runs). Both legs
+	// use the same constant-time verifier; an unset test secret is a no-op
+	// (verifyRazorpaySignature returns false on an empty secret). The live-first
+	// ordering means the common path costs exactly one HMAC.
+	sigOK := verifyRazorpaySignature(payload, sig, h.cfg.RazorpayWebhookSecret)
+	if !sigOK && h.cfg.RazorpayTestWebhookSecret != "" {
+		sigOK = verifyRazorpaySignature(payload, sig, h.cfg.RazorpayTestWebhookSecret)
+		if sigOK {
+			slog.Info("billing.webhook.verified_test_secret")
+		}
+	}
+	if !sigOK {
 		slog.Error("billing.webhook.signature_failed")
 		// B18 wave-3 hardening (2026-05-21): emit an audit_log row on every
 		// signature-mismatch attempt so an operator dashboard can chart
