@@ -1,0 +1,207 @@
+name: nr-ci-event
+description: >-
+  Emit a CI test-run result to New Relic so a red CI run (test, e2e, smoke,
+  deploy gate) is studyable from NR dashboards, not just GitHub logs. Posts an
+  InstantCITestRun custom event on every gated job, plus an InstantCITestFailure
+  event when result=fail. No-ops cleanly (logs the payload it WOULD send) when
+  the NR secret/account is absent — never fails the calling job because NR is
+  unreachable (fork PRs, secret not yet provisioned).
+
+# Mechanism (CLAUDE.md design ref docs/ci/01-CI-INTEGRATION-DESIGN.md §NR
+# observability): the NR Event API is a single HTTP POST to
+#   https://insights-collector.newrelic.com/v1/accounts/<acct>/events
+# authenticated with the ingest license key (the SAME NEW_RELIC_LICENSE_KEY the
+# Go agents use at runtime — it is a valid Insert Key for the Event API). The
+# account id is the numeric NEW_RELIC_ACCOUNT_ID. Both are passed as inputs from
+# repo secrets by the caller. When EITHER is empty the action prints the payload
+# and exits 0 (the no-op-without-secret contract — rule: never red a PR because
+# NR is down). EU-region accounts override the collector host via nr-region.
+
+inputs:
+  # --- NR credentials (caller passes from secrets; empty => no-op) ---
+  license-key:
+    description: >-
+      NR ingest license key (Insert Key for the Event API). Pass
+      `secrets.NEW_RELIC_LICENSE_KEY`. Empty => action no-ops (dry-run log).
+    required: false
+    default: ''
+  account-id:
+    description: >-
+      Numeric NR account id. Pass `secrets.NEW_RELIC_ACCOUNT_ID`.
+      Empty => action no-ops (dry-run log).
+    required: false
+    default: ''
+  nr-region:
+    description: 'US (default) or EU — selects the insights-collector host.'
+    required: false
+    default: 'US'
+
+  # --- event payload (caller fills from the GitHub context + job result) ---
+  result:
+    description: 'pass | fail — usually `job.status == ''success'' && ''pass'' || ''fail''`.'
+    required: true
+  suite:
+    description: >-
+      Logical suite name, e.g. build-and-test, coverage, playwright, pr-smoke,
+      e2e-prod, deploy-gate. The dashboard FACETs on this.
+    required: true
+  # NOTE: composite actions cannot read the `github` context in their own
+  # expressions, so the caller MUST pass these from its `with:` block (e.g.
+  # repo: `github.repository`). The defaults below only apply when a caller
+  # omits them entirely.
+  repo:
+    description: 'Repository (owner/name). Caller passes `github.repository`.'
+    required: false
+    default: ''
+  workflow:
+    description: 'Workflow name. Caller passes `github.workflow`.'
+    required: false
+    default: ''
+  branch:
+    description: 'Branch ref name. Caller passes `github.ref_name`.'
+    required: false
+    default: ''
+  commit-sha:
+    description: 'Commit SHA under test. Caller passes `github.sha`.'
+    required: false
+    default: ''
+  pr-number:
+    description: 'PR number (empty on push). Caller passes `github.event.pull_request.number`.'
+    required: false
+    default: ''
+  duration-ms:
+    description: 'Suite duration in milliseconds (0 if not measured).'
+    required: false
+    default: '0'
+  failed-step:
+    description: 'On failure: the step/phase that failed (free text, no PII). Empty on pass.'
+    required: false
+    default: ''
+  log-url:
+    description: 'URL to the run logs for triage. Caller passes the run URL.'
+    required: false
+    default: ''
+  event-name:
+    description: 'GitHub event name. Caller passes `github.event_name`.'
+    required: false
+    default: ''
+  actor:
+    description: 'GitHub actor. Caller passes `github.actor`.'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Emit CI result to New Relic (no-op without secret)
+      shell: bash
+      env:
+        # Composite actions may reference ONLY `inputs` (+ env/runner/steps) in
+        # their expressions — `secrets`, `job`, and `github` are NOT available
+        # here, so the CALLER resolves those and passes them as inputs. All
+        # untrusted/free-form values flow through env, never interpolated into
+        # the shell body (injection-safe — same posture as ci.yml's
+        # dispatch-auth-contract-e2e job).
+        NR_LICENSE_KEY: ${{ inputs.license-key }}
+        NR_ACCOUNT_ID: ${{ inputs.account-id }}
+        NR_REGION: ${{ inputs.nr-region }}
+        EV_RESULT: ${{ inputs.result }}
+        EV_SUITE: ${{ inputs.suite }}
+        EV_REPO: ${{ inputs.repo }}
+        EV_WORKFLOW: ${{ inputs.workflow }}
+        EV_BRANCH: ${{ inputs.branch }}
+        EV_COMMIT: ${{ inputs.commit-sha }}
+        EV_PR: ${{ inputs.pr-number }}
+        EV_DURATION_MS: ${{ inputs.duration-ms }}
+        EV_FAILED_STEP: ${{ inputs.failed-step }}
+        EV_LOG_URL: ${{ inputs.log-url }}
+        EV_EVENT_NAME: ${{ inputs.event-name }}
+        EV_ACTOR: ${{ inputs.actor }}
+      run: |
+        set -uo pipefail
+
+        # Normalise the result to the pass|fail enum the dashboard FACETs on.
+        # Anything that isn't exactly "pass" is treated as "fail" so a typo or
+        # a cancelled job reads as a non-pass (conservative — never a false green).
+        case "${EV_RESULT}" in
+          pass) RESULT="pass" ;;
+          *)    RESULT="fail" ;;
+        esac
+
+        # Build the InstantCITestRun event (always) and, on fail, the
+        # InstantCITestFailure event. jq composes the JSON so every value is
+        # passed as an argument (no shell concatenation of free-form text).
+        DURATION="${EV_DURATION_MS}"
+        case "${DURATION}" in ''|*[!0-9]*) DURATION=0 ;; esac
+
+        RUN_EVENT=$(jq -n -c \
+          --arg eventType "InstantCITestRun" \
+          --arg repo "${EV_REPO}" \
+          --arg workflow "${EV_WORKFLOW}" \
+          --arg branch "${EV_BRANCH}" \
+          --arg commit_sha "${EV_COMMIT}" \
+          --arg pr_number "${EV_PR}" \
+          --arg result "${RESULT}" \
+          --arg suite "${EV_SUITE}" \
+          --arg event_name "${EV_EVENT_NAME}" \
+          --arg actor "${EV_ACTOR}" \
+          --arg log_url "${EV_LOG_URL}" \
+          --argjson duration_ms "${DURATION}" \
+          '{eventType:$eventType, repo:$repo, workflow:$workflow, branch:$branch,
+            commit_sha:$commit_sha, pr_number:$pr_number, result:$result,
+            suite:$suite, event_name:$event_name, actor:$actor, log_url:$log_url,
+            duration_ms:$duration_ms}')
+
+        PAYLOAD="[${RUN_EVENT}]"
+        if [ "${RESULT}" = "fail" ]; then
+          FAIL_EVENT=$(jq -n -c \
+            --arg eventType "InstantCITestFailure" \
+            --arg repo "${EV_REPO}" \
+            --arg workflow "${EV_WORKFLOW}" \
+            --arg branch "${EV_BRANCH}" \
+            --arg commit_sha "${EV_COMMIT}" \
+            --arg pr_number "${EV_PR}" \
+            --arg suite "${EV_SUITE}" \
+            --arg failed_step "${EV_FAILED_STEP}" \
+            --arg log_url "${EV_LOG_URL}" \
+            --arg event_name "${EV_EVENT_NAME}" \
+            '{eventType:$eventType, repo:$repo, workflow:$workflow, branch:$branch,
+              commit_sha:$commit_sha, pr_number:$pr_number, suite:$suite,
+              failed_step:$failed_step, log_url:$log_url, event_name:$event_name}')
+          PAYLOAD="[${RUN_EVENT},${FAIL_EVENT}]"
+        fi
+
+        # No-op-without-secret contract: print what WOULD be sent and exit 0 so
+        # a fork PR (no secret) or an unprovisioned repo never reds because NR
+        # is unreachable.
+        if [ -z "${NR_LICENSE_KEY}" ] || [ -z "${NR_ACCOUNT_ID}" ]; then
+          echo "::notice title=nr-ci-event::NEW_RELIC_LICENSE_KEY or NEW_RELIC_ACCOUNT_ID absent — dry-run only (no event sent)."
+          echo "would POST to NR Event API the following payload:"
+          echo "${PAYLOAD}" | jq .
+          exit 0
+        fi
+
+        case "$(echo "${NR_REGION}" | tr '[:lower:]' '[:upper:]')" in
+          EU) HOST="insights-collector.eu01.nr-data.net" ;;
+          *)  HOST="insights-collector.newrelic.com" ;;
+        esac
+        URL="https://${HOST}/v1/accounts/${NR_ACCOUNT_ID}/events"
+
+        echo "POSTing ${RESULT} result for suite='${EV_SUITE}' to NR account ${NR_ACCOUNT_ID} (${HOST})"
+        HTTP_CODE=$(curl -sS -o /tmp/nr_ci_event.out -w '%{http_code}' \
+          -X POST "${URL}" \
+          -H "Content-Type: application/json" \
+          -H "Api-Key: ${NR_LICENSE_KEY}" \
+          --data-binary "${PAYLOAD}" || echo "000")
+
+        echo "NR Event API responded HTTP ${HTTP_CODE}"
+        cat /tmp/nr_ci_event.out 2>/dev/null || true
+        echo
+
+        # NR returns 200 on accept. Any other code (incl. network failure 000)
+        # is logged as a warning but NEVER fails the job — observability must
+        # not gate the pipeline.
+        if [ "${HTTP_CODE}" != "200" ]; then
+          echo "::warning title=nr-ci-event::NR Event API returned ${HTTP_CODE} (expected 200). CI result not recorded in NR; not failing the job."
+        fi
+        exit 0

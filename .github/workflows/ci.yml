@@ -179,6 +179,29 @@ jobs:
       #     the BillingHandler.ensureRazorpayFns data race.
       - run: go test ./... -short -race -count=1 -p 1
 
+      # Wave 5 — push the gated-test result to New Relic so a red run is
+      # studyable from an NR dashboard, not just the GitHub Actions log.
+      # if: always() so a FAILED `go test` step still records the failure
+      # (InstantCITestRun result=fail + InstantCITestFailure). No-ops cleanly
+      # when the NR secret/account is absent (fork PRs) — never reds the PR.
+      - name: Emit CI result to New Relic
+        if: always()
+        uses: ./.github/actions/nr-ci-event
+        with:
+          license-key: ${{ secrets.NEW_RELIC_LICENSE_KEY }}
+          account-id: ${{ secrets.NEW_RELIC_ACCOUNT_ID }}
+          result: ${{ job.status == 'success' && 'pass' || 'fail' }}
+          suite: build-and-test
+          pr-number: ${{ github.event.pull_request.number }}
+          failed-step: ${{ job.status != 'success' && 'go build / vet / test (-short -race -p 1)' || '' }}
+          repo: ${{ github.repository }}
+          workflow: ${{ github.workflow }}
+          branch: ${{ github.ref_name }}
+          commit-sha: ${{ github.sha }}
+          log-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          event-name: ${{ github.event_name }}
+          actor: ${{ github.actor }}
+
   # E2E requires a live Kubernetes stack (see repo CLAUDE.md). This job does not
   # run on push/PR — only on schedule or manual dispatch — so default CI stays fast.
   e2e:

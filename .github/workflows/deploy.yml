@@ -323,3 +323,25 @@ jobs:
           done
           echo "::error::live /healthz never reported commit_id=${SHORT_SHA}"
           exit 1
+
+      # Wave 5 — record the deploy outcome in New Relic (suite=deploy) so a
+      # failed deploy (test gate, image build, rollout, or the /healthz
+      # build-SHA gate above) is studyable from the CI-health dashboard, not
+      # only the Actions log. if: always() captures the failure path.
+      # No-ops without the NR secret.
+      - name: Emit deploy result to New Relic
+        if: always()
+        uses: ./api/.github/actions/nr-ci-event
+        with:
+          license-key: ${{ secrets.NEW_RELIC_LICENSE_KEY }}
+          account-id: ${{ secrets.NEW_RELIC_ACCOUNT_ID }}
+          result: ${{ job.status == 'success' && 'pass' || 'fail' }}
+          suite: deploy
+          failed-step: ${{ job.status != 'success' && 'deploy (test gate / build / rollout / healthz SHA gate)' || '' }}
+          repo: ${{ github.repository }}
+          workflow: ${{ github.workflow }}
+          branch: ${{ github.ref_name }}
+          commit-sha: ${{ github.sha }}
+          log-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          event-name: ${{ github.event_name }}
+          actor: ${{ github.actor }}
