@@ -102,6 +102,33 @@ func TestRazorpayTestPlanIDFor_OnlySelfServeTiers(t *testing.T) {
 	assert.Equal(t, "", handlers.ExerciseRazorpayTestPlanIDFor(bh, "nonsense"))
 }
 
+// TestCreateSubscription_TestModeDefaultClosure exercises the PRODUCTION
+// default CreateSubscription closure with the private test-mode flag set, so
+// the rzp_test_* key-swap + flag-strip branch runs (no DB; the unconfigured
+// Razorpay call errors out, which is fine — we only need the closure body to
+// execute). Pairs with the non-flag ExerciseCreateSubscription.
+func TestCreateSubscription_TestModeDefaultClosure(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{RazorpayTestKeyID: testCohortKeyID, RazorpayTestKeySecret: testCohortKeySecret}
+	bh := handlers.NewBillingHandler(nil, cfg, nil)
+	handlers.ExerciseCreateSubscriptionTestMode(bh) // must not panic
+}
+
+// TestResolveCheckoutTestMode_FailsClosedOnDBError proves the is_test_cohort
+// lookup error path returns useTest=false (fail CLOSED) so a DB blip never
+// routes a real customer through the test account. A closed *sql.DB makes
+// IsTestCohort return an error.
+func TestResolveCheckoutTestMode_FailsClosedOnDBError(t *testing.T) {
+	cov2NeedsDB(t)
+	db, clean := testhelpers.SetupTestDB(t)
+	cfg := &config.Config{RazorpayTestKeyID: testCohortKeyID, RazorpayTestKeySecret: testCohortKeySecret, RazorpayTestPlanIDPro: testCohortPlanPro}
+	bh := handlers.NewBillingHandler(db, cfg, nil)
+	clean() // close the DB so IsTestCohort errors
+	useTest, planID := handlers.ExerciseResolveCheckoutTestMode(bh, context.Background(), uuid.New(), "pro")
+	assert.False(t, useTest, "a DB error on is_test_cohort must fail CLOSED (live path)")
+	assert.Equal(t, "", planID)
+}
+
 // ── Full routing tests (DB-gated) ────────────────────────────────────────────
 
 // TestCohortCheckout_UsesTestKeyAndPlan is the core Wave 4b proof: a cohort
