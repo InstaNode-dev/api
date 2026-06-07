@@ -81,7 +81,7 @@ type errorCodeMeta struct {
 // Used by respondError when status >= 500 and the code is not in the
 // registry. Keeps the agent_action field populated even for plumbing
 // errors so the calling agent always has something concrete to relay.
-const AgentActionContactSupport = "Tell the user something on our side went wrong. Email support@instanode.dev with this request_id and a brief description — see https://instanode.dev/support."
+const AgentActionContactSupport = "Tell the user something on our side went wrong. Email contact@instanode.dev with this request_id and a brief description — see https://instanode.dev/support."
 
 // codeToAgentAction maps respondError `code` values to the sentence the
 // agent should surface and, where relevant, the upgrade URL. Codes absent
@@ -152,7 +152,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	// right "not yet available / contact sales" message. Refs: memory
 	// `project_team_plan_not_rolled_out_no_payment`.
 	"tier_not_yet_available": {
-		AgentAction: "Tell the user the Team plan is not yet available for self-serve purchase. They should contact support@instanode.dev — see https://instanode.dev/pricing.",
+		AgentAction: "Tell the user the Team plan is not yet available for self-serve purchase. They should contact contact@instanode.dev — see https://instanode.dev/pricing.",
 		UpgradeURL:  "https://instanode.dev/pricing",
 	},
 	"events_query_failed": {
@@ -288,7 +288,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user this invitation has already been accepted — they're on the team. Have them open https://instanode.dev/app to see their resources.",
 	},
 	"already_claimed": {
-		AgentAction: "Tell the user these resources were already claimed by another account. If they believe this is wrong, have them email support@instanode.dev — see https://instanode.dev/support.",
+		AgentAction: "Tell the user these resources were already claimed by another account. If they believe this is wrong, have them email contact@instanode.dev — see https://instanode.dev/support.",
 	},
 
 	// ── Expired / gone ─────────────────────────────────────────────────────
@@ -663,7 +663,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user their session belongs to a different team than the storage token. Re-authenticate as the token's owning team — see https://instanode.dev/docs/auth.",
 	},
 	"env_load_failed": {
-		AgentAction: "Tell the user the persisted environment variables could not be loaded for this stack. Retry the redeploy in 30 seconds — see https://instanode.dev/status. If it keeps failing, email support@instanode.dev with the request_id.",
+		AgentAction: "Tell the user the persisted environment variables could not be loaded for this stack. Retry the redeploy in 30 seconds — see https://instanode.dev/status. If it keeps failing, email contact@instanode.dev with the request_id.",
 	},
 	"invalid_service": {
 		AgentAction: "Tell the user the service value is unknown. Use one of: postgres, redis, mongodb, queue, storage, webhook, vector — see https://instanode.dev/docs.",
@@ -876,7 +876,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user billing is not configured on this deployment. Operators must set RAZORPAY_KEY_ID / SECRET — see https://instanode.dev/docs/billing.",
 	},
 	"downgrade_not_self_serve": {
-		AgentAction: "Tell the user downgrades and cancellations are not self-serve. Email support@instanode.dev — see https://instanode.dev/support.",
+		AgentAction: "Tell the user downgrades and cancellations are not self-serve. Email contact@instanode.dev — see https://instanode.dev/support.",
 	},
 	"yearly_change_plan_unsupported": {
 		AgentAction: "Tell the user yearly subscriptions can't switch plans inline. Cancel the current subscription, then start the new plan at https://instanode.dev/pricing.",
@@ -888,7 +888,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 
 	// ── Razorpay codes (kept as raw passthrough) ───────────────────────────
 	"razorpay_error": {
-		AgentAction: "Tell the user Razorpay returned an error completing the payment. Check the error message and retry, or contact support@instanode.dev — see https://instanode.dev/support.",
+		AgentAction: "Tell the user Razorpay returned an error completing the payment. Check the error message and retry, or contact contact@instanode.dev — see https://instanode.dev/support.",
 	},
 
 	// ── Validation 4xx: signature / state ──────────────────────────────────
@@ -939,7 +939,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the platform database hit a transient error. Retry in 30 seconds with exponential backoff — see https://instanode.dev/status if it persists.",
 	},
 	"internal_error": {
-		AgentAction: "Tell the user something on our side went wrong. Email support@instanode.dev with this request_id, or check https://instanode.dev/status.",
+		AgentAction: "Tell the user something on our side went wrong. Email contact@instanode.dev with this request_id, or check https://instanode.dev/status.",
 	},
 	"lookup_failed": {
 		AgentAction: "Tell the user a lookup on the platform backend timed out. Retry in 30 seconds — see https://instanode.dev/status.",
@@ -988,7 +988,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user creating the restore failed. Retry in 60 seconds — see https://instanode.dev/status.",
 	},
 	"restore_failed": {
-		AgentAction: "Tell the user the restore did not complete. Retry in 60 seconds; if it persists email support@instanode.dev — see https://instanode.dev/status.",
+		AgentAction: "Tell the user the restore did not complete. Retry in 60 seconds; if it persists email contact@instanode.dev — see https://instanode.dev/status.",
 	},
 	"deletion_request_failed": {
 		AgentAction: "Tell the user the team-deletion request failed to persist. Retry in 30 seconds — see https://instanode.dev/status.",
@@ -1000,10 +1000,10 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user recording the promote rejection failed. Retry the rejection in 30 seconds — see https://instanode.dev/status.",
 	},
 	"execute_failed": {
-		AgentAction: "Tell the user executing the action failed. Retry in 30 seconds; if it persists email support@instanode.dev — see https://instanode.dev/support.",
+		AgentAction: "Tell the user executing the action failed. Retry in 30 seconds; if it persists email contact@instanode.dev — see https://instanode.dev/support.",
 	},
 	"summary_failed": {
-		AgentAction: "Tell the user computing the summary failed. Retry in 30 seconds; if it persists email support@instanode.dev — see https://instanode.dev/support.",
+		AgentAction: "Tell the user computing the summary failed. Retry in 30 seconds; if it persists email contact@instanode.dev — see https://instanode.dev/support.",
 	},
 	"status_failed": {
 		AgentAction: "Tell the user reading the status failed. Retry in 30 seconds — see https://instanode.dev/status.",
@@ -1012,13 +1012,13 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user reading the resource status failed. Retry in 30 seconds — see https://instanode.dev/status.",
 	},
 	"tier_failed": {
-		AgentAction: "Tell the user updating the tier failed. Retry in 30 seconds; if it persists email support@instanode.dev — see https://instanode.dev/support.",
+		AgentAction: "Tell the user updating the tier failed. Retry in 30 seconds; if it persists email contact@instanode.dev — see https://instanode.dev/support.",
 	},
 	"upgrade_failed": {
-		AgentAction: "Tell the user the tier upgrade could not be applied right now. Retry in 30 seconds; if it persists email support@instanode.dev — see https://instanode.dev/support.",
+		AgentAction: "Tell the user the tier upgrade could not be applied right now. Retry in 30 seconds; if it persists email contact@instanode.dev — see https://instanode.dev/support.",
 	},
 	"revocation_failed": {
-		AgentAction: "Tell the user revoking the session failed. Retry in 30 seconds; if it persists email support@instanode.dev — see https://instanode.dev/support.",
+		AgentAction: "Tell the user revoking the session failed. Retry in 30 seconds; if it persists email contact@instanode.dev — see https://instanode.dev/support.",
 	},
 	"role_lookup_failed": {
 		AgentAction: "Tell the user a team-role lookup failed. Retry in 30 seconds — see https://instanode.dev/status.",
@@ -1027,13 +1027,13 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user a team lookup failed. Retry in 30 seconds — see https://instanode.dev/status.",
 	},
 	"team_creation_failed": {
-		AgentAction: "Tell the user creating the team failed. Retry in 30 seconds; if it persists email support@instanode.dev — see https://instanode.dev/support.",
+		AgentAction: "Tell the user creating the team failed. Retry in 30 seconds; if it persists email contact@instanode.dev — see https://instanode.dev/support.",
 	},
 	"team_has_no_users": {
 		AgentAction: "Tell the user this team has no users yet — add an owner before issuing operations against it. See https://instanode.dev/docs/team.",
 	},
 	"user_creation_failed": {
-		AgentAction: "Tell the user creating the user account failed. Retry in 30 seconds; if it persists email support@instanode.dev — see https://instanode.dev/support.",
+		AgentAction: "Tell the user creating the user account failed. Retry in 30 seconds; if it persists email contact@instanode.dev — see https://instanode.dev/support.",
 	},
 	"user_upsert_failed": {
 		AgentAction: "Tell the user upserting the user record failed. Retry in 30 seconds — see https://instanode.dev/status.",
@@ -1061,10 +1061,10 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	},
 	// (deletion_token_invalid covered in the deletion-confirmed section above)
 	"encryption_failed": {
-		AgentAction: "Tell the user the encryption step failed. Retry in 30 seconds; if it persists email support@instanode.dev with this request_id — see https://instanode.dev/support.",
+		AgentAction: "Tell the user the encryption step failed. Retry in 30 seconds; if it persists email contact@instanode.dev with this request_id — see https://instanode.dev/support.",
 	},
 	"decrypt_failed": {
-		AgentAction: "Tell the user decrypting the stored credential failed. Retry in 30 seconds; if it persists email support@instanode.dev with this request_id — see https://instanode.dev/support.",
+		AgentAction: "Tell the user decrypting the stored credential failed. Retry in 30 seconds; if it persists email contact@instanode.dev with this request_id — see https://instanode.dev/support.",
 	},
 	"encryption_unavailable": {
 		AgentAction: "Tell the user the encryption backend is temporarily unavailable. Retry in 60 seconds — see https://instanode.dev/status.",
@@ -1127,7 +1127,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user the quota check failed. Retry in 30 seconds — see https://instanode.dev/status.",
 	},
 	"billing_persistence_failed": {
-		AgentAction: "Tell the user persisting the billing change failed. Retry the action in 30 seconds; if it persists email support@instanode.dev with this request_id — see https://instanode.dev/support.",
+		AgentAction: "Tell the user persisting the billing change failed. Retry the action in 30 seconds; if it persists email contact@instanode.dev with this request_id — see https://instanode.dev/support.",
 	},
 
 	// ── 429 rate-limited (canonical) ───────────────────────────────────────
@@ -1186,7 +1186,7 @@ var codeToAgentAction = map[string]errorCodeMeta{
 		AgentAction: "Tell the user marking the deletion as confirmed failed. Retry in 30 seconds — see https://instanode.dev/status.",
 	},
 	"subscription_cancel_failed": {
-		AgentAction: "Tell the user cancelling the Razorpay subscription failed. The team-delete is paused; email support@instanode.dev so an operator can reconcile — see https://instanode.dev/support.",
+		AgentAction: "Tell the user cancelling the Razorpay subscription failed. The team-delete is paused; email contact@instanode.dev so an operator can reconcile — see https://instanode.dev/support.",
 	},
 
 	// ── Auth content-type gate (AUTH-163, CSRF). Per-IP rate-limit (AUTH-097/107)

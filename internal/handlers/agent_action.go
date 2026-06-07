@@ -347,7 +347,7 @@ const AgentActionBindingLookupFailed = "Tell the user the platform couldn't reso
 // the middleware can't import handlers (cycle), so both sides keep their
 // own copy. The contract test asserts only one of the two copies; touching
 // either without the other is the regression we want CI to catch.
-const AgentActionAdminRequired = "Tell the user this endpoint requires platform-admin access. Ask support@instanode.dev via https://instanode.dev/support if you think this is wrong."
+const AgentActionAdminRequired = "Tell the user this endpoint requires platform-admin access. Ask contact@instanode.dev via https://instanode.dev/support if you think this is wrong."
 
 // newAgentActionAdminTierChanged is returned in the success response of
 // POST /api/v1/admin/customers/:team_id/tier so the calling agent has

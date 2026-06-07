@@ -192,7 +192,7 @@ func TestAdminAuditEmit_RateLimited_Writes403Row(t *testing.T) {
 			"ok":           false,
 			"error":        "forbidden",
 			"message":      "platform-admin access required",
-			"agent_action": "Tell the user this endpoint requires platform-admin access. Ask support@instanode.dev via https://instanode.dev/support if you think this is wrong.",
+			"agent_action": "Tell the user this endpoint requires platform-admin access. Ask contact@instanode.dev via https://instanode.dev/support if you think this is wrong.",
 		})
 	})
 
