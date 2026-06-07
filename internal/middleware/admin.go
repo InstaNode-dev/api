@@ -44,7 +44,7 @@ const AdminEmailsEnvVar = "ADMIN_EMAILS"
 // Duplicated here rather than imported because middleware is depended on by
 // handlers, not the other way around; a cross-import would introduce a
 // cycle. The handlers package re-exports the same string as a constant.
-const adminForbiddenAgentAction = "Tell the user this endpoint requires platform-admin access. Ask support@instanode.dev via https://instanode.dev/support if you think this is wrong."
+const adminForbiddenAgentAction = "Tell the user this endpoint requires platform-admin access. Ask contact@instanode.dev via https://instanode.dev/support if you think this is wrong."
 
 // AdminEmailAllowlist returns the parsed, lowercased ADMIN_EMAILS set. Empty
 // when ADMIN_EMAILS is unset or blank. Exported so tests / observability

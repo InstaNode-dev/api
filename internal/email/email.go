@@ -553,11 +553,11 @@ func clampAttemptCount(n int) int {
 // TEXT column on the table, so adding a new kind never needs a migration —
 // the only invariant is "operators can filter by kind in the dashboard".
 const (
-	EmailSendKindPaymentFailed    = "payment_failed"
-	EmailSendKindPaymentReceipt   = "receipt"
-	EmailSendKindTeamInvite       = "team_invite"
-	EmailSendKindDeletionConfirm  = "deletion_confirm"
-	EmailSendKindMagicLink        = "magic_link"
+	EmailSendKindPaymentFailed   = "payment_failed"
+	EmailSendKindPaymentReceipt  = "receipt"
+	EmailSendKindTeamInvite      = "team_invite"
+	EmailSendKindDeletionConfirm = "deletion_confirm"
+	EmailSendKindMagicLink       = "magic_link"
 )
 
 // SendPaymentFailed sends a payment failure notification email.
@@ -728,7 +728,7 @@ Receipt
 
 View your billing details: https://instanode.dev/app/billing
 
-Need help? Reply to this email or contact support@instanode.dev.
+Need help? Reply to this email or contact contact@instanode.dev.
 
 — The instanode.dev team
 `, headline, leadPlain, receipt.Plan, amountPlain, receipt.Period)
@@ -752,7 +752,7 @@ Need help? Reply to this email or contact support@instanode.dev.
   </p>
   <p style="margin-top:24px;color:#666;font-size:13px;">
     Need help? Reply to this email or contact
-    <a href="mailto:support@instanode.dev" style="color:#444;">support@instanode.dev</a>.
+    <a href="mailto:contact@instanode.dev" style="color:#444;">contact@instanode.dev</a>.
   </p>
   <p style="margin-top:40px;color:#666;font-size:13px;">— The instanode.dev team</p>
 </body>
