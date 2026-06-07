@@ -77,6 +77,42 @@ func TestDeleteTeamHard_DeletesAndIsIdempotent(t *testing.T) {
 	require.False(t, deleted, "re-delete of a gone team is a clean no-op")
 }
 
+// TestDeleteTeamHard_CascadesPendingCheckouts is the regression guard for
+// migration 069: a team that started a checkout has a pending_checkouts row, and
+// before 069 that FK had no ON DELETE CASCADE — so DeleteTeamHard (the e2e reap)
+// failed with `pending_checkouts_team_id_fkey` and the cohort team LEAKED. This
+// surfaced the instant test-cohort checkout was armed (a cohort Pro upgrade
+// creates a pending_checkouts row → the reap 503'd). With the cascade, deleting
+// the team removes its pending_checkouts rows and the reap succeeds.
+func TestDeleteTeamHard_CascadesPendingCheckouts(t *testing.T) {
+	skipUnlessE2EModelsDB(t)
+	ctx := context.Background()
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+
+	team, err := models.CreateTestCohortTeam(ctx, db, "cohort-with-checkout")
+	require.NoError(t, err)
+
+	// Seed a pending_checkouts row (the exact FK that used to block the delete).
+	subID := "sub_test_" + uuid.NewString()
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO pending_checkouts (subscription_id, team_id, customer_email, plan_tier)
+		 VALUES ($1, $2, $3, $4)`,
+		subID, team.ID, "cohort@example.com", "pro")
+	require.NoError(t, err, "seed pending_checkouts")
+
+	// Pre-069 this returned the FK-violation error; with the cascade it succeeds.
+	deleted, err := models.DeleteTeamHard(ctx, db, team.ID)
+	require.NoError(t, err, "DeleteTeamHard must cascade pending_checkouts, not error on the FK")
+	require.True(t, deleted)
+
+	// The child row is gone too (cascaded), not orphaned.
+	var n int
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT count(*) FROM pending_checkouts WHERE subscription_id = $1`, subID).Scan(&n))
+	require.Equal(t, 0, n, "pending_checkouts row must be cascade-deleted with the team")
+}
+
 func TestMarkTeamResourcesForReaper_RetiersAndExpires(t *testing.T) {
 	skipUnlessE2EModelsDB(t)
 	ctx := context.Background()
