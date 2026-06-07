@@ -552,11 +552,16 @@ func (h *BillingHandler) razorpayPlanIDFor(tier, frequency string) string {
 
 // testModeConfigured reports whether the operator has wired the minimum
 // rzp_test_* credentials (key id + secret) for the synthetic test-cohort
-// checkout path. When false the whole test-mode path is INERT: a cohort team
-// falls back to the normal skip/inert behaviour (rejectIfTestCohort), and the
-// live path is never affected.
+// checkout path AND explicitly enabled the test-mode kill-switch
+// (PAYMENT_TEST_MODE_ENABLED). When false the whole test-mode path is INERT: a
+// cohort team falls back to the normal skip/inert behaviour
+// (rejectIfTestCohort), and the live path is never affected. The flag is
+// required on TOP of the secrets so the on/off decision is independent of the
+// secret values — an operator can kill test-mode routing instantly without
+// rotating keys, and a leftover test plan_id cannot silently affect billing.
 func (h *BillingHandler) testModeConfigured() bool {
-	return h.cfg.RazorpayTestKeyID != "" && h.cfg.RazorpayTestKeySecret != ""
+	return h.cfg.PaymentTestModeEnabled &&
+		h.cfg.RazorpayTestKeyID != "" && h.cfg.RazorpayTestKeySecret != ""
 }
 
 // razorpayTestPlanIDFor returns the configured rzp_test_* plan_id for a
@@ -667,16 +672,33 @@ func (h *BillingHandler) planIDToTier(planID string) string {
 	if h.cfg.RazorpayPlanIDProYearly != "" && planID == h.cfg.RazorpayPlanIDProYearly {
 		return "pro"
 	}
+	// rzp_test_* plan IDs (test-cohort checkout). A TEST-mode
+	// subscription.activated/charged webhook carries the TEST plan_id, which must
+	// map to the SAME canonical tier as its live counterpart — otherwise a
+	// test-cohort upgrade silently lands on the fail-safe fallback (hobby) and
+	// emits a bogus billing.charge_undeliverable. Test plans only exist in
+	// Razorpay TEST mode, so they can never collide with a live plan_id. Grouped
+	// with their tier to preserve the most-paid→least-paid ordering.
+	// See resolveCheckoutTestMode + RAZORPAY_TEST_PLAN_ID_*.
+	if h.cfg.RazorpayTestPlanIDPro != "" && planID == h.cfg.RazorpayTestPlanIDPro {
+		return "pro"
+	}
 	if h.cfg.RazorpayPlanIDHobbyPlus != "" && planID == h.cfg.RazorpayPlanIDHobbyPlus {
 		return "hobby_plus"
 	}
 	if h.cfg.RazorpayPlanIDHobbyPlusYearly != "" && planID == h.cfg.RazorpayPlanIDHobbyPlusYearly {
 		return "hobby_plus"
 	}
+	if h.cfg.RazorpayTestPlanIDHobbyPlus != "" && planID == h.cfg.RazorpayTestPlanIDHobbyPlus {
+		return "hobby_plus"
+	}
 	if h.cfg.RazorpayPlanIDHobby != "" && planID == h.cfg.RazorpayPlanIDHobby {
 		return "hobby"
 	}
 	if h.cfg.RazorpayPlanIDHobbyYearly != "" && planID == h.cfg.RazorpayPlanIDHobbyYearly {
+		return "hobby"
+	}
+	if h.cfg.RazorpayTestPlanIDHobby != "" && planID == h.cfg.RazorpayTestPlanIDHobby {
 		return "hobby"
 	}
 	// No configured plan_id matched. Log at Error level so NR picks this up as
@@ -706,6 +728,12 @@ func (h *BillingHandler) planIDRecognised(planID string) bool {
 		h.cfg.RazorpayPlanIDPro, h.cfg.RazorpayPlanIDProYearly,
 		h.cfg.RazorpayPlanIDHobbyPlus, h.cfg.RazorpayPlanIDHobbyPlusYearly,
 		h.cfg.RazorpayPlanIDHobby, h.cfg.RazorpayPlanIDHobbyYearly,
+		// rzp_test_* plan IDs (test-cohort checkout) are genuine, configured
+		// plan IDs — a test-mode subscription.charged for one is recognised, not
+		// a make-good guess. Kept in sync with planIDToTier's test-plan branches.
+		h.cfg.RazorpayTestPlanIDPro,
+		h.cfg.RazorpayTestPlanIDHobbyPlus,
+		h.cfg.RazorpayTestPlanIDHobby,
 	} {
 		if configured != "" && planID == configured {
 			return true
@@ -1356,15 +1384,17 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 	sig := c.Get("X-Razorpay-Signature")
 
 	// Wave 4b: verify against the LIVE webhook secret first, then (only if that
-	// fails) the rzp_test_* webhook secret. This lets a real test-mode
-	// subscription.charged/activated from Razorpay's TEST account upgrade a
-	// synthetic cohort team WITHOUT a separate endpoint, while live webhooks are
-	// unaffected (live secret matches first, test branch never runs). Both legs
-	// use the same constant-time verifier; an unset test secret is a no-op
-	// (verifyRazorpaySignature returns false on an empty secret). The live-first
-	// ordering means the common path costs exactly one HMAC.
+	// fails AND the test-mode kill-switch is ON) the rzp_test_* webhook secret.
+	// This lets a real test-mode subscription.charged/activated from Razorpay's
+	// TEST account upgrade a synthetic cohort team WITHOUT a separate endpoint,
+	// while live webhooks are unaffected (live secret matches first, test branch
+	// never runs). Both legs use the same constant-time verifier. The test branch
+	// is additionally gated on PaymentTestModeEnabled so a configured-but-disabled
+	// deployment never honours a test-signed webhook (fail-CLOSED, same flag that
+	// gates checkout routing). An unset test secret is a no-op anyway. The
+	// live-first ordering means the common path costs exactly one HMAC.
 	sigOK := verifyRazorpaySignature(payload, sig, h.cfg.RazorpayWebhookSecret)
-	if !sigOK && h.cfg.RazorpayTestWebhookSecret != "" {
+	if !sigOK && h.cfg.PaymentTestModeEnabled && h.cfg.RazorpayTestWebhookSecret != "" {
 		sigOK = verifyRazorpaySignature(payload, sig, h.cfg.RazorpayTestWebhookSecret)
 		if sigOK {
 			slog.Info("billing.webhook.verified_test_secret")

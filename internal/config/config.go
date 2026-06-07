@@ -66,7 +66,17 @@ type Config struct {
 	RazorpayTestPlanIDHobby     string // RAZORPAY_TEST_PLAN_ID_HOBBY
 	RazorpayTestPlanIDHobbyPlus string // RAZORPAY_TEST_PLAN_ID_HOBBY_PLUS
 	RazorpayTestPlanIDPro       string // RAZORPAY_TEST_PLAN_ID_PRO
-	ResendAPIKey                string
+	// PaymentTestModeEnabled is the explicit kill-switch for the whole
+	// test-cohort checkout path (RAZORPAY_TEST_PLAN_MODE_ENABLED). Default
+	// FALSE / fail-CLOSED: even when the rzp_test_* keys + plan_ids above are
+	// all configured, NO checkout routes through them and NO test webhook
+	// secret is honoured unless this flag is explicitly ON. This gives an
+	// operator a single flip to disable real-money-adjacent test-mode routing
+	// independently of the secret values (which stay in instant-secrets), so a
+	// leftover test plan_id can never silently alter a live customer's billing.
+	// resolveCheckoutTestMode + the webhook try-both verify both require it.
+	PaymentTestModeEnabled bool
+	ResendAPIKey           string
 	// EmailProvider explicitly selects the outbound email backend. Accepted
 	// values: "brevo" | "resend" | "noop". When empty, internal/email
 	// auto-detects: BREVO_API_KEY > RESEND_API_KEY (≠ "CHANGE_ME") > noop.
@@ -571,6 +581,21 @@ func Load() *Config {
 		cfg.ResourceCountCapsEnabled = true
 	default:
 		cfg.ResourceCountCapsEnabled = false
+	}
+
+	// PAYMENT_TEST_MODE_ENABLED: default FALSE / fail-CLOSED. The explicit
+	// kill-switch for test-cohort checkout routing through the rzp_test_* keys.
+	// Off → resolveCheckoutTestMode never returns useTest=true and the webhook
+	// handler ignores the test webhook secret, regardless of whether the
+	// RAZORPAY_TEST_* secrets are configured. This separates the on/off decision
+	// (this flag) from the secret values (instant-secrets) so test-mode routing
+	// can be killed instantly without rotating keys, and a stale test plan_id
+	// can never touch a live customer's billing.
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PAYMENT_TEST_MODE_ENABLED"))) {
+	case "true", "1", "yes":
+		cfg.PaymentTestModeEnabled = true
+	default:
+		cfg.PaymentTestModeEnabled = false
 	}
 
 	// GITHUB_APP_ENABLED: default FALSE (off until the operator registers the

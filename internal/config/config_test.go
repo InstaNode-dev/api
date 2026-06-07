@@ -40,6 +40,9 @@ func allKeys() []string {
 		"RAZORPAY_PLAN_ID_TEAM", "RAZORPAY_PLAN_ID_HOBBY_ANNUAL",
 		"RAZORPAY_PLAN_ID_HOBBY_PLUS_ANNUAL", "RAZORPAY_PLAN_ID_PRO_ANNUAL",
 		"RAZORPAY_PLAN_ID_GROWTH_ANNUAL", "RAZORPAY_PLAN_ID_TEAM_ANNUAL",
+		"RAZORPAY_TEST_KEY_ID", "RAZORPAY_TEST_KEY_SECRET", "RAZORPAY_TEST_WEBHOOK_SECRET",
+		"RAZORPAY_TEST_PLAN_ID_HOBBY", "RAZORPAY_TEST_PLAN_ID_HOBBY_PLUS",
+		"RAZORPAY_TEST_PLAN_ID_PRO", "PAYMENT_TEST_MODE_ENABLED",
 		"RESEND_API_KEY", "EMAIL_PROVIDER", "BREVO_API_KEY",
 		"EMAIL_FROM_NAME", "EMAIL_FROM_ADDRESS",
 		"GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET",
@@ -415,6 +418,21 @@ func TestLoad_ResourceCountCapsEnabled(t *testing.T) {
 		applyBaselineEnv(t, map[string]string{"RESOURCE_COUNT_CAPS_ENABLED": val})
 		if Load().ResourceCountCapsEnabled {
 			t.Errorf("RESOURCE_COUNT_CAPS_ENABLED=%q should stay disabled (default OFF)", val)
+		}
+	}
+}
+
+func TestLoad_PaymentTestModeEnabled(t *testing.T) {
+	for _, val := range []string{"true", "1", "yes", "TRUE", "  Yes  "} {
+		applyBaselineEnv(t, map[string]string{"PAYMENT_TEST_MODE_ENABLED": val})
+		if !Load().PaymentTestModeEnabled {
+			t.Errorf("PAYMENT_TEST_MODE_ENABLED=%q should enable", val)
+		}
+	}
+	for _, val := range []string{"false", "0", "no", "maybe", ""} {
+		applyBaselineEnv(t, map[string]string{"PAYMENT_TEST_MODE_ENABLED": val})
+		if Load().PaymentTestModeEnabled {
+			t.Errorf("PAYMENT_TEST_MODE_ENABLED=%q should stay disabled (default OFF / fail-closed)", val)
 		}
 	}
 }
