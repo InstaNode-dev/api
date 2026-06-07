@@ -57,9 +57,11 @@ const (
 // ── Pure-function inert proofs (NO DB — always run in CI) ────────────────────
 
 // TestTestModeConfigured_InertWhenUnset proves the whole test-mode path is
-// INERT when the operator has not wired the rzp_test_* key+secret. This is the
-// "default empty = inert" guarantee: on prod (no test keys) the cohort routing
-// never engages, so live billing is provably untouched.
+// INERT unless the operator has BOTH wired the rzp_test_* key+secret AND flipped
+// the PAYMENT_TEST_MODE_ENABLED kill-switch on. This is the "default empty +
+// default off = inert" guarantee: on prod (no test keys, flag off) the cohort
+// routing never engages, so live billing is provably untouched — and even with
+// the secrets present, the flag must be ON for test mode to arm.
 func TestTestModeConfigured_InertWhenUnset(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -70,7 +72,9 @@ func TestTestModeConfigured_InertWhenUnset(t *testing.T) {
 		{"both unset", config.Config{}, false},
 		{"only id set", config.Config{RazorpayTestKeyID: testCohortKeyID}, false},
 		{"only secret set", config.Config{RazorpayTestKeySecret: testCohortKeySecret}, false},
-		{"both set → configured", config.Config{RazorpayTestKeyID: testCohortKeyID, RazorpayTestKeySecret: testCohortKeySecret}, true},
+		{"keys set, flag OFF → still inert", config.Config{RazorpayTestKeyID: testCohortKeyID, RazorpayTestKeySecret: testCohortKeySecret}, false},
+		{"flag on, keys unset → inert", config.Config{PaymentTestModeEnabled: true}, false},
+		{"keys set + flag ON → configured", config.Config{RazorpayTestKeyID: testCohortKeyID, RazorpayTestKeySecret: testCohortKeySecret, PaymentTestModeEnabled: true}, true},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -121,7 +125,7 @@ func TestCreateSubscription_TestModeDefaultClosure(t *testing.T) {
 func TestResolveCheckoutTestMode_FailsClosedOnDBError(t *testing.T) {
 	cov2NeedsDB(t)
 	db, clean := testhelpers.SetupTestDB(t)
-	cfg := &config.Config{RazorpayTestKeyID: testCohortKeyID, RazorpayTestKeySecret: testCohortKeySecret, RazorpayTestPlanIDPro: testCohortPlanPro}
+	cfg := &config.Config{PaymentTestModeEnabled: true, RazorpayTestKeyID: testCohortKeyID, RazorpayTestKeySecret: testCohortKeySecret, RazorpayTestPlanIDPro: testCohortPlanPro}
 	bh := handlers.NewBillingHandler(db, cfg, nil)
 	clean() // close the DB so IsTestCohort errors
 	useTest, planID := handlers.ExerciseResolveCheckoutTestMode(bh, context.Background(), uuid.New(), "pro")
@@ -145,13 +149,14 @@ func TestCohortCheckout_UsesTestKeyAndPlan(t *testing.T) {
 		JWTSecret: "test-secret-that-is-at-least-32-bytes-long!!",
 		// Live key on a dev deployment would normally 503 via the BUG-P112
 		// guard — the test-mode path MUST bypass it for cohort teams.
-		Environment:           "development",
-		RazorpayKeyID:         liveKeyExample,
-		RazorpayKeySecret:     "live-secret-fixture",
-		RazorpayPlanIDPro:     "plan_LIVE_pro",
-		RazorpayTestKeyID:     testCohortKeyID,
-		RazorpayTestKeySecret: testCohortKeySecret,
-		RazorpayTestPlanIDPro: testCohortPlanPro,
+		Environment:            "development",
+		PaymentTestModeEnabled: true,
+		RazorpayKeyID:          liveKeyExample,
+		RazorpayKeySecret:      "live-secret-fixture",
+		RazorpayPlanIDPro:      "plan_LIVE_pro",
+		RazorpayTestKeyID:      testCohortKeyID,
+		RazorpayTestKeySecret:  testCohortKeySecret,
+		RazorpayTestPlanIDPro:  testCohortPlanPro,
 	}
 	teamID, userID := seedVerifiedTeamUser(t, db, "free")
 	require.NoError(t, models.SetTestCohort(context.Background(), db, uuid.MustParse(teamID), true))
@@ -210,13 +215,14 @@ func TestCohortCheckout_InertWhenTierHasNoTestPlan(t *testing.T) {
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
 	cfg := &config.Config{
-		JWTSecret:             "test-secret-that-is-at-least-32-bytes-long!!",
-		Environment:           "production",
-		RazorpayKeyID:         liveKeyExample,
-		RazorpayKeySecret:     "live-secret-fixture",
-		RazorpayPlanIDPro:     "plan_LIVE_pro",
-		RazorpayTestKeyID:     testCohortKeyID,
-		RazorpayTestKeySecret: testCohortKeySecret,
+		JWTSecret:              "test-secret-that-is-at-least-32-bytes-long!!",
+		Environment:            "production",
+		PaymentTestModeEnabled: true,
+		RazorpayKeyID:          liveKeyExample,
+		RazorpayKeySecret:      "live-secret-fixture",
+		RazorpayPlanIDPro:      "plan_LIVE_pro",
+		RazorpayTestKeyID:      testCohortKeyID,
+		RazorpayTestKeySecret:  testCohortKeySecret,
 		// RazorpayTestPlanIDPro intentionally UNSET → no test plan for pro.
 	}
 	teamID, userID := seedVerifiedTeamUser(t, db, "free")
@@ -239,14 +245,15 @@ func TestNonCohortCheckout_AlwaysLivePath(t *testing.T) {
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
 	cfg := &config.Config{
-		JWTSecret:             "test-secret-that-is-at-least-32-bytes-long!!",
-		Environment:           "production",
-		RazorpayKeyID:         liveKeyExample,
-		RazorpayKeySecret:     "live-secret-fixture",
-		RazorpayPlanIDPro:     "plan_LIVE_pro",
-		RazorpayTestKeyID:     testCohortKeyID,
-		RazorpayTestKeySecret: testCohortKeySecret,
-		RazorpayTestPlanIDPro: testCohortPlanPro,
+		JWTSecret:              "test-secret-that-is-at-least-32-bytes-long!!",
+		Environment:            "production",
+		PaymentTestModeEnabled: true,
+		RazorpayKeyID:          liveKeyExample,
+		RazorpayKeySecret:      "live-secret-fixture",
+		RazorpayPlanIDPro:      "plan_LIVE_pro",
+		RazorpayTestKeyID:      testCohortKeyID,
+		RazorpayTestKeySecret:  testCohortKeySecret,
+		RazorpayTestPlanIDPro:  testCohortPlanPro,
 	}
 	// NOT a cohort team — default is_test_cohort=false.
 	teamID, userID := seedVerifiedTeamUser(t, db, "free")
@@ -313,6 +320,7 @@ func postRzpWebhook(t *testing.T, app *fiber.App, body []byte, sig string) int {
 func TestWebhook_VerifiesTestSecret(t *testing.T) {
 	t.Parallel()
 	cfg := &config.Config{
+		PaymentTestModeEnabled:    true,
 		RazorpayWebhookSecret:     "live-webhook-secret",
 		RazorpayTestWebhookSecret: testCohortWebhookSecret,
 	}
@@ -349,4 +357,59 @@ func TestWebhook_TestSecretInertWhenUnset(t *testing.T) {
 	assert.Equal(t, http.StatusOK, postRzpWebhook(t, app, body, signRzp(body, "live-webhook-secret")))
 	assert.Equal(t, http.StatusBadRequest, postRzpWebhook(t, app, body, signRzp(body, testCohortWebhookSecret)),
 		"with no test secret configured, the test-secret leg must be inert")
+}
+
+// TestWebhook_TestSecretIgnoredWhenFlagOff is the kill-switch proof for the
+// webhook leg: with the rzp_test_* webhook secret fully configured but
+// PAYMENT_TEST_MODE_ENABLED OFF, a test-secret-signed payload is REJECTED (400).
+// The flag disables test-mode independently of the secret values, so a leftover
+// test secret can never be honoured on a deployment where test mode is off.
+func TestWebhook_TestSecretIgnoredWhenFlagOff(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{
+		PaymentTestModeEnabled:    false, // kill-switch OFF (explicit)
+		RazorpayWebhookSecret:     "live-webhook-secret",
+		RazorpayTestWebhookSecret: testCohortWebhookSecret, // configured but must be ignored
+	}
+	bh := handlers.NewBillingHandler(nil, cfg, nil)
+	app := newRzpWebhookApp(bh)
+	body := []byte(`{"event":"order.paid","created_at":` + nowUnixStr() + `,"id":"evt_flagoff_4b"}`)
+
+	assert.Equal(t, http.StatusOK, postRzpWebhook(t, app, body, signRzp(body, "live-webhook-secret")),
+		"the live secret must still verify regardless of the test-mode flag")
+	assert.Equal(t, http.StatusBadRequest, postRzpWebhook(t, app, body, signRzp(body, testCohortWebhookSecret)),
+		"with the kill-switch OFF, a configured test secret must NOT be honoured")
+}
+
+// TestCohortCheckout_InertWhenFlagOff is the kill-switch proof for the checkout
+// leg: a cohort team with the FULL rzp_test_* key+secret+plan configured but
+// PAYMENT_TEST_MODE_ENABLED OFF must NOT mint a test subscription — it hits the
+// inert synthetic_test_cohort skip (403) and never reaches CreateSubscription.
+// This proves test-mode routing is gated on the flag, not merely on the presence
+// of the secrets, so the operator has a single instant kill-switch.
+func TestCohortCheckout_InertWhenFlagOff(t *testing.T) {
+	cov2NeedsDB(t)
+	db, clean := testhelpers.SetupTestDB(t)
+	defer clean()
+	cfg := &config.Config{
+		JWTSecret:              "test-secret-that-is-at-least-32-bytes-long!!",
+		Environment:            "production",
+		PaymentTestModeEnabled: false, // kill-switch OFF — fully configured otherwise
+		RazorpayKeyID:          liveKeyExample,
+		RazorpayKeySecret:      "live-secret-fixture",
+		RazorpayPlanIDPro:      "plan_LIVE_pro",
+		RazorpayTestKeyID:      testCohortKeyID,
+		RazorpayTestKeySecret:  testCohortKeySecret,
+		RazorpayTestPlanIDPro:  testCohortPlanPro,
+	}
+	teamID, userID := seedVerifiedTeamUser(t, db, "free")
+	require.NoError(t, models.SetTestCohort(context.Background(), db, uuid.MustParse(teamID), true))
+
+	app, bh := cov2CheckoutApp(t, db, cfg, teamID, userID)
+	bh.CreateSubscription = func(_ map[string]any) (map[string]any, error) {
+		return nil, assertingError("kill-switch-off cohort must NOT mint a subscription")
+	}
+	status, respBody := postCheckoutReq(t, app, map[string]any{"plan": "pro"})
+	require.Equal(t, http.StatusForbidden, status, "flag-off cohort must 403-skip, body=%v", respBody)
+	assert.Equal(t, "synthetic_test_cohort", respBody["error"])
 }

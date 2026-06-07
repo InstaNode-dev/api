@@ -1150,6 +1150,47 @@ func TestPlanIDToTier_MapsYearlyPlanIDsToCanonicalTier(t *testing.T) {
 	}
 }
 
+// TestPlanIDToTier_MapsTestPlanIDsToCanonicalTier is the regression guard for
+// the test-cohort webhook path: a TEST-mode subscription.activated/charged
+// carries the rzp_test_* plan_id, which MUST map to the same canonical tier as
+// its live counterpart. Before this mapping existed, a test-cohort pro upgrade
+// silently resolved to the fail-safe fallback tier ("hobby") and emitted a bogus
+// billing.charge_undeliverable — so the full UI card→webhook→Pro chain could
+// never actually reach Pro. planIDRecognised must ALSO accept them (a configured
+// test plan_id is a recognised plan, not a make-good guess). The map is keyed by
+// the config field so a new test tier can't be added without a row here.
+func TestPlanIDToTier_MapsTestPlanIDsToCanonicalTier(t *testing.T) {
+	cfg := &config.Config{
+		// live plan IDs (must keep mapping to their tiers, untouched)
+		RazorpayPlanIDPro:   "plan_live_pro",
+		RazorpayPlanIDHobby: "plan_live_hobby",
+		// rzp_test_* plan IDs — DISTINCT strings (test plans only exist in test mode)
+		RazorpayTestPlanIDPro:       "plan_test_pro",
+		RazorpayTestPlanIDHobbyPlus: "plan_test_hobby_plus",
+		RazorpayTestPlanIDHobby:     "plan_test_hobby",
+	}
+	bh := handlers.NewBillingHandler(nil, cfg, email.NewNoop())
+	cases := []struct {
+		planID string
+		want   string
+	}{
+		{"plan_test_pro", "pro"},
+		{"plan_test_hobby_plus", "hobby_plus"},
+		{"plan_test_hobby", "hobby"},
+		// live mappings still intact alongside the test ones
+		{"plan_live_pro", "pro"},
+		{"plan_live_hobby", "hobby"},
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.want, handlers.ExportedPlanIDToTier(bh, c.planID), "planIDToTier(%q)", c.planID)
+		assert.True(t, handlers.ExportedPlanIDRecognised(bh, c.planID),
+			"planIDRecognised(%q) must be true — a configured test plan_id is recognised, not a guess", c.planID)
+	}
+	// A genuinely unknown plan_id is still unrecognised → fail-safe fallback.
+	assert.False(t, handlers.ExportedPlanIDRecognised(bh, "plan_test_unknown"))
+	assert.Equal(t, handlers.PlanIDToTierFallbackForTest, handlers.ExportedPlanIDToTier(bh, "plan_test_unknown"))
+}
+
 // ── Slice 1: planIDToTier fail-safe regression tests ─────────────────────────
 //
 // These table-driven tests are the regression guard for DESIGN-P1-B §4:
