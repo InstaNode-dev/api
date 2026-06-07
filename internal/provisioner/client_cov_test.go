@@ -43,6 +43,11 @@ type covServer struct {
 	// Override ProvisionResource success payload.
 	provisionResp *provisionerv1.ProvisionResponse
 
+	// If non-nil, ProvisionResource blocks until this channel is closed OR
+	// the RPC context is cancelled (whichever comes first) — simulating a
+	// hung provisioner so the client-side deadline can be exercised.
+	provisionBlock chan struct{}
+
 	// Sniffed inbound metadata from the most recent ProvisionResource call.
 	lastAuthToken []string
 	lastRequestID []string
@@ -62,6 +67,15 @@ func (s *covServer) ProvisionResource(ctx context.Context, req *provisionerv1.Pr
 		s.lastAuthToken = md.Get("x-instant-provisioner-token")
 		s.lastRequestID = md.Get("x-request-id")
 		s.lastTeamID = md.Get("x-instant-team-id")
+	}
+	if s.provisionBlock != nil {
+		// Simulate a hung provisioner: block until released or the RPC
+		// context (carrying the client's deadline) is cancelled.
+		select {
+		case <-s.provisionBlock:
+		case <-ctx.Done():
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
 	}
 	if s.provisionErr != nil {
 		return nil, s.provisionErr
@@ -408,6 +422,77 @@ func TestProvisionCache_SuccessAndError(t *testing.T) {
 	if _, err := h.client.ProvisionCache(ctx, "tok", "pro", ""); err == nil ||
 		!strings.Contains(err.Error(), "provisioner.ProvisionCache:") {
 		t.Errorf("err = %v; want wrapped ProvisionCache error", err)
+	}
+}
+
+// TestCacheProvisionTimeout_Value pins the production deadline so a future
+// edit that re-grants Redis the multi-minute cold-pod budget (re-introducing
+// the /cache/new hang) reds the suite.
+func TestCacheProvisionTimeout_Value(t *testing.T) {
+	if cacheProvisionTimeout != 45*time.Second {
+		t.Errorf("cacheProvisionTimeout = %s; want 45s (generous-but-bounded Redis carve ceiling)", cacheProvisionTimeout)
+	}
+	// Must be well under provisionTimeout's pod-backed budget — that gap is
+	// the whole point: a hung provisioner fails /cache/new fast instead of
+	// hanging it for minutes.
+	if cacheProvisionTimeout >= provisionTimeout("pro") {
+		t.Errorf("cacheProvisionTimeout (%s) must be tighter than provisionTimeout(pro) (%s)",
+			cacheProvisionTimeout, provisionTimeout("pro"))
+	}
+}
+
+// TestProvisionCache_HangBecomesDeadlineError proves the defensive fix: when
+// the provisioner hangs, ProvisionCache's own client-side deadline fires and
+// returns a DeadlineExceeded-class error in ~the bounded window — NOT an
+// indefinite block. This is the error the cache handler converts into a 503
+// provision_failed after soft-deleting the pending resource.
+//
+// We shrink cacheProvisionTimeout to a few ms (restored via t.Cleanup) so the
+// test is fast, and give the *caller* context a generous timeout so the error
+// is provably caused by our internal deadline, not the caller's.
+func TestProvisionCache_HangBecomesDeadlineError(t *testing.T) {
+	orig := cacheProvisionTimeout
+	cacheProvisionTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { cacheProvisionTimeout = orig })
+
+	h := newCovHarness(t, "hang-secret")
+	defer h.close()
+
+	// Server blocks forever (channel never closed) → only the client-side
+	// deadline can end the RPC.
+	h.mock.provisionBlock = make(chan struct{})
+
+	// Caller context is far more generous than the 50ms internal deadline,
+	// so a failure here is unambiguously our deadline firing.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := h.client.ProvisionCache(ctx, "tok", "pro", "team-hang")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("ProvisionCache returned nil; want a DeadlineExceeded-class error from the bounded deadline")
+		}
+		if !strings.Contains(err.Error(), "provisioner.ProvisionCache:") {
+			t.Errorf("err = %v; want wrapped ProvisionCache error", err)
+		}
+		if st, ok := status.FromError(err); !ok || st.Code() != codes.DeadlineExceeded {
+			t.Errorf("err = %v; want gRPC DeadlineExceeded", err)
+		}
+		// Bounded: must finish well within the caller's 10s, near the 50ms
+		// internal deadline — proves the api no longer hangs on a hung provisioner.
+		if elapsed > 5*time.Second {
+			t.Errorf("ProvisionCache took %s; expected ~the bounded deadline (50ms), not an indefinite hang", elapsed)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("ProvisionCache hung past the bounded deadline — the defensive timeout did not fire")
 	}
 }
 
