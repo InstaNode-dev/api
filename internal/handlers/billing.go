@@ -1350,12 +1350,37 @@ type rzpEntityWrapper struct {
 	Entity json.RawMessage `json:"entity"`
 }
 
+// rzpNotes is Razorpay's `notes` field. It is POLYMORPHIC on the wire: an
+// OBJECT ({"team_id":"…"}) when populated, but an empty ARRAY ([]) when there
+// are no notes. A plain map[string]string fails to unmarshal the [] form with
+// "cannot unmarshal array into Go struct field …notes of type map[string]string"
+// — which silently broke handlePaymentFailed for every payment.failed webhook
+// carrying notes:[] (the immediate payment-failure path). UnmarshalJSON
+// tolerates object / empty-array / null, decoding only the object form.
+// Found by the live failure-path test (2026-06-07).
+type rzpNotes map[string]string
+
+func (n *rzpNotes) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	// null, empty, or any array form (Razorpay's "no notes" is `[]`) → empty map.
+	if s == "" || s == "null" || (len(s) > 0 && s[0] == '[') {
+		*n = rzpNotes{}
+		return nil
+	}
+	m := map[string]string{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+	*n = m
+	return nil
+}
+
 type rzpSubscriptionEntity struct {
-	ID        string            `json:"id"`
-	PlanID    string            `json:"plan_id"`
-	Status    string            `json:"status"`
-	Notes     map[string]string `json:"notes"`
-	PaidCount *int64            `json:"paid_count"`
+	ID        string   `json:"id"`
+	PlanID    string   `json:"plan_id"`
+	Status    string   `json:"status"`
+	Notes     rzpNotes `json:"notes"`
+	PaidCount *int64   `json:"paid_count"`
 }
 
 type rzpPaymentEntity struct {
@@ -1372,9 +1397,9 @@ type rzpPaymentEntity struct {
 	// `notes` for any caller-supplied metadata (Razorpay copies notes
 	// from the parent subscription onto the payment). resolveTeamFromPayment
 	// reads these in priority order.
-	SubscriptionID string            `json:"subscription_id"`
-	OrderID        string            `json:"order_id"`
-	Notes          map[string]string `json:"notes"`
+	SubscriptionID string   `json:"subscription_id"`
+	OrderID        string   `json:"order_id"`
+	Notes          rzpNotes `json:"notes"`
 }
 
 // RazorpayWebhook handles POST /razorpay/webhook.
