@@ -33,6 +33,28 @@ const (
 	provisionerCircuitCooldown  = 30 * time.Second
 )
 
+// cacheProvisionTimeout bounds the api → provisioner ProvisionCache RPC.
+//
+// Unlike Postgres/Mongo, a Redis namespace provision does NOT spin up a
+// per-tenant pod with a PVC bind + image pull + DB init — it carves a
+// namespace/ACL out of an already-running Redis (observed ~1–6s end to
+// end, anonymous AND authenticated). It therefore does not need the
+// 4–5m cold-pod budget that provisionTimeout() grants the pod-backed
+// resource types.
+//
+// Granting Redis that same multi-minute budget means a *hung* provisioner
+// hangs the whole /cache/new request for up to 5 minutes (the symptom that
+// motivated this fix: authed /cache/new observed hanging >60s while anon
+// returned in ~6s). A generous-but-bounded 45s ceiling is ~7× the slowest
+// observed healthy provision, so a legitimately slow-but-OK Redis carve
+// still succeeds, while a genuine hang fails fast — the existing handler
+// error path then soft-deletes the pending resource and returns a clean
+// 503 provision_failed instead of an indefinite hang.
+//
+// A package var (not const) so the timeout→503 unit test can shrink it to
+// a few ms instead of blocking the suite for 45s; production never mutates it.
+var cacheProvisionTimeout = 45 * time.Second
+
 // Credentials matches the shape returned by local providers.
 type Credentials struct {
 	URL                string
@@ -313,7 +335,10 @@ func (c *Client) ProvisionPostgres(ctx context.Context, token, tier, teamID stri
 func (c *Client) ProvisionCache(ctx context.Context, token, tier, teamID string) (*Credentials, error) {
 	return callWithBreaker(c.breaker, func() (*Credentials, error) {
 		start := time.Now()
-		ctx, cancel := context.WithTimeout(c.ctxWithTeamID(c.ctxWithAuth(ctx), teamID), provisionTimeout(tier))
+		// Redis carve is fast for every tier — bound it tighter than the
+		// pod-backed resource types so a hung provisioner returns a clean
+		// 503 in ≤45s instead of hanging /cache/new for minutes.
+		ctx, cancel := context.WithTimeout(c.ctxWithTeamID(c.ctxWithAuth(ctx), teamID), cacheProvisionTimeout)
 		defer cancel()
 		resp, err := c.grpc.ProvisionResource(ctx, &provisionerv1.ProvisionRequest{
 			Token:        token,
