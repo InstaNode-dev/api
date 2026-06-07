@@ -46,6 +46,17 @@ func TestRzpNotes_ToleratesArrayObjectAndNull(t *testing.T) {
 		}
 	})
 
+	// A malformed object (non-string value) must surface the decode error rather
+	// than silently swallow it — covers the json.Unmarshal error branch.
+	t.Run("object with non-string value errors", func(t *testing.T) {
+		t.Parallel()
+		var p rzpPaymentEntity
+		err := json.Unmarshal([]byte(`{"id":"p","notes":{"k":123}}`), &p)
+		if err == nil {
+			t.Fatal("a notes object with a non-string value must return a decode error, not be swallowed")
+		}
+	})
+
 	// null and empty-array on the subscription entity → empty map, no error.
 	for _, tc := range []struct{ name, body string }{
 		{"null", `{"id":"s","notes":null}`},
