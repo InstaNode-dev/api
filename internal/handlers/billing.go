@@ -997,7 +997,7 @@ func (h *BillingHandler) CreateCheckoutAPI(c *fiber.Ctx) error {
 		// "contact sales / not yet available" message instead of telling
 		// the user they made a typo.
 		return respondError(c, fiber.StatusBadRequest, "tier_not_yet_available",
-			"The Team plan is not yet available for self-serve checkout — contact support@instanode.dev.")
+			"The Team plan is not yet available for self-serve checkout — contact contact@instanode.dev.")
 	default:
 		return respondError(c, fiber.StatusBadRequest, "invalid_plan", "plan must be 'hobby', 'hobby_plus', or 'pro'")
 	}
@@ -3141,7 +3141,7 @@ func resolveTeamFromNotes(ctx context.Context, h *BillingHandler, sub rzpSubscri
 // dashboard, executed by support staff, which fires the subscription.cancelled
 // webhook → handleSubscriptionCancelled in RazorpayWebhook (unchanged).
 //
-// The dashboard surfaces cancellation as a mailto:support@instanode.dev link,
+// The dashboard surfaces cancellation as a mailto:contact@instanode.dev link,
 // not as a button that calls this API.
 //
 // If a future internal flow (RTBF / team deletion) needs to cancel a
@@ -3461,7 +3461,7 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 		// OK — fall through.
 	case "yearly":
 		return respondError(c, fiber.StatusBadRequest, "yearly_change_plan_unsupported",
-			"Changing to a yearly plan via /change-plan is not yet supported. Cancel and use POST /api/v1/billing/checkout with plan_frequency='yearly', or contact support@instanode.dev.")
+			"Changing to a yearly plan via /change-plan is not yet supported. Cancel and use POST /api/v1/billing/checkout with plan_frequency='yearly', or contact contact@instanode.dev.")
 	default:
 		return respondError(c, fiber.StatusBadRequest, "invalid_frequency",
 			"plan_frequency must be 'monthly' or 'yearly'")
@@ -3489,7 +3489,7 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 	// happens to be set in this environment.
 	if target == "team" {
 		return respondError(c, fiber.StatusBadRequest, "tier_not_yet_available",
-			"The Team plan is not yet available for self-serve plan changes — contact support@instanode.dev.")
+			"The Team plan is not yet available for self-serve plan changes — contact contact@instanode.dev.")
 	}
 	planIDs := h.razorpayPlanIDs()
 	if _, ok := planIDs[target]; !ok {
@@ -3505,9 +3505,9 @@ func (h *BillingHandler) ChangePlanAPI(c *fiber.Ctx) error {
 	targetRank := plans.Rank(target)
 	if currentRank >= 0 && targetRank >= 0 && targetRank <= currentRank {
 		return respondErrorWithAgentAction(c, fiber.StatusBadRequest, "downgrade_not_self_serve",
-			"Plan downgrades are handled by support, not self-serve. Email support@instanode.dev to change to a lower tier.",
-			"Tell the user that downgrading to a lower plan is support-assisted. Have them email support@instanode.dev with their team and the target plan.",
-			"mailto:support@instanode.dev")
+			"Plan downgrades are handled by support, not self-serve. Email contact@instanode.dev to change to a lower tier.",
+			"Tell the user that downgrading to a lower plan is support-assisted. Have them email contact@instanode.dev with their team and the target plan.",
+			"mailto:contact@instanode.dev")
 	}
 	// (Target=team is rejected above with tier_not_yet_available — the
 	// 2026-06-04 CEO re-gate. Only hobby/hobby_plus/pro upgrades reach here.)

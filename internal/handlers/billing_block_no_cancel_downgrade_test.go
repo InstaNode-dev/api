@@ -140,7 +140,7 @@ func TestBillingBlock_NoSelfServeCancelOrDowngradeRoute(t *testing.T) {
 // paying team requesting a LOWER or EQUAL tier via the in-app change-plan path
 // is rejected with downgrade_not_self_serve and routed to support, NOT
 // silently dropped. Verified against billing.go:ChangePlanAPI (it returns 400
-// downgrade_not_self_serve + a mailto:support@instanode.dev agent_action for
+// downgrade_not_self_serve + a mailto:contact@instanode.dev agent_action for
 // any target whose rank ≤ the current tier's rank).
 func TestBillingBlock_ChangePlanRejectsDowngrade(t *testing.T) {
 	if billingBlockSkipNoDB(t) {

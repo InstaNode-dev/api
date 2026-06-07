@@ -236,7 +236,7 @@ func TestErrorEnvelope_500_NoRetryAfter(t *testing.T) {
 	assert.NotEmpty(t, body["agent_action"],
 		"5xx must always carry an agent_action — registry entry preferred, fallback as floor")
 	if action, ok := body["agent_action"].(string); ok {
-		assert.Contains(t, action, "support@instanode.dev",
+		assert.Contains(t, action, "contact@instanode.dev",
 			"every 5xx agent_action — whether registry or fallback — names the support contact")
 	}
 }
@@ -336,7 +336,7 @@ func TestErrorEnvelope_ContactSupportContract(t *testing.T) {
 	assert.Contains(t, s, "request_id",
 		"AgentActionContactSupport must name request_id so the user knows what to quote")
 	// 3. Exact next action.
-	assert.Contains(t, s, "support@instanode.dev",
+	assert.Contains(t, s, "contact@instanode.dev",
 		"AgentActionContactSupport must name the support email — that's the action")
 	// 4. Full https URL.
 	assert.Contains(t, s, "https://instanode.dev/",

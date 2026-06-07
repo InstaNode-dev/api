@@ -585,7 +585,7 @@ plans:
   # public /pricing page, marketing homepage, or dashboard PricingGrid.
   # The marketing surface stays Anonymous / Hobby / Pro / Team to keep
   # the comparison uncluttered. Growth is reached only via assisted
-  # sales conversations (support@instanode.dev) — there is no in-product
+  # sales conversations (contact@instanode.dev) — there is no in-product
   # upsell card for it today. If/when growth becomes a primary outbound
   # funnel, surface it in instanode-web/PricingPage.tsx and the dashboard
   # PricingGrid in lock-step with this file.
