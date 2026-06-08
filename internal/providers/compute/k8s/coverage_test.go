@@ -189,6 +189,53 @@ func TestDeploymentStatus(t *testing.T) {
 	if got := deploymentStatus(failed); got != "failed" {
 		t.Errorf("failed = %q", got)
 	}
+
+	// ProgressDeadlineExceeded with NO available replica → failed. This is the
+	// silent runtime-deploy-failure case: pods created but the container can't
+	// start (broken image / no CMD), Progressing=False, UnavailableReplicas>0.
+	// Pre-fix this mapped to "deploying" forever.
+	progressTimeout := &appsv1.Deployment{Status: appsv1.DeploymentStatus{
+		UnavailableReplicas: 1,
+		Conditions: []appsv1.DeploymentCondition{
+			{
+				Type:   appsv1.DeploymentProgressing,
+				Status: corev1.ConditionFalse,
+				Reason: progressDeadlineExceededReason,
+			},
+		},
+	}}
+	if got := deploymentStatus(progressTimeout); got != "failed" {
+		t.Errorf("progress-deadline-exceeded = %q, want failed", got)
+	}
+
+	// A serving deployment (AvailableReplicas>=1) whose newest rollout timed
+	// out (e.g. a failed redeploy that left the previous ReplicaSet serving)
+	// stays healthy — the available-replica check precedes the deadline check.
+	healthyDespiteTimeout := &appsv1.Deployment{Status: appsv1.DeploymentStatus{
+		AvailableReplicas: 1,
+		Conditions: []appsv1.DeploymentCondition{
+			{
+				Type:   appsv1.DeploymentProgressing,
+				Status: corev1.ConditionFalse,
+				Reason: progressDeadlineExceededReason,
+			},
+		},
+	}}
+	if got := deploymentStatus(healthyDespiteTimeout); got != "healthy" {
+		t.Errorf("healthy-despite-timeout = %q, want healthy", got)
+	}
+
+	// Progressing=True (rollout still within its deadline) must NOT be read as
+	// a deadline failure — it stays deploying.
+	progressingOK := &appsv1.Deployment{Status: appsv1.DeploymentStatus{
+		UnavailableReplicas: 1,
+		Conditions: []appsv1.DeploymentCondition{
+			{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: "ReplicaSetUpdated"},
+		},
+	}}
+	if got := deploymentStatus(progressingOK); got != "deploying" {
+		t.Errorf("progressing-ok = %q, want deploying", got)
+	}
 }
 
 // ── Tarball extraction ───────────────────────────────────────────────────────
