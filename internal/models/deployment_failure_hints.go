@@ -39,6 +39,11 @@ var FailureHint = map[string]string{
 		"Large base images or slow package installs can cause this. " +
 		"Try a smaller base image (e.g. alpine) and pre-install dependencies in the Dockerfile.",
 
+	FailureReasonStartFailed: "Kubernetes created your app's pod but the container could not start. " +
+		"The most common cause is a built image with no CMD/ENTRYPOINT (nothing to run) " +
+		"or an invalid container configuration. Make sure your Dockerfile ends with a " +
+		"CMD or ENTRYPOINT instruction, then re-deploy.",
+
 	FailureReasonError: "A Kubernetes replica failure was detected. " +
 		"This is often a transient scheduling or resource constraint. " +
 		"Re-deploy to retry; if it persists, check your Dockerfile for correct CMD/ENTRYPOINT.",

@@ -2451,24 +2451,65 @@ func deployIngressURL(appID string) string {
 	return scheme + "://" + appID + "." + domain
 }
 
+// progressDeadlineExceededReason is the Reason k8s stamps on a Deployment's
+// Progressing condition (status=False) when a rollout fails to make progress
+// within spec.progressDeadlineSeconds (default 600s). k8s does not export it as
+// a typed constant (it lives in the deployment controller as
+// deploymentutil.TimedOutReason), so we name it here per the no-hardcoded-
+// strings rule. `kubectl rollout status` treats this exact reason as a failed
+// rollout.
+const progressDeadlineExceededReason = "ProgressDeadlineExceeded"
+
 // deploymentStatus translates k8s Deployment conditions and replica counts into
 // one of: building|deploying|healthy|failed|stopped.
 func deploymentStatus(deploy *appsv1.Deployment) string {
-	// Check for failure conditions first.
+	// Replica-creation failure first (the ReplicaSet could not create pods:
+	// quota exhausted, forbidden, etc.) — terminal.
 	for _, cond := range deploy.Status.Conditions {
 		if cond.Type == appsv1.DeploymentReplicaFailure && cond.Status == corev1.ConditionTrue {
 			return "failed"
 		}
 	}
 
+	// At least one replica serving → healthy. Checked BEFORE the progress-
+	// deadline failure below so a partially-failed *redeploy* whose previous
+	// ReplicaSet still serves is reported healthy, not failed.
 	if deploy.Status.AvailableReplicas >= 1 {
 		return "healthy"
 	}
+
+	// Rollout exceeded its progress deadline with NO available replica: the
+	// pods were created but their containers cannot start — the modal cause is
+	// a broken built image (CreateContainerError "no command specified",
+	// ImagePullBackOff, or CrashLoopBackOff). k8s does NOT retry past the
+	// deadline, so this is terminal. Without this branch such a deploy reports
+	// "deploying" forever (UnavailableReplicas>0 below) and never reaches a
+	// terminal state — the silent runtime-deploy-failure class (twin of the
+	// build-Job-failed fix). Kept in sync with the worker's
+	// deploy_status_reconcile.deploymentStatusFromK8s.
+	if deploymentProgressDeadlineExceeded(deploy) {
+		return "failed"
+	}
+
 	if deploy.Status.UpdatedReplicas > 0 || deploy.Status.UnavailableReplicas > 0 {
 		return "deploying"
 	}
 	// No replicas scheduled yet.
 	return "building"
+}
+
+// deploymentProgressDeadlineExceeded reports whether the Deployment's
+// Progressing condition is False with reason ProgressDeadlineExceeded — k8s's
+// definitive "this rollout will not make progress" verdict.
+func deploymentProgressDeadlineExceeded(deploy *appsv1.Deployment) bool {
+	for _, cond := range deploy.Status.Conditions {
+		if cond.Type == appsv1.DeploymentProgressing &&
+			cond.Status == corev1.ConditionFalse &&
+			cond.Reason == progressDeadlineExceededReason {
+			return true
+		}
+	}
+	return false
 }
 
 // maxExtractedTarBytes caps the total uncompressed size extractTarGz will

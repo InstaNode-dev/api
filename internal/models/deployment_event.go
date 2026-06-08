@@ -61,6 +61,15 @@ const (
 	// (10-minute deadline in runDeploy / waitForJobComplete).
 	FailureReasonDeadlineExceeded = "DeadlineExceeded"
 
+	// FailureReasonStartFailed means k8s created the app's pod but the
+	// container could not start — the runtime "CreateContainerError",
+	// "CreateContainerConfigError", or "RunContainerError" waiting reasons.
+	// The modal cause is a built image with no CMD/ENTRYPOINT ("no command
+	// specified") or an invalid container configuration. Distinct from
+	// ImagePullBackOff (image unreachable) and CrashLoopBackOff (image runs
+	// then exits non-zero): here the container is never successfully created.
+	FailureReasonStartFailed = "StartFailed"
+
 	// FailureReasonError covers transient k8s API errors and generic
 	// "ReplicaFailure" conditions that don't map to a more specific reason.
 	FailureReasonError = "Error"
