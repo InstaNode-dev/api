@@ -233,6 +233,37 @@ const (
 	errCodeAccountExists = "account_exists"
 )
 
+// attachClaimedResourceToTeam links a single anonymous resource to the claiming
+// team and elevates it anonymous->free. It is the shared write path for BOTH
+// claim-time resource grabs (the JWT-listed loop and the fingerprint-discovered
+// loop) so they behave identically and observably.
+//
+// Pre-fix both call sites used `_, _ = h.db.ExecContext(...)`, swallowing any
+// error: a failed UPDATE left the resource with team_id IS NULL AFTER a
+// successful claim — an orphaned-after-claim resource with NO log and NO metric,
+// invisible to operators (the user "claimed" but their resource never attached).
+// The claim itself is deliberately NOT failed over one attach hiccup (the
+// team+user already exist; the next claim/reconcile can re-grab the still-NULL
+// row), but the failure is now logged at WARN so it is visible in NR Logs. The
+// error is returned for the caller's awareness and for tests; callers may ignore
+// it. The `WHERE team_id IS NULL` guard keeps this idempotent (0 rows when the
+// resource was already attached — not an error).
+func attachClaimedResourceToTeam(ctx context.Context, db *sql.DB, teamID, resourceID uuid.UUID, requestID string) error {
+	if _, err := db.ExecContext(ctx, `
+		UPDATE resources SET team_id = $1, tier = 'free'
+		WHERE id = $2 AND team_id IS NULL
+	`, teamID, resourceID); err != nil {
+		slog.Warn("onboarding.claim.resource_attach_failed",
+			"error", err,
+			"resource_id", resourceID,
+			"team_id", teamID,
+			"request_id", requestID,
+			"note", "resource left orphaned (team_id NULL) after a successful claim — reaper/re-claim follow-up")
+		return err
+	}
+	return nil
+}
+
 // Claim handles POST /claim — converts an anonymous session to a registered team.
 func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 	ctx, span := otel.Tracer("instant.dev/handlers").Start(c.UserContext(), "onboarding.claim")
@@ -455,10 +486,7 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 		// the Razorpay subscription.charged webhook clears it (via
 		// ElevateResourceTiersByTeam). If the user never pays, the reaper
 		// deletes the resource at expires_at — same fate as an anonymous one.
-		_, _ = h.db.ExecContext(ctx, `
-			UPDATE resources SET team_id = $1, tier = 'free'
-			WHERE id = $2 AND team_id IS NULL
-		`, team.ID, resource.ID)
+		_ = attachClaimedResourceToTeam(ctx, h.db, team.ID, resource.ID, requestID)
 	}
 
 	// Also claim any additional fingerprint resources not yet in the JWT.
@@ -472,10 +500,7 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 			if claimedIDs[r.ID] || r.TeamID.Valid {
 				continue
 			}
-			_, _ = h.db.ExecContext(ctx, `
-				UPDATE resources SET team_id = $1, tier = 'free'
-				WHERE id = $2 AND team_id IS NULL
-			`, team.ID, r.ID)
+			_ = attachClaimedResourceToTeam(ctx, h.db, team.ID, r.ID, requestID)
 		}
 	}
 
