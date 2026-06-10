@@ -3,9 +3,11 @@
 // Rule-22 coverage block — symptom: api/internal/db migration runner +
 // connect entry points are the platform-DB boot gate. Enumeration: every
 // exported symbol in postgres.go + redis.go.
-//   RunMigrations, embeddedMigrationFilenames, MigrationFiles,
-//   ErrDBConnect.{Error,Unwrap}, ConnectPostgres,
-//   ErrRedisConnect.{Error,Unwrap}, ConnectRedis.
+//
+//	RunMigrations, embeddedMigrationFilenames, MigrationFiles,
+//	ErrDBConnect.{Error,Unwrap}, ConnectPostgres,
+//	ErrRedisConnect.{Error,Unwrap}, ConnectRedis.
+//
 // Sites touched: all of the above. Coverage test: this file.
 package db
 
@@ -496,4 +498,38 @@ func TestConnectRedis_PanicsOnUnreachable(t *testing.T) {
 	// 127.0.0.1:1 has nothing listening; the client retries within 10s
 	// then returns the ping error → ConnectRedis panics with *ErrRedisConnect.
 	ConnectRedis("redis://127.0.0.1:1/0")
+}
+
+// TestMigrations_ResourcesStatusCheck_ForwardConsistent guards the
+// 2026-06-10 incident: the migration runner RE-APPLIES every migration on
+// each boot. Migration 024 originally re-added a NARROW
+// resources_status_check (missing 'suspended' [added 049] and 'pending'
+// [added 057]); once a valid row held one of those later-added statuses, the
+// 024 re-apply failed with a constraint violation and crashed the api boot
+// (prod survived only on a not-yet-restarted pod). Any migration that re-adds
+// resources_status_check MUST allow the full canonical status set, so
+// re-applying it mid-sequence can never reject a valid row. No DB needed —
+// reads the embedded SQL via the same seam the runner uses.
+func TestMigrations_ResourcesStatusCheck_ForwardConsistent(t *testing.T) {
+	canonical := []string{"pending", "active", "paused", "suspended", "expired", "deleted", "reaped"}
+	checked := 0
+	for _, name := range MigrationFiles() {
+		b, err := readMigrationFile(name)
+		if err != nil {
+			t.Fatalf("readMigrationFile(%s): %v", name, err)
+		}
+		sql := string(b)
+		if !strings.Contains(sql, "ADD CONSTRAINT resources_status_check") {
+			continue
+		}
+		checked++
+		for _, st := range canonical {
+			if !strings.Contains(sql, "'"+st+"'") {
+				t.Errorf("%s re-adds resources_status_check but omits status %q — a valid row in that status will crash the api boot when this migration re-applies before a later widening migration. Use the full canonical set: %v", name, st, canonical)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no migration adds resources_status_check — test wiring broken (did the constraint move?)")
+	}
 }
