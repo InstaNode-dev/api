@@ -1050,7 +1050,7 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	api.Delete("/resources/:id",
 		middleware.RequireEnvAccess(middleware.EnvPolicyActionDeleteResource,
 			middleware.WithEnvLookup(func(c *fiber.Ctx) (string, error) {
-				return handlers.ResourceEnvByTokenForMiddleware(c, db)
+				return handlers.ResourceEnvByTokenOrIDForMiddleware(c, db)
 			}),
 		),
 		resourceH.Delete,

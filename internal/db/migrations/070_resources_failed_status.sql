@@ -1,0 +1,51 @@
+-- Migration: 070_resources_failed_status
+--
+-- Add 'failed' as a permitted value in the resources.status CHECK constraint.
+--
+-- Background (Wave-2 A1, cross-interface durability sweep 2026-06-11):
+--   When the synchronous backend provision RPC fails or times out, every
+--   provision handler used to ROLL BACK the just-created 'pending' row by
+--   soft-deleting it (status='deleted'). From the caller's point of view the
+--   resource simply VANISHED: a timed-out /db/new (or /cache/new, /nosql/new,
+--   /queue/new, /vector/new, /storage/new, twin provision) returned 503 and
+--   any follow-up GET on the token 404'd because the public read surface
+--   hides deleted rows. Agents polling for an in-flight provision had no
+--   terminal state to observe.
+--
+--   The handlers now mark the row status='failed' instead
+--   (models.MarkResourceFailed, pending→failed). A failed row is:
+--     * visible in GET /api/v1/resources (lists filter only status='deleted')
+--     * deletable via DELETE /api/v1/resources/:id (the status!='deleted'
+--       guard in SoftDeleteResourceIfActive admits it)
+--     * NOT counted toward plan quotas (quota counts filter status='active')
+--     * never swept by the provisioner_reconciler (it keys on 'pending') or
+--       the TTL reaper (ReapableStatuses() = active/paused/suspended) — the
+--       backend object either never existed or was already torn down by the
+--       rollback's best-effort cleanup, so there is nothing to deprovision.
+--
+-- Without this migration every MarkResourceFailed UPDATE would hit
+-- constraint-violation 23514 and the rollback path itself would error.
+--
+-- Status semantics (updated):
+--   pending    — row inserted, backend provision RPC + URL persistence not yet
+--                complete; the transient mid-provision state. NOT usable.
+--   active     — provisioned, accepting connections (or status-only for queue/storage/webhook)
+--   paused     — user-initiated pause (Pro+ only); infra revoked; data preserved
+--   suspended  — system-initiated suspend on storage quota breach; infra revoked
+--   failed     — terminal: the backend provision RPC failed/timed out and the
+--                rollback kept the row as a pollable terminal state. No live
+--                backing infra. Visible in lists; deletable; quota-exempt.
+--   expired    — TTL reached (anonymous resources); soft-deleted equivalent for anon
+--   deleted    — user-deleted (permanent credentials removed)
+--   reaped     — legacy: worker-reaped before 'deleted' was the canonical term
+--
+-- Idempotent: DROP IF EXISTS + re-ADD with the same syntax, so re-running on a
+-- schema that already applied this migration is harmless. Migrations 024/049/057
+-- were updated in the same change to define this same canonical set (the
+-- migration runner RE-APPLIES every migration on each boot — see the
+-- forward-consistency note in 024, incident 2026-06-10).
+
+ALTER TABLE resources DROP CONSTRAINT IF EXISTS resources_status_check;
+ALTER TABLE resources
+    ADD CONSTRAINT resources_status_check
+    CHECK (status IN ('pending', 'active', 'paused', 'suspended', 'failed', 'expired', 'deleted', 'reaped'));

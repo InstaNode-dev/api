@@ -77,16 +77,18 @@ func TestFinalizeProvision_PersistenceFailure_ReturnsErrorAndRunsCleanup(t *test
 		"finalizeProvision must run the cleanup closure on persistence failure to tear down "+
 			"the just-provisioned backend object; otherwise the platform leaks an orphan")
 
-	// 3. Row is soft-deleted (status='deleted'), NOT left at 'pending' or
-	//    'active'. A pending row would be picked up by the reconciler; an
-	//    active row would falsely advertise itself as usable in dashboard
-	//    listings and quota counts.
+	// 3. Row is marked failed (status='failed'), NOT left at 'pending' or
+	//    'active', and NOT soft-deleted. A pending row would be picked up by
+	//    the reconciler; an active row would falsely advertise itself as
+	//    usable in dashboard listings and quota counts; a deleted row would
+	//    VANISH from the caller's read surface (the pre-Wave-2-A1 behaviour)
+	//    leaving no pollable terminal state.
 	var status string
 	require.NoError(t, dbConn.QueryRow(
 		`SELECT status FROM resources WHERE id = $1`, res.ID,
 	).Scan(&status))
-	assert.Equal(t, "deleted", status,
-		"on a persistence failure the row must be soft-deleted so it doesn't leak as an orphan")
+	assert.Equal(t, models.StatusFailed, status,
+		"on a persistence failure the row must be marked 'failed' — a pollable terminal state")
 }
 
 // TestFinalizeProvision_Success_FlipsToActive is the happy-path guard:

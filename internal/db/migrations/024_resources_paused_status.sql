@@ -29,11 +29,12 @@ ALTER TABLE resources
     ADD CONSTRAINT resources_status_check
     -- Forward-consistent full status set (incident 2026-06-10). The migration
     -- runner RE-APPLIES every migration on each boot; a NARROW constraint here
-    -- (missing 'suspended' [added in 049] / 'pending' [added in 057]) crashes
-    -- the boot the moment a row already holds one of those later-added — but
-    -- valid — statuses. Re-adding the canonical set makes 024 safe to re-run
-    -- regardless of data. (024/049/057 now all define the same set.)
-    CHECK (status IN ('pending', 'active', 'paused', 'suspended', 'expired', 'deleted', 'reaped'));
+    -- (missing 'suspended' [added in 049] / 'pending' [added in 057] /
+    -- 'failed' [added in 070]) crashes the boot the moment a row already holds
+    -- one of those later-added — but valid — statuses. Re-adding the canonical
+    -- set makes 024 safe to re-run regardless of data. (024/049/057/070 now
+    -- all define the same set.)
+    CHECK (status IN ('pending', 'active', 'paused', 'suspended', 'failed', 'expired', 'deleted', 'reaped'));
 
 ALTER TABLE resources ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ;
 

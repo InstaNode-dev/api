@@ -297,8 +297,9 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 		middleware.RecordProvisionFail("queue", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("queue.new.provision_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
-		// Soft-delete the resource record so limits aren't falsely consumed.
-		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+		// Mark the pending row 'failed' — a pollable terminal state. Failed
+		// rows never count against quota (counts filter status='active').
+		if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("queue.new.soft_delete_failed", "error", delErr, "resource_id", resource.ID)
 		}
 		return respondProvisionFailed(c, err, "Failed to provision NATS credentials")
@@ -523,7 +524,7 @@ func (h *QueueHandler) newQueueAuthenticated(
 		middleware.RecordProvisionFail("queue", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("queue.new.provision_failed_auth",
 			"error", err, "token", tokenStr, "team_id", teamIDStr, "request_id", requestID)
-		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+		if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("queue.new.soft_delete_failed_auth", "error", delErr, "resource_id", resource.ID)
 		}
 		return respondProvisionFailed(c, err, "Failed to provision NATS credentials")

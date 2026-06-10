@@ -67,7 +67,8 @@ type fakeProvisioner struct {
 	failProvision    bool
 	deprovisionCalls int
 
-	lastReq *provisionerv1.ProvisionRequest
+	lastReq            *provisionerv1.ProvisionRequest
+	lastDeprovisionReq *provisionerv1.DeprovisionRequest
 }
 
 func (f *fakeProvisioner) ProvisionResource(_ context.Context, req *provisionerv1.ProvisionRequest) (*provisionerv1.ProvisionResponse, error) {
@@ -113,11 +114,19 @@ func (f *fakeProvisioner) ProvisionResource(_ context.Context, req *provisionerv
 	}
 }
 
-func (f *fakeProvisioner) DeprovisionResource(_ context.Context, _ *provisionerv1.DeprovisionRequest) (*provisionerv1.DeprovisionResponse, error) {
+func (f *fakeProvisioner) DeprovisionResource(_ context.Context, req *provisionerv1.DeprovisionRequest) (*provisionerv1.DeprovisionResponse, error) {
 	f.mu.Lock()
 	f.deprovisionCalls++
+	f.lastDeprovisionReq = req
 	f.mu.Unlock()
 	return &provisionerv1.DeprovisionResponse{}, nil
+}
+
+// lastDeprovision returns the most recent DeprovisionRequest (nil if none).
+func (f *fakeProvisioner) lastDeprovision() *provisionerv1.DeprovisionRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastDeprovisionReq
 }
 
 func (f *fakeProvisioner) deprovisionCount() int {
@@ -231,6 +240,7 @@ func setupGRPCProvFixture(t *testing.T, fake *fakeProvisioner, badAESKey bool) g
 
 	middleware.SetRoleLookupDB(db)
 	api := app.Group("/api/v1", middleware.RequireAuth(cfg), middleware.PopulateTeamRole())
+	api.Get("/resources", resourceH.List)
 	api.Get("/resources/:id", resourceH.Get)
 	api.Delete("/resources/:id", resourceH.Delete)
 	api.Post("/resources/:id/provision-twin", twinH.ProvisionTwin)

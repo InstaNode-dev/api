@@ -42,7 +42,10 @@
 ALTER TABLE resources DROP CONSTRAINT IF EXISTS resources_status_check;
 ALTER TABLE resources
     ADD CONSTRAINT resources_status_check
-    CHECK (status IN ('pending', 'active', 'paused', 'suspended', 'expired', 'deleted', 'reaped'));
+    -- Forward-consistent full status set (incident 2026-06-10): include 'failed'
+    -- (added in 070) so re-applying 057 on boot can't crash on a valid failed
+    -- row before 070 runs. 024/049/057/070 now all define the same canonical set.
+    CHECK (status IN ('pending', 'active', 'paused', 'suspended', 'failed', 'expired', 'deleted', 'reaped'));
 
 -- idx_resources_pending_sweep (the partial index the reconciler scans) was
 -- already created by migration 030_resource_heartbeat.sql — it indexes

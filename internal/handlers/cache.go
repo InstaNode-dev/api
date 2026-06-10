@@ -221,8 +221,9 @@ func (h *CacheHandler) NewCache(c *fiber.Ctx) error {
 		middleware.RecordProvisionFail("redis", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("cache.new.provision_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
-		// Soft-delete the resource record so limits aren't falsely consumed.
-		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+		// Mark the pending row 'failed' — a pollable terminal state. Failed
+		// rows never count against quota (counts filter status='active').
+		if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("cache.new.soft_delete_failed", "error", delErr, "resource_id", resource.ID)
 		}
 		return respondProvisionFailed(c, err, "Failed to provision Redis namespace")
@@ -387,7 +388,7 @@ func (h *CacheHandler) newCacheAuthenticated(
 		middleware.RecordProvisionFail("redis", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("cache.new.provision_failed_auth",
 			"error", err, "token", tokenStr, "team_id", teamIDStr, "request_id", requestID)
-		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+		if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("cache.new.soft_delete_failed_auth", "error", delErr, "resource_id", resource.ID)
 		}
 		return respondProvisionFailed(c, err, "Failed to provision Redis namespace")
@@ -563,7 +564,7 @@ func (h *CacheHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionFor
 		middleware.RecordProvisionFail(models.ResourceTypeRedis, middleware.ProvisionFailBackendUnavailable)
 		slog.Error("twin.cache.provision_failed",
 			"error", err, "token", tokenStr, "team_id", in.TeamID, "request_id", in.RequestID)
-		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+		if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("twin.cache.soft_delete_failed",
 				"error", delErr, "resource_id", resource.ID, "request_id", in.RequestID)
 		}

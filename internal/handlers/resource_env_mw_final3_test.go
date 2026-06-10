@@ -1,7 +1,7 @@
 package handlers_test
 
 // resource_env_mw_final3_test.go — FINAL serial pass #3. Covers all three arms
-// of ResourceEnvByTokenForMiddleware (env_policy_helpers.go):
+// of ResourceEnvByTokenOrIDForMiddleware (env_policy_helpers.go):
 //   - non-UUID :id → ("", nil)               (line 32)
 //   - token not found → ("", nil) fail-open   (line 38)
 //   - real resource → (env, nil) happy        (line 40)
@@ -27,15 +27,15 @@ func TestResourceEnvByTokenMWFinal3_Arms(t *testing.T) {
 	teamID := testhelpers.MustCreateTeamDB(t, db, "pro")
 
 	// Seed a real resource so the happy arm returns its env.
-	var token string
+	var rowID, token string
 	require.NoError(t, db.QueryRowContext(context.Background(),
 		`INSERT INTO resources (team_id, resource_type, tier, env, status)
 		 VALUES ($1::uuid, 'postgres', 'pro', 'staging', 'active')
-		 RETURNING token::text`, teamID).Scan(&token))
+		 RETURNING id::text, token::text`, teamID).Scan(&rowID, &token))
 
 	app := fiber.New()
 	app.Get("/r/:id", func(c *fiber.Ctx) error {
-		env, err := handlers.ResourceEnvByTokenForMiddleware(c, db)
+		env, err := handlers.ResourceEnvByTokenOrIDForMiddleware(c, db)
 		if err != nil {
 			return c.Status(http.StatusInternalServerError).SendString("err")
 		}
@@ -59,7 +59,12 @@ func TestResourceEnvByTokenMWFinal3_Arms(t *testing.T) {
 	_, body = get(uuid.NewString())
 	assert.Empty(t, body)
 
-	// real resource → its env (line 40).
+	// real resource by token → its env (line 40).
 	_, body = get(token)
+	assert.Equal(t, "staging", body)
+
+	// real resource by ROW ID → its env (Wave-2 A1: the id-addressed DELETE
+	// form must hit the same env-policy gate as the token form).
+	_, body = get(rowID)
 	assert.Equal(t, "staging", body)
 }

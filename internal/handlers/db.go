@@ -260,7 +260,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 		middleware.RecordProvisionFail("postgres", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("db.new.provision_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
-		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+		if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("db.new.soft_delete_failed", "error", delErr, "resource_id", resource.ID)
 		}
 		return respondProvisionFailed(c, err, "Failed to provision Postgres database")
@@ -438,7 +438,7 @@ func (h *DBHandler) newDBAuthenticated(
 		middleware.RecordProvisionFail("postgres", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("db.new.provision_failed_auth",
 			"error", err, "token", tokenStr, "team_id", teamIDStr, "request_id", requestID)
-		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+		if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("db.new.soft_delete_failed_auth", "error", delErr, "resource_id", resource.ID)
 		}
 		return respondProvisionFailed(c, err, "Failed to provision Postgres database")
@@ -647,7 +647,7 @@ func (h *DBHandler) ProvisionForTwinCore(ctx context.Context, in ProvisionForTwi
 		middleware.RecordProvisionFail(models.ResourceTypePostgres, middleware.ProvisionFailBackendUnavailable)
 		slog.Error("twin.db.provision_failed",
 			"error", err, "token", tokenStr, "team_id", in.TeamID, "request_id", in.RequestID)
-		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+		if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("twin.db.soft_delete_failed",
 				"error", delErr, "resource_id", resource.ID, "request_id", in.RequestID)
 		}

@@ -14,24 +14,27 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
-	"instant.dev/internal/models"
 )
 
-// ResourceEnvByTokenForMiddleware reads the env stored on a resource row
-// addressed by the URL :id param (a public token UUID). Returns the env on
-// success or "" on any error — the env-policy middleware fails OPEN on
-// lookup error so a malformed/non-existent :id falls through to the
-// handler's own 400/404 instead of a confusing 403/env_policy_denied.
+// ResourceEnvByTokenOrIDForMiddleware reads the env stored on a resource row
+// addressed by the URL :id param — resolved first as a public token UUID,
+// then as the row's primary-key id (resolveResourceByTokenOrID), matching
+// the DELETE handler's own resolution so the env-policy gate covers BOTH
+// address forms (without the id fallback an id-addressed DELETE would skip
+// env-policy enforcement entirely). Returns the env on success or "" on any
+// error — the env-policy middleware fails OPEN on lookup error so a
+// malformed/non-existent :id falls through to the handler's own 400/404
+// instead of a confusing 403/env_policy_denied.
 //
 // Exported with the verbose suffix so its single intended caller (the
 // router wiring) is unambiguous; this is not a general-purpose helper.
-func ResourceEnvByTokenForMiddleware(c *fiber.Ctx, db *sql.DB) (string, error) {
+func ResourceEnvByTokenOrIDForMiddleware(c *fiber.Ctx, db *sql.DB) (string, error) {
 	tokenStr := c.Params("id")
-	token, err := uuid.Parse(tokenStr)
+	pathUUID, err := uuid.Parse(tokenStr)
 	if err != nil {
 		return "", nil
 	}
-	r, err := models.GetResourceByToken(c.Context(), db, token)
+	r, err := resolveResourceByTokenOrID(c.Context(), db, pathUUID)
 	if err != nil {
 		// Including ErrResourceNotFound — fail open so the handler returns
 		// its own 404 (which contains a stable, agent-readable shape).

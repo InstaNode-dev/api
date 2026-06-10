@@ -29,7 +29,7 @@ import (
 // allRawStatuses is the set of status strings the resources table can
 // hold plus a junk value, so the equivalence check exercises the
 // unrecognised-value path too.
-var allRawStatuses = []string{"active", "paused", "suspended", "expired", "deleted", "garbage"}
+var allRawStatuses = []string{"active", "paused", "suspended", "failed", "expired", "deleted", "garbage"}
 
 // TestPauseStatusPredicate_EquivalentToOldLiterals covers resource.go
 // Pause: old code rejected with "already_paused" on Status == "paused"

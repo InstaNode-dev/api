@@ -511,7 +511,7 @@ func TestConnectRedis_PanicsOnUnreachable(t *testing.T) {
 // re-applying it mid-sequence can never reject a valid row. No DB needed —
 // reads the embedded SQL via the same seam the runner uses.
 func TestMigrations_ResourcesStatusCheck_ForwardConsistent(t *testing.T) {
-	canonical := []string{"pending", "active", "paused", "suspended", "expired", "deleted", "reaped"}
+	canonical := []string{"pending", "active", "paused", "suspended", "failed", "expired", "deleted", "reaped"}
 	checked := 0
 	for _, name := range MigrationFiles() {
 		b, err := readMigrationFile(name)

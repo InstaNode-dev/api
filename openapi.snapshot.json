@@ -4581,6 +4581,7 @@
       "delete": {
         "parameters": [
           {
+            "description": "Accepts EITHER the resource's 'id' (as returned by GET /api/v1/resources) OR its provision 'token'. Resolution tries token first, then id; authorization (team ownership) is identical for both forms.",
             "in": "path",
             "name": "id",
             "required": true,
@@ -4596,6 +4597,9 @@
           },
           "403": {
             "description": "Forbidden — not your resource OR blocked by team env_policy. The env_policy variant carries body: { error: 'env_policy_denied', env, action, role, allowed_roles, agent_action }."
+          },
+          "404": {
+            "description": "Not found — no resource with that id or token, or it belongs to another team."
           }
         },
         "security": [

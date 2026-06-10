@@ -197,6 +197,17 @@ const StatusPending = "pending"
 // StatusActive is the canonical "provisioned and usable" status.
 const StatusActive = "active"
 
+// StatusFailed is the terminal status a resource row carries when the backend
+// provision RPC failed or timed out and the handler rolled the provision back.
+// Before Wave-2 A1 (2026-06-11) the rollback soft-deleted the row, so a
+// timed-out provision VANISHED from every read surface and the caller had no
+// terminal state to poll. A failed row is visible in lists (only 'deleted' is
+// hidden), deletable via DELETE /api/v1/resources/:id, exempt from quota
+// counts (those filter status='active'), and carries no live backing infra —
+// the backend object either never existed or was torn down by the rollback's
+// best-effort cleanup. Added by migration 070_resources_failed_status.sql.
+const StatusFailed = "failed"
+
 // CreateResource inserts a new resource row and returns it.
 //
 // MR-P0-2 (BugBash 2026-05-20): the row is inserted with status='pending', NOT
@@ -270,6 +281,31 @@ func MarkResourceActive(ctx context.Context, db *sql.DB, id uuid.UUID) error {
 // missing or not in 'pending' status — the caller asked to activate a row
 // that is not in the expected mid-provision state.
 var ErrResourceNotPending = fmt.Errorf("models: resource is not pending")
+
+// MarkResourceFailed flips a resource from 'pending' → 'failed'. It is the
+// provision-rollback counterpart of MarkResourceActive: the handler runs it
+// when the backend provision RPC fails/times out, or when a post-RPC
+// persistence step fails (finalizeProvision), so the caller is left with a
+// pollable terminal row instead of a vanished one.
+//
+// The atomic `WHERE status = 'pending'` guard mirrors MarkResourceActive: a
+// row some other path already moved out of 'pending' (a reconciler abandon, a
+// concurrent delete) is NOT clobbered. Returns ErrResourceNotPending on a
+// zero-row update so the caller can log the unexpected state; rollback callers
+// treat that as best-effort (the 503 to the customer is unchanged either way).
+func MarkResourceFailed(ctx context.Context, db *sql.DB, id uuid.UUID) error {
+	res, err := db.ExecContext(ctx, `
+		UPDATE resources SET status = 'failed' WHERE id = $1 AND status = 'pending'
+	`, id)
+	if err != nil {
+		return fmt.Errorf("models.MarkResourceFailed: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrResourceNotPending
+	}
+	return nil
+}
 
 // CountActiveResourcesByTeamAndType returns the number of active (non-deleted)
 // resources of the given type owned by a team. Used for plan limit enforcement.
@@ -450,19 +486,6 @@ func SetWebhookHMACSecret(ctx context.Context, db *sql.DB, resourceID uuid.UUID,
 	)
 	if err != nil {
 		return fmt.Errorf("models.SetWebhookHMACSecret: %w", err)
-	}
-	return nil
-}
-
-// SoftDeleteResource marks a resource status as 'deleted'. Used by the
-// provision-rollback paths (db/cache/nosql/queue/storage/vector), which always
-// operate on a row they just created — they don't need the concurrency guard.
-func SoftDeleteResource(ctx context.Context, db *sql.DB, id uuid.UUID) error {
-	_, err := db.ExecContext(ctx, `
-		UPDATE resources SET status = 'deleted' WHERE id = $1
-	`, id)
-	if err != nil {
-		return fmt.Errorf("models.SoftDeleteResource: %w", err)
 	}
 	return nil
 }
