@@ -344,6 +344,13 @@
             "format": "uuid",
             "type": "string"
           },
+          "ignored_fields": {
+            "description": "D7: present (sorted) only when the request body carried keys this build does not recognise — e.g. a typo'd or hallucinated field like 'region'/'size'. The named keys were ACCEPTED-AND-IGNORED, not rejected: the provision still succeeded. An agent should treat a non-empty ignored_fields as a hint to fix the typo or drop the field. Absent when every key sent was recognised.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "internal_url": {
             "description": "Cluster-internal redis:// URL routed via instant-redis-proxy. Use this when calling from a workload deployed inside the instanode cluster.",
             "type": "string"
@@ -601,6 +608,13 @@
             "description": "Resource row id.",
             "format": "uuid",
             "type": "string"
+          },
+          "ignored_fields": {
+            "description": "D7: present (sorted) only when the request body carried keys this build does not recognise — e.g. a typo'd or hallucinated field like 'region'/'size'. The named keys were ACCEPTED-AND-IGNORED, not rejected: the provision still succeeded. An agent should treat a non-empty ignored_fields as a hint to fix the typo or drop the field. Absent when every key sent was recognised.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "internal_url": {
             "description": "Cluster-internal postgres:// URL routed via instant-pg-proxy. Use this when calling from a workload deployed inside the instanode cluster (e.g. an app started by /deploy/new) — the public hostname does not hairpin reliably.",
@@ -1105,6 +1119,10 @@
             "description": "Stable machine-readable error code (e.g. 'quota_exceeded', 'invalid_token', 'forbidden', 'storage_limit_reached'). Programmatic clients should branch on this.",
             "type": "string"
           },
+          "error_code": {
+            "description": "Optional. Finer-grained sub-classification of the top-level 'error', emitted today on auth-rejection (401) envelopes from RequireAuth/OptionalAuthStrict: 'missing_credentials' (no Authorization header), 'malformed_token' (header present but not a well-formed JWT/PAT, or signature mismatch), 'expired_token' (JWT parsed + signature valid but past exp), 'invalid_claims' (signature valid but a required uid/tid claim is empty), 'revoked_session' (the jti was revoked via POST /auth/logout). The top-level 'error' stays 'unauthorized' on every one of these so existing clients matching on it keep working; branch on 'error_code' when you need to tell 'I never sent credentials' from 'my token expired'. Absent on envelopes that have no sub-classification.",
+            "type": "string"
+          },
           "message": {
             "description": "Human-readable explanation of the error. May contain tier names, resource IDs, or other context. Not stable — use the 'error' code for programmatic decisions.",
             "type": "string"
@@ -1377,6 +1395,13 @@
             "format": "uuid",
             "type": "string"
           },
+          "ignored_fields": {
+            "description": "D7: present (sorted) only when the request body carried keys this build does not recognise — e.g. a typo'd or hallucinated field like 'region'/'size'. The named keys were ACCEPTED-AND-IGNORED, not rejected: the provision still succeeded. An agent should treat a non-empty ignored_fields as a hint to fix the typo or drop the field. Absent when every key sent was recognised.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "internal_url": {
             "description": "Cluster-internal mongodb:// URL routed via instant-mongo-proxy. Use this when calling from a workload deployed inside the instanode cluster.",
             "type": "string"
@@ -1550,6 +1575,13 @@
             "description": "Resource row id.",
             "format": "uuid",
             "type": "string"
+          },
+          "ignored_fields": {
+            "description": "D7: present (sorted) only when the request body carried keys this build does not recognise — e.g. a typo'd or hallucinated field like 'region'/'size'. The named keys were ACCEPTED-AND-IGNORED, not rejected: the provision still succeeded. An agent should treat a non-empty ignored_fields as a hint to fix the typo or drop the field. Absent when every key sent was recognised.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "internal_url": {
             "description": "Cluster-internal nats:// URL routed via instant-nats-proxy. Use this when calling from a workload deployed inside the instanode cluster.",
@@ -1944,6 +1976,13 @@
             "description": "Resource row id",
             "format": "uuid",
             "type": "string"
+          },
+          "ignored_fields": {
+            "description": "D7: present (sorted) only when the request body carried keys this build does not recognise — e.g. a typo'd or hallucinated field like 'region'/'size'. The named keys were ACCEPTED-AND-IGNORED, not rejected: the provision still succeeded. An agent should treat a non-empty ignored_fields as a hint to fix the typo or drop the field. Absent when every key sent was recognised.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "limits": {
             "properties": {
@@ -2392,6 +2431,13 @@
             "format": "uuid",
             "type": "string"
           },
+          "ignored_fields": {
+            "description": "D7: present (sorted) only when the request body carried keys this build does not recognise — e.g. a typo'd or hallucinated field like 'region'/'size'. The named keys were ACCEPTED-AND-IGNORED, not rejected: the provision still succeeded. An agent should treat a non-empty ignored_fields as a hint to fix the typo or drop the field. Absent when every key sent was recognised.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "internal_url": {
             "description": "Cluster-internal postgres:// URL routed via instant-pg-proxy. Use this when calling from a workload deployed inside the instanode cluster.",
             "type": "string"
@@ -2466,6 +2512,13 @@
             "description": "Resource row id.",
             "format": "uuid",
             "type": "string"
+          },
+          "ignored_fields": {
+            "description": "D7: present (sorted) only when the request body carried keys this build does not recognise — e.g. a typo'd or hallucinated field like 'region'/'size'. The named keys were ACCEPTED-AND-IGNORED, not rejected: the provision still succeeded. An agent should treat a non-empty ignored_fields as a hint to fix the typo or drop the field. Absent when every key sent was recognised.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "limits": {
             "properties": {
@@ -7953,7 +8006,7 @@
     },
     "/auth/cli/{id}": {
       "get": {
-        "description": "Returns 202 with {pending:true} while the user is still completing OAuth, or 200 with the issued API key and identity once they have. The session is single-use and is deleted on the first 200 response. After Redis expiry (or on lookup failure) the endpoint fails open with pending=true so the CLI keeps polling.",
+        "description": "Returns 202 with {status:'pending', pending:true} while the user is still completing login, or 200 with {status:'complete', api_token, ...} once they have. The session is single-use and is deleted on the first 200 response. After Redis expiry (or on lookup failure) the endpoint fails open with status='pending' so the CLI keeps polling. The legacy 'pending' (bool) and 'api_key' fields mirror 'status'/'api_token' for back-compat with older CLI builds.",
         "parameters": [
           {
             "in": "path",
@@ -7971,6 +8024,11 @@
                 "schema": {
                   "properties": {
                     "api_key": {
+                      "description": "Deprecated alias for api_token.",
+                      "type": "string"
+                    },
+                    "api_token": {
+                      "description": "The team API key (PAT, ink_ prefix) the CLI persists. Returned exactly once.",
                       "type": "string"
                     },
                     "claimed_tokens": {
@@ -7987,6 +8045,13 @@
                     "ok": {
                       "type": "boolean"
                     },
+                    "status": {
+                      "description": "Canonical completion marker.",
+                      "enum": [
+                        "complete"
+                      ],
+                      "type": "string"
+                    },
                     "team_name": {
                       "type": "string"
                     },
@@ -8001,6 +8066,30 @@
             "description": "Login complete"
           },
           "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "pending": {
+                      "enum": [
+                        true
+                      ],
+                      "type": "boolean"
+                    },
+                    "status": {
+                      "enum": [
+                        "pending"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
             "description": "Still pending"
           },
           "400": {
@@ -8011,6 +8100,59 @@
           }
         },
         "summary": "Poll a CLI device-flow login session for completion"
+      }
+    },
+    "/auth/cli/{id}/complete": {
+      "post": {
+        "description": "Called by the dashboard with the signed-in user's session Bearer once they approve the CLI login in the browser. Mints a fresh team API key (the long-lived bearer the CLI persists) + gathers the team's claimed resource tokens, and flips the pending Redis session to complete so the CLI's next GET /auth/cli/{id} poll returns 200 with the api_token. Idempotent: a second call on an already-completed session is a no-op 200. This is the missing call site that makes 'instant login' work (D2, 2026-06-10).",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "ok": {
+                      "enum": [
+                        true
+                      ],
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Session completed (or already complete)"
+          },
+          "400": {
+            "description": "Missing session id"
+          },
+          "401": {
+            "description": "Missing or invalid session token"
+          },
+          "404": {
+            "description": "Session not found or expired"
+          },
+          "503": {
+            "description": "Transient server error minting the key / completing the session — retry the login"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Complete a CLI device-flow login session"
       }
     },
     "/auth/email/callback": {

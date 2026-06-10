@@ -167,16 +167,24 @@ func TestRecycleGate_FiresWith402_WhenMarkerExistsAndNoActiveRow(t *testing.T) {
 	//   SELECT ... FROM resources WHERE fingerprint = $1 AND team_id IS NULL
 	//     AND status = 'active' ORDER BY created_at DESC
 	// (cross-service: any active resource for this fingerprint counts).
-	// We return zero rows.
-	mock.ExpectQuery(`SELECT.*FROM resources.*fingerprint`).
-		WithArgs(fp).
-		WillReturnRows(sqlmock.NewRows([]string{
+	// We return zero rows. F1: the gate now mints a claim JWT, which issues a
+	// SECOND identical fingerprint lookup inside issueOnboardingJWT — expect
+	// both (each returns zero rows; sqlmock matches in order).
+	emptyRows := func() *sqlmock.Rows {
+		return sqlmock.NewRows([]string{
 			"id", "team_id", "token", "resource_type", "name", "connection_url",
 			"key_prefix", "tier", "env", "fingerprint", "cloud_vendor",
 			"country_code", "status", "migration_status", "expires_at",
 			"storage_bytes", "provider_resource_id", "created_request_id",
 			"parent_resource_id", "created_at",
-		}))
+		})
+	}
+	mock.ExpectQuery(`SELECT.*FROM resources.*fingerprint`).
+		WithArgs(fp).
+		WillReturnRows(emptyRows())
+	mock.ExpectQuery(`SELECT.*FROM resources.*fingerprint`).
+		WithArgs(fp).
+		WillReturnRows(emptyRows())
 
 	var gateFired bool
 	status, body := drive(t, func(c *fiber.Ctx) error {
@@ -192,9 +200,15 @@ func TestRecycleGate_FiresWith402_WhenMarkerExistsAndNoActiveRow(t *testing.T) {
 	assert.Equal(t, false, body["ok"])
 	assert.Equal(t, RecycleGateErrorCode, body["error"],
 		"error code must be the stable machine-readable %s", RecycleGateErrorCode)
-	assert.Equal(t, RecycleGateClaimURL, body["claim_url"],
-		"402 must include claim_url so the agent has a place to send the user")
-	assert.Equal(t, RecycleGateClaimURL, body["upgrade_url"],
+	// F1: claim_url is no longer the tokenless dead-end RecycleGateClaimURL —
+	// it now carries a minted claim JWT so the EXISTING /claim?t= page works.
+	claimURL, ok := body["claim_url"].(string)
+	require.True(t, ok, "402 must include a claim_url string")
+	assert.Contains(t, claimURL, "?t=",
+		"F1: claim_url must embed a minted claim JWT (?t=<jwt>), not a tokenless dead-end")
+	assert.NotEqual(t, RecycleGateClaimURL, claimURL,
+		"F1: claim_url must no longer be the bare tokenless https://instanode.dev/claim")
+	assert.Equal(t, claimURL, body["upgrade_url"],
 		"upgrade_url must mirror claim_url for parity with the existing 402 contract")
 	if msg, ok := body["agent_action"].(string); ok {
 		assert.Contains(t, msg, "claim", "agent_action must instruct claiming")
@@ -202,6 +216,119 @@ func TestRecycleGate_FiresWith402_WhenMarkerExistsAndNoActiveRow(t *testing.T) {
 		t.Errorf("agent_action must be a string; got %T", body["agent_action"])
 	}
 
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestRecycleGate_ClaimURL_MintFailedFallsBackToBareURL asserts the F1
+// fail-soft path: when claim-JWT signing fails (issueOnboardingJWT errors), the
+// gate still returns a USABLE recovery URL — the bare RecycleGateClaimURL — and
+// never an error. The 402 contract (error code, agent_action) is unchanged.
+//
+// SignOnboardingJWT cannot be forced to error from config (HMAC over any []byte
+// key, including empty, signs successfully), so the mint-failure is injected
+// through the issueOnboardingJWTFn seam — the only deterministic way to reach
+// recycleClaimURL's mint_failed arm (provision_helper.go:371-375).
+func TestRecycleGate_ClaimURL_MintFailedFallsBackToBareURL(t *testing.T) {
+	h, _, _, cleanup := newTestHelper(t)
+	defer cleanup()
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	defer db.Close()
+	h.db = db
+
+	const fp = "fp_recycler_mint_path"
+	require.NoError(t, h.markRecycleSeen(context.Background(), fp))
+
+	emptyRows := func() *sqlmock.Rows {
+		return sqlmock.NewRows([]string{
+			"id", "team_id", "token", "resource_type", "name", "connection_url",
+			"key_prefix", "tier", "env", "fingerprint", "cloud_vendor",
+			"country_code", "status", "migration_status", "expires_at",
+			"storage_bytes", "provider_resource_id", "created_request_id",
+			"parent_resource_id", "created_at",
+		})
+	}
+	// recycle lookup returns zero rows → gate fires. The claim-JWT mint that
+	// follows is forced to fail by the seam below, so issueOnboardingJWT (and
+	// its own fingerprint lookup) is never reached — only ONE query expected.
+	mock.ExpectQuery(`SELECT.*FROM resources.*fingerprint`).
+		WithArgs(fp).
+		WillReturnRows(emptyRows())
+
+	// Force the mint to fail → exercises the mint_failed arm + bare-URL fallback.
+	orig := issueOnboardingJWTFn
+	issueOnboardingJWTFn = func(
+		_ *provisionHelper, _ context.Context,
+		_, _, _, _ string, _ []string,
+	) (string, string, error) {
+		return "", "", errors.New("simulated jwt sign failure")
+	}
+	defer func() { issueOnboardingJWTFn = orig }()
+
+	status, body := drive(t, func(c *fiber.Ctx) error {
+		if h.recycleGate(c, fp, "postgres") {
+			return nil
+		}
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{"ok": true})
+	})
+
+	assert.Equal(t, fiber.StatusPaymentRequired, status, "gate still fires")
+	assert.Equal(t, RecycleGateErrorCode, body["error"], "402 contract unchanged on mint trouble")
+	claimURL, ok := body["claim_url"].(string)
+	require.True(t, ok, "claim_url must always be a usable string, even on mint trouble")
+	assert.Equal(t, RecycleGateClaimURL, claimURL,
+		"mint failure must fall back to the bare tokenless RecycleGateClaimURL")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestRecycleGate_ClaimURL_MintSucceeds_EmbedsJWT covers the happy mint arm
+// (provision_helper.go:376-377): when the seam returns a token, claim_url is the
+// /start?t=<jwt> bounce URL (not the bare fallback). Pins the minted-metric path
+// alongside the mint_failed path above.
+func TestRecycleGate_ClaimURL_MintSucceeds_EmbedsJWT(t *testing.T) {
+	h, _, _, cleanup := newTestHelper(t)
+	defer cleanup()
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	defer db.Close()
+	h.db = db
+
+	const fp = "fp_recycler_mint_ok"
+	require.NoError(t, h.markRecycleSeen(context.Background(), fp))
+
+	mock.ExpectQuery(`SELECT.*FROM resources.*fingerprint`).
+		WithArgs(fp).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "team_id", "token", "resource_type", "name", "connection_url",
+			"key_prefix", "tier", "env", "fingerprint", "cloud_vendor",
+			"country_code", "status", "migration_status", "expires_at",
+			"storage_bytes", "provider_resource_id", "created_request_id",
+			"parent_resource_id", "created_at",
+		}))
+
+	orig := issueOnboardingJWTFn
+	issueOnboardingJWTFn = func(
+		_ *provisionHelper, _ context.Context,
+		_, _, _, _ string, _ []string,
+	) (string, string, error) {
+		return "minted.jwt.token", "jti-1", nil
+	}
+	defer func() { issueOnboardingJWTFn = orig }()
+
+	_, body := drive(t, func(c *fiber.Ctx) error {
+		if h.recycleGate(c, fp, "postgres") {
+			return nil
+		}
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{"ok": true})
+	})
+
+	claimURL, ok := body["claim_url"].(string)
+	require.True(t, ok)
+	assert.Contains(t, claimURL, "?t=minted.jwt.token",
+		"a successful mint must embed the JWT in the /start bounce URL")
+	assert.NotEqual(t, RecycleGateClaimURL, claimURL)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

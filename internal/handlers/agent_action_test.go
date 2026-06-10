@@ -126,11 +126,15 @@ func TestRespondError_KnownCode_PopulatesAgentAction(t *testing.T) {
 			wantActionSubstr: "url path tokens",
 		},
 		{
-			name:             "unauthorized points at login",
+			// D1/D8 (2026-06-10): the `unauthorized` agent_action steers a
+			// HEADLESS agent at the CLI device-flow / INSTANT_TOKEN PAT, NOT the
+			// browser /login page. Assert it names the device-flow endpoint and
+			// the canonical bearer env var.
+			name:             "unauthorized steers headless agents at the device-flow",
 			code:             "unauthorized",
 			status:           fiber.StatusUnauthorized,
 			wantUpgradeURL:   false,
-			wantActionSubstr: "log in at https://instanode.dev/login",
+			wantActionSubstr: "/auth/cli",
 		},
 		{
 			name:             "auth_required points at login/signup",

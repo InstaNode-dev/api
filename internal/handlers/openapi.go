@@ -1698,13 +1698,28 @@ const openAPISpec = `{
     "/auth/cli/{id}": {
       "get": {
         "summary": "Poll a CLI device-flow login session for completion",
-        "description": "Returns 202 with {pending:true} while the user is still completing OAuth, or 200 with the issued API key and identity once they have. The session is single-use and is deleted on the first 200 response. After Redis expiry (or on lookup failure) the endpoint fails open with pending=true so the CLI keeps polling.",
+        "description": "Returns 202 with {status:'pending', pending:true} while the user is still completing login, or 200 with {status:'complete', api_token, ...} once they have. The session is single-use and is deleted on the first 200 response. After Redis expiry (or on lookup failure) the endpoint fails open with status='pending' so the CLI keeps polling. The legacy 'pending' (bool) and 'api_key' fields mirror 'status'/'api_token' for back-compat with older CLI builds.",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
         "responses": {
-          "200": { "description": "Login complete", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "api_key": { "type": "string" }, "email": { "type": "string", "format": "email" }, "tier": { "type": "string" }, "team_name": { "type": "string" }, "claimed_tokens": { "type": "array", "items": { "type": "string", "format": "uuid" } } } } } } },
-          "202": { "description": "Still pending" },
+          "200": { "description": "Login complete", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "status": { "type": "string", "enum": ["complete"], "description": "Canonical completion marker." }, "api_token": { "type": "string", "description": "The team API key (PAT, ink_ prefix) the CLI persists. Returned exactly once." }, "api_key": { "type": "string", "description": "Deprecated alias for api_token." }, "email": { "type": "string", "format": "email" }, "tier": { "type": "string" }, "team_name": { "type": "string" }, "claimed_tokens": { "type": "array", "items": { "type": "string", "format": "uuid" } } } } } } },
+          "202": { "description": "Still pending", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "status": { "type": "string", "enum": ["pending"] }, "pending": { "type": "boolean", "enum": [true] } } } } } },
           "400": { "description": "Missing session id" },
           "404": { "description": "Session not found or expired" }
+        }
+      }
+    },
+    "/auth/cli/{id}/complete": {
+      "post": {
+        "summary": "Complete a CLI device-flow login session",
+        "description": "Called by the dashboard with the signed-in user's session Bearer once they approve the CLI login in the browser. Mints a fresh team API key (the long-lived bearer the CLI persists) + gathers the team's claimed resource tokens, and flips the pending Redis session to complete so the CLI's next GET /auth/cli/{id} poll returns 200 with the api_token. Idempotent: a second call on an already-completed session is a no-op 200. This is the missing call site that makes 'instant login' work (D2, 2026-06-10).",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Session completed (or already complete)", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean", "enum": [true] } } } } } },
+          "400": { "description": "Missing session id" },
+          "401": { "description": "Missing or invalid session token" },
+          "404": { "description": "Session not found or expired" },
+          "503": { "description": "Transient server error minting the key / completing the session — retry the login" }
         }
       }
     },
@@ -2748,6 +2763,7 @@ const openAPISpec = `{
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket the resource landed in (defaults to 'development' when env was omitted — see migration 026)." },
           "env_override_reason": { "type": "string", "description": "Present only when the request omitted env and the API defaulted it (value 'default_no_env_specified'). Absent when env was sent explicitly." },
+          "ignored_fields": { "type": "array", "items": { "type": "string" }, "description": "D7: present (sorted) only when the request body carried keys this build does not recognise — e.g. a typo'd or hallucinated field like 'region'/'size'. The named keys were ACCEPTED-AND-IGNORED, not rejected: the provision still succeeded. An agent should treat a non-empty ignored_fields as a hint to fix the typo or drop the field. Absent when every key sent was recognised." },
           "expires_at": { "type": "string", "format": "date-time", "description": "Anonymous-tier only. RFC3339 timestamp at which the resource auto-expires (24h TTL). Absent on authenticated provisions (no auto-expiry). Added by T19 P0-2 (BugHunt 2026-05-20) so the TTL contract matches storage/webhook." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "dedicated": { "type": "boolean", "description": "True when the resource was provisioned on dedicated (single-tenant) infrastructure rather than the shared pool. Authenticated provisions only." },
@@ -2780,6 +2796,7 @@ const openAPISpec = `{
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
+          "ignored_fields": { "type": "array", "items": { "type": "string" }, "description": "D7: present (sorted) only when the request body carried keys this build does not recognise — e.g. a typo'd or hallucinated field like 'region'/'size'. The named keys were ACCEPTED-AND-IGNORED, not rejected: the provision still succeeded. An agent should treat a non-empty ignored_fields as a hint to fix the typo or drop the field. Absent when every key sent was recognised." },
           "expires_at": { "type": "string", "format": "date-time", "description": "Anonymous-tier only. RFC3339 24h-TTL expiry. T19 P0-2 (BugHunt 2026-05-20)." },
           "extension": { "type": "string", "enum": ["pgvector"], "description": "Always 'pgvector' for /vector/new. Declared so clients can confirm the extension is present without querying pg_extension." },
           "dimensions": { "type": "integer", "description": "Echo of the requested dimensions hint (defaults to 1536). Informational only — pgvector enforces dimensions per column, not per database." },
@@ -2805,6 +2822,7 @@ const openAPISpec = `{
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
+          "ignored_fields": { "type": "array", "items": { "type": "string" }, "description": "D7: present (sorted) only when the request body carried keys this build does not recognise — e.g. a typo'd or hallucinated field like 'region'/'size'. The named keys were ACCEPTED-AND-IGNORED, not rejected: the provision still succeeded. An agent should treat a non-empty ignored_fields as a hint to fix the typo or drop the field. Absent when every key sent was recognised." },
           "expires_at": { "type": "string", "format": "date-time", "description": "Anonymous-tier only. RFC3339 24h-TTL expiry. T19 P0-2 (BugHunt 2026-05-20)." },
           "limits": { "type": "object", "properties": { "memory_mb": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "dedicated": { "type": "boolean", "description": "True when the resource was provisioned on dedicated (single-tenant) infrastructure rather than the shared pool. Authenticated provisions only." },
@@ -2827,6 +2845,7 @@ const openAPISpec = `{
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
+          "ignored_fields": { "type": "array", "items": { "type": "string" }, "description": "D7: present (sorted) only when the request body carried keys this build does not recognise — e.g. a typo'd or hallucinated field like 'region'/'size'. The named keys were ACCEPTED-AND-IGNORED, not rejected: the provision still succeeded. An agent should treat a non-empty ignored_fields as a hint to fix the typo or drop the field. Absent when every key sent was recognised." },
           "expires_at": { "type": "string", "format": "date-time", "description": "Anonymous-tier only. RFC3339 24h-TTL expiry. T19 P0-2 (BugHunt 2026-05-20)." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "connections": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "dedicated": { "type": "boolean", "description": "True when the resource was provisioned on dedicated (single-tenant) infrastructure rather than the shared pool. Authenticated provisions only." },
@@ -2863,6 +2882,7 @@ const openAPISpec = `{
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
+          "ignored_fields": { "type": "array", "items": { "type": "string" }, "description": "D7: present (sorted) only when the request body carried keys this build does not recognise — e.g. a typo'd or hallucinated field like 'region'/'size'. The named keys were ACCEPTED-AND-IGNORED, not rejected: the provision still succeeded. An agent should treat a non-empty ignored_fields as a hint to fix the typo or drop the field. Absent when every key sent was recognised." },
           "expires_at": { "type": "string", "format": "date-time", "description": "Anonymous-tier only. RFC3339 24h-TTL expiry. T19 P0-2 (BugHunt 2026-05-20)." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "expires_in": { "type": "string", "description": "Anonymous-only" } }, "description": "Queue storage cap. storage_mb is read from plans.yaml for the resolved tier." },
           "dedicated": { "type": "boolean", "description": "True when the resource was provisioned on dedicated (single-tenant) infrastructure rather than the shared pool." },
@@ -2883,6 +2903,7 @@ const openAPISpec = `{
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
+          "ignored_fields": { "type": "array", "items": { "type": "string" }, "description": "D7: present (sorted) only when the request body carried keys this build does not recognise — e.g. a typo'd or hallucinated field like 'region'/'size'. The named keys were ACCEPTED-AND-IGNORED, not rejected: the provision still succeeded. An agent should treat a non-empty ignored_fields as a hint to fix the typo or drop the field. Absent when every key sent was recognised." },
           "limits": { "type": "object", "properties": { "requests_stored": { "type": "integer" }, "expires_in": { "type": "string" } } },
           "expires_at": { "type": "string", "format": "date-time" },
           "note": { "type": "string" },
@@ -2912,6 +2933,7 @@ const openAPISpec = `{
           "tier": { "type": "string" },
           "env": { "type": "string", "description": "Resolved environment bucket (defaults to 'development' when omitted)." },
           "env_override_reason": { "type": "string", "description": "Present only when env was omitted and defaulted ('default_no_env_specified')." },
+          "ignored_fields": { "type": "array", "items": { "type": "string" }, "description": "D7: present (sorted) only when the request body carried keys this build does not recognise — e.g. a typo'd or hallucinated field like 'region'/'size'. The named keys were ACCEPTED-AND-IGNORED, not rejected: the provision still succeeded. An agent should treat a non-empty ignored_fields as a hint to fix the typo or drop the field. Absent when every key sent was recognised." },
           "limits": { "type": "object", "properties": { "storage_mb": { "type": "integer" }, "expires_in": { "type": "string", "description": "Anonymous-only" } } },
           "warning": { "type": "string", "description": "Present only when the bucket is already over its storage limit at provision time — accompanied by the X-Instant-Notice: storage_limit_reached response header." },
           "expires_at": { "type": "string", "format": "date-time", "description": "Anonymous-tier only. RFC3339 timestamp at which the resource auto-expires (24h TTL)." },
@@ -3340,6 +3362,7 @@ const openAPISpec = `{
         "properties": {
           "ok": { "type": "boolean", "enum": [false], "description": "Always false on error responses" },
           "error": { "type": "string", "description": "Stable machine-readable error code (e.g. 'quota_exceeded', 'invalid_token', 'forbidden', 'storage_limit_reached'). Programmatic clients should branch on this." },
+          "error_code": { "type": "string", "description": "Optional. Finer-grained sub-classification of the top-level 'error', emitted today on auth-rejection (401) envelopes from RequireAuth/OptionalAuthStrict: 'missing_credentials' (no Authorization header), 'malformed_token' (header present but not a well-formed JWT/PAT, or signature mismatch), 'expired_token' (JWT parsed + signature valid but past exp), 'invalid_claims' (signature valid but a required uid/tid claim is empty), 'revoked_session' (the jti was revoked via POST /auth/logout). The top-level 'error' stays 'unauthorized' on every one of these so existing clients matching on it keep working; branch on 'error_code' when you need to tell 'I never sent credentials' from 'my token expired'. Absent on envelopes that have no sub-classification." },
           "message": { "type": "string", "description": "Human-readable explanation of the error. May contain tier names, resource IDs, or other context. Not stable — use the 'error' code for programmatic decisions." },
           "request_id": { "type": "string", "description": "Echo of the X-Request-ID header for this request. Stable correlator agents can quote when emailing contact@instanode.dev — saves the user from copy/pasting headers." },
           "retry_after_seconds": { "type": ["integer", "null"], "description": "Seconds the agent should wait before retrying. null on 4xx (no retry — fix the request). int on transient 5xx: 30 for 503, 60 for 429, 10 for 502/504. For 429/502/503/504 the same value is also set in the Retry-After HTTP header." },

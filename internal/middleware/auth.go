@@ -44,21 +44,39 @@ const (
 	audienceMismatchError = "invalid_token"
 )
 
-// AuthLoginURL is the URL agents should show users when their session
-// token is rejected. Exposed as a package-level variable so tests and
-// self-hosted operators can override it. Mirrors handlers.DefaultLoginURL —
-// duplicated rather than imported because the handlers package consumes
-// middleware (not the other way around), and a circular import would
-// otherwise be required to share the constant.
+// AuthLoginURL is the URL surfaced in the 401 envelope's upgrade_url field —
+// the browser sign-in page a *human* follows when their session token is
+// rejected. Exposed as a package-level variable so tests and self-hosted
+// operators can override it. Mirrors handlers.DefaultLoginURL — duplicated
+// rather than imported because the handlers package consumes middleware (not
+// the other way around), and a circular import would otherwise be required to
+// share the constant.
+//
+// D1 NOTE: upgrade_url stays the browser /login page (the human path), but the
+// agent_action prose below deliberately steers a HEADLESS agent at the
+// CLI device-flow / PAT instead — an agent following a browser /login URL has
+// no browser to follow it with. See unauthorizedAgentAction.
 var AuthLoginURL = "https://instanode.dev/login"
 
 // unauthorizedAgentAction is the canonical agent_action sentence served on
-// every 401 from RequireAuth. Mirrors the "unauthorized" entry in
-// handlers.codeToAgentAction so an agent inspecting either a handler-emitted
-// 401 (e.g. a stale session bouncing off /api/v1/billing/usage) or a
-// middleware-emitted 401 (e.g. no Authorization header at all) gets the same
-// remediation prose either way.
-const unauthorizedAgentAction = "The user's INSTANODE_TOKEN is invalid or expired. Have them log in at https://instanode.dev/login to mint a new one."
+// every 401 from RequireAuth/OptionalAuthStrict. Mirrors the "unauthorized"
+// entry in handlers.codeToAgentAction so an agent inspecting either a
+// handler-emitted 401 (e.g. a stale session bouncing off /api/v1/billing/usage)
+// or a middleware-emitted 401 (e.g. no Authorization header at all) gets the
+// same remediation prose either way.
+//
+// D1/D8 (2026-06-10): the pre-fix copy told the agent to "log in at
+// https://instanode.dev/login" and named INSTANODE_TOKEN. Both mis-steer a
+// HEADLESS agent (Claude Code / curl / MCP): there is no browser to open
+// /login in, and the CLI reads its bearer from INSTANT_TOKEN (not
+// INSTANODE_TOKEN). The new copy points the agent at the two mechanisms a
+// headless caller can actually drive — the CLI device-flow (POST /auth/cli →
+// open the returned auth_url once → poll GET /auth/cli/{id} for the api_token)
+// or a Personal Access Token exported as INSTANT_TOKEN. Adheres to the U3
+// agent_action contract: "Tell the user" opening, names the exact next action,
+// carries a full https://instanode.dev/ URL, under 280 chars. The browser
+// /login page is still surfaced for humans via the upgrade_url field.
+const unauthorizedAgentAction = "Tell the user their INSTANT_TOKEN is missing or expired. A headless agent should re-auth via the CLI device-flow (POST https://api.instanode.dev/auth/cli, open the auth_url, poll GET /auth/cli/{id}) or set INSTANT_TOKEN to a PAT. See https://instanode.dev/docs/cli."
 
 // unauthorizedMessage is the human-readable explanation paired with the
 // "unauthorized" error code in the envelope. Required by the canonical
@@ -76,7 +94,7 @@ const unauthorizedMessage = "Authentication required: missing, malformed, or exp
 //	  "message": "Authentication required: ...",
 //	  "request_id": "<x-request-id>",
 //	  "retry_after_seconds": null,
-//	  "agent_action": "The user's INSTANODE_TOKEN is invalid or expired...",
+//	  "agent_action": "Tell the user their INSTANT_TOKEN is missing or expired. A headless agent should re-auth via the CLI device-flow...",
 //	  "upgrade_url": "https://instanode.dev/login"
 //	}
 //
@@ -90,11 +108,13 @@ const unauthorizedMessage = "Authentication required: missing, malformed, or exp
 // unconditionally null on a 401 — re-auth is the remediation, not a retry.
 //
 // agent_action is the verbatim sentence the calling agent should surface to
-// the human user, per the §10.15 agent-action contract. upgrade_url points
-// at the login page because re-auth is the remediation for every variant of
-// this error (no header, malformed JWT, expired JWT, wrong secret, missing
-// claims, invalid PAT). Kept as a single helper so adding RFC 6750
-// WWW-Authenticate headers in a future PR happens in one place.
+// the human user, per the §10.15 agent-action contract — D1/D8: it steers a
+// headless agent at the CLI device-flow / INSTANT_TOKEN PAT, not the browser
+// /login page. upgrade_url still points at the login page because that is the
+// HUMAN remediation for every variant of this error (no header, malformed JWT,
+// expired JWT, wrong secret, missing claims, invalid PAT). Kept as a single
+// helper so adding RFC 6750 WWW-Authenticate headers in a future PR happens in
+// one place.
 func respondUnauthorized(c *fiber.Ctx) error {
 	return respondUnauthorizedWithReason(c, AuthErrorMissingCredentials)
 }
@@ -283,7 +303,8 @@ func rejectAudienceMismatch(c *fiber.Ctx) error {
 //	{
 //	  "ok": false,
 //	  "error": "unauthorized",
-//	  "agent_action": "The user's INSTANODE_TOKEN is invalid or expired...",
+//	  "error_code": "expired_token",
+//	  "agent_action": "Tell the user their INSTANT_TOKEN is missing or expired. A headless agent should re-auth via the CLI device-flow...",
 //	  "upgrade_url": "https://instanode.dev/login"
 //	}
 //

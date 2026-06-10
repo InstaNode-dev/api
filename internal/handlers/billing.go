@@ -1427,6 +1427,11 @@ func (h *BillingHandler) RazorpayWebhook(c *fiber.Ctx) error {
 	}
 	if !sigOK {
 		slog.Error("billing.webhook.signature_failed")
+		// S4 (metric half): bump the inbound-signature-failure counter so the
+		// "N razorpay signature failures / hour" NR alert can fire without
+		// grepping the slog line above. Mirrors the GitHub webhook bad-signature
+		// counter; the Prom rule + NR alert JSON are the infra agent's job.
+		metrics.RazorpayWebhookSigFail.Inc()
 		// B18 wave-3 hardening (2026-05-21): emit an audit_log row on every
 		// signature-mismatch attempt so an operator dashboard can chart
 		// "N auth failures / hour" without grepping NR logs. Best-effort
