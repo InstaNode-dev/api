@@ -1052,7 +1052,7 @@ func stashIgnoredFields(c *fiber.Ctx, raw []byte, v any) {
 func knownJSONFields(v any) map[string]bool {
 	known := map[string]bool{}
 	rv := reflect.ValueOf(v)
-	for rv.Kind() == reflect.Ptr {
+	for rv.Kind() == reflect.Pointer {
 		if rv.IsNil() {
 			rt := rv.Type().Elem()
 			collectJSONFields(rt, known)
@@ -1072,7 +1072,7 @@ func knownJSONFields(v any) map[string]bool {
 // so their promoted fields are recorded too — matching encoding/json's
 // unmarshal behaviour.
 func collectJSONFields(rt reflect.Type, known map[string]bool) {
-	for rt.Kind() == reflect.Ptr {
+	for rt.Kind() == reflect.Pointer {
 		rt = rt.Elem()
 	}
 	if rt.Kind() != reflect.Struct {
@@ -1093,7 +1093,7 @@ func collectJSONFields(rt reflect.Type, known map[string]bool) {
 		// unexported struct type entirely).
 		if f.Anonymous && tagName == "" {
 			ft := f.Type
-			for ft.Kind() == reflect.Ptr {
+			for ft.Kind() == reflect.Pointer {
 				ft = ft.Elem()
 			}
 			if ft.Kind() == reflect.Struct {
