@@ -1128,7 +1128,12 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 	// previously absent from the test app.
 	queueH := handlers.NewQueueHandler(db, rdb, cfg, nil, planReg)
 	app.Post("/queue/new", middleware.OptionalAuth(cfg), middleware.Idempotency(rdb, "queue.new"), queueH.NewQueue)
+	// CLI device-flow: create (POST), poll (GET), and complete (POST,
+	// RequireAuth) — mirrors router.go so the full `instant login` round-trip
+	// (D2) is exercisable at the handler-integration layer.
 	app.Post("/auth/cli", cliAuthH.CreateCLISession)
+	app.Post("/auth/cli/:id/complete", middleware.RequireAuth(cfg), cliAuthH.CompleteCLISessionHandler)
+	app.Get("/auth/cli/:id", cliAuthH.PollCLISession)
 
 	// Phase 6: deploy
 	deployH := handlers.NewDeployHandler(db, rdb, cfg, planReg)

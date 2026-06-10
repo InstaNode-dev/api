@@ -169,8 +169,14 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	},
 
 	// ── Auth / token errors ────────────────────────────────────────────────
+	// D1/D8 (2026-06-10): this is the handler-emitted twin of
+	// middleware.unauthorizedAgentAction — both must steer a HEADLESS agent at
+	// the CLI device-flow / INSTANT_TOKEN PAT rather than the browser /login
+	// page (an agent has no browser). Kept verbatim-identical to the middleware
+	// constant so an agent sees one remediation regardless of which layer
+	// rejected the request.
 	"unauthorized": {
-		AgentAction: "Tell the user their INSTANODE_TOKEN is missing or invalid. Have them log in at https://instanode.dev/login to mint a new one — takes 30 seconds.",
+		AgentAction: "Tell the user their INSTANT_TOKEN is missing or expired. A headless agent should re-auth via the CLI device-flow (POST https://api.instanode.dev/auth/cli, open the auth_url, poll GET /auth/cli/{id}) or set INSTANT_TOKEN to a PAT. See https://instanode.dev/docs/cli.",
 	},
 	// brevo_secret_mismatch is a Brevo webhook URL-path-token mismatch — NOT a
 	// user-auth failure. The generic "unauthorized" agent_action ("log in to mint
@@ -268,8 +274,13 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"invalid_token": {
 		AgentAction: "Tell the user the supplied token is invalid or expired. URL path tokens must be a valid UUID returned by a provision response (POST /db/new, /webhook/new, /storage/new etc.); onboarding claim JWTs come from anonymous provision flows — see https://instanode.dev/docs.",
 	},
+	// D8 (2026-06-10): canonicalize the bearer env var to INSTANT_TOKEN (the
+	// name the CLI reads). This is the default for the `missing_token` code;
+	// the onboarding-claim emitter (onboarding.go) overrides it with a
+	// `token`-field-specific sentence, so this default only renders on the
+	// rarer bearer-context emitters.
 	"missing_token": {
-		AgentAction: "Tell the user no INSTANODE_TOKEN was provided. Have them log in at https://instanode.dev/login and pass it via Authorization: Bearer <token>.",
+		AgentAction: "Tell the user no INSTANT_TOKEN was provided. A headless agent should run the CLI device-flow (POST https://api.instanode.dev/auth/cli) or set INSTANT_TOKEN to a Personal Access Token, then pass it via Authorization: Bearer <token>. See https://instanode.dev/docs/cli.",
 	},
 	// cookie_missing_or_expired — POST /auth/exchange (browser-only bridge
 	// from the magic-link / OAuth callback into the SPA) saw no bridge
@@ -741,6 +752,22 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	},
 	"session_not_found": {
 		AgentAction: "Tell the user this CLI login session was not found or has expired. Restart with `instanode auth login` — see https://instanode.dev/docs/cli.",
+	},
+	// D2 (2026-06-10): the CLI device-flow completion (POST /auth/cli/:id/complete)
+	// surfaces these transient 503 codes. Each is a server-side hiccup during
+	// the final mint/flip step, NOT a caller error — the remediation is "retry
+	// the login in a moment". They point at the CLI docs page.
+	"session_lookup_failed": {
+		AgentAction: "Tell the user the CLI login session could not be loaded — a transient server issue. Have them retry `instanode auth login` in a moment. See https://instanode.dev/docs/cli.",
+	},
+	"key_generation_failed": {
+		AgentAction: "Tell the user the CLI API key could not be minted — a transient server issue. Have them retry `instanode auth login` in a moment. See https://instanode.dev/docs/cli.",
+	},
+	"key_create_failed": {
+		AgentAction: "Tell the user the CLI API key could not be saved — a transient server issue. Have them retry `instanode auth login` in a moment. See https://instanode.dev/docs/cli.",
+	},
+	"session_complete_failed": {
+		AgentAction: "Tell the user the CLI login could not be finalized — a transient server issue. Have them retry `instanode auth login` in a moment. See https://instanode.dev/docs/cli.",
 	},
 	"magic_link_not_found": {
 		AgentAction: "Tell the user this magic-link is invalid, used, or expired. Request a new one at https://instanode.dev/login.",

@@ -135,16 +135,17 @@ var routeTestMap = map[string]string{
 	"POST /claim":        "TestE2E_Claim_Success_Returns201WithTeamID",
 
 	// ── auth: magic-link, github, cli device-flow, session (W1) ──────────────
-	"POST /auth/email/start":    "TestE2E_Persona_Onboarding_ClaimValidatesEmail",
-	"GET /auth/email/callback":  "TestE2E_AuthFlow_AuthMe_ValidSession_ReturnsTierAndEmail",
-	"POST /auth/github":         "TestE2E_AuthFlow_AuthMe_NoAuth_Returns401",
-	"GET /auth/github/start":    "TestE2E_AuthFlow_AuthMe_NoAuth_Returns401",
-	"GET /auth/github/callback": "TestE2E_AuthFlow_AuthMe_NoAuth_Returns401",
-	"POST /auth/exchange":       "TestE2E_AuthFlow_AuthMe_ValidSession_ReturnsTierAndEmail",
-	"POST /auth/logout":         "TestE2E_AuthFlow_AuthMe_NoAuth_Returns401",
-	"GET /auth/me":              "TestE2E_AuthFlow_AuthMe_ValidSession_ReturnsTierAndEmail",
-	"POST /auth/cli":            "TestE2E_Persona_CLIDeviceFlow_CreateAndPollSession",
-	"GET /auth/cli/:id":         "TestE2E_Persona_CLIDeviceFlow_GetCurrentUser_NoAuth",
+	"POST /auth/email/start":      "TestE2E_Persona_Onboarding_ClaimValidatesEmail",
+	"GET /auth/email/callback":    "TestE2E_AuthFlow_AuthMe_ValidSession_ReturnsTierAndEmail",
+	"POST /auth/github":           "TestE2E_AuthFlow_AuthMe_NoAuth_Returns401",
+	"GET /auth/github/start":      "TestE2E_AuthFlow_AuthMe_NoAuth_Returns401",
+	"GET /auth/github/callback":   "TestE2E_AuthFlow_AuthMe_NoAuth_Returns401",
+	"POST /auth/exchange":         "TestE2E_AuthFlow_AuthMe_ValidSession_ReturnsTierAndEmail",
+	"POST /auth/logout":           "TestE2E_AuthFlow_AuthMe_NoAuth_Returns401",
+	"GET /auth/me":                "TestE2E_AuthFlow_AuthMe_ValidSession_ReturnsTierAndEmail",
+	"POST /auth/cli":              "TestE2E_Persona_CLIDeviceFlow_CreateAndPollSession",
+	"POST /auth/cli/:id/complete": "TestE2E_CLIDeviceFlow_Complete_FlipsSessionAndMintsToken",
+	"GET /auth/cli/:id":           "TestE2E_Persona_CLIDeviceFlow_GetCurrentUser_NoAuth",
 
 	// ── management API: identity + resources (W2/W3) ─────────────────────────
 	"GET /api/v1/whoami":                            "TestE2E_FullCustomerFlow_WhoamiBeforeClaim",

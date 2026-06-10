@@ -58,6 +58,36 @@ func TestOpenAPI_BearerAuthDocumentsClaimFlow(t *testing.T) {
 	}
 }
 
+// TestOpenAPI_ErrorResponseDocumentsErrorCode guards D6 (2026-06-10): the
+// auth-rejection 401 envelopes emit an `error_code` sub-classification, but the
+// canonical ErrorResponse schema never documented it — an agent reading the
+// spec alone couldn't discover the field exists or what values it takes. Assert
+// the property is present and its description names at least the device-flow-
+// relevant sub-codes so the contract is self-describing.
+func TestOpenAPI_ErrorResponseDocumentsErrorCode(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(openAPISpec), &v); err != nil {
+		t.Fatalf("openAPISpec parse: %v", err)
+	}
+	props, ok := digMap(v, "components", "schemas", "ErrorResponse", "properties")
+	if !ok {
+		t.Fatal("could not navigate to ErrorResponse.properties in spec")
+	}
+	ec, ok := props["error_code"].(map[string]any)
+	if !ok {
+		t.Fatal("ErrorResponse.properties.error_code is missing — auth endpoints emit it but the spec never documented it (D6)")
+	}
+	if ec["type"] != "string" {
+		t.Errorf("error_code.type = %v; want string", ec["type"])
+	}
+	desc, _ := ec["description"].(string)
+	for _, must := range []string{"missing_credentials", "expired_token", "revoked_session"} {
+		if !strings.Contains(desc, must) {
+			t.Errorf("error_code.description must enumerate the sub-code %q; got: %s", must, desc)
+		}
+	}
+}
+
 // TestOpenAPI_ClaimPreviewEndpointDocumented guards friction #15: the
 // /claim/preview probe was implemented but undocumented, so agents had no
 // machine-readable signal that they could surface "what will I claim?" to

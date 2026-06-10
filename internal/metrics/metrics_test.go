@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func TestStatusClass(t *testing.T) {
@@ -110,6 +110,9 @@ func TestAllMetricsRegistered(t *testing.T) {
 	BrevoWebhookEventsTotal.WithLabelValues("delivered").Inc()
 	MagicLinkEmailRateLimited.Inc()
 	RazorpayWebhookTeamNotFound.Inc()
+	RazorpayWebhookSigFail.Inc()
+	RecycleClaimRecovery.WithLabelValues("minted").Inc()
+	RecycleClaimRecovery.WithLabelValues("mint_failed").Inc()
 	PGPoolInUse.WithLabelValues("platform_db").Set(3)
 	PGPoolIdle.WithLabelValues("platform_db").Set(2)
 	PGPoolOpen.WithLabelValues("platform_db").Set(5)

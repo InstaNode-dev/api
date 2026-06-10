@@ -99,15 +99,33 @@ func assertAgentActionUnauthorized(t *testing.T, resp *http.Response) {
 	action, ok := body["agent_action"].(string)
 	require.True(t, ok, "agent_action must be a string field on every 401 from RequireAuth — this is the whole point of the fix")
 	assert.NotEmpty(t, action, "agent_action must be populated, not just present")
-	assert.Contains(t, action, "INSTANODE_TOKEN",
-		"agent_action must name the env var the user sets — otherwise the agent has nothing concrete to mention")
-	assert.Contains(t, action, "https://instanode.dev/login",
-		"agent_action must include the login URL inline so the agent's prose carries the link without a second lookup")
 
+	// D1/D8 (2026-06-10): the agent_action must steer a HEADLESS agent at the
+	// CLI device-flow / INSTANT_TOKEN PAT, NOT the browser /login page (an
+	// agent has no browser). It MUST name the canonical bearer env var
+	// (INSTANT_TOKEN, the name the CLI reads — not the old INSTANODE_TOKEN)
+	// and the device-flow endpoint, and MUST NOT push the agent at /login.
+	assert.Contains(t, action, "INSTANT_TOKEN",
+		"agent_action must name the canonical bearer env var INSTANT_TOKEN (the name the CLI reads)")
+	assert.NotContains(t, action, "INSTANODE_TOKEN",
+		"D8: the bearer env var was canonicalized to INSTANT_TOKEN — INSTANODE_TOKEN must not reappear")
+	assert.Contains(t, action, "/auth/cli",
+		"D1: agent_action must steer a headless agent at the CLI device-flow endpoint")
+	assert.NotContains(t, action, "/login",
+		"D1: agent_action must NOT push a headless agent at the browser /login page (it has no browser)")
+
+	// error_code carries the finer-grained sub-classification on every 401.
+	ec, ecOK := body["error_code"].(string)
+	require.True(t, ecOK, "error_code must be present on every 401 from RequireAuth (D6 surface)")
+	assert.NotEmpty(t, ec, "error_code must be populated, not just present")
+
+	// upgrade_url still points at the browser /login page — that is the HUMAN
+	// remediation surfaced for a person reading the agent's prose, distinct
+	// from the agent's own device-flow path in agent_action.
 	url, ok := body["upgrade_url"].(string)
 	require.True(t, ok, "upgrade_url must be present so MPP-style agents can follow it programmatically")
 	assert.Equal(t, "https://instanode.dev/login", url,
-		"upgrade_url for 'unauthorized' must point at the login page, not pricing")
+		"upgrade_url for 'unauthorized' must point at the login page (the human remediation), not pricing")
 }
 
 // TestRequireAuth_NoHeader_EmitsAgentAction — the bare-call case. Before the

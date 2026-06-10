@@ -116,11 +116,17 @@ test-e2e:
 #                              without it every test can hit the recycle gate.
 #
 # Requires: kubectl access to the `instant` namespace.
+#   E2E_ACCOUNT_TOKEN        — guard secret for POST/DELETE /internal/e2e/account;
+#                              authed cohort-flow tests (CLI device-flow complete,
+#                              live 401 error_code shape) mint+reap a real
+#                              is_test_cohort account against prod with it. Absent
+#                              → those tests SKIP cleanly.
 test-e2e-full:
 	E2E_JWT_SECRET=$(shell kubectl get secret instant-secrets -n instant -o jsonpath='{.data.JWT_SECRET}' 2>/dev/null | base64 -d) \
 	E2E_RAZORPAY_WEBHOOK_SECRET=$(shell kubectl get secret instant-secrets -n instant -o jsonpath='{.data.RAZORPAY_WEBHOOK_SECRET}' 2>/dev/null | base64 -d) \
 	E2E_RAZORPAY_PLAN_ID_PRO=$(shell kubectl get secret instant-secrets -n instant -o jsonpath='{.data.RAZORPAY_PLAN_ID_PRO}' 2>/dev/null | base64 -d) \
 	E2E_TEST_TOKEN=$(shell kubectl get secret instant-secrets -n instant -o jsonpath='{.data.E2E_TEST_TOKEN}' 2>/dev/null | base64 -d) \
+	E2E_ACCOUNT_TOKEN=$(shell kubectl get secret instant-secrets -n instant -o jsonpath='{.data.E2E_ACCOUNT_TOKEN}' 2>/dev/null | base64 -d) \
 	  go test ./e2e/... -v -tags e2e -timeout 90s
 
 test-e2e-docker:

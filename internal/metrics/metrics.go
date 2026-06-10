@@ -87,6 +87,21 @@ var (
 		Help: "Anonymous provisions blocked by free-tier recycle email gate",
 	}, []string{"resource_type"})
 
+	// RecycleClaimRecovery counts recycle-gate 402s for which the api
+	// successfully minted a short-lived claim JWT and embedded it in the
+	// returned claim_url (?t=<jwt>) — i.e. the gated caller was handed a
+	// working, tokenless-dead-end-free recovery path (F1/F7). result:
+	//   "minted"      — claim JWT minted + embedded; claim_url carries ?t=
+	//   "mint_failed" — JWT signing failed (claim_url falls back to the bare
+	//                   /claim page so the gate still returns a usable URL)
+	// Lazy *Vec — no series at /metrics until the first recycle gate fires.
+	// The Prom rule + NR tile for this counter are owned by the infra agent
+	// (rule 25); the METRICS-CATALOG row ships with this PR.
+	RecycleClaimRecovery = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_recycle_claim_recovery_total",
+		Help: "Recycle-gate 402s by claim-JWT recovery outcome (minted/mint_failed). F1/F7.",
+	}, []string{"result"})
+
 	// ConversionFunnel counts conversion funnel steps:
 	// provision, jwt_issued, landing_viewed, claimed, paid.
 	ConversionFunnel = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -394,6 +409,24 @@ var (
 	RazorpayWebhookTeamNotFound = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "razorpay_webhook_team_not_found_total",
 		Help: "Razorpay webhooks whose signature verified but whose notes.team_id (or subscription_id fallback) referenced a non-existent team — operator signal for typo/deleted-team/probing (Wave-3 chaos verify P3, 2026-05-21).",
+	})
+
+	// RazorpayWebhookSigFail counts inbound POST /razorpay/webhook deliveries
+	// whose X-Razorpay-Signature did NOT verify against either the live or the
+	// test webhook secret (the !sigOK branch). Mirrors the GitHub webhook
+	// bad-signature counter (instant_github_webhook_received_total{result=
+	// "bad_signature"}) so an operator can chart "N razorpay signature failures /
+	// hour" without grepping the billing.webhook.signature_failed slog line — a
+	// rising rate is a probe, a misconfigured secret, or a Razorpay key rotation.
+	// Counter (no labels): each occurrence is independently meaningful for the NR
+	// rate alert; presence/source-subnet detail lands in the matching audit_log
+	// row (AuditKindRazorpayWebhookUnauthorized). S4 (metric half) — the Prom
+	// rule + NR alert JSON are the infra agent's job (rule 25); the
+	// METRICS-CATALOG row ships with this PR.
+	// Lazy: no series at /metrics until the first signature failure.
+	RazorpayWebhookSigFail = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "instant_razorpay_webhook_sig_fail_total",
+		Help: "POST /razorpay/webhook deliveries whose X-Razorpay-Signature failed to verify against the live or test webhook secret (S4).",
 	})
 
 	// readyzCheckStatusGauge is the per-component readiness status for

@@ -828,8 +828,15 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// the real confirm step.
 	app.Get("/auth/email/confirm-deletion", handlers.EmailConfirmDeletionRedirectHandler(cfg.DashboardBaseURL))
 
-	// CLI device-flow login — POST creates session, GET polls for completion
+	// CLI device-flow login — POST creates session, GET polls for completion.
+	// POST /auth/cli/:id/complete (D2) is the missing call site that flips a
+	// pending session to complete: the dashboard makes an AUTHENTICATED POST
+	// (user's session Bearer) once the user approves the login, which mints the
+	// team API key + claimed tokens and writes the completed Redis state so the
+	// CLI's poll returns the api_token. RequireAuth gates it — only a signed-in
+	// user can complete their own login.
 	app.Post("/auth/cli", cliAuthH.CreateCLISession)
+	app.Post("/auth/cli/:id/complete", middleware.RequireAuth(cfg), cliAuthH.CompleteCLISessionHandler)
 	app.Get("/auth/cli/:id", cliAuthH.PollCLISession)
 	app.Get("/auth/me", middleware.RequireAuth(cfg), cliAuthH.GetCurrentUser)
 

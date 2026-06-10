@@ -140,6 +140,7 @@ func (h *CLIAuthHandler) PollCLISession(c *fiber.Ctx) error {
 		// Fail open — return pending rather than an error so the CLI keeps polling.
 		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
 			"ok":      true,
+			"status":  cliStatusPending,
 			"pending": true,
 		})
 	}
@@ -150,6 +151,7 @@ func (h *CLIAuthHandler) PollCLISession(c *fiber.Ctx) error {
 			"request_id", requestID, "session_id", sessionID, "error", err)
 		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
 			"ok":      true,
+			"status":  cliStatusPending,
 			"pending": true,
 		})
 	}
@@ -157,6 +159,7 @@ func (h *CLIAuthHandler) PollCLISession(c *fiber.Ctx) error {
 	if state.Pending {
 		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
 			"ok":      true,
+			"status":  cliStatusPending,
 			"pending": true,
 		})
 	}
@@ -170,8 +173,15 @@ func (h *CLIAuthHandler) PollCLISession(c *fiber.Ctx) error {
 		"email", state.Email,
 		"tier", state.Tier)
 
+	// D2 (2026-06-10): emit the canonical {status, api_token} shape the CLI +
+	// instanode-web depend on, alongside the legacy {pending, api_key} fields
+	// kept for back-compat with older CLI builds. status="complete" + api_token
+	// is the contract; pending/api_key are deprecated aliases.
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{
 		"ok":             true,
+		"status":         cliStatusComplete,
+		"pending":        false,
+		"api_token":      state.APIKey,
 		"api_key":        state.APIKey,
 		"email":          state.Email,
 		"tier":           state.Tier,
@@ -179,6 +189,153 @@ func (h *CLIAuthHandler) PollCLISession(c *fiber.Ctx) error {
 		"claimed_tokens": state.ClaimedTokens,
 	})
 }
+
+// cliStatus* are the canonical `status` field values on GET /auth/cli/:id.
+// "pending" until the browser approves the login, "complete" once
+// CompleteCLISessionHandler has flipped the session (api_token then present).
+const (
+	cliStatusPending  = "pending"
+	cliStatusComplete = "complete"
+)
+
+// CompleteCLISessionHandler handles POST /auth/cli/:id/complete.
+//
+// D2 (2026-06-10): `instant login` was BROKEN because the only function that
+// flips a pending CLI session to complete — CompleteCLISession (below) — had
+// ZERO callers. The CLI created a session (POST /auth/cli) and polled it
+// (GET /auth/cli/:id) forever, because nothing ever wrote the completed state.
+// This handler is the missing call site: after the user approves the login in
+// the browser (landing on the dashboard's /login?cli_session=<id> page while
+// already signed in), the dashboard makes an AUTHENTICATED POST to this
+// endpoint with the user's session Bearer. We mint a fresh team API key
+// (the long-lived bearer the CLI persists), gather the team's claimed resource
+// tokens, and flip the Redis session so the CLI's next poll returns 200 with
+// the api_token.
+//
+// CONTRACT (instanode-web depends on this exact shape):
+//
+//	POST /auth/cli/{id}/complete   (Authorization: Bearer <session JWT>)
+//	  → 200 { "ok": true }
+//	  side effect: GET /auth/cli/{id} now returns 200 { status:"complete", api_token, ... }
+//
+// RequireAuth has already validated the Bearer and populated team/user locals.
+func (h *CLIAuthHandler) CompleteCLISessionHandler(c *fiber.Ctx) error {
+	requestID := middleware.GetRequestID(c)
+	sessionID := c.Params("id")
+	if sessionID == "" {
+		return respondError(c, fiber.StatusBadRequest, "missing_session_id", "Session ID required")
+	}
+
+	// The pending CLI session must exist + still be pending. Reading it first
+	// gives a clean 404 for a stale/typo'd id (instead of minting an API key
+	// for a session no CLI is polling), and lets us no-op idempotently on a
+	// session a previous POST already completed.
+	key := cliSessionPrefix + sessionID
+	raw, err := h.rdb.Get(c.Context(), key).Bytes()
+	if err == redis.Nil {
+		return respondError(c, fiber.StatusNotFound, "session_not_found",
+			"Login session not found or expired")
+	}
+	if err != nil {
+		slog.Error("cli_auth.complete.redis_get",
+			"request_id", requestID, "session_id", sessionID, "error", err)
+		return respondError(c, fiber.StatusServiceUnavailable, "session_lookup_failed",
+			"Could not load login session")
+	}
+	var existing cliSessionState
+	if uerr := json.Unmarshal(raw, &existing); uerr != nil {
+		slog.Error("cli_auth.complete.unmarshal",
+			"request_id", requestID, "session_id", sessionID, "error", uerr)
+		return respondError(c, fiber.StatusServiceUnavailable, "session_lookup_failed",
+			"Could not read login session")
+	}
+	if !existing.Pending {
+		// Already completed — idempotent success so a double-POST (browser
+		// retry, dashboard re-render) doesn't 409 or mint a second key.
+		return c.JSON(fiber.Map{"ok": true})
+	}
+
+	teamIDStr := middleware.GetTeamID(c)
+	teamID, err := uuid.Parse(teamIDStr)
+	if err != nil {
+		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Authentication required")
+	}
+	userIDStr := middleware.GetUserID(c)
+	userUUID, uerr := uuid.Parse(userIDStr)
+	if uerr != nil {
+		return respondError(c, fiber.StatusUnauthorized, "unauthorized", "Authentication required")
+	}
+
+	team, err := models.GetTeamByID(c.Context(), h.db, teamID)
+	if err != nil {
+		var notFound *models.ErrTeamNotFound
+		if errors.As(err, &notFound) {
+			return respondError(c, fiber.StatusNotFound, "team_not_found", "Team not found")
+		}
+		slog.Error("cli_auth.complete.team_lookup",
+			"request_id", requestID, "team_id", teamIDStr, "error", err)
+		return respondError(c, fiber.StatusServiceUnavailable, "db_error", "Failed to fetch team")
+	}
+
+	// Mint the long-lived team API key the CLI persists. Plaintext is returned
+	// to the caller exactly once (here, via the completed Redis state → the
+	// CLI's poll); only the SHA-256 is stored.
+	plaintext, err := models.GenerateAPIKeyPlaintext()
+	if err != nil {
+		slog.Error("cli_auth.complete.keygen", "request_id", requestID, "error", err)
+		return respondError(c, fiber.StatusServiceUnavailable, "key_generation_failed",
+			"Could not mint CLI API key")
+	}
+	if _, err := models.CreateAPIKey(c.Context(), h.db, teamID,
+		uuid.NullUUID{UUID: userUUID, Valid: true},
+		cliAPIKeyName, models.HashAPIKey(plaintext), nil); err != nil {
+		slog.Error("cli_auth.complete.create_key",
+			"request_id", requestID, "team_id", teamIDStr, "error", err)
+		return respondError(c, fiber.StatusServiceUnavailable, "key_create_failed",
+			"Could not persist CLI API key")
+	}
+
+	// Gather the team's claimed resource tokens so the CLI can list them after
+	// login (best-effort: a lookup failure does NOT abort the login — the api
+	// key is already minted and is the load-bearing artifact).
+	var claimedTokens []string
+	resources, rerr := models.ListResourcesByTeam(c.Context(), h.db, teamID)
+	if rerr != nil {
+		slog.Warn("cli_auth.complete.list_resources",
+			"request_id", requestID, "team_id", teamIDStr, "error", rerr)
+	} else {
+		for _, r := range resources {
+			claimedTokens = append(claimedTokens, r.Token.String())
+		}
+	}
+
+	teamName := ""
+	if team.Name.Valid {
+		teamName = team.Name.String
+	}
+	email := middleware.GetEmail(c)
+
+	// Flip the pending session so the CLI's next poll returns the api_token.
+	if err := CompleteCLISession(c.Context(), h.rdb, sessionID,
+		plaintext, email, team.PlanTier, teamName, claimedTokens); err != nil {
+		slog.Error("cli_auth.complete.write_session",
+			"request_id", requestID, "session_id", sessionID, "error", err)
+		return respondError(c, fiber.StatusServiceUnavailable, "session_complete_failed",
+			"Could not complete login session")
+	}
+
+	slog.Info("cli_auth.complete.done",
+		"request_id", requestID, "session_id", sessionID,
+		"team_id", teamIDStr, "tier", team.PlanTier,
+		"claimed_token_count", len(claimedTokens))
+
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// cliAPIKeyName is the display name stamped on the api_keys row minted by the
+// CLI device-flow completion. Distinguishes CLI-minted keys from
+// dashboard-minted ones in the team's key list.
+const cliAPIKeyName = "CLI login"
 
 // CompleteCLISession is called by the OAuth callback handler after a user
 // successfully authenticates. It writes the result into Redis so the CLI's
@@ -366,4 +523,3 @@ func frontendURL(cfg *config.Config) string {
 	}
 	return "http://localhost:5173"
 }
-

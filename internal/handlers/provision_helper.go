@@ -16,10 +16,13 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -322,11 +325,56 @@ func (h *provisionHelper) recycleGate(c *fiber.Ctx, fp, resourceType string) boo
 	metrics.RecycleGateBlocked.WithLabelValues(resourceType).Inc()
 	slog.Info("provision.recycle_gate.blocked",
 		"fingerprint", fp, "resource_type", resourceType)
+
+	// F1: the pre-fix claim_url was a bare https://instanode.dev/claim — a
+	// tokenless dead-end. The dashboard's ClaimPage reads the onboarding JWT
+	// from ?t= (useSearchParams); with no token it renders an empty "nothing
+	// to claim" state and the gated agent has no recovery path. Mint a
+	// short-lived claim JWT for this fingerprint and route it through the
+	// canonical /start?t=<jwt> bounce (api validates the JWT and 302s to
+	// instanode.dev/claim?t=<jwt>) — exactly the URL shape every successful
+	// anonymous provision already returns in upgrade_url/claim_url. The JWT
+	// carries the fingerprint so /start can hydrate the claim landing even
+	// though there are zero ACTIVE resources right now (the recycle case is
+	// "I had something yesterday"); it captures any still-listed tokens too.
+	claimURL := h.recycleClaimURL(ctx, fp, resourceType)
+
 	// Route through the canonical ErrorResponse envelope (request_id +
 	// retry_after_seconds + claim_url) instead of a hand-built fiber.Map.
 	_ = respondRecycleGate(c, RecycleGateErrorCode, RecycleGateMessage,
-		RecycleGateAgentAction, RecycleGateClaimURL)
+		RecycleGateAgentAction, claimURL)
 	return true
+}
+
+// recycleClaimURL mints a short-lived claim JWT for the recycling fingerprint
+// and returns the canonical /start?t=<jwt> bounce URL the agent can hand the
+// user to clear the gate. The minted JWT is the same OnboardingClaims shape the
+// successful-provision path issues, so /start + POST /claim accept it unchanged.
+//
+// Fail-soft (F1/F7): if signing fails we fall back to the bare
+// RecycleGateClaimURL constant — a recovery path is still returned (the
+// dashboard's friendly empty-claim state), never an error — and bump the
+// mint_failed metric so the operator can see signing trouble. On the happy
+// path we bump the minted metric. We do NOT persist an onboarding_events row
+// here: the recycle gate is a best-effort recovery nudge, not a tracked
+// conversion event, and a DB write would add a failure mode to the gate path.
+func (h *provisionHelper) recycleClaimURL(ctx context.Context, fp, resourceType string) string {
+	// issueOnboardingJWT looks up any still-listed resources for the
+	// fingerprint and folds them into the JWT; on the recycle path that set is
+	// typically empty (that's why the gate fired), but a partially-expired
+	// session may still have one. country/vendor are advisory upsell hints on
+	// the landing page — empty is fine here, the claim itself only needs fp.
+	// resourceType is the type the gated agent was trying to provision, so the
+	// landing page reflects what the user is here to claim.
+	jwtToken, _, err := h.issueOnboardingJWT(ctx, fp, "", "", resourceType, nil)
+	if err != nil || jwtToken == "" {
+		slog.Warn("provision.recycle_gate.claim_jwt_failed",
+			"error", err, "fingerprint", fp)
+		metrics.RecycleClaimRecovery.WithLabelValues("mint_failed").Inc()
+		return RecycleGateClaimURL
+	}
+	metrics.RecycleClaimRecovery.WithLabelValues("minted").Inc()
+	return urls.UpgradeStartURL(jwtToken)
 }
 
 // deprovisionBestEffort tears down a just-provisioned backend object after a
@@ -943,7 +991,140 @@ func parseProvisionBody(c *fiber.Ctx, v any) error {
 		return respondError(c, fiber.StatusBadRequest, "invalid_body",
 			"Request body could not be parsed as JSON: "+err.Error())
 	}
+
+	// D7 (2026-06-10): an agent that sends an unrecognized key (a typo'd or
+	// hallucinated field like "region", "size", "plan") got ZERO signal that
+	// the field was silently dropped — the provision succeeded as if the field
+	// were never sent, so a misconfigured request looked identical to a correct
+	// one. We do NOT hard-reject (that would break forward-compat for callers
+	// on a newer schema than this build) — instead we stash the list of unknown
+	// keys in Locals so the success response can ECHO them under `ignored_fields`.
+	// The agent sees exactly which of its keys this build ignored and can fix
+	// the typo / drop the field. Detection is best-effort: any reflection /
+	// re-decode hiccup leaves ignored_fields absent (the pre-fix behaviour).
+	stashIgnoredFields(c, raw, v)
 	return nil
+}
+
+// ignoredFieldsKey is the Locals key under which parseProvisionBody stashes the
+// sorted list of request-body keys this build did not recognise. Read via
+// decorateIgnoredFields (and surfaced through respondCreated/respondOK); tests
+// can assert it directly.
+const ignoredFieldsKey = "ignored_fields"
+
+// stashIgnoredFields computes the set of top-level JSON keys present in the raw
+// request body that do NOT correspond to a known json-tagged field on v, and
+// stashes the sorted slice in c.Locals(ignoredFieldsKey) when non-empty. v is
+// the already-parsed destination struct (pointer). Best-effort: a re-decode or
+// reflection failure is a silent no-op (no ignored_fields surfaces), preserving
+// the pre-D7 behaviour rather than risking a spurious response field.
+func stashIgnoredFields(c *fiber.Ctx, raw []byte, v any) {
+	var present map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &present); err != nil {
+		// Body isn't a JSON object (e.g. a bare array / scalar that BodyParser
+		// tolerated) — nothing meaningful to diff against the struct.
+		return
+	}
+	if len(present) == 0 {
+		return
+	}
+	known := knownJSONFields(v)
+	var unknown []string
+	for k := range present {
+		if !known[k] {
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) == 0 {
+		return
+	}
+	sort.Strings(unknown) // deterministic order for a stable response + test
+	c.Locals(ignoredFieldsKey, unknown)
+}
+
+// knownJSONFields returns the set of JSON key names a struct (or pointer to
+// one) accepts, derived from each exported field's `json` tag (falling back to
+// the field name when no tag is present, mirroring encoding/json). Embedded
+// structs are flattened so promoted fields count as known. A "-" tag excludes
+// the field. Non-struct inputs yield an empty set (every key is then unknown,
+// which is the conservative choice — but every parseProvisionBody caller passes
+// a struct pointer).
+func knownJSONFields(v any) map[string]bool {
+	known := map[string]bool{}
+	rv := reflect.ValueOf(v)
+	for rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			rt := rv.Type().Elem()
+			collectJSONFields(rt, known)
+			return known
+		}
+		rv = rv.Elem()
+	}
+	if rv.Kind() != reflect.Struct {
+		return known
+	}
+	collectJSONFields(rv.Type(), known)
+	return known
+}
+
+// collectJSONFields walks a struct type, recording every accepted JSON key into
+// known. Embedded (anonymous) structs without their own json tag are flattened
+// so their promoted fields are recorded too — matching encoding/json's
+// unmarshal behaviour.
+func collectJSONFields(rt reflect.Type, known map[string]bool) {
+	for rt.Kind() == reflect.Ptr {
+		rt = rt.Elem()
+	}
+	if rt.Kind() != reflect.Struct {
+		return
+	}
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		tag := f.Tag.Get("json")
+		tagName := ""
+		if tag != "" {
+			tagName = strings.Split(tag, ",")[0]
+		}
+		// Flatten anonymous (embedded) structs that have no explicit json
+		// name, so their promoted fields count as known keys. encoding/json
+		// promotes the EXPORTED fields of an embedded struct even when the
+		// embedded TYPE itself is unexported — so we recurse BEFORE the
+		// unexported-field skip below (which would otherwise drop an embedded
+		// unexported struct type entirely).
+		if f.Anonymous && tagName == "" {
+			ft := f.Type
+			for ft.Kind() == reflect.Ptr {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				collectJSONFields(ft, known)
+				continue
+			}
+		}
+		if f.PkgPath != "" {
+			continue // unexported, non-embedded — never reachable via JSON
+		}
+		if tagName == "-" {
+			continue // explicitly excluded from JSON
+		}
+		name := f.Name
+		if tagName != "" {
+			name = tagName
+		}
+		known[name] = true
+	}
+}
+
+// decorateIgnoredFields injects "ignored_fields" into a response map when
+// parseProvisionBody stashed a non-empty unknown-key set on the request.
+// No-op (compact shape) when every key the caller sent was recognised, so the
+// common happy path is unchanged. Applied at the respondCreated/respondOK
+// chokepoint alongside decorateEnvOverride.
+func decorateIgnoredFields(c *fiber.Ctx, resp fiber.Map) fiber.Map {
+	if v, ok := c.Locals(ignoredFieldsKey).([]string); ok && len(v) > 0 {
+		resp[ignoredFieldsKey] = v
+	}
+	return resp
 }
 
 // resolveEnv extracts the requested environment from the request, preferring
@@ -1034,14 +1215,14 @@ func decorateEnvOverride(c *fiber.Ctx, resp fiber.Map) fiber.Map {
 // Equivalent to the prior c.Status(fiber.StatusCreated).JSON(resp), but
 // also stamps env_override_reason when resolveEnv flagged the request.
 func respondCreated(c *fiber.Ctx, resp fiber.Map) error {
-	return c.Status(fiber.StatusCreated).JSON(decorateEnvOverride(c, resp))
+	return c.Status(fiber.StatusCreated).JSON(decorateIgnoredFields(c, decorateEnvOverride(c, resp)))
 }
 
 // respondOK writes a 200 JSON response with the same env-override decoration.
 // Mirror of respondCreated for endpoints that re-emit existing resources
 // (e.g. the fingerprint-dedup branch returns the existing resource at 200).
 func respondOK(c *fiber.Ctx, resp fiber.Map) error {
-	return c.JSON(decorateEnvOverride(c, resp))
+	return c.JSON(decorateIgnoredFields(c, decorateEnvOverride(c, resp)))
 }
 
 // resolveFamilyParent parses the body's optional parent_resource_id and
