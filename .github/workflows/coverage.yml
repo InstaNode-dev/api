@@ -145,7 +145,7 @@ jobs:
         continue-on-error: true
         run: go test ./... -short -count=1 -p 1 -coverprofile=coverage.out -covermode=atomic
 
-      - uses: codecov/codecov-action@v6
+      - uses: codecov/codecov-action@v7
         with:
           files: api/coverage.out
           flags: api
