@@ -280,7 +280,7 @@ func (h *CLIAuthHandler) CompleteCLISessionHandler(c *fiber.Ctx) error {
 	// Mint the long-lived team API key the CLI persists. Plaintext is returned
 	// to the caller exactly once (here, via the completed Redis state → the
 	// CLI's poll); only the SHA-256 is stored.
-	plaintext, err := models.GenerateAPIKeyPlaintext()
+	plaintext, err := generateAPIKeyPlaintextFn()
 	if err != nil {
 		slog.Error("cli_auth.complete.keygen", "request_id", requestID, "error", err)
 		return respondError(c, fiber.StatusServiceUnavailable, "key_generation_failed",
@@ -336,6 +336,14 @@ func (h *CLIAuthHandler) CompleteCLISessionHandler(c *fiber.Ctx) error {
 // CLI device-flow completion. Distinguishes CLI-minted keys from
 // dashboard-minted ones in the team's key list.
 const cliAPIKeyName = "CLI login"
+
+// generateAPIKeyPlaintextFn is the seam through which CompleteCLISessionHandler
+// mints the CLI PAT. It indirects to models.GenerateAPIKeyPlaintext in prod;
+// tests override it to exercise the (otherwise-unreachable) crypto/rand failure
+// arm — GenerateAPIKeyPlaintext only errors when crypto/rand.Read does, which
+// cannot be injected without a seam. Mirrors the promoteDeploymentTTLsForTeamFn
+// pattern in billing.go.
+var generateAPIKeyPlaintextFn = models.GenerateAPIKeyPlaintext
 
 // CompleteCLISession is called by the OAuth callback handler after a user
 // successfully authenticates. It writes the result into Redis so the CLI's

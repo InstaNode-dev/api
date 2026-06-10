@@ -346,6 +346,19 @@ func (h *provisionHelper) recycleGate(c *fiber.Ctx, fp, resourceType string) boo
 	return true
 }
 
+// issueOnboardingJWTFn is the seam through which recycleClaimURL mints the
+// claim JWT. It delegates to (*provisionHelper).issueOnboardingJWT in prod;
+// tests override it to force the mint-failure arm. SignOnboardingJWT cannot be
+// made to error from config (HMAC over any []byte key — even empty — signs
+// successfully), so without this seam the F1 fail-soft branch is unreachable.
+// Mirrors the promoteDeploymentTTLsForTeamFn pattern in billing.go.
+var issueOnboardingJWTFn = func(
+	h *provisionHelper, ctx context.Context,
+	fp, country, vendor, resourceType string, tokens []string,
+) (string, string, error) {
+	return h.issueOnboardingJWT(ctx, fp, country, vendor, resourceType, tokens)
+}
+
 // recycleClaimURL mints a short-lived claim JWT for the recycling fingerprint
 // and returns the canonical /start?t=<jwt> bounce URL the agent can hand the
 // user to clear the gate. The minted JWT is the same OnboardingClaims shape the
@@ -366,7 +379,7 @@ func (h *provisionHelper) recycleClaimURL(ctx context.Context, fp, resourceType 
 	// the landing page — empty is fine here, the claim itself only needs fp.
 	// resourceType is the type the gated agent was trying to provision, so the
 	// landing page reflects what the user is here to claim.
-	jwtToken, _, err := h.issueOnboardingJWT(ctx, fp, "", "", resourceType, nil)
+	jwtToken, _, err := issueOnboardingJWTFn(h, ctx, fp, "", "", resourceType, nil)
 	if err != nil || jwtToken == "" {
 		slog.Warn("provision.recycle_gate.claim_jwt_failed",
 			"error", err, "fingerprint", fp)
