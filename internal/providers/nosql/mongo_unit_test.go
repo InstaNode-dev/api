@@ -54,14 +54,14 @@ func dropMongo(t *testing.T, uri, token string) {
 
 // TestNew_Defaults covers the empty-arg default branches.
 func TestNew_Defaults(t *testing.T) {
-	p := nosqlprovider.New("", "")
+	p := nosqlprovider.New("", "", "")
 	// We can't read unexported fields, but Provision against the default URI
 	// (root:root@localhost:27017) is exercised elsewhere; here we simply assert
 	// the constructor returns a usable, non-nil provider.
 	if p == nil {
 		t.Fatal("New must return a provider")
 	}
-	p2 := nosqlprovider.New("mongodb://x@h:1", "h:1")
+	p2 := nosqlprovider.New("mongodb://x@h:1", "h:1", "")
 	if p2 == nil {
 		t.Fatal("New must return a provider for explicit args")
 	}
@@ -75,7 +75,7 @@ func TestProvision_DuplicateUser(t *testing.T) {
 	token := "dupuser01"
 	defer dropMongo(t, uri, token)
 
-	p := nosqlprovider.New(uri, host)
+	p := nosqlprovider.New(uri, host, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -96,7 +96,7 @@ func TestStorageBytes_PositiveAfterWrite(t *testing.T) {
 	token := "storagesz01"
 	defer dropMongo(t, uri, token)
 
-	p := nosqlprovider.New(uri, host)
+	p := nosqlprovider.New(uri, host, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -146,9 +146,44 @@ func TestDeprovision_DropUserFailsNonFatal(t *testing.T) {
 	}
 	client.Disconnect(ctx)
 
-	p := nosqlprovider.New(uri, host)
+	p := nosqlprovider.New(uri, host, "")
 	if err := p.Deprovision(ctx, token); err != nil {
 		t.Fatalf("Deprovision must succeed even when dropUser fails: %v", err)
+	}
+}
+
+// TestDeprovision_DBSafetyRefusesProductionHost asserts the dbsafety guard
+// fires BEFORE any mongo connection: a non-dev admin host (truehomie pattern —
+// PROVISIONER_ADDR unset against a managed/public Mongo) makes Deprovision
+// return a refusal, NOT a connect error, with no DROP attempted. Deterministic
+// and needs no live mongod.
+func TestDeprovision_DBSafetyRefusesProductionHost(t *testing.T) {
+	p := nosqlprovider.New("mongodb://root:root@mongo.instanode.dev:27017", "mongo.instanode.dev:27017", "production")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := p.Deprovision(ctx, "tok")
+	if err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("Deprovision against a non-dev Mongo host must be refused; got %v", err)
+	}
+	// It must be a guard refusal, not a connect attempt.
+	if strings.Contains(err.Error(), "connect") {
+		t.Fatalf("guard must refuse before connecting; got connect error: %v", err)
+	}
+}
+
+// TestDeprovision_DBSafetyRefusesBadName asserts the name guard fires for a
+// malformed token even against a dev host (the token would yield a db name
+// outside the per-tenant convention). Deterministic, no live mongod.
+func TestDeprovision_DBSafetyRefusesBadName(t *testing.T) {
+	p := nosqlprovider.New("mongodb://root:root@localhost:27017", "localhost:27017", "development")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// A token with a space makes db_<token> fail validTokenChars → refusal.
+	err := p.Deprovision(ctx, "bad token")
+	if err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("malformed token must be refused; got %v", err)
 	}
 }
 
@@ -156,7 +191,7 @@ func TestDeprovision_DropUserFailsNonFatal(t *testing.T) {
 // StorageBytes (fail-open → 0,nil) and Deprovision, using a syntactically
 // invalid URI that fails at ApplyURI/Connect time.
 func TestConnectErrorBranches(t *testing.T) {
-	p := nosqlprovider.New("not-a-valid-uri", "h:1")
+	p := nosqlprovider.New("not-a-valid-uri", "h:1", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -185,7 +220,7 @@ func TestProvision_InitInsertNonFatal(t *testing.T) {
 	token := "init$bad"
 	defer dropMongo(t, uri, token)
 
-	p := nosqlprovider.New(uri, host)
+	p := nosqlprovider.New(uri, host, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -208,7 +243,7 @@ func TestProvision_InitInsertNonFatal(t *testing.T) {
 func TestStorageBytes_MissingDB_FailOpen(t *testing.T) {
 	uri := requireMongoURI(t)
 	host := hostFromURI(uri)
-	p := nosqlprovider.New(uri, host)
+	p := nosqlprovider.New(uri, host, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -224,7 +259,7 @@ func TestStorageBytes_MissingDB_FailOpen(t *testing.T) {
 func TestStorageBytes_DBStatsError(t *testing.T) {
 	uri := requireMongoURI(t)
 	host := hostFromURI(uri)
-	p := nosqlprovider.New(uri, host)
+	p := nosqlprovider.New(uri, host, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 

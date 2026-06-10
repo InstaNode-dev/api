@@ -86,7 +86,7 @@ func seamCleanup(t *testing.T, uri, token string) {
 // errors and StorageBytes fails open with (0, nil).
 func TestStorageBytes_DBStatsError_FailOpen(t *testing.T) {
 	uri := seamMongoURI(t)
-	p := New(uri, seamHost(uri))
+	p := New(uri, seamHost(uri), "")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -100,7 +100,7 @@ func TestStorageBytes_DBStatsError_FailOpen(t *testing.T) {
 // MongoDB database name, which the driver rejects when Drop is called.
 func TestDeprovision_DropDatabaseError(t *testing.T) {
 	uri := seamMongoURI(t)
-	p := New(uri, seamHost(uri))
+	p := New(uri, seamHost(uri), "")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -119,7 +119,7 @@ func TestProvision_RandReadFailure(t *testing.T) {
 	randRead = func(b []byte) (int, error) { return 0, errors.New("entropy depleted") }
 	t.Cleanup(func() { randRead = orig })
 
-	p := New(uri, seamHost(uri))
+	p := New(uri, seamHost(uri), "")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -144,7 +144,7 @@ func TestProvision_DisconnectError(t *testing.T) {
 	}
 	t.Cleanup(func() { mongoDisconnect = orig })
 
-	p := New(uri, seamHost(uri))
+	p := New(uri, seamHost(uri), "")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -169,7 +169,7 @@ func TestStorageBytes_DisconnectError(t *testing.T) {
 	}
 	t.Cleanup(func() { mongoDisconnect = orig })
 
-	p := New(uri, seamHost(uri))
+	p := New(uri, seamHost(uri), "")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -191,7 +191,7 @@ func TestDeprovision_DisconnectError(t *testing.T) {
 	}
 	t.Cleanup(func() { mongoDisconnect = orig })
 
-	p := New(uri, seamHost(uri))
+	p := New(uri, seamHost(uri), "")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 

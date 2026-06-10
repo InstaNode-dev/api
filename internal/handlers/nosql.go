@@ -41,7 +41,10 @@ func NewNoSQLHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, provClie
 	}
 	if provClient == nil {
 		// fall back to local provider
-		h.nosqlProvider = nosqlprovider.New(cfg.MongoAdminURI, cfg.MongoHost)
+		h.nosqlProvider = nosqlprovider.New(cfg.MongoAdminURI, cfg.MongoHost, cfg.Environment)
+		// Wire the *sql.DB-backed dbsafety audit sink so the dev-fallback
+		// provider's dropUser/dropDatabase are recorded in audit_log.
+		models.WireDBSafetyAuditSink(db)
 	}
 	return h
 }

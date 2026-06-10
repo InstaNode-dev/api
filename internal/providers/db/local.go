@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"instant.dev/internal/providers/dbsafety"
 )
 
 const defaultCustomersURL = "postgres://instant_cust:instant_cust@postgres-customers:5432/instant_customers?sslmode=disable"
@@ -47,14 +48,18 @@ var pgxConnect = func(ctx context.Context, connString string) (pgConn, error) {
 // LocalBackend provisions databases on the shared postgres-customers instance.
 type LocalBackend struct {
 	customersURL string // admin connection URL
+	env          string // process ENVIRONMENT — feeds the dbsafety production refusal
 }
 
 // newLocalBackend creates a LocalBackend using the given admin connection URL.
-func newLocalBackend(customersURL string) *LocalBackend {
+// env is the process ENVIRONMENT (cfg.Environment); it feeds the dbsafety
+// production-refusal guard so this dev-only fallback fails closed when
+// PROVISIONER_ADDR is unset against a non-dev customer-DB host.
+func newLocalBackend(customersURL, env string) *LocalBackend {
 	if customersURL == "" {
 		customersURL = defaultCustomersURL
 	}
-	return &LocalBackend{customersURL: customersURL}
+	return &LocalBackend{customersURL: customersURL, env: env}
 }
 
 // generatePassword returns a cryptographically random alphanumeric string of length n.
@@ -205,6 +210,22 @@ func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResource
 func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceID string) error {
 	dbName := "db_" + token
 	username := "usr_" + token
+
+	// dbsafety guard (truehomie-db incident): refuse the DROP entirely when
+	// this dev-only fallback is effectively in production (non-dev customer-DB
+	// host) or the target name doesn't match the per-tenant convention, and
+	// audit every sanctioned drop. Runs BEFORE we open the superuser
+	// connection so a refused op never even touches the customer cluster.
+	if err := dbsafety.GuardDrop(ctx, dbsafety.DropParams{
+		Provider:     "db.local",
+		Env:          b.env,
+		DSNHost:      b.customersURL,
+		Token:        token,
+		DatabaseName: dbName,
+		UserName:     username,
+	}); err != nil {
+		return fmt.Errorf("db.local.Deprovision: %w", err)
+	}
 
 	conn, err := pgxConnect(ctx, b.customersURL)
 	if err != nil {

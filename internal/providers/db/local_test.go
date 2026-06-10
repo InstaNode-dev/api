@@ -78,11 +78,11 @@ func randHex() string {
 }
 
 func TestNewLocalBackend_DefaultURL(t *testing.T) {
-	b := newLocalBackend("")
+	b := newLocalBackend("", "")
 	if b.customersURL != defaultCustomersURL {
 		t.Fatalf("empty URL must fall back to default; got %q", b.customersURL)
 	}
-	b2 := newLocalBackend("postgres://x:y@h:5432/d")
+	b2 := newLocalBackend("postgres://x:y@h:5432/d", "")
 	if b2.customersURL != "postgres://x:y@h:5432/d" {
 		t.Fatalf("explicit URL must be preserved; got %q", b2.customersURL)
 	}
@@ -131,7 +131,7 @@ func TestExtractHostAndIndexOf(t *testing.T) {
 }
 
 func TestBuildURLs(t *testing.T) {
-	b := newLocalBackend("postgres://admin:pw@pghost:5432/instant_customers?sslmode=disable")
+	b := newLocalBackend("postgres://admin:pw@pghost:5432/instant_customers?sslmode=disable", "")
 	got := b.buildDBURL("usr_x", "secret", "db_x")
 	want := "postgres://usr_x:secret@pghost:5432/db_x"
 	if got != want {
@@ -143,7 +143,7 @@ func TestBuildURLs(t *testing.T) {
 		t.Fatalf("buildAdminNewDBURL must end with /db_x; got %q", admin)
 	}
 	// No-slash URL falls back to appending /db_x.
-	b2 := newLocalBackend("postgresnohost")
+	b2 := newLocalBackend("postgresnohost", "")
 	if got := b2.buildAdminNewDBURL("db_y"); got != "postgresnohost/db_y" {
 		t.Fatalf("no-slash fallback = %q", got)
 	}
@@ -156,7 +156,7 @@ func TestLocalBackend_ProvisionDeprovision_HappyPath(t *testing.T) {
 	token := uniqueToken("happy")
 	defer cleanupDB(t, dsn, token)
 
-	b := newLocalBackend(dsn)
+	b := newLocalBackend(dsn, "")
 	ctx := context.Background()
 
 	creds, err := b.Provision(ctx, token, "anonymous")
@@ -215,7 +215,7 @@ func TestLocalBackend_ProvisionWithExtensions(t *testing.T) {
 	token := uniqueToken("ext")
 	defer cleanupDB(t, dsn, token)
 
-	b := newLocalBackend(dsn)
+	b := newLocalBackend(dsn, "")
 	ctx := context.Background()
 
 	_, err := b.ProvisionWithExtensions(ctx, token, "pro", []string{"vector"})
@@ -236,7 +236,7 @@ func TestLocalBackend_ProvisionWithExtensions(t *testing.T) {
 // TestLocalBackend_ProvisionWithExtensions_Rejected covers the allowlist
 // rejection branch before any DB connection is opened.
 func TestLocalBackend_ProvisionWithExtensions_Rejected(t *testing.T) {
-	b := newLocalBackend("postgres://u:p@127.0.0.1:1/db?sslmode=disable")
+	b := newLocalBackend("postgres://u:p@127.0.0.1:1/db?sslmode=disable", "")
 	_, err := b.ProvisionWithExtensions(context.Background(), "tok", "pro", []string{"postgis"})
 	if err == nil || !strings.Contains(err.Error(), "allowlist") {
 		t.Fatalf("want allowlist rejection, got %v", err)
@@ -250,7 +250,7 @@ func TestLocalBackend_DuplicateProvision(t *testing.T) {
 	token := uniqueToken("dup")
 	defer cleanupDB(t, dsn, token)
 
-	b := newLocalBackend(dsn)
+	b := newLocalBackend(dsn, "")
 	ctx := context.Background()
 
 	if _, err := b.Provision(ctx, token, "anonymous"); err != nil {
@@ -265,7 +265,7 @@ func TestLocalBackend_DuplicateProvision(t *testing.T) {
 // TestLocalBackend_ConnectFailure covers every connect-error branch by pointing
 // the backend at a dead port.
 func TestLocalBackend_ConnectFailure(t *testing.T) {
-	b := newLocalBackend("postgres://u:p@127.0.0.1:1/db?sslmode=disable&connect_timeout=1")
+	b := newLocalBackend("postgres://u:p@127.0.0.1:1/db?sslmode=disable&connect_timeout=1", "")
 	ctx := context.Background()
 
 	if _, err := b.Provision(ctx, "tok", "anonymous"); err == nil {
@@ -297,7 +297,7 @@ func TestLocalBackend_CreateUserConflict(t *testing.T) {
 	}
 	conn.Close(ctx)
 
-	b := newLocalBackend(dsn)
+	b := newLocalBackend(dsn, "")
 	_, err = b.Provision(ctx, token, "anonymous")
 	if err == nil || !strings.Contains(err.Error(), "CREATE USER") {
 		t.Fatalf("want CREATE USER conflict; got %v", err)
@@ -312,7 +312,7 @@ func TestLocalBackend_Deprovision_TerminatesConnections(t *testing.T) {
 	token := uniqueToken("term")
 	defer cleanupDB(t, dsn, token)
 
-	b := newLocalBackend(dsn)
+	b := newLocalBackend(dsn, "")
 	ctx := context.Background()
 
 	creds, err := b.Provision(ctx, token, "anonymous")
@@ -348,7 +348,7 @@ func TestLocalBackend_Provision_LimitedRole_NonFatalGrants(t *testing.T) {
 	token := uniqueToken("limgrant")
 	defer cleanupDB(t, dsn, token)
 
-	b := newLocalBackend(limited)
+	b := newLocalBackend(limited, "")
 	creds, err := b.Provision(context.Background(), token, "anonymous")
 	if err != nil {
 		t.Fatalf("Provision under limited role must still succeed (grants are best-effort): %v", err)
@@ -378,7 +378,7 @@ func TestLocalBackend_Deprovision_DropFails(t *testing.T) {
 
 	ctx := context.Background()
 	// Provision as the superuser so the DB is owned by the superuser.
-	super := newLocalBackend(dsn)
+	super := newLocalBackend(dsn, "")
 	creds, err := super.Provision(ctx, token, "anonymous")
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -393,7 +393,7 @@ func TestLocalBackend_Deprovision_DropFails(t *testing.T) {
 	// Deprovision as the limited role: pg_terminate_backend on another role's
 	// backend is denied (logged, non-fatal), then DROP DATABASE on a DB it does
 	// not own returns an error.
-	lb := newLocalBackend(limited)
+	lb := newLocalBackend(limited, "")
 	if err := lb.Deprovision(ctx, token, ""); err == nil {
 		t.Fatal("limited-role Deprovision must fail on DROP DATABASE")
 	}
@@ -436,7 +436,7 @@ func TestLocalBackend_Deprovision_DropUserFails(t *testing.T) {
 	defer cleanupDB(t, dsn, token)
 
 	// Deprovision as limited: DROP DATABASE succeeds, DROP USER fails (logged).
-	lb := newLocalBackend(limited)
+	lb := newLocalBackend(limited, "")
 	if err := lb.Deprovision(ctx, token, ""); err != nil {
 		t.Fatalf("Deprovision should succeed (DROP USER failure is non-fatal): %v", err)
 	}
@@ -450,7 +450,7 @@ func TestLocalBackend_StorageBytes_CancelledCtx(t *testing.T) {
 	token := uniqueToken("cancel")
 	defer cleanupDB(t, dsn, token)
 
-	b := newLocalBackend(dsn)
+	b := newLocalBackend(dsn, "")
 	if _, err := b.Provision(context.Background(), token, "anonymous"); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -467,7 +467,7 @@ func TestLocalBackend_StorageBytes_CancelledCtx(t *testing.T) {
 // branch for a database that doesn't exist.
 func TestLocalBackend_StorageBytes_MissingDB(t *testing.T) {
 	dsn := testCustomersURL(t)
-	b := newLocalBackend(dsn)
+	b := newLocalBackend(dsn, "")
 	_, err := b.StorageBytes(context.Background(), "definitely-not-provisioned-xyz", "")
 	if err == nil || !strings.Contains(err.Error(), "pg_database_size") {
 		t.Fatalf("want pg_database_size error for missing db; got %v", err)

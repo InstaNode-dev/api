@@ -17,7 +17,7 @@ func New(cfg *config.Config, customersURL string) *Provider {
 	case "neon":
 		return &Provider{backend: newNeonBackend(cfg.NeonAPIKey, cfg.NeonRegionID)}
 	default: // "local"
-		return &Provider{backend: newLocalBackend(customersURL)}
+		return &Provider{backend: newLocalBackend(customersURL, cfg.Environment)}
 	}
 }
 

@@ -111,7 +111,7 @@ func TestProvision_RandFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { randInt = orig })
 
-	b := newLocalBackend("postgres://x:y@h:5432/d")
+	b := newLocalBackend("postgres://x:y@h:5432/d", "")
 	_, err := b.Provision(context.Background(), "tok", "anonymous")
 	if err == nil || !strings.Contains(err.Error(), "db.local.Provision") {
 		t.Fatalf("Provision must fail on RNG error; got %v", err)
@@ -133,7 +133,7 @@ func TestProvision_NonFatalBranches(t *testing.T) {
 	}
 	withFakeConn(t, []*fakePgConn{adminConn, newDBConn}, nil)
 
-	b := newLocalBackend("postgres://admin:pw@host:5432/instant_customers")
+	b := newLocalBackend("postgres://admin:pw@host:5432/instant_customers", "")
 	creds, err := b.Provision(context.Background(), "nonfatal", "anonymous")
 	if err != nil {
 		t.Fatalf("non-fatal branches must not fail provision: %v", err)
@@ -154,7 +154,7 @@ func TestProvision_NewDBConnectFails_WithExtensions(t *testing.T) {
 	// First connect (admin) succeeds; second connect (new DB) fails.
 	withFakeConn(t, []*fakePgConn{adminConn}, []error{nil, errors.New("new db unreachable")})
 
-	b := newLocalBackend("postgres://admin:pw@host:5432/instant_customers")
+	b := newLocalBackend("postgres://admin:pw@host:5432/instant_customers", "")
 	_, err := b.Provision(context.Background(), "extfail", "pro")
 	// No extensions requested → non-fatal, provision succeeds.
 	if err != nil {
@@ -168,7 +168,7 @@ func TestProvisionWithExtensions_NewDBConnectFails(t *testing.T) {
 	adminConn := &fakePgConn{}
 	withFakeConn(t, []*fakePgConn{adminConn}, []error{nil, errors.New("new db unreachable")})
 
-	b := newLocalBackend("postgres://admin:pw@host:5432/instant_customers")
+	b := newLocalBackend("postgres://admin:pw@host:5432/instant_customers", "")
 	_, err := b.ProvisionWithExtensions(context.Background(), "extloud", "pro", []string{"vector"})
 	if err == nil || !strings.Contains(err.Error(), "install extensions") {
 		t.Fatalf("requested extensions + new-db connect fail must error loudly; got %v", err)
@@ -180,7 +180,7 @@ func TestProvision_CreateUserFails(t *testing.T) {
 	adminConn := &fakePgConn{execErr: map[string]error{"CREATE USER": errors.New("user exists")}}
 	withFakeConn(t, []*fakePgConn{adminConn}, nil)
 
-	b := newLocalBackend("postgres://admin:pw@host:5432/d")
+	b := newLocalBackend("postgres://admin:pw@host:5432/d", "")
 	_, err := b.Provision(context.Background(), "dupuser", "anonymous")
 	if err == nil || !strings.Contains(err.Error(), "CREATE USER") {
 		t.Fatalf("want CREATE USER error; got %v", err)
@@ -192,7 +192,7 @@ func TestProvision_GrantDatabaseFails(t *testing.T) {
 	adminConn := &fakePgConn{execErr: map[string]error{"GRANT ALL PRIVILEGES ON DATABASE": errors.New("denied")}}
 	withFakeConn(t, []*fakePgConn{adminConn}, nil)
 
-	b := newLocalBackend("postgres://admin:pw@host:5432/d")
+	b := newLocalBackend("postgres://admin:pw@host:5432/d", "")
 	_, err := b.Provision(context.Background(), "grantfail", "anonymous")
 	if err == nil || !strings.Contains(err.Error(), "GRANT DATABASE") {
 		t.Fatalf("want GRANT DATABASE error; got %v", err)
@@ -205,7 +205,7 @@ func TestStorageBytes_CloseError(t *testing.T) {
 	conn := &fakePgConn{closeErr: errors.New("close failed"), queryRowVal: 4096}
 	withFakeConn(t, []*fakePgConn{conn}, nil)
 
-	b := newLocalBackend("postgres://admin:pw@host:5432/d")
+	b := newLocalBackend("postgres://admin:pw@host:5432/d", "")
 	size, err := b.StorageBytes(context.Background(), "tok", "")
 	if err != nil {
 		t.Fatalf("StorageBytes: %v", err)
@@ -231,7 +231,7 @@ func TestDeprovision_NonFatalBranches(t *testing.T) {
 	}
 	withFakeConn(t, []*fakePgConn{conn}, nil)
 
-	b := newLocalBackend("postgres://admin:pw@host:5432/d")
+	b := newLocalBackend("postgres://admin:pw@host:5432/d", "")
 	if err := b.Deprovision(context.Background(), "tok", ""); err != nil {
 		t.Fatalf("Deprovision non-fatal branches must succeed: %v", err)
 	}
@@ -245,9 +245,47 @@ func TestDeprovision_DropDatabaseFails(t *testing.T) {
 	conn := &fakePgConn{execErr: map[string]error{"DROP DATABASE": errors.New("not owner")}}
 	withFakeConn(t, []*fakePgConn{conn}, nil)
 
-	b := newLocalBackend("postgres://admin:pw@host:5432/d")
+	b := newLocalBackend("postgres://admin:pw@host:5432/d", "")
 	if err := b.Deprovision(context.Background(), "tok", ""); err == nil ||
 		!strings.Contains(err.Error(), "DROP DATABASE") {
 		t.Fatalf("want DROP DATABASE error; got %v", err)
+	}
+}
+
+// TestDeprovision_DBSafetyRefusesProductionHost covers the dbsafety guard
+// refusal branch in Deprovision: a non-dev customer-DB admin host (the
+// truehomie pattern — PROVISIONER_ADDR unset against the prod/managed cluster)
+// must be refused BEFORE any connection is opened. We install a fake conn that
+// would FAIL the test if it were ever dialled, then assert the refusal fires
+// first (no Exec, no Close).
+func TestDeprovision_DBSafetyRefusesProductionHost(t *testing.T) {
+	conn := &fakePgConn{}
+	withFakeConn(t, []*fakePgConn{conn}, nil)
+
+	b := newLocalBackend("postgres://admin:pw@pg.instanode.dev:25060/instant_customers?sslmode=require", "production")
+	err := b.Deprovision(context.Background(), "tok", "")
+	if err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("Deprovision against a non-dev host must be refused; got %v", err)
+	}
+	if conn.closed != 0 {
+		t.Fatalf("guard must refuse before any connection is opened; conn.closed=%d", conn.closed)
+	}
+}
+
+// TestDeprovision_DBSafetyRefusesBadName covers the name-guard refusal branch:
+// a malformed token (here a system DB name flowed into the token field) is
+// refused even against a dev host, before any DROP runs.
+func TestDeprovision_DBSafetyRefusesBadName(t *testing.T) {
+	conn := &fakePgConn{}
+	withFakeConn(t, []*fakePgConn{conn}, nil)
+
+	// token "postgres" → dbName "db_postgres" embeds a reserved system token.
+	b := newLocalBackend("postgres://admin:pw@localhost:5432/d", "development")
+	err := b.Deprovision(context.Background(), "postgres", "")
+	if err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("malformed token must be refused; got %v", err)
+	}
+	if conn.closed != 0 {
+		t.Fatalf("guard must refuse before any connection is opened; conn.closed=%d", conn.closed)
 	}
 }

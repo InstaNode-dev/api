@@ -76,7 +76,7 @@ func TestMongoProvider_Provision_Success(t *testing.T) {
 	token := "provok123"
 	defer cleanupMongo(t, uri, token)
 
-	p := nosqlprovider.New(uri, host)
+	p := nosqlprovider.New(uri, host, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -98,7 +98,7 @@ func TestMongoProvider_Provision_URLFormat(t *testing.T) {
 	token := "urlfmt456"
 	defer cleanupMongo(t, uri, token)
 
-	p := nosqlprovider.New(uri, host)
+	p := nosqlprovider.New(uri, host, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -121,7 +121,7 @@ func TestMongoProvider_StorageBytes_ReturnsZeroOnMissingDB(t *testing.T) {
 	uri := requireMongo(t)
 	host := mongoHost(uri)
 
-	p := nosqlprovider.New(uri, host)
+	p := nosqlprovider.New(uri, host, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -140,7 +140,7 @@ func TestMongoProvider_Deprovision_DropsUserAndDB(t *testing.T) {
 	host := mongoHost(uri)
 	token := "deprovtest789"
 
-	p := nosqlprovider.New(uri, host)
+	p := nosqlprovider.New(uri, host, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
