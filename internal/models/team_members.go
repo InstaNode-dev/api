@@ -170,9 +170,15 @@ func InviteMember(ctx context.Context, db *sql.DB, teamID uuid.UUID, email, role
 	}
 
 	var existing int
-	_ = db.QueryRowContext(ctx, `
+	// Fail CLOSED on a query error: the pre-fix `_ = ...Scan(&existing)` swallowed
+	// it, leaving existing=0 so the "already a member" guard silently passed on any
+	// DB hiccup — inviting someone already on the team. Surface the error so the
+	// invite fails (caller retries) rather than proceeding blind.
+	if err := db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM users WHERE team_id = $1 AND lower(email) = lower($2)
-	`, teamID, email).Scan(&existing)
+	`, teamID, email).Scan(&existing); err != nil {
+		return nil, fmt.Errorf("models.InviteMember: check existing member: %w", err)
+	}
 	if existing > 0 {
 		return nil, ErrAlreadyTeamMember
 	}
@@ -451,10 +457,10 @@ func LeaveTeam(ctx context.Context, db *sql.DB, teamID, userID uuid.UUID) error 
 // owner/primary in the same transaction. "member" is retained as a legacy
 // alias of developer for callers that haven't migrated to the RBAC names.
 var allowedMemberRoles = map[string]struct{}{
-	RoleAdmin:        {},
-	RoleDeveloper:    {},
-	RoleViewer:       {},
-	"member":         {}, // legacy alias of developer
+	RoleAdmin:     {},
+	RoleDeveloper: {},
+	RoleViewer:    {},
+	"member":      {}, // legacy alias of developer
 }
 
 // UpdateMemberRole rewrites users.role for a target team-member. Refuses to

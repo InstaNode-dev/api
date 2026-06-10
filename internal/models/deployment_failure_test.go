@@ -21,6 +21,7 @@ var knownReasons = []string{
 	FailureReasonCrashLoopBackOff,
 	FailureReasonBuildFailed,
 	FailureReasonDeadlineExceeded,
+	FailureReasonStartFailed,
 	FailureReasonError,
 	FailureReasonUnknown,
 }
