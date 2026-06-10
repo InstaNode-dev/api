@@ -19,6 +19,7 @@ package handlers_test
 // caps). A unique IP per call keeps the rate-limit/fingerprint counters clean.
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -37,6 +38,7 @@ import (
 	"instant.dev/internal/config"
 	"instant.dev/internal/handlers"
 	"instant.dev/internal/middleware"
+	"instant.dev/internal/models"
 	"instant.dev/internal/plans"
 	"instant.dev/internal/testhelpers"
 )
@@ -114,7 +116,9 @@ func postBadBackend(t *testing.T, app *fiber.App, path, jwt, ip string) (int, st
 }
 
 // TestProvisionFinal2_BackendFailure_SoftDelete_Auth covers the authenticated
-// backend-failure soft-delete arms in db.go (L424) and nosql.go.
+// backend-failure rollback arms in db.go (L424) and nosql.go. Post Wave-2 A1
+// the rollback persists the row as status='failed' (a pollable terminal
+// state) instead of soft-deleting it — asserted per resource type below.
 func TestProvisionFinal2_BackendFailure_SoftDelete_Auth(t *testing.T) {
 	if os.Getenv("TEST_DATABASE_URL") == "" {
 		t.Skip("TEST_DATABASE_URL not set")
@@ -123,10 +127,25 @@ func TestProvisionFinal2_BackendFailure_SoftDelete_Auth(t *testing.T) {
 	teamID := testhelpers.MustCreateTeamDB(t, liveDB, "pro")
 	jwt := authSessionJWT(t, liveDB, teamID)
 
-	for i, path := range []string{"/db/new", "/nosql/new", "/vector/new", "/queue/new"} {
-		status, errCode := postBadBackend(t, app, path, jwt, "10.220."+digitStr(i)+".7")
-		assert.Equalf(t, http.StatusServiceUnavailable, status, "%s backend-fail must 503", path)
-		assert.Equalf(t, "provision_failed", errCode, "%s error code", path)
+	cases := []struct{ path, resourceType string }{
+		{"/db/new", "postgres"},
+		{"/nosql/new", "mongodb"},
+		{"/vector/new", "vector"},
+		{"/queue/new", "queue"},
+	}
+	for i, tc := range cases {
+		status, errCode := postBadBackend(t, app, tc.path, jwt, "10.220."+digitStr(i)+".7")
+		assert.Equalf(t, http.StatusServiceUnavailable, status, "%s backend-fail must 503", tc.path)
+		assert.Equalf(t, "provision_failed", errCode, "%s error code", tc.path)
+
+		// Wave-2 A1: the rolled-back row must persist as 'failed', not vanish.
+		var rowStatus string
+		require.NoErrorf(t, liveDB.QueryRowContext(context.Background(),
+			`SELECT status FROM resources WHERE team_id = $1::uuid AND resource_type = $2
+			 ORDER BY created_at DESC LIMIT 1`, teamID, tc.resourceType).Scan(&rowStatus),
+			"%s rollback row must exist", tc.path)
+		assert.Equalf(t, models.StatusFailed, rowStatus,
+			"%s rollback row must be status='failed' (pollable terminal state)", tc.path)
 	}
 }
 

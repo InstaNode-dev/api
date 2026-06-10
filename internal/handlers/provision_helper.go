@@ -430,7 +430,9 @@ var errProvisionPersistFailed = errors.New("provision persistence failed")
 // this helper:
 //
 //   - runs the caller-supplied cleanup closure (best-effort backend deprovision),
-//   - soft-deletes the resource row,
+//   - marks the resource row 'failed' (a pollable terminal state — see
+//     models.MarkResourceFailed; failed rows are list-visible, deletable,
+//     and quota-exempt),
 //   - returns errProvisionPersistFailed.
 //
 // The caller treats a non-nil return as a hard provision failure
@@ -505,12 +507,14 @@ func (h *provisionHelper) finalizeProvision(
 	}
 
 	// Persistence failed — the resource is unreachable / un-addressable. Tear
-	// down the backend object (best-effort) and soft-delete the row so the
-	// platform is not left billing an orphan, then signal a hard failure.
+	// down the backend object (best-effort) and mark the row 'failed' so the
+	// caller has a pollable terminal state and the platform is not left
+	// billing an orphan (quota counts filter status='active'), then signal a
+	// hard failure.
 	if cleanup != nil {
 		cleanup()
 	}
-	if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+	if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
 		slog.Error(logPrefix+".cleanup_soft_delete_failed", "error", delErr,
 			"resource_id", resource.ID, "request_id", requestID)
 	}
@@ -518,7 +522,7 @@ func (h *provisionHelper) finalizeProvision(
 	// MR-P0-3: emit the operator-alert audit row. This is the moment the
 	// platform produced an unreachable resource — the backend object existed
 	// (briefly), the platform DB could not address it, and the deprovision +
-	// soft-delete is the compensation. Operators key on this kind to
+	// 'failed' mark is the compensation. Operators key on this kind to
 	// reconstruct the exact request, find the upstream failure cause
 	// (DB unreachable / encrypt failure / etc.), and audit-trace any backend
 	// objects that escaped the best-effort cleanup. Best-effort emit: audit-

@@ -328,7 +328,7 @@ func (h *StorageHandler) NewStorage(c *fiber.Ctx) error {
 		middleware.RecordProvisionFail("storage", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("storage.new.provision_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
-		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+		if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("storage.new.soft_delete_failed", "error", delErr, "resource_id", resource.ID)
 		}
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision storage credentials")
@@ -528,7 +528,7 @@ func (h *StorageHandler) newStorageAuthenticated(
 		middleware.RecordProvisionFail("storage", middleware.ProvisionFailBackendUnavailable)
 		slog.Error("storage.new.provision_failed_auth",
 			"error", err, "token", tokenStr, "team_id", teamIDStr, "request_id", requestID)
-		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+		if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("storage.new.soft_delete_failed_auth", "error", delErr, "resource_id", resource.ID)
 		}
 		return respondError(c, fiber.StatusServiceUnavailable, "provision_failed", "Failed to provision storage credentials")

@@ -181,7 +181,29 @@ func (h *ResourceHandler) Get(c *fiber.Ctx) error {
 	})
 }
 
+// resolveResourceByTokenOrID resolves a path UUID first as a provision token
+// (the historical DELETE contract), then — when no token matches — as the
+// row's primary-key id. GET /api/v1/resources keys its items by `id`, so
+// before this fallback the natural list→delete-by-id flow 404'd 100% of the
+// time (Wave-2 A1). Token resolution stays first so existing token-addressed
+// callers see byte-identical behaviour; a collision between one row's token
+// and another row's id is a 2^-122 non-event.
+func resolveResourceByTokenOrID(ctx context.Context, db *sql.DB, pathUUID uuid.UUID) (*models.Resource, error) {
+	resource, err := models.GetResourceByToken(ctx, db, pathUUID)
+	if err != nil {
+		var notFound *models.ErrResourceNotFound
+		if errors.As(err, &notFound) {
+			return models.GetResourceByID(ctx, db, pathUUID)
+		}
+	}
+	return resource, err
+}
+
 // Delete handles DELETE /api/v1/resources/:id — soft-deletes a resource.
+// :id accepts EITHER the resource's provision token (historical contract)
+// OR its `id` as returned by GET /api/v1/resources (see
+// resolveResourceByTokenOrID). Authorization is identical for both forms:
+// the row must belong to the caller's team.
 func (h *ResourceHandler) Delete(c *fiber.Ctx) error {
 	requestID := middleware.GetRequestID(c)
 
@@ -191,12 +213,12 @@ func (h *ResourceHandler) Delete(c *fiber.Ctx) error {
 	}
 
 	tokenStr := c.Params("id")
-	token, parseErr := uuid.Parse(tokenStr)
+	pathUUID, parseErr := uuid.Parse(tokenStr)
 	if parseErr != nil {
 		return respondError(c, fiber.StatusBadRequest, "invalid_id", "Resource ID must be a valid UUID")
 	}
 
-	resource, err := models.GetResourceByToken(c.Context(), h.db, token)
+	resource, err := resolveResourceByTokenOrID(c.Context(), h.db, pathUUID)
 	if err != nil {
 		var notFound *models.ErrResourceNotFound
 		if errors.As(err, &notFound) {
@@ -209,6 +231,11 @@ func (h *ResourceHandler) Delete(c *fiber.Ctx) error {
 		)
 		return respondError(c, fiber.StatusServiceUnavailable, "fetch_failed", "Failed to fetch resource")
 	}
+
+	// token is the resource's TOKEN, not the raw path UUID — under the
+	// id-addressed form the path param is the row id, and every backend
+	// object name / cache key / audit summary derives from the token.
+	token := resource.Token
 
 	if !resource.TeamID.Valid || resource.TeamID.UUID != teamID {
 		// 404 not 403: never confirm the existence of resources owned by
@@ -298,8 +325,9 @@ func (h *ResourceHandler) Delete(c *fiber.Ctx) error {
 
 	// Invalidate the cached resource entry so any in-flight requests
 	// see the deletion immediately rather than waiting for TTL expiry.
-	// Use token.String() (normalized lowercase UUID) to match the key written by
-	// getResourceCached — tokenStr is the raw URL param and may be mixed-case.
+	// Use token.String() (normalized lowercase TOKEN UUID) to match the key
+	// written by getResourceCached — tokenStr is the raw URL param, may be
+	// mixed-case, and under the id-addressed form isn't the token at all.
 	h.rdb.Del(c.Context(), fmt.Sprintf("res:%s", token.String()))
 
 	slog.Info("resource.deleted",

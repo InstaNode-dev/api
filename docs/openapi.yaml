@@ -538,7 +538,17 @@ paths:
       security:
         - BearerAuth: []
       parameters:
-        - $ref: "#/components/parameters/id"
+        - name: id
+          in: path
+          required: true
+          description: >-
+            Accepts EITHER the resource's `id` (as returned by
+            GET /api/v1/resources) OR its provision `token`. Resolution tries
+            token first, then id; authorization (team ownership) is identical
+            for both forms.
+          schema:
+            type: string
+            format: uuid
       responses:
         "200":
           description: Resource deleted.

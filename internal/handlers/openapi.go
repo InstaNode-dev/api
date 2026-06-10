@@ -882,10 +882,11 @@ const openAPISpec = `{
       "delete": {
         "summary": "Delete a resource",
         "security": [{ "bearerAuth": [] }],
-        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" }, "description": "Accepts EITHER the resource's 'id' (as returned by GET /api/v1/resources) OR its provision 'token'. Resolution tries token first, then id; authorization (team ownership) is identical for both forms." }],
         "responses": {
           "200": { "description": "Resource deleted" },
-          "403": { "description": "Forbidden — not your resource OR blocked by team env_policy. The env_policy variant carries body: { error: 'env_policy_denied', env, action, role, allowed_roles, agent_action }." }
+          "403": { "description": "Forbidden — not your resource OR blocked by team env_policy. The env_policy variant carries body: { error: 'env_policy_denied', env, action, role, allowed_roles, agent_action }." },
+          "404": { "description": "Not found — no resource with that id or token, or it belongs to another team." }
         }
       }
     },

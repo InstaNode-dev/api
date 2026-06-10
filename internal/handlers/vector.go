@@ -360,7 +360,7 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 		metrics.ProvisionFailures.WithLabelValues(models.ResourceTypeVector, "grpc_error").Inc()
 		slog.Error("vector.new.provision_failed",
 			"error", err, "token", tokenStr, "request_id", requestID)
-		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+		if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("vector.new.soft_delete_failed", "error", delErr, "resource_id", resource.ID)
 		}
 		return respondProvisionFailed(c, err, "Failed to provision vector database")
@@ -520,7 +520,7 @@ func (h *VectorHandler) newVectorAuthenticated(
 		metrics.ProvisionFailures.WithLabelValues(models.ResourceTypeVector, "grpc_error").Inc()
 		slog.Error("vector.new.provision_failed_auth",
 			"error", err, "token", tokenStr, "team_id", teamIDStr, "request_id", requestID)
-		if delErr := models.SoftDeleteResource(ctx, h.db, resource.ID); delErr != nil {
+		if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
 			slog.Error("vector.new.soft_delete_failed_auth", "error", delErr, "resource_id", resource.ID)
 		}
 		return respondProvisionFailed(c, err, "Failed to provision vector database")

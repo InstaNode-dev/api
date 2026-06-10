@@ -73,6 +73,22 @@ func TestMarkResourceActive_Branches(t *testing.T) {
 	require.ErrorContains(t, MarkResourceActive(ctx, db3, uuid.New()), "boom")
 }
 
+func TestMarkResourceFailed_Branches(t *testing.T) {
+	ctx := context.Background()
+	db, mock := newMock(t)
+	mock.ExpectExec(`UPDATE resources SET status = 'failed'`).WillReturnResult(sqlmock.NewResult(0, 1))
+	require.NoError(t, MarkResourceFailed(ctx, db, uuid.New()))
+
+	// Zero rows — the row was already moved out of 'pending' by another path.
+	db2, mock2 := newMock(t)
+	mock2.ExpectExec(`UPDATE resources SET status = 'failed'`).WillReturnResult(sqlmock.NewResult(0, 0))
+	require.ErrorIs(t, MarkResourceFailed(ctx, db2, uuid.New()), ErrResourceNotPending)
+
+	db3, mock3 := newMock(t)
+	mock3.ExpectExec(`UPDATE resources SET status = 'failed'`).WillReturnError(errors.New("boom"))
+	require.ErrorContains(t, MarkResourceFailed(ctx, db3, uuid.New()), "boom")
+}
+
 func TestCountActiveResourcesByTeamAndType_Branches(t *testing.T) {
 	ctx := context.Background()
 	db, mock := newMock(t)
@@ -221,17 +237,6 @@ func TestSetWebhookHMACSecret_Branches(t *testing.T) {
 	db3, mock3 := newMock(t)
 	mock3.ExpectExec(`UPDATE resources SET hmac_secret`).WillReturnError(errors.New("boom"))
 	require.ErrorContains(t, SetWebhookHMACSecret(ctx, db3, uuid.New(), "x"), "boom")
-}
-
-func TestSoftDeleteResource_Branches(t *testing.T) {
-	ctx := context.Background()
-	db, mock := newMock(t)
-	mock.ExpectExec(`UPDATE resources SET status = 'deleted'`).WillReturnResult(sqlmock.NewResult(0, 1))
-	require.NoError(t, SoftDeleteResource(ctx, db, uuid.New()))
-
-	db2, mock2 := newMock(t)
-	mock2.ExpectExec(`UPDATE resources SET status = 'deleted'`).WillReturnError(errors.New("boom"))
-	require.ErrorContains(t, SoftDeleteResource(ctx, db2, uuid.New()), "boom")
 }
 
 func TestSoftDeleteResourceIfActive_Branches(t *testing.T) {

@@ -33,27 +33,40 @@ const (
 	provisionerCircuitCooldown  = 30 * time.Second
 )
 
+// dedicatedProvisionReadyWait mirrors the provisioner's k8s-backend pod-ready
+// timeouts (redisK8sReadyTO / k8sReadyTimeout / natsK8sReadyTO /
+// mongoK8sReadyTO in provisioner/internal/backend/* — all 3 minutes): the
+// documented budget a dedicated-pod provision may legitimately spend waiting
+// for PVC bind + image pull + readiness. Every provision RPC deadline on this
+// client MUST be ≥ this value plus provisionRPCDeadlineMargin — an RPC
+// deadline that undercuts the backend's own ready-wait kills a provision that
+// was still on track to succeed (and, post Wave-2 A1, strands a 'failed' row
+// for a resource the provisioner then finishes bringing up).
+// TestProvisionTimeouts_NeverUndercutDedicatedReadyWait enforces the
+// invariant for every tier and every provision deadline in this file.
+const dedicatedProvisionReadyWait = 3 * time.Minute
+
+// provisionRPCDeadlineMargin is the headroom an RPC deadline carries on top
+// of dedicatedProvisionReadyWait, covering the non-pod-wait parts of the
+// provision (credential mint, ACL setup, network round-trips).
+const provisionRPCDeadlineMargin = 30 * time.Second
+
 // cacheProvisionTimeout bounds the api → provisioner ProvisionCache RPC.
 //
-// Unlike Postgres/Mongo, a Redis namespace provision does NOT spin up a
-// per-tenant pod with a PVC bind + image pull + DB init — it carves a
-// namespace/ACL out of an already-running Redis (observed ~1–6s end to
-// end, anonymous AND authenticated). It therefore does not need the
-// 4–5m cold-pod budget that provisionTimeout() grants the pod-backed
-// resource types.
-//
-// Granting Redis that same multi-minute budget means a *hung* provisioner
-// hangs the whole /cache/new request for up to 5 minutes (the symptom that
-// motivated this fix: authed /cache/new observed hanging >60s while anon
-// returned in ~6s). A generous-but-bounded 45s ceiling is ~7× the slowest
-// observed healthy provision, so a legitimately slow-but-OK Redis carve
-// still succeeds, while a genuine hang fails fast — the existing handler
-// error path then soft-deletes the pending resource and returns a clean
-// 503 provision_failed instead of an indefinite hang.
+// History: this was a 45s "fail fast" ceiling from when a Redis provision was
+// believed to always be a shared-instance namespace/ACL carve (~1–6s). In
+// production REDIS_PROVISION_BACKEND=k8s provisions a dedicated Redis pod
+// (and under tier-aware routing the Team tier always does), which the
+// provisioner legitimately waits up to dedicatedProvisionReadyWait (3m) for —
+// so the 45s RPC deadline undercut the backend's own ready-wait and killed
+// cold-pod provisions mid-flight. Reconciled (Wave-2 A1): the deadline is now
+// derived from the dedicated ready-wait plus margin, never below it. Hung-
+// provisioner protection comes from this still-bounded deadline plus the
+// shared circuit breaker (5 consecutive failures → ErrOpen in <1ms).
 //
 // A package var (not const) so the timeout→503 unit test can shrink it to
-// a few ms instead of blocking the suite for 45s; production never mutates it.
-var cacheProvisionTimeout = 45 * time.Second
+// a few ms instead of blocking the suite; production never mutates it.
+var cacheProvisionTimeout = dedicatedProvisionReadyWait + provisionRPCDeadlineMargin
 
 // Credentials matches the shape returned by local providers.
 type Credentials struct {
@@ -282,7 +295,9 @@ func (c *Client) ctxWithAuth(ctx context.Context) context.Context {
 // every-tier change). PVC bind + image pull + postgres init can take 30-90s on
 // a cold node, so 10s (the old anonymous default) drops the connection while
 // the pod is still coming up. Anonymous gets a tight 4m budget; pro/team get
-// 5m for larger images and bigger PVCs.
+// 5m for larger images and bigger PVCs. Both budgets honour the floor of
+// dedicatedProvisionReadyWait + provisionRPCDeadlineMargin (3m30s) — see the
+// invariant on dedicatedProvisionReadyWait.
 func provisionTimeout(tier string) time.Duration {
 	if tier == "pro" || tier == "team" || tier == "growth" {
 		return 5 * time.Minute

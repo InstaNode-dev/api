@@ -73,7 +73,7 @@ func envPolicyApp(t *testing.T, db *sql.DB) *fiber.App {
 	api.Delete("/resources/:id",
 		middleware.RequireEnvAccess(middleware.EnvPolicyActionDeleteResource,
 			middleware.WithEnvLookup(func(c *fiber.Ctx) (string, error) {
-				return handlers.ResourceEnvByTokenForMiddleware(c, db)
+				return handlers.ResourceEnvByTokenOrIDForMiddleware(c, db)
 			}),
 		),
 		func(c *fiber.Ctx) error { return c.JSON(fiber.Map{"ok": true}) },

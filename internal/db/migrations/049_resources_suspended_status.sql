@@ -31,9 +31,10 @@ ALTER TABLE resources DROP CONSTRAINT IF EXISTS resources_status_check;
 ALTER TABLE resources
     ADD CONSTRAINT resources_status_check
     -- Forward-consistent full status set (incident 2026-06-10): include 'pending'
-    -- (added in 057) so re-applying 049 on boot can't crash on a valid pending
-    -- row before 057 runs. 024/049/057 now all define the same canonical set.
-    CHECK (status IN ('pending', 'active', 'paused', 'suspended', 'expired', 'deleted', 'reaped'));
+    -- (added in 057) and 'failed' (added in 070) so re-applying 049 on boot
+    -- can't crash on a valid later-added row before its own migration runs.
+    -- 024/049/057/070 now all define the same canonical set.
+    CHECK (status IN ('pending', 'active', 'paused', 'suspended', 'failed', 'expired', 'deleted', 'reaped'));
 
 -- Partial index for the auto-unsuspend scan.
 -- EnforceStorageQuotaWorker scans WHERE status = 'suspended' on every run to

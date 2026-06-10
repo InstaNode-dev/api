@@ -425,19 +425,39 @@ func TestProvisionCache_SuccessAndError(t *testing.T) {
 	}
 }
 
-// TestCacheProvisionTimeout_Value pins the production deadline so a future
-// edit that re-grants Redis the multi-minute cold-pod budget (re-introducing
-// the /cache/new hang) reds the suite.
+// TestCacheProvisionTimeout_Value pins the production deadline derivation:
+// the cache RPC deadline must equal the provisioner's dedicated pod-ready
+// budget plus margin. A bare literal here (the old 45s "Redis is always a
+// shared carve" ceiling) undercut the provisioner's 3m k8s ready-wait and
+// killed legitimate cold-pod provisions mid-flight (Wave-2 A1).
 func TestCacheProvisionTimeout_Value(t *testing.T) {
-	if cacheProvisionTimeout != 45*time.Second {
-		t.Errorf("cacheProvisionTimeout = %s; want 45s (generous-but-bounded Redis carve ceiling)", cacheProvisionTimeout)
+	if want := dedicatedProvisionReadyWait + provisionRPCDeadlineMargin; cacheProvisionTimeout != want {
+		t.Errorf("cacheProvisionTimeout = %s; want %s (dedicatedProvisionReadyWait + provisionRPCDeadlineMargin)",
+			cacheProvisionTimeout, want)
 	}
-	// Must be well under provisionTimeout's pod-backed budget — that gap is
-	// the whole point: a hung provisioner fails /cache/new fast instead of
-	// hanging it for minutes.
-	if cacheProvisionTimeout >= provisionTimeout("pro") {
-		t.Errorf("cacheProvisionTimeout (%s) must be tighter than provisionTimeout(pro) (%s)",
+	// Still bounded: must not balloon past provisionTimeout's pod-backed
+	// budget — a hung provisioner has to fail /cache/new within the same
+	// envelope as every other provision RPC.
+	if cacheProvisionTimeout > provisionTimeout("pro") {
+		t.Errorf("cacheProvisionTimeout (%s) must not exceed provisionTimeout(pro) (%s)",
 			cacheProvisionTimeout, provisionTimeout("pro"))
+	}
+}
+
+// TestProvisionTimeouts_NeverUndercutDedicatedReadyWait enforces the Wave-2 A1
+// invariant for EVERY provision deadline in this package: no RPC deadline may
+// undercut the provisioner's dedicated pod-ready wait (3m) plus margin. The
+// tier list spans both provisionTimeout branches plus unknown-tier fallback so
+// a future tier addition can't silently reintroduce an undercutting budget.
+func TestProvisionTimeouts_NeverUndercutDedicatedReadyWait(t *testing.T) {
+	floor := dedicatedProvisionReadyWait + provisionRPCDeadlineMargin
+	for _, tier := range []string{"anonymous", "free", "hobby", "hobby_plus", "pro", "growth", "team", "some-future-tier"} {
+		if got := provisionTimeout(tier); got < floor {
+			t.Errorf("provisionTimeout(%q) = %s; must be >= %s (dedicated ready-wait + margin)", tier, got, floor)
+		}
+	}
+	if cacheProvisionTimeout < floor {
+		t.Errorf("cacheProvisionTimeout = %s; must be >= %s (dedicated ready-wait + margin)", cacheProvisionTimeout, floor)
 	}
 }
 
@@ -445,7 +465,7 @@ func TestCacheProvisionTimeout_Value(t *testing.T) {
 // the provisioner hangs, ProvisionCache's own client-side deadline fires and
 // returns a DeadlineExceeded-class error in ~the bounded window — NOT an
 // indefinite block. This is the error the cache handler converts into a 503
-// provision_failed after soft-deleting the pending resource.
+// provision_failed after marking the pending resource 'failed'.
 //
 // We shrink cacheProvisionTimeout to a few ms (restored via t.Cleanup) so the
 // test is fast, and give the *caller* context a generous timeout so the error
