@@ -415,6 +415,13 @@ func deprovisionBestEffort(ctx context.Context, provClient *provisioner.Client, 
 // respondProvisionFailed — never a 201. See MR-P0-3.
 var errProvisionPersistFailed = errors.New("provision persistence failed")
 
+// finalizeProvisionPanicHook is a test-only seam. nil in prod (zero overhead);
+// tests set it to panic so the finalizeProvision recover path — which marks the
+// row 'failed' + tears down the backend on a mid-finalize crash — is reachable
+// without a real driver panic. Mirrors the resourcePGOpen / issueOnboardingJWTFn
+// seam convention. Reset to nil by the test on cleanup.
+var finalizeProvisionPanicHook func()
+
 // finalizeProvision is the second phase of the MR-P0-2 / MR-P0-3 two-phase
 // provision lifecycle. The caller runs it AFTER the backend provision RPC has
 // succeeded; it:
@@ -448,7 +455,40 @@ func (h *provisionHelper) finalizeProvision(
 	resource *models.Resource,
 	connectionURL, keyPrefix, providerResourceID, requestID, logPrefix string,
 	cleanup func(),
-) error {
+) (err error) {
+	// #285 follow-up (runtime-reliability audit): the backend Provision RPC has
+	// already SUCCEEDED by the time finalizeProvision runs — the backend object
+	// (DB / cache / mongo user) exists. If this helper PANICS partway (a nil-map
+	// deref, a driver panic, an OOM in crypto.Encrypt) the deferred error paths
+	// below never run, so without this recover the row would be stranded
+	// 'pending' forever (quota off by one, customer can't poll to completion)
+	// AND the backend object would leak. The recover makes the finalize-failure
+	// path TERMINAL even under a crash: best-effort tear down the backend, mark
+	// the row 'failed' (the same compensation the error path uses), then re-panic
+	// so the request still 500s — we never swallow the panic, only ensure the row
+	// and backend are reconciled before it unwinds.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error(logPrefix+".finalize_panic",
+				"panic", fmt.Sprintf("%v", r), "resource_id", resource.ID, "request_id", requestID)
+			if cleanup != nil {
+				cleanup()
+			}
+			if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
+				slog.Error(logPrefix+".finalize_panic_mark_failed", "error", delErr,
+					"resource_id", resource.ID, "request_id", requestID)
+			}
+			// Re-raise so the request surfaces a 500 (the panic is a real bug)
+			// — the row is now terminal and the backend is reconciled.
+			panic(r)
+		}
+	}()
+
+	// Test-only crash injection (nil in prod) — exercises the recover path above.
+	if finalizeProvisionPanicHook != nil {
+		finalizeProvisionPanicHook()
+	}
+
 	persistFailed := false
 
 	// 0. Persist the provisioner key_prefix (Redis ACL namespace). A missing
