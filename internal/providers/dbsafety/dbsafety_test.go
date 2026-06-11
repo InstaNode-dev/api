@@ -122,6 +122,7 @@ func TestCheckDatabaseName(t *testing.T) {
 		"db_pool-abc123",
 		"db_tok",
 		"db_e2e.cohort_42",
+		"db_AbCdEf012345", // mixed-case token (e2e/CI tokens may carry A-Z) — exercises the uppercase char-class branch
 	}
 	for _, n := range good {
 		if err := CheckDatabaseName(n); err != nil {
