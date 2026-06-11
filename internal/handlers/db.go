@@ -53,6 +53,9 @@ func NewDBHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, provClient 
 	if provClient == nil {
 		// fall back to local provider
 		h.dbProvider = dbprovider.New(cfg, cfg.PostgresCustomersURL)
+		// Wire the *sql.DB-backed dbsafety audit sink so the dev-fallback
+		// provider's direct DROPs are recorded in audit_log (truehomie-db).
+		models.WireDBSafetyAuditSink(db)
 	}
 	return h
 }

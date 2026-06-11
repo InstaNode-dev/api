@@ -87,6 +87,8 @@ func NewVectorHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, provCli
 	}
 	if provClient == nil {
 		h.dbProvider = dbprovider.New(cfg, cfg.PostgresCustomersURL)
+		// Wire the dbsafety audit sink for the dev-fallback DROP path.
+		models.WireDBSafetyAuditSink(db)
 	}
 	return h
 }

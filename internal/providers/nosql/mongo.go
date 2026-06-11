@@ -16,6 +16,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"instant.dev/internal/providers/dbsafety"
 )
 
 // connectTimeout is the maximum time to wait for a MongoDB server to be found.
@@ -55,17 +56,20 @@ type Credentials struct {
 type Provider struct {
 	adminURI  string // admin connection URI, e.g. mongodb://root:root@localhost:27017
 	mongoHost string // host for building connection strings, e.g. localhost:27017
+	env       string // process ENVIRONMENT — feeds the dbsafety production refusal
 }
 
-// New creates a Provider.
-func New(adminURI, mongoHost string) *Provider {
+// New creates a Provider. env is the process ENVIRONMENT (cfg.Environment); it
+// feeds the dbsafety production-refusal guard so this dev-only fallback fails
+// closed when PROVISIONER_ADDR is unset against a non-dev Mongo admin host.
+func New(adminURI, mongoHost, env string) *Provider {
 	if adminURI == "" {
 		adminURI = "mongodb://root:root@localhost:27017"
 	}
 	if mongoHost == "" {
 		mongoHost = "localhost:27017"
 	}
-	return &Provider{adminURI: adminURI, mongoHost: mongoHost}
+	return &Provider{adminURI: adminURI, mongoHost: mongoHost, env: env}
 }
 
 // Provision creates a MongoDB database and user for the given token.
@@ -185,6 +189,25 @@ func storageSizeToInt64(v any) int64 {
 // Deprovision drops the user and database for the given token.
 // Drops user first, then drops the database.
 func (p *Provider) Deprovision(ctx context.Context, token string) error {
+	dbName := "db_" + token
+	username := "usr_" + token
+
+	// dbsafety guard (truehomie-db incident): refuse the dropUser/dropDatabase
+	// entirely when this dev-only fallback is effectively in production (non-dev
+	// Mongo admin host) or the target name doesn't match the per-tenant
+	// convention, and audit every sanctioned drop. Runs BEFORE we open the
+	// admin connection so a refused op never even touches the customer Mongo.
+	if err := dbsafety.GuardDrop(ctx, dbsafety.DropParams{
+		Provider:     "nosql.mongo",
+		Env:          p.env,
+		DSNHost:      p.adminURI,
+		Token:        token,
+		DatabaseName: dbName,
+		UserName:     username,
+	}); err != nil {
+		return fmt.Errorf("nosql.Deprovision: %w", err)
+	}
+
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI(p.adminURI).
 		SetServerSelectionTimeout(connectTimeout))
 	if err != nil {
@@ -195,9 +218,6 @@ func (p *Provider) Deprovision(ctx context.Context, token string) error {
 			slog.Error("nosql.Deprovision: disconnect", "error", discErr)
 		}
 	}()
-
-	dbName := "db_" + token
-	username := "usr_" + token
 
 	// Drop the user from the admin database.
 	adminDB := client.Database("admin")
