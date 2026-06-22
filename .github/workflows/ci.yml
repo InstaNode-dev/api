@@ -49,7 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Fail if PR branch is behind its base branch
@@ -100,10 +100,10 @@ jobs:
       # exactly as deploy.yml's proven-green gate does.
       TEST_POSTGRES_CUSTOMERS_URL: postgres://postgres:postgres@localhost:5432/instant_customers?sslmode=disable
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Checkout proto sibling (for go.mod replace ../proto)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
@@ -113,7 +113,7 @@ jobs:
         run: mv _proto_ci ../proto
 
       - name: Checkout common sibling (for go.mod replace ../common)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
@@ -208,10 +208,10 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Checkout proto sibling
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
@@ -220,7 +220,7 @@ jobs:
       - run: mv _proto_ci ../proto
 
       - name: Checkout common sibling
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
