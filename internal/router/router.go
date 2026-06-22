@@ -423,6 +423,7 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	capabilitiesH := handlers.NewCapabilitiesHandler(planRegistry)
 	incidentsH := handlers.NewIncidentsHandler()
 	statusH := handlers.NewStatusHandler(db, rdb)
+	leadsH := handlers.NewLeadsHandler(db)
 
 	// ── Routes ───────────────────────────────────────────────────────────────
 
@@ -557,6 +558,9 @@ func NewWithHooks(cfg *config.Config, db *sql.DB, rdb *redis.Client, geoDbs *mid
 	// `uptime_prober` job. Cached 60s in Redis. No auth — anyone can ask
 	// "is instanode up". See handlers/status.go.
 	app.Get("/api/v1/status", statusH.Get)
+	// Wave-3 A5: enterprise lead capture. Public — no auth required.
+	// Replaces the Team/Enterprise mailto: with a real form + DB record.
+	app.Post("/api/v1/leads", leadsH.Create)
 
 	// MCP authorization profile — RFC 8414 / OAuth 2.0 Protected Resource Metadata.
 	app.Get("/.well-known/oauth-protected-resource", handlers.ServeOAuthProtectedResourceMetadata)
