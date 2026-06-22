@@ -17,11 +17,13 @@ import (
 	"strings"
 	"testing"
 
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/gofiber/fiber/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"instant.dev/internal/handlers"
+	"instant.dev/internal/middleware"
 	"instant.dev/internal/testhelpers"
 )
 
@@ -36,6 +38,25 @@ func newLeadsApp(h *handlers.LeadsHandler) *fiber.App {
 			}
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"ok": false, "error": err.Error()})
 		},
+	})
+	app.Post("/api/v1/leads", h.Create)
+	return app
+}
+
+// newLeadsAppWithTeam is like newLeadsApp but injects a team ID into Fiber
+// locals before the handler runs, exercising the authenticated-caller branch.
+func newLeadsAppWithTeam(h *handlers.LeadsHandler, teamID string) *fiber.App {
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			if errors.Is(err, handlers.ErrResponseWritten) {
+				return nil
+			}
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"ok": false, "error": err.Error()})
+		},
+	})
+	app.Use(func(c *fiber.Ctx) error {
+		c.Locals(middleware.LocalKeyTeamID, teamID)
+		return c.Next()
 	})
 	app.Post("/api/v1/leads", h.Create)
 	return app
@@ -127,6 +148,49 @@ func TestLeadsCreate_FieldLengthLimits(t *testing.T) {
 			assert.Equal(t, tc.want, body.Error)
 		})
 	}
+}
+
+// TestLeadsCreate_AuthenticatedCaller covers leads.go lines 89-92.
+// A middleware injects a valid UUID team ID so GetTeamID returns a non-empty
+// string, uuid.Parse succeeds, and teamID.Valid is set to true before INSERT.
+func TestLeadsCreate_AuthenticatedCaller(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	const teamID = "550e8400-e29b-41d4-a716-446655440001"
+	const newLeadID = "550e8400-e29b-41d4-a716-446655440002"
+	mock.ExpectQuery(`INSERT INTO enterprise_leads`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(newLeadID))
+
+	app := newLeadsAppWithTeam(handlers.NewLeadsHandler(db), teamID)
+	code, body := postLead(t, app, map[string]string{
+		"email": "authed@example.com",
+		"name":  "Bob",
+	})
+
+	require.Equal(t, http.StatusCreated, code)
+	assert.True(t, body.OK)
+	assert.Equal(t, newLeadID, body.ID)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestLeadsCreate_DBError covers leads.go lines 97-99.
+// The mock DB returns an error on INSERT so the handler responds 500.
+func TestLeadsCreate_DBError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	mock.ExpectQuery(`INSERT INTO enterprise_leads`).
+		WillReturnError(errors.New("connection closed"))
+
+	app := newLeadsApp(handlers.NewLeadsHandler(db))
+	code, body := postLead(t, app, map[string]string{"email": "fail@example.com"})
+
+	assert.Equal(t, http.StatusInternalServerError, code)
+	assert.Equal(t, "internal_error", body.Error)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 // Happy-path test — requires TEST_DATABASE_URL and a migrated schema.
