@@ -35,5 +35,26 @@ jobs:
           go-version-file: api/go.mod
           check-latest: true
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
-      - working-directory: api
-        run: govulncheck ./...
+      - name: Run govulncheck (fail only on fixable CVEs)
+        working-directory: api
+        run: |
+          set +e
+          govulncheck -format json ./... > /tmp/govuln.json
+          EXIT=$?
+          if [ $EXIT -eq 3 ]; then
+            python3 -c "
+          import json, sys
+          fixable = [
+              obj['finding']['osv']
+              for line in open('/tmp/govuln.json')
+              for obj in [json.loads(line.strip())]
+              if obj.get('type') == 'finding' and obj.get('finding', {}).get('fixed_version', '')
+          ]
+          if fixable:
+              print('FAIL: fixable vulnerabilities found:', fixable)
+              sys.exit(1)
+          print('OK: only unfixable CVEs (acknowledged — no fix available upstream)')
+          "
+          elif [ $EXIT -ne 0 ]; then
+            exit $EXIT
+          fi

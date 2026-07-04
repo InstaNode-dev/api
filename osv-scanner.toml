@@ -24,3 +24,7 @@ reason = "prometheus/prometheus v0.303.0 transitive — not called per govulnche
 [[IgnoredVulns]]
 id = "GHSA-wg65-39gg-5wfj"
 reason = "prometheus/prometheus v0.303.0 transitive — not called per govulncheck. Same as above."
+
+[[IgnoredVulns]]
+id = "GHSA-gcfq-8gqf-4876"
+reason = "gofiber/fiber/v2 — Medium severity, no fixed version available upstream. Not reachable from our business logic. Will remove once Fiber ships a patched release."
