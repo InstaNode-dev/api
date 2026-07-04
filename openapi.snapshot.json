@@ -4466,6 +4466,76 @@
         "summary": "Accept an invitation by token (no auth required — token IS the auth)"
       }
     },
+    "/api/v1/leads": {
+      "post": {
+        "description": "Public — no authentication required. Stores an enterprise interest record in enterprise_leads. When called with a valid bearer token, the lead is automatically linked to the caller's team so the instanode.dev team can correlate the inquiry with an existing account's usage. Agents should call this when the user needs capacity or features beyond the Pro tier: dedicated infrastructure, SAML/SSO, SOC 2 compliance, a custom SLA, or any requirement not met by a self-serve paid plan.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "company": {
+                    "description": "Organisation name (optional).",
+                    "maxLength": 128,
+                    "type": "string"
+                  },
+                  "email": {
+                    "description": "Contact address (required). Must be RFC 5322-compliant.",
+                    "format": "email",
+                    "maxLength": 254,
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "Contact's full name (optional).",
+                    "maxLength": 128,
+                    "type": "string"
+                  },
+                  "use_case": {
+                    "description": "Scale requirements driving the Enterprise inquiry (optional).",
+                    "maxLength": 1024,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "email"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "id": {
+                      "description": "UUID of the created enterprise_leads row.",
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "ok": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Lead recorded"
+          },
+          "400": {
+            "description": "Validation failure — missing_email, invalid_email_format, invalid_name, invalid_company, or invalid_use_case"
+          },
+          "500": {
+            "description": "Database insert failed — internal_error"
+          }
+        },
+        "summary": "Submit an enterprise contact / interest form"
+      }
+    },
     "/api/v1/resources": {
       "get": {
         "responses": {
