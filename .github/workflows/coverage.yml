@@ -93,7 +93,7 @@ jobs:
       # nosql package contributes to coverage too.
       TEST_MONGO_URI: mongodb://localhost:27017
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: api
           # Full history so diff-cover can resolve origin/<base_ref> for the
@@ -101,14 +101,14 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout proto sibling (for go.mod replace ../proto)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
           path: proto
 
       - name: Checkout common sibling (for go.mod replace ../common)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
