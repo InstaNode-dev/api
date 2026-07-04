@@ -8,7 +8,7 @@
 -- Notification email to contact@instanode.dev is emitted by the
 -- event_email_forwarder worker job via an audit_log kind="lead.captured" row.
 
-CREATE TABLE enterprise_leads (
+CREATE TABLE IF NOT EXISTS enterprise_leads (
     id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     email      TEXT        NOT NULL,
     name       TEXT,
@@ -22,8 +22,8 @@ CREATE TABLE enterprise_leads (
 
 -- Supports "new leads in the last 24h" dashboard queries and keeps the
 -- INSERT path cheap (no lock contention on PK index for time-ordered reads).
-CREATE INDEX enterprise_leads_created_at_idx ON enterprise_leads (created_at DESC);
+CREATE INDEX IF NOT EXISTS enterprise_leads_created_at_idx ON enterprise_leads (created_at DESC);
 -- Prevents duplicate submission from the same email (common with retry-happy
 -- forms). Duplicate submits within the same day are silently deduplicated via
 -- ON CONFLICT DO NOTHING at the application layer.
-CREATE INDEX enterprise_leads_email_idx ON enterprise_leads (email);
+CREATE INDEX IF NOT EXISTS enterprise_leads_email_idx ON enterprise_leads (email);
