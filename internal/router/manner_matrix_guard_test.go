@@ -231,7 +231,8 @@ func authNegativeApplies(method, path string) bool {
 		// /api/v1/capabilities, /status, /incidents are public; invitations
 		// accept is public-but-404. Everything else is RequireAuth.
 		switch path {
-		case "/api/v1/capabilities", "/api/v1/status", "/api/v1/incidents":
+		case "/api/v1/capabilities", "/api/v1/status", "/api/v1/incidents",
+			"/api/v1/leads": // public — no RequireAuth; optional bearer enriches but never gates
 			return false
 		}
 		if path == "/api/v1/invitations/:token/accept" {

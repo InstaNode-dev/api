@@ -745,6 +745,12 @@ var codeToAgentAction = map[string]errorCodeMeta{
 	"invalid_manifest": {
 		AgentAction: "Tell the user the stack manifest YAML is invalid. Check syntax + required fields — see https://instanode.dev/docs/stacks.",
 	},
+	"invalid_company": {
+		AgentAction: "Tell the user the 'company' field is too long. Keep the company name under 128 characters and retry — see https://instanode.dev/docs.",
+	},
+	"invalid_use_case": {
+		AgentAction: "Tell the user the 'use_case' field is too long. Keep the use-case description under 1024 characters and retry — see https://instanode.dev/docs.",
+	},
 
 	// ── Not-found / gone ───────────────────────────────────────────────────
 	"webhook_expired": {

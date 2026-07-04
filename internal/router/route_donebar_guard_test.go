@@ -116,6 +116,9 @@ var routeTestMap = map[string]string{
 	"GET /api/v1/status":       "TestE2E_Healthz_ReturnsOK",
 	"GET /.well-known/oauth-protected-resource": "TestMerged_WellKnown_OAuthProtectedResource",
 
+	// ── enterprise lead capture (public, no auth) ────────────────────────────
+	"POST /api/v1/leads": "TestLeadsCreate_HappyPath",
+
 	// ── anonymous provisioning (W2) ──────────────────────────────────────────
 	"POST /db/new":      "TestE2E_DBProvision_Returns201",
 	"POST /vector/new":  "TestE2E_DBProvision_Returns201",
