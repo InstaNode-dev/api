@@ -2684,6 +2684,47 @@ const openAPISpec = `{
         }
       }
     },
+    "/api/v1/leads": {
+      "post": {
+        "summary": "Submit an enterprise contact / interest form",
+        "description": "Public — no authentication required. Stores an enterprise interest record in enterprise_leads. When called with a valid bearer token, the lead is automatically linked to the caller's team so the instanode.dev team can correlate the inquiry with an existing account's usage. Agents should call this when the user needs capacity or features beyond the Pro tier: dedicated infrastructure, SAML/SSO, SOC 2 compliance, a custom SLA, or any requirement not met by a self-serve paid plan.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email"],
+                "properties": {
+                  "email":    { "type": "string", "format": "email", "maxLength": 254, "description": "Contact address (required). Must be RFC 5322-compliant." },
+                  "name":     { "type": "string", "maxLength": 128, "description": "Contact's full name (optional)." },
+                  "company":  { "type": "string", "maxLength": 128, "description": "Organisation name (optional)." },
+                  "use_case": { "type": "string", "maxLength": 1024, "description": "Scale requirements driving the Enterprise inquiry (optional)." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Lead recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "type": "boolean" },
+                    "id": { "type": "string", "format": "uuid", "description": "UUID of the created enterprise_leads row." }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Validation failure — missing_email, invalid_email_format, invalid_name, invalid_company, or invalid_use_case" },
+          "500": { "description": "Database insert failed — internal_error" }
+        }
+      }
+    },
     "/internal/set-tier": {
       "post": {
         "summary": "Internal: forcibly elevate a team's tier (dev only)",
