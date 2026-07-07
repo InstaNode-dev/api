@@ -973,25 +973,26 @@ const openAPISpec = `{
           "403": { "description": "Forbidden — caller doesn't own the resource" },
           "404": { "description": "not_found — resource doesn't exist" },
           "409": { "description": "already_paused — the resource is already paused (idempotent error)" },
-          "503": { "description": "provider_failed — the provider-side revoke failed; the DB row is unchanged" }
+          "422": { "description": "invalid_resource_state — the resource's stored credentials are malformed (the provider-side revoke can't resolve a username), so the pause can never succeed by retrying. Rotate credentials and try again. Distinct from the transient 503 — a deterministic failure, not a retry-me." },
+          "503": { "description": "provider_failed — the provider-side revoke failed transiently (after a bounded retry); the DB row is unchanged. Retrying is appropriate." }
         }
       }
     },
     "/api/v1/resources/{id}/resume": {
       "post": {
         "summary": "Resume a paused resource (restore from same data)",
-        "description": "Flips status from 'paused' back to 'active' and re-grants the provider-side connection (GRANT CONNECT / ACL on / grantRolesToUser). The connection URL is preserved unchanged — no re-issuance, no new password — so any existing client config still works. Tier-gated to Pro+ in symmetry with pause.",
+        "description": "Flips status from 'paused' back to 'active' and re-grants the provider-side connection (GRANT CONNECT / ACL on / grantRolesToUser). The connection URL is preserved unchanged — no re-issuance, no new password — so any existing client config still works. Resume is NEVER tier-gated: a team that owns a paused resource must always be able to un-pause it, even on a non-Pro tier (the Pro+ wall lives only at pause time).",
         "security": [{ "bearerAuth": [] }],
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
         "responses": {
           "200": { "description": "Resource resumed", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "id": { "type": "string", "format": "uuid" }, "token": { "type": "string", "format": "uuid" }, "status": { "type": "string", "enum": ["active"] }, "message": { "type": "string" } } } } } },
           "400": { "description": "invalid_id" },
           "401": { "description": "Unauthorized" },
-          "402": { "description": "upgrade_required — pause/resume requires Pro+" },
           "403": { "description": "Forbidden" },
           "404": { "description": "not_found" },
           "409": { "description": "not_paused — the resource isn't currently paused" },
-          "503": { "description": "provider_failed — the provider-side grant failed; the DB row is unchanged" }
+          "422": { "description": "invalid_resource_state — the resource's stored credentials are malformed, so the provider-side re-grant can never succeed by retrying. Rotate credentials and try again." },
+          "503": { "description": "provider_failed — the provider-side grant failed transiently (after a bounded retry); the DB row is unchanged. Retrying is appropriate." }
         }
       }
     },
@@ -2997,6 +2998,9 @@ const openAPISpec = `{
           "name": { "type": "string", "description": "Human-readable label supplied at creation time (stored in env_vars._name; emitted as a top-level field for convenience). Empty string when created before mandatory-naming was enforced." },
           "url": { "type": "string" },
           "status": { "type": "string", "enum": ["building", "deploying", "healthy", "failed", "stopped", "expired"] },
+          "status_reason": { "type": "string", "enum": ["sleeping"], "description": "Present only when status is 'healthy' but the app is scaled to zero (replicas=0). 'sleeping' means the deploy succeeded and is reconcilable, but the app URL 404s until a request (or POST /deploy/{id}/wake) cold-starts it. Absent for awake deployments — do NOT treat a 'healthy' deploy as reachable without checking this field." },
+          "scaled_to_zero": { "type": "boolean", "description": "True while the app is descheduled at replicas=0 (idle scale-to-zero). Pairs with status_reason='sleeping'." },
+          "always_on": { "type": "boolean", "description": "True when the app is pinned and never auto-descheduled (no cold start)." },
           "tier": { "type": "string" },
           "environment": { "type": "string", "description": "Environment scope (production / staging / dev / ...)." },
           "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Application env vars. Credential values are masked '***'; the internal _name key is never present." },

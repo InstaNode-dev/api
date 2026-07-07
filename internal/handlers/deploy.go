@@ -328,6 +328,12 @@ const errCodeDeploymentNotRedeployable = "deployment_not_redeployable"
 // top-level `name` field.
 const deployNameEnvKey = "_name"
 
+// deployStatusReasonSleeping is the status_reason value emitted on a 'healthy'
+// deployment whose pod is scaled to zero (replicas=0). It disambiguates "the
+// deploy succeeded and is reconcilable" (status) from "the app is reachable
+// right now" (it isn't — a request cold-starts it). See deploymentToMapWithDB.
+const deployStatusReasonSleeping = "sleeping"
+
 // privateDeployAllowedTiers is the set of tiers permitted to use private=true.
 // Hobby / anonymous / free fall through to the 402 wall.
 var privateDeployAllowedTiers = map[string]bool{
@@ -577,6 +583,17 @@ func deploymentToMapWithDB(d *models.Deployment, db *sql.DB) fiber.Map {
 		// and POSTs /deploy/:id/wake. always_on=true → pinned (never descheduled).
 		"scaled_to_zero": d.ScaledToZero,
 		"always_on":      d.AlwaysOn,
+	}
+	// status_reason disambiguates a 'healthy' row that is actually asleep:
+	// scaled_to_zero=true means the row's status stays 'healthy' (the deploy
+	// succeeded and the pod is reconcilable) but replicas=0, so the app URL 404s
+	// until a request/POST /deploy/:id/wake cold-starts it. Without this an agent
+	// (or the dashboard) reads status:"healthy" and reports the app as up while
+	// it's actually sleeping — the deploy-side twin of the stack status-lies-
+	// healthy gap. Emitted ONLY for the sleeping case so non-sleeping rows keep
+	// their compact shape and existing `status` semantics are untouched.
+	if d.ScaledToZero && d.Status == models.DeployStatusHealthy {
+		m["status_reason"] = deployStatusReasonSleeping
 	}
 	if d.Source == "image" {
 		m["image_ref"] = d.ImageRef

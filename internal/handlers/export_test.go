@@ -8,6 +8,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -97,6 +98,44 @@ func CopyVaultRefsForPromoteForTest(ctx context.Context, db *sql.DB, teamID, use
 // ErrProvisionPersistFailedForTest re-exports the persistence-failure sentinel
 // for MR-P0-3 regression tests.
 var ErrProvisionPersistFailedForTest = errProvisionPersistFailed
+
+// ── pause/resume provider retry (FIX 1) test seams ───────────────────────────
+
+// ErrPermanentProviderFailureForTest re-exports the permanent-failure sentinel
+// so the retry test can assert fail-fast classification.
+var ErrPermanentProviderFailureForTest = errPermanentProviderFailure
+
+// RunProviderWithRetryForTest re-exports the unexported runProviderWithRetry so
+// the retry/classifier behaviour (transient → retried, permanent → fail fast)
+// is testable without a live customer DB.
+func RunProviderWithRetryForTest(ctx context.Context, label string, resourceID uuid.UUID, op func(context.Context) error) error {
+	return runProviderWithRetry(ctx, label, resourceID, op)
+}
+
+// SetProviderRetrySleepForTest swaps the backoff sleep for a no-op (or a
+// recorder) so the retry path runs at test speed. Returns a restore func.
+func SetProviderRetrySleepForTest(fn func(time.Duration)) (restore func()) {
+	prev := providerRetrySleep
+	providerRetrySleep = fn
+	return func() { providerRetrySleep = prev }
+}
+
+// ProviderRetryAttemptsForTest exposes the attempt budget for assertion.
+const ProviderRetryAttemptsForTest = providerRetryAttempts
+
+// ValidateSQLIdentForTest re-exports validateSQLIdent so the test can assert it
+// returns a permanent-classified error for an empty/malformed identifier.
+func ValidateSQLIdentForTest(s string) error { return validateSQLIdent(s) }
+
+// SetFinalizeProvisionPanicHookForTest installs (and returns a restore func for)
+// the test-only crash-injection seam used by the #285-follow-up finalize-panic
+// regression test. Lets the black-box test trigger a mid-finalize panic without
+// the unexported var being part of the public surface.
+func SetFinalizeProvisionPanicHookForTest(fn func()) (restore func()) {
+	prev := finalizeProvisionPanicHook
+	finalizeProvisionPanicHook = fn
+	return func() { finalizeProvisionPanicHook = prev }
+}
 
 // RunFinalizeProvisionForTest invokes the unexported finalizeProvision helper
 // with the supplied dependencies. Used by the MR-P0-3 regression test to

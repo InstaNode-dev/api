@@ -26,6 +26,7 @@ import (
 	"instant.dev/internal/safego"
 	commonv1 "instant.dev/proto/common/v1"
 	"log/slog"
+	mathrand "math/rand"
 	"net/url"
 	"time"
 )
@@ -644,7 +645,24 @@ func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
 
 	// Provider-side revoke FIRST. If this fails, the DB row stays 'active'
 	// and the caller gets a 503 — the iron-rule atomicity guarantee.
-	if provErr := h.pauseProvider(ctx, resource); provErr != nil {
+	//
+	// Wrapped in a bounded exponential-backoff retry: the revoke runs over a
+	// fresh per-call connection to the shared customer DB / Redis / Mongo, so a
+	// single transient blip used to deterministically 503 the customer (the live
+	// pause-503 dogfood). A permanent failure (malformed/empty identifier from a
+	// resource whose stored URL can't yield a username) fails fast and is
+	// surfaced as 422 invalid_resource_state — telling the customer to "retry in
+	// a few seconds" on a deterministic error is the bug we're closing.
+	if provErr := runProviderWithRetry(ctx, "resource.pause.provider", resource.ID,
+		func(c context.Context) error { return h.pauseProvider(c, resource) }); provErr != nil {
+		if errors.Is(provErr, errPermanentProviderFailure) {
+			slog.Error("resource.pause.provider_permanent_failed",
+				"error", provErr, "resource_id", resource.ID,
+				"resource_type", resource.ResourceType, "request_id", requestID)
+			return respondError(c, fiber.StatusUnprocessableEntity, "invalid_resource_state",
+				"This resource cannot be paused because its stored credentials are malformed. "+
+					"Rotate credentials (POST /api/v1/resources/:id/rotate-credentials) and try again.")
+		}
 		slog.Error("resource.pause.provider_failed",
 			"error", provErr,
 			"resource_id", resource.ID,
@@ -677,7 +695,8 @@ func (h *ResourceHandler) Pause(c *fiber.Ctx) error {
 		}
 		slog.Error("resource.pause.db_update_failed",
 			"error", pauseErr, "resource_id", resource.ID, "request_id", requestID)
-		if rbErr := h.resumeProvider(context.Background(), resource); rbErr != nil {
+		if rbErr := runProviderWithRetry(context.Background(), "resource.pause.rollback", resource.ID,
+			func(c context.Context) error { return h.resumeProvider(c, resource) }); rbErr != nil {
 			slog.Warn("resource.pause.rollback_failed",
 				"error", rbErr, "resource_id", resource.ID, "request_id", requestID)
 		}
@@ -788,8 +807,20 @@ func (h *ResourceHandler) Resume(c *fiber.Ctx) error {
 	// permanently locked out of resources they legitimately own.
 
 	// Provider-side grant FIRST. Iron-rule mirror of Pause: if the grant
-	// fails, the DB row stays 'paused' and the caller gets a 503.
-	if provErr := h.resumeProvider(ctx, resource); provErr != nil {
+	// fails, the DB row stays 'paused' and the caller gets a 503. Same bounded
+	// retry as Pause so a transient blip doesn't 503 a customer trying to wake
+	// their own paused resource — and resume stays NEVER tier-gated (the tier
+	// wall lives only at Pause time; see the rationale comment above).
+	if provErr := runProviderWithRetry(ctx, "resource.resume.provider", resource.ID,
+		func(c context.Context) error { return h.resumeProvider(c, resource) }); provErr != nil {
+		if errors.Is(provErr, errPermanentProviderFailure) {
+			slog.Error("resource.resume.provider_permanent_failed",
+				"error", provErr, "resource_id", resource.ID,
+				"resource_type", resource.ResourceType, "request_id", requestID)
+			return respondError(c, fiber.StatusUnprocessableEntity, "invalid_resource_state",
+				"This resource cannot be resumed because its stored credentials are malformed. "+
+					"Rotate credentials (POST /api/v1/resources/:id/rotate-credentials) and try again.")
+		}
 		slog.Error("resource.resume.provider_failed",
 			"error", provErr,
 			"resource_id", resource.ID,
@@ -811,7 +842,8 @@ func (h *ResourceHandler) Resume(c *fiber.Ctx) error {
 		}
 		slog.Error("resource.resume.db_update_failed",
 			"error", resumeErr, "resource_id", resource.ID, "request_id", requestID)
-		if rbErr := h.pauseProvider(context.Background(), resource); rbErr != nil {
+		if rbErr := runProviderWithRetry(context.Background(), "resource.resume.rollback", resource.ID,
+			func(c context.Context) error { return h.pauseProvider(c, resource) }); rbErr != nil {
 			slog.Warn("resource.resume.rollback_failed",
 				"error", rbErr, "resource_id", resource.ID, "request_id", requestID)
 		}
@@ -950,16 +982,106 @@ func (h *ResourceHandler) resumeProvider(ctx context.Context, r *models.Resource
 	}
 }
 
+// errPermanentProviderFailure marks a pause/resume provider error that retrying
+// cannot fix — a malformed/empty SQL identifier, an unparseable connection URL,
+// or a decrypt miss. The retry wrapper (runProviderWithRetry) fails fast on a
+// permanent error instead of burning the backoff budget, and the Pause/Resume
+// handlers surface it as a distinct 422 (invalid_resource_state) rather than the
+// transient "retry in a few seconds" 503 — the latter wrongly tells the customer
+// to retry a deterministically-failing call (the live pause-503 dogfood class).
+var errPermanentProviderFailure = errors.New("permanent provider failure")
+
+// providerRetryAttempts is the total number of attempts (1 initial + N-1
+// retries) runProviderWithRetry makes for a transient pause/resume provider
+// failure. Three attempts with a 100ms exponential base covers a single
+// customer-DB connection blip / brief packet loss without materially adding to
+// the request latency budget on the happy path (zero retries = zero added
+// latency).
+const providerRetryAttempts = 3
+
+// providerRetryBaseDelay is the base backoff between transient retries. Attempt
+// n waits providerRetryBaseDelay * 2^(n-1) plus up to one base-delay of jitter,
+// so the cap before attempt 3 is ~ 100ms + 200ms + jitter ≈ sub-second.
+const providerRetryBaseDelay = 100 * time.Millisecond
+
+// providerRetrySleep is the seam the backoff sleeps through. Tests swap it for a
+// no-op so the retry path is exercised without real wall-clock delay. time.Sleep
+// can't be cancelled, but the surrounding ctx deadline is re-checked before each
+// attempt, so a cancelled context short-circuits the loop within one base delay.
+var providerRetrySleep = time.Sleep
+
+// runProviderWithRetry runs a pause/resume provider action with a bounded
+// exponential backoff. A transient failure (customer-DB connection blip, brief
+// Redis/Mongo unreachability) is retried up to providerRetryAttempts times; a
+// permanent failure (errPermanentProviderFailure — empty/malformed identifier,
+// unparseable URL) fails FAST on the first attempt because retrying a
+// deterministic error only delays the inevitable error response.
+//
+// This is the fix for the live pause-503 dogfood: a single transient blip on the
+// fresh-per-call REVOKE/ACL/role connection used to deterministically 503 the
+// customer with no retry. label is the slog/structured key prefix (e.g.
+// "resource.pause.provider"); op is the provider closure (pauseProvider /
+// resumeProvider bound to the resource).
+func runProviderWithRetry(ctx context.Context, label string, resourceID uuid.UUID, op func(context.Context) error) error {
+	var lastErr error
+	for attempt := 1; attempt <= providerRetryAttempts; attempt++ {
+		// Respect a cancelled/deadline-exceeded request context: don't start a
+		// fresh attempt we can't finish.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if lastErr != nil {
+				return lastErr
+			}
+			return ctxErr
+		}
+
+		lastErr = op(ctx)
+		if lastErr == nil {
+			if attempt > 1 {
+				// A retry recovered the transient failure — record it so the
+				// pause-503 class is observable without a new metric (rule 25:
+				// prefer structured slog over an un-alerted counter).
+				slog.Info(label+".retry_succeeded",
+					"resource_id", resourceID, "attempt", attempt)
+			}
+			return nil
+		}
+
+		// Permanent failures are deterministic — surface immediately.
+		if errors.Is(lastErr, errPermanentProviderFailure) {
+			slog.Error(label+".permanent_failure",
+				"error", lastErr, "resource_id", resourceID, "attempt", attempt)
+			return lastErr
+		}
+
+		if attempt < providerRetryAttempts {
+			delay := providerRetryBaseDelay * time.Duration(1<<(attempt-1))
+			// Full-jitter up to one base delay so concurrent retries from many
+			// resources don't synchronise into a thundering herd on the shared
+			// customer DB.
+			delay += time.Duration(mathrand.Int63n(int64(providerRetryBaseDelay)))
+			slog.Warn(label+".transient_retry",
+				"error", lastErr, "resource_id", resourceID,
+				"attempt", attempt, "next_delay_ms", delay.Milliseconds())
+			providerRetrySleep(delay)
+		}
+	}
+	slog.Error(label+".retries_exhausted",
+		"error", lastErr, "resource_id", resourceID, "attempts", providerRetryAttempts)
+	return lastErr
+}
+
 // validateSQLIdent rejects identifiers that would let an injection escape the
 // quoted form. We only allow [a-z0-9_-] which is the charset our provisioner
-// uses for db / user names.
+// uses for db / user names. A failure is wrapped in errPermanentProviderFailure
+// so the retry classifier never retries an empty/malformed identifier — that
+// shape is deterministic, not transient.
 func validateSQLIdent(s string) error {
 	if s == "" {
-		return fmt.Errorf("empty identifier")
+		return fmt.Errorf("%w: empty identifier", errPermanentProviderFailure)
 	}
 	for _, ch := range s {
 		if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-') {
-			return fmt.Errorf("unsafe identifier %q", s)
+			return fmt.Errorf("%w: unsafe identifier %q", errPermanentProviderFailure, s)
 		}
 	}
 	return nil
@@ -1026,7 +1148,8 @@ func grantPostgresConnect(ctx context.Context, dsn, dbName, username string) err
 func setRedisACLEnabled(ctx context.Context, originalURL, username string, enable bool) error {
 	opts, err := redis.ParseURL(originalURL)
 	if err != nil {
-		return fmt.Errorf("setRedisACLEnabled: parse url: %w", err)
+		// A malformed stored URL is deterministic — never retry it.
+		return fmt.Errorf("setRedisACLEnabled: parse url: %w: %v", errPermanentProviderFailure, err)
 	}
 	client := redis.NewClient(opts)
 	defer func() { _ = client.Close() }()
