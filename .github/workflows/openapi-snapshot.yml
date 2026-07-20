@@ -69,7 +69,7 @@ jobs:
       - name: Place ../common for Go replace directive
         run: mv _common_ci ../common
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.25'
 
