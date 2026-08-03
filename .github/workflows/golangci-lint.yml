@@ -34,7 +34,7 @@ jobs:
           repository: InstaNode-dev/proto
           path: proto
         continue-on-error: true
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: api/go.mod
       - uses: golangci/golangci-lint-action@v9

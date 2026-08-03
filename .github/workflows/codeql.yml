@@ -33,16 +33,16 @@ jobs:
         with:
           repository: InstaNode-dev/proto
           path: proto
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: api/go.mod
-      - uses: github/codeql-action/init@v4
+      - uses: github/codeql-action/init@v4.37.4
         with:
           languages: go
           queries: security-extended
       - name: Build
         working-directory: api
         run: go build ./...
-      - uses: github/codeql-action/analyze@v4
+      - uses: github/codeql-action/analyze@v4.37.4
         with:
           category: "/language:go"
