@@ -336,8 +336,8 @@ func (h *provisionHelper) recycleGate(c *fiber.Ctx, fp, resourceType string) boo
 	// anonymous provision already returns in upgrade_url/claim_url. The JWT
 	// carries the fingerprint so /start can hydrate the claim landing even
 	// though there are zero ACTIVE resources right now (the recycle case is
-	// "I had something yesterday"); it captures any still-listed tokens too.
-	claimURL := h.recycleClaimURL(ctx, fp, resourceType)
+	// "I had something yesterday"); it captures any chained tokens too.
+	claimURL := h.recycleClaimURL(c, fp, resourceType)
 
 	// Route through the canonical ErrorResponse envelope (request_id +
 	// retry_after_seconds + claim_url) instead of a hand-built fiber.Map.
@@ -353,10 +353,10 @@ func (h *provisionHelper) recycleGate(c *fiber.Ctx, fp, resourceType string) boo
 // successfully), so without this seam the F1 fail-soft branch is unreachable.
 // Mirrors the promoteDeploymentTTLsForTeamFn pattern in billing.go.
 var issueOnboardingJWTFn = func(
-	h *provisionHelper, ctx context.Context,
+	h *provisionHelper, c *fiber.Ctx,
 	fp, country, vendor, resourceType string, tokens []string,
 ) (string, string, error) {
-	return h.issueOnboardingJWT(ctx, fp, country, vendor, resourceType, tokens)
+	return h.issueOnboardingJWT(c, fp, country, vendor, resourceType, tokens)
 }
 
 // recycleClaimURL mints a short-lived claim JWT for the recycling fingerprint
@@ -371,15 +371,17 @@ var issueOnboardingJWTFn = func(
 // path we bump the minted metric. We do NOT persist an onboarding_events row
 // here: the recycle gate is a best-effort recovery nudge, not a tracked
 // conversion event, and a DB write would add a failure mode to the gate path.
-func (h *provisionHelper) recycleClaimURL(ctx context.Context, fp, resourceType string) string {
-	// issueOnboardingJWT looks up any still-listed resources for the
-	// fingerprint and folds them into the JWT; on the recycle path that set is
-	// typically empty (that's why the gate fired), but a partially-expired
-	// session may still have one. country/vendor are advisory upsell hints on
-	// the landing page — empty is fine here, the claim itself only needs fp.
-	// resourceType is the type the gated agent was trying to provision, so the
-	// landing page reflects what the user is here to claim.
-	jwtToken, _, err := issueOnboardingJWTFn(h, ctx, fp, "", "", resourceType, nil)
+func (h *provisionHelper) recycleClaimURL(c *fiber.Ctx, fp, resourceType string) string {
+	// The gate only fires when this fingerprint has ZERO active resources, so
+	// there is nothing of the caller's own to list here — the minted token
+	// carries only whatever the caller chained on HeaderPriorUpgradeToken (a
+	// partially-expired session may still have one live row). It is never
+	// populated from the fingerprint; see issueOnboardingJWT.
+	// country/vendor are advisory upsell hints on the landing page — empty is
+	// fine here, the claim itself only needs fp. resourceType is the type the
+	// gated agent was trying to provision, so the landing page reflects what
+	// the user is here to claim.
+	jwtToken, _, err := issueOnboardingJWTFn(h, c, fp, "", "", resourceType, nil)
 	if err != nil || jwtToken == "" {
 		slog.Warn("provision.recycle_gate.claim_jwt_failed",
 			"error", err, "fingerprint", fp)
@@ -583,26 +585,88 @@ func emitProvisionPersistenceFailedAudit(
 	}
 }
 
+// HeaderPriorUpgradeToken is the request header through which a caller chains
+// a previously issued onboarding token — the `upgrade_jwt` field returned by
+// every anonymous provisioning response — onto a subsequent provision, so one
+// agent session's services end up in ONE claimable bundle.
+//
+// This header exists because ownership must derive from a capability the
+// caller HOLDS, never from the caller's network address. See
+// issueOnboardingJWT for the full rationale.
+const HeaderPriorUpgradeToken = "X-Instant-Upgrade-Token"
+
+// maxChainedUpgradeTokens caps how many resource tokens a single onboarding
+// JWT may carry. The chain grows by exactly one token per anonymous provision
+// and the per-fingerprint daily cap already bounds that, so this ceiling is
+// belt-and-braces against an unbounded header/JWT: past it, the oldest entries
+// are dropped rather than letting the token grow without limit. Overflow is
+// counted (metrics.UpgradeTokenChain{result="truncated"}) and logged.
+const maxChainedUpgradeTokens = 25
+
+// priorUpgradeClaims returns the VERIFIED claims of the onboarding token the
+// caller chained on HeaderPriorUpgradeToken, or nil when the header is absent,
+// malformed, expired, or signed with a key that is not ours.
+//
+// It NEVER fails the provision. An invalid chain degrades to "this request's
+// own token only" — which is also the no-header default — because a broken or
+// stale chain header is a client bug, not a reason to deny an agent the
+// credentials it just asked for. The failure is logged at WARN and counted so
+// a broken client (or someone probing the chain) is visible in NR.
+func (h *provisionHelper) priorUpgradeClaims(c *fiber.Ctx) *crypto.OnboardingClaims {
+	raw := strings.TrimSpace(c.Get(HeaderPriorUpgradeToken))
+	if raw == "" {
+		return nil
+	}
+
+	claims, err := crypto.VerifyOnboardingJWT([]byte(h.cfg.JWTSecret), raw)
+	if err != nil {
+		// Deliberately does NOT log the token itself — it is a bearer
+		// credential for whatever resources it legitimately lists.
+		slog.Warn("provision.upgrade_chain.rejected",
+			"error", err,
+			"reason", "prior upgrade token failed verification; degrading to single-token JWT")
+		metrics.UpgradeTokenChain.WithLabelValues("rejected").Inc()
+		return nil
+	}
+
+	metrics.UpgradeTokenChain.WithLabelValues("accepted").Inc()
+	return claims
+}
+
 // issueOnboardingJWT signs a short-lived JWT for the upgrade CTA.
-// It looks up ALL active resources for the fingerprint so the landing page
-// reflects the full session (not just the current service).
+//
+// SECURITY (2026-08-13) — the token list is built from CAPABILITY, never from
+// the network. This function used to call
+// models.GetAllActiveResourcesByFingerprint and fold every match into the
+// signed `tok` array. Because a fingerprint is SHA256(/24 subnet + ASN), every
+// caller behind one NAT/CGNAT range shares a bucket: the JWT handed to caller
+// A enumerated caller B's live resource tokens, and POST /claim then bound
+// them to A's brand-new team. The signature was no defence — the *contents*
+// were assembled from the network. Confirmed live in prod: a team ended up
+// owning three Postgres databases it never created.
+//
+// The multi-service bundle is preserved by CHAINING instead: a caller who
+// re-presents its previous, signature-verified onboarding token on
+// HeaderPriorUpgradeToken has proven it received that token, and its list is
+// carried forward. A stranger on the same /24 cannot produce one.
+//
+// Absent / invalid prior token → this request's `tokens` only. There is no
+// fingerprint fallback, by design. `fp` is still stamped into the claims
+// because the claim landing page and the conversion-funnel analytics read it —
+// it is an attribute of the session, not a grant of ownership.
+//
 // Returns ("", "", err) if signing fails — callers treat this as a soft error
 // and proceed without the JWT (upgrade URL will be empty).
 func (h *provisionHelper) issueOnboardingJWT(
-	ctx context.Context,
+	c *fiber.Ctx,
 	fp, country, vendor string,
 	resourceType string,
 	tokens []string,
 ) (jwtToken, jti string, err error) {
-	// Look up all active resources for this fingerprint so the JWT captures
-	// every service provisioned in one agent session.
-	allResources, lookupErr := models.GetAllActiveResourcesByFingerprint(ctx, h.db, fp)
-	if lookupErr != nil {
-		slog.Warn("issueOnboardingJWT: fingerprint lookup failed (using current token only)",
-			"error", lookupErr, "fingerprint", fp)
-	}
-
-	allTokens := tokens
+	// Copy rather than alias: append() must never write through the caller's
+	// backing array. Tokens land newest-first (this request, then the chain in
+	// reverse-provision order) so the truncation below drops the OLDEST.
+	allTokens := append([]string(nil), tokens...)
 	allTypes := []string{resourceType}
 	// Use "type:" prefix consistently for type dedup keys to avoid collision
 	// with token UUID strings (which have no prefix).
@@ -610,21 +674,31 @@ func (h *provisionHelper) issueOnboardingJWT(
 	for _, tok := range tokens {
 		seen[tok] = true
 	}
-	for _, r := range allResources {
-		// Skip resource types that are not enabled in config. The JWT should only
-		// advertise claimable services.
-		if !h.cfg.IsServiceEnabled(r.ResourceType) {
-			continue
+
+	if prior := h.priorUpgradeClaims(c); prior != nil {
+		for _, tok := range prior.Tokens {
+			if tok == "" || seen[tok] {
+				continue
+			}
+			allTokens = append(allTokens, tok)
+			seen[tok] = true
 		}
-		tokStr := r.Token.String()
-		if !seen[tokStr] {
-			allTokens = append(allTokens, tokStr)
-			seen[tokStr] = true
+		for _, rt := range prior.ResourceTypes {
+			// The JWT should only advertise claimable services — a service
+			// disabled since the prior token was minted is not one.
+			if rt == "" || seen["type:"+rt] || !h.cfg.IsServiceEnabled(rt) {
+				continue
+			}
+			allTypes = append(allTypes, rt)
+			seen["type:"+rt] = true
 		}
-		if !seen["type:"+r.ResourceType] {
-			allTypes = append(allTypes, r.ResourceType)
-			seen["type:"+r.ResourceType] = true
-		}
+	}
+
+	if len(allTokens) > maxChainedUpgradeTokens {
+		slog.Warn("provision.upgrade_chain.truncated",
+			"chained", len(allTokens), "cap", maxChainedUpgradeTokens, "fingerprint", fp)
+		metrics.UpgradeTokenChain.WithLabelValues("truncated").Inc()
+		allTokens = allTokens[:maxChainedUpgradeTokens]
 	}
 
 	secret := []byte(h.cfg.JWTSecret)

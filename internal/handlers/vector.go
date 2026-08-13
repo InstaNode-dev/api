@@ -286,7 +286,7 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 			return h.denyProvisionOverCap(c, fp, models.ResourceTypeVector)
 		}
 		if lookupErr == nil {
-			jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, models.ResourceTypeVector, []string{existing.Token.String()})
+			jwtToken, jti, jwtErr := h.issueOnboardingJWT(c, fp, country, vendor, models.ResourceTypeVector, []string{existing.Token.String()})
 			if jwtErr == nil && jti != "" {
 				if evErr := h.createOnboardingEvent(ctx, fp, jti, existing.Token); evErr != nil {
 					slog.Error("vector.new.onboarding_event_failed_limit_path", "error", evErr, "request_id", requestID)
@@ -377,7 +377,7 @@ func (h *VectorHandler) NewVector(c *fiber.Ctx) error {
 		return respondProvisionFailed(c, finErr, "Failed to persist vector resource")
 	}
 
-	jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, models.ResourceTypeVector, []string{tokenStr})
+	jwtToken, jti, jwtErr := h.issueOnboardingJWT(c, fp, country, vendor, models.ResourceTypeVector, []string{tokenStr})
 	if jwtErr != nil {
 		slog.Error("vector.new.jwt_issue_failed", "error", jwtErr, "request_id", requestID)
 	}

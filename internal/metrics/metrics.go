@@ -102,6 +102,27 @@ var (
 		Help: "Recycle-gate 402s by claim-JWT recovery outcome (minted/mint_failed). F1/F7.",
 	}, []string{"result"})
 
+	// UpgradeTokenChain counts anonymous provisions that presented a prior
+	// onboarding token on the X-Instant-Upgrade-Token request header, by
+	// verification outcome. This is the capability that replaced the network
+	// fingerprint as the basis for multi-service claim bundling (SEC:
+	// claim-by-fingerprint, 2026-08-13). result:
+	//   "accepted" — signature verified; the prior token list was carried
+	//                forward into the newly issued onboarding JWT.
+	//   "rejected" — absent-but-nonempty / malformed / expired / wrong-key
+	//                header. The provision still succeeds, degraded to this
+	//                request's own token only. A sustained "rejected" rate is
+	//                either a broken client or someone probing the chain.
+	//   "truncated" — the chain exceeded maxChainedUpgradeTokens and the
+	//                 overflow was dropped.
+	// Lazy *Vec — no series at /metrics until the first chained provision.
+	// The Prom rule + NR tile for this counter are owned by the infra agent
+	// (rule 25); see the PR report for the exact follow-up.
+	UpgradeTokenChain = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "instant_upgrade_token_chain_total",
+		Help: "Anonymous provisions presenting a prior onboarding token, by verification outcome (accepted/rejected/truncated).",
+	}, []string{"result"})
+
 	// ConversionFunnel counts conversion funnel steps:
 	// provision, jwt_issued, landing_viewed, claimed, paid.
 	ConversionFunnel = promauto.NewCounterVec(prometheus.CounterOpts{

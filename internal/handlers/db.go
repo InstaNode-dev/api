@@ -170,7 +170,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 			return h.denyProvisionOverCap(c, fp, "postgres")
 		}
 		if err == nil {
-			jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "postgres", []string{existing.Token.String()})
+			jwtToken, jti, jwtErr := h.issueOnboardingJWT(c, fp, country, vendor, "postgres", []string{existing.Token.String()})
 			if jwtErr == nil && jti != "" {
 				if evErr := h.createOnboardingEvent(ctx, fp, jti, existing.Token); evErr != nil {
 					slog.Error("db.new.onboarding_event_failed_limit_path", "error", evErr, "request_id", requestID)
@@ -280,7 +280,7 @@ func (h *DBHandler) NewDB(c *fiber.Ctx) error {
 		return respondProvisionFailed(c, finErr, "Failed to persist Postgres resource")
 	}
 
-	jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "postgres", []string{tokenStr})
+	jwtToken, jti, jwtErr := h.issueOnboardingJWT(c, fp, country, vendor, "postgres", []string{tokenStr})
 	if jwtErr != nil {
 		slog.Error("db.new.jwt_issue_failed", "error", jwtErr, "request_id", requestID)
 	}

@@ -141,7 +141,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 			return h.denyProvisionOverCap(c, fp, "mongodb")
 		}
 		if err == nil {
-			jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "mongodb", []string{existing.Token.String()})
+			jwtToken, jti, jwtErr := h.issueOnboardingJWT(c, fp, country, vendor, "mongodb", []string{existing.Token.String()})
 			if jwtErr == nil && jti != "" {
 				if evErr := h.createOnboardingEvent(ctx, fp, jti, existing.Token); evErr != nil {
 					slog.Error("nosql.new.onboarding_event_failed_limit_path", "error", evErr, "request_id", requestID)
@@ -238,7 +238,7 @@ func (h *NoSQLHandler) NewNoSQL(c *fiber.Ctx) error {
 		return respondProvisionFailed(c, finErr, "Failed to persist MongoDB resource")
 	}
 
-	jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "mongodb", []string{tokenStr})
+	jwtToken, jti, jwtErr := h.issueOnboardingJWT(c, fp, country, vendor, "mongodb", []string{tokenStr})
 	if jwtErr != nil {
 		slog.Error("nosql.new.jwt_issue_failed", "error", jwtErr, "request_id", requestID)
 	}

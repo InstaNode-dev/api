@@ -216,10 +216,17 @@ func TestResidualMaskEmailForLog(t *testing.T) {
 	assert.NotPanics(t, func() { _ = handlers.MaskEmailForLogForTest("") })
 }
 
-// TestResidualClaimPreview_FingerprintResources drives the ClaimPreview
-// fingerprint-augmentation loop (147-167): a preview whose JWT carries a
-// fingerprint with active resources NOT in the token list.
-func TestResidualClaimPreview_FingerprintResources(t *testing.T) {
+// TestResidualClaimPreview_IgnoresFingerprintResources is the inverted
+// descendant of TestResidualClaimPreview_FingerprintResources, which used to
+// assert that ClaimPreview augmented its list from
+// GetAllActiveResourcesByFingerprint. That augmentation WAS the bug (see
+// claim_fingerprint_isolation_test.go): a fingerprint is SHA256(/24 + ASN), so
+// the "augmented" rows routinely belonged to a stranger behind the same NAT,
+// and /claim then bound them.
+//
+// The same fixture now pins the opposite contract: a JWT with an empty token
+// list previews NOTHING, no matter how many active rows share its fingerprint.
+func TestResidualClaimPreview_IgnoresFingerprintResources(t *testing.T) {
 	db, clean := testhelpers.SetupTestDB(t)
 	defer clean()
 	app := onboardingResidualApp(t, db)
@@ -239,13 +246,17 @@ func TestResidualClaimPreview_FingerprintResources(t *testing.T) {
 		`, uuid.NewString(), fp)
 		require.NoError(t, err)
 	}
-	signed := mintOnboardingJWT(t, jti, fp, nil) // empty token list → all via fingerprint
+	signed := mintOnboardingJWT(t, jti, fp, nil) // empty token list
 	resp := doGet(t, app, "/claim/preview?t="+signed)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	var body map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+
 	res, _ := body["resources"].([]any)
-	assert.GreaterOrEqual(t, len(res), 2, "fingerprint-augmented resources must appear in preview")
+	assert.Empty(t, res,
+		"a preview must list only what the JWT names — never rows discovered by fingerprint")
+	items, _ := body["items"].([]any)
+	assert.Empty(t, items, "the canonical `items` alias must agree with `resources`")
 }
 
 // TestResidualClaim_AccountExists_409 drives the account-takeover-guard arm
@@ -314,7 +325,10 @@ func TestResidualClaim_HappyPath_ClaimsResources(t *testing.T) {
 	`, listedToken, fp)
 	require.NoError(t, err)
 
-	// A fingerprint-only anonymous resource NOT in the JWT token list.
+	// A fingerprint-only anonymous resource NOT in the JWT token list — i.e.
+	// what a stranger behind the same NAT would have. It must NOT be claimed
+	// (this assertion was inverted on 2026-08-13 when the claim-time
+	// fingerprint sweep was removed; see claim_fingerprint_isolation_test.go).
 	fpToken := uuid.NewString()
 	_, err = db.ExecContext(ctx, `
 		INSERT INTO resources (token, resource_type, tier, env, status, fingerprint)
@@ -343,14 +357,27 @@ func TestResidualClaim_HappyPath_ClaimsResources(t *testing.T) {
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 
-	// Both resources should now belong to the new team at tier=free.
+	// The JWT-listed resource is claimed → free. The fingerprint-only one is
+	// untouched: it was never named by a token the caller could produce.
 	var listedTier, fpTier string
+	var fpTeam sql.NullString
 	require.NoError(t, db.QueryRowContext(ctx,
 		`SELECT tier FROM resources WHERE token = $1`, listedToken).Scan(&listedTier))
 	require.NoError(t, db.QueryRowContext(ctx,
-		`SELECT tier FROM resources WHERE token = $1`, fpToken).Scan(&fpTier))
+		`SELECT tier, team_id::text FROM resources WHERE token = $1`, fpToken).Scan(&fpTier, &fpTeam))
 	assert.Equal(t, "free", listedTier, "JWT-listed resource must be claimed → free")
-	assert.Equal(t, "free", fpTier, "fingerprint resource must be claimed → free")
+	assert.Equal(t, "anonymous", fpTier,
+		"a fingerprint-only resource must NOT be elevated by someone else's claim")
+	assert.False(t, fpTeam.Valid,
+		"a fingerprint-only resource must NOT be attached to the claiming team")
+
+	// The already-claimed token in the list stays with its original owner.
+	var claimedOwner sql.NullString
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT team_id::text FROM resources WHERE token = $1`, claimedToken).Scan(&claimedOwner))
+	require.True(t, claimedOwner.Valid)
+	assert.Equal(t, otherTeam, claimedOwner.String,
+		"an already-claimed token named in the JWT must be skipped, not re-pointed")
 }
 
 // ── Claim create-failure arms (sqlmock mid-sequence) ─────────────────────────

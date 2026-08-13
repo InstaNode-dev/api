@@ -910,7 +910,7 @@ func LastBulkTwinHandler() *handlers.BulkTwinHandler {
 
 // NewTestApp creates a Fiber app wired to the provided DB and Redis clients
 // using the same handler/middleware chain as production (minus GeoIP lookup).
-// Routes registered: POST /cache/new, GET /start, POST /claim, /api/v1/resources.
+// Routes registered: POST /cache/new, GET /start, POST /claim, GET /claim/preview, /api/v1/resources.
 // Only the "redis" service is enabled. Use NewTestAppWithServices to enable others.
 // provisioningNamePaths is the set of JSON provisioning endpoints where
 // `name` is now a STRICTLY REQUIRED field. injectDefaultProvisionName
@@ -1061,6 +1061,10 @@ func NewTestAppWithServices(t *testing.T, db *sql.DB, rdb *redis.Client, service
 
 	app.Get("/start", onboardH.StartLanding)
 	app.Post("/claim", onboardH.Claim)
+	// /claim/preview is registered alongside /claim on purpose: the
+	// preview-equals-claim invariant (onboarding.go) can only be asserted
+	// end-to-end if both live on the same app with the same DB.
+	app.Get("/claim/preview", onboardH.ClaimPreview)
 	app.Get("/auth/me", middleware.RequireAuth(cfg), cliAuthH.GetCurrentUser)
 
 	// Wave 3 P2 (BugHunt 2026-05-20): mirror production routes that the
