@@ -10,14 +10,17 @@ package handlers_test
 // direct calls cover each arm.
 
 import (
+	"context"
 	"testing"
 
 	"github.com/nats-io/nkeys"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	natsqp "instant.dev/common/queueprovider/nats"
 	"instant.dev/internal/config"
 	"instant.dev/internal/handlers"
+	"instant.dev/internal/natsresolver"
 )
 
 // TestBuildQueueProvider_DefaultNoSeed_FallsBackToLegacyOpen — empty
@@ -41,11 +44,19 @@ func TestBuildQueueProvider_DefaultNoSeed_FallsBackToLegacyOpen(t *testing.T) {
 
 // TestBuildQueueProvider_DefaultWithSeed_SelectsNATS — empty QueueBackend but
 // a valid operator seed present → the "nats" backend is selected and builds.
+//
+// An operator seed also means real account claims will be minted, so the
+// system-account resolver publisher must come up too; the constructor seam is
+// stubbed here so no NATS server is needed.
 func TestBuildQueueProvider_DefaultWithSeed_SelectsNATS(t *testing.T) {
 	kp, err := nkeys.CreateOperator()
 	require.NoError(t, err)
 	seed, err := kp.Seed()
 	require.NoError(t, err)
+
+	restore := handlers.SwapResolverPusherFactoryForTest(
+		func(natsresolver.Config) (natsqp.ResolverPusher, error) { return stubResolverPusher{}, nil })
+	defer restore()
 
 	cfg := &config.Config{
 		QueueBackend:         "",
@@ -53,11 +64,44 @@ func TestBuildQueueProvider_DefaultWithSeed_SelectsNATS(t *testing.T) {
 		NATSHost:             "nats.test",
 		NATSPublicHost:       "nats.instanode.dev",
 		NATSSystemAccountKey: "",
+		NATSSystemUserJWT:    "eyJ0eXAiOiJKV1QifQ.sys.user",
+		NATSSystemUserSeed:   "SUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 	}
 	qp, err := handlers.BuildQueueProviderForTest(cfg)
 	require.NoError(t, err)
 	require.NotNil(t, qp)
 	assert.Equal(t, "nats", qp.Name())
+}
+
+// stubResolverPusher is an accept-everything resolver publisher for the
+// backend-selection tests, which are not about push behaviour.
+type stubResolverPusher struct{}
+
+func (stubResolverPusher) PushAccountClaim(context.Context, string, string) error { return nil }
+
+// TestBuildQueueProvider_SeedWithoutSystemCreds_Errors — the regression guard
+// for the bug this wiring fixes. An operator seed with no SYS user credentials
+// means account claims can never be pushed to nats-server, so every issued
+// credential would be rejected at CONNECT. buildQueueProvider must refuse to
+// return a provider rather than let the caller degrade to legacy_open.
+func TestBuildQueueProvider_SeedWithoutSystemCreds_Errors(t *testing.T) {
+	kp, err := nkeys.CreateOperator()
+	require.NoError(t, err)
+	seed, err := kp.Seed()
+	require.NoError(t, err)
+
+	cfg := &config.Config{
+		QueueBackend:     "nats",
+		NATSOperatorSeed: string(seed),
+		NATSHost:         "nats.test",
+		NATSPublicHost:   "nats.instanode.dev",
+		// NATSSystemUserJWT / NATSSystemUserSeed deliberately unset.
+	}
+	qp, err := handlers.BuildQueueProviderForTest(cfg)
+	require.Error(t, err)
+	assert.Nil(t, qp)
+	assert.ErrorIs(t, err, natsresolver.ErrPushFailed)
+	assert.Contains(t, err.Error(), "NATS_SYSTEM_USER_JWT")
 }
 
 // TestBuildQueueProvider_ExplicitLegacyOpen — explicit backend overrides the

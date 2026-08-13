@@ -65,21 +65,40 @@ func NewQueueHandler(db *sql.DB, rdb *redis.Client, cfg *config.Config, provClie
 	// does not yet have a ProvisionQueue RPC. When it does, wire it here like
 	// CacheHandler.provisionCache does.
 	h.queueProvider = queueprovider.New(cfg.NATSHost)
-	// Build the credential issuer. Falls back to legacy_open when no operator
-	// seed is configured so api can deploy before the operator-key generation.
-	if cp, err := buildQueueProvider(cfg); err == nil {
+	// Build the credential issuer. Three outcomes: a working provider; a
+	// legacy_open fallback when NO operator seed is configured (so api can
+	// deploy before the operator-key generation); or — when the operator seed
+	// IS configured but the isolation path could not be initialised — a
+	// provider that refuses to issue, so /queue/new 503s instead of returning
+	// credentials nats-server would reject.
+	cp, err := buildQueueProvider(cfg)
+	switch {
+	case err == nil:
 		h.credProvider = cp
-	} else {
+	case cfg.NATSOperatorSeed != "":
+		// Isolation is CONFIGURED (operator seed present) but could not be
+		// initialised — typically the $SYS resolver publisher failed to
+		// connect. Falling back to legacy_open here would hand every caller a
+		// connection URL with no credentials against an auth_required server:
+		// the exact "issued but dead" failure this path exists to prevent.
+		// Fail the queue credential path loudly instead; /queue/new answers
+		// 503 until the operator fixes the NATS wiring.
+		slog.Error("queue.cred_provider_init_failed_isolation_unavailable",
+			"error", err,
+			"backend", cfg.QueueBackend,
+			"detail", "operator seed is set — refusing to downgrade to legacy_open; /queue/new will 503")
+		h.credProvider = unavailableCredProvider{cause: err}
+	default:
 		slog.Error("queue.cred_provider_init_failed_fallback_legacy_open",
 			"error", err,
 			"backend", cfg.QueueBackend)
 		// Defensive: never leave h.credProvider nil. The legacyopen provider
 		// is always registered so this fallback always succeeds.
 		fallback, _ := commonqp.Factory(commonqp.Config{
-			Backend:    "legacy_open",
+			Backend:    queueBackendLegacyOpen,
 			Host:       cfg.NATSHost,
 			PublicHost: cfg.NATSPublicHost,
-			Port:       4222,
+			Port:       natsClientPort,
 			UseTLS:     cfg.NATSUseTLS,
 		})
 		h.credProvider = fallback
@@ -148,6 +167,32 @@ func (h *QueueHandler) issueTenantCreds(ctx context.Context, token, subjectPrefi
 		return nil, err
 	}
 	return creds, nil
+}
+
+// failQueueCredIssue aborts a provision whose per-tenant credentials could not
+// be issued because the isolation path is broken (the account claim never
+// reached the nats-server resolver).
+//
+// CLAUDE.md rule 2: provisioning is synchronous and a backend failure is a
+// 503 — never a 201 carrying credentials for something the backend does not
+// know about. Returning the legacy_open response shape here would be exactly
+// that: a connection URL with no credentials against an auth_required server.
+// So the backend resource is torn down, the row is marked failed (failed rows
+// never count against quota) and the caller gets 503.
+func (h *QueueHandler) failQueueCredIssue(
+	c *fiber.Ctx, resource *models.Resource, prid, token, logPrefix string, cause error,
+) error {
+	ctx := c.UserContext()
+	metrics.ProvisionFailures.WithLabelValues("queue", "cred_issue_error").Inc()
+	middleware.RecordProvisionFail("queue", middleware.ProvisionFailBackendUnavailable)
+	slog.Error(logPrefix+".cred_issue_failed_isolation_unavailable",
+		"error", cause, "token", token, "resource_id", resource.ID)
+	deprovisionBestEffort(ctx, h.provClient, token, prid, "queue", logPrefix)
+	if delErr := models.MarkResourceFailed(ctx, h.db, resource.ID); delErr != nil {
+		slog.Error(logPrefix+".soft_delete_failed_cred_issue",
+			"error", delErr, "resource_id", resource.ID)
+	}
+	return respondProvisionFailed(c, cause, "Failed to issue isolated NATS credentials")
 }
 
 // NewQueue handles POST /queue/new.
@@ -308,7 +353,10 @@ func (h *QueueHandler) NewQueue(c *fiber.Ctx) error {
 	// MR-P0-5: issue per-tenant credentials via the queueprovider abstraction.
 	// May return AuthMode=isolated (real per-tenant account JWT) or
 	// AuthMode=legacy_open (no auth — staged-cutover fallback).
-	tenantCreds, _ := h.issueTenantCreds(ctx, tokenStr, creds.SubjectPrefix)
+	tenantCreds, credErr := h.issueTenantCreds(ctx, tokenStr, creds.SubjectPrefix)
+	if isolationUnavailable(credErr) {
+		return h.failQueueCredIssue(c, resource, creds.ProviderResourceID, tokenStr, "queue.new", credErr)
+	}
 	authMode := commonqp.AuthModeLegacyOpen
 	if tenantCreds != nil && tenantCreds.AuthMode != "" {
 		authMode = tenantCreds.AuthMode
@@ -531,7 +579,10 @@ func (h *QueueHandler) newQueueAuthenticated(
 	}
 
 	// MR-P0-5: issue per-tenant credentials via the queueprovider abstraction.
-	tenantCreds, _ := h.issueTenantCreds(ctx, tokenStr, creds.SubjectPrefix)
+	tenantCreds, credErr := h.issueTenantCreds(ctx, tokenStr, creds.SubjectPrefix)
+	if isolationUnavailable(credErr) {
+		return h.failQueueCredIssue(c, resource, creds.ProviderResourceID, tokenStr, "queue.new.auth", credErr)
+	}
 	authMode := commonqp.AuthModeLegacyOpen
 	if tenantCreds != nil && tenantCreds.AuthMode != "" {
 		authMode = tenantCreds.AuthMode
