@@ -54,6 +54,7 @@ func allKeys() []string {
 		"POSTGRES_CUSTOMERS_URL", "PROVISIONER_ADDR", "PROVISIONER_SECRET",
 		"NATS_HOST", "QUEUE_BACKEND", "NATS_PUBLIC_HOST",
 		"NATS_OPERATOR_SEED", "NATS_SYSTEM_ACCOUNT_PUBLIC_KEY", "NATS_USE_TLS",
+		"NATS_SYSTEM_USER_JWT", "NATS_SYSTEM_USER_SEED", "NATS_SYSTEM_URL",
 		"R2_ENDPOINT", "R2_BUCKET_NAME", "R2_API_TOKEN",
 		"OBJECT_STORE_MODE", "OBJECT_STORE_BACKEND", "OBJECT_STORE_ENDPOINT",
 		"OBJECT_STORE_PUBLIC_URL", "OBJECT_STORE_ACCESS_KEY",
@@ -307,6 +308,9 @@ func TestLoad_OverrideDefaults(t *testing.T) {
 		"NATS_OPERATOR_SEED":             "SO_seed",
 		"NATS_SYSTEM_ACCOUNT_PUBLIC_KEY": "ACSYS",
 		"NATS_USE_TLS":                   "true",
+		"NATS_SYSTEM_USER_JWT":           " eyJ0eXAiOiJKV1QifQ.sys.user\n",
+		"NATS_SYSTEM_USER_SEED":          "SUSYSSEED\n",
+		"NATS_SYSTEM_URL":                " nats://nats.x:4222 ",
 		"R2_ENDPOINT":                    "r2.x",
 		"R2_BUCKET_NAME":                 "x-bucket",
 		"R2_API_TOKEN":                   "r2tok",
@@ -332,6 +336,18 @@ func TestLoad_OverrideDefaults(t *testing.T) {
 	}
 	if !cfg.NATSUseTLS {
 		t.Error("NATSUseTLS must be true when env=true")
+	}
+	// SYS-account user credentials + system-URL override. All three are
+	// whitespace-trimmed: trailing newlines are what `kubectl create secret
+	// --from-file` leaves behind, and an untrimmed NKey seed fails to parse.
+	if cfg.NATSSystemUserJWT != "eyJ0eXAiOiJKV1QifQ.sys.user" {
+		t.Errorf("NATSSystemUserJWT trim: %q", cfg.NATSSystemUserJWT)
+	}
+	if cfg.NATSSystemUserSeed != "SUSYSSEED" {
+		t.Errorf("NATSSystemUserSeed trim: %q", cfg.NATSSystemUserSeed)
+	}
+	if cfg.NATSSystemURL != "nats://nats.x:4222" {
+		t.Errorf("NATSSystemURL trim: %q", cfg.NATSSystemURL)
 	}
 	// API_PUBLIC_URL — trailing slash must be trimmed.
 	if cfg.APIPublicURL != "https://api.x" {

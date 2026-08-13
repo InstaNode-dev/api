@@ -134,9 +134,23 @@ type Config struct {
 	NATSOperatorSeed     string // NATS_OPERATOR_SEED — operator NKey seed; empty = legacy_open fallback
 	NATSSystemAccountKey string // NATS_SYSTEM_ACCOUNT_PUBLIC_KEY — system account public key
 	NATSUseTLS           bool   // NATS_USE_TLS — true → tls:// URLs
-	R2Endpoint           string // R2_ENDPOINT — R2 endpoint hostname (default: r2.instant.dev)
-	R2BucketName         string // R2_BUCKET_NAME — shared R2 bucket name (default: instant-shared)
-	R2APIToken           string // R2_API_TOKEN — Cloudflare API token; if empty, R2 is not used
+
+	// System-account USER credentials (distinct from NATSSystemAccountKey,
+	// which is only the account's public key). Minting a tenant account JWT
+	// is useless unless the claim is pushed to the running nats-server on
+	// $SYS.REQ.CLAIMS.UPDATE, and only a connection authenticated INTO the
+	// system account may publish there. Both are secrets and are never
+	// logged. Required whenever NATSOperatorSeed is set; without them
+	// /queue/new would issue credentials the server rejects.
+	NATSSystemUserJWT  string // NATS_SYSTEM_USER_JWT — SYS-account user JWT (secret)
+	NATSSystemUserSeed string // NATS_SYSTEM_USER_SEED — SYS-account user NKey seed (secret)
+	// NATSSystemURL overrides the URL used for that system-account
+	// connection. Default: nats://<NATS_HOST>:4222 (in-cluster, plaintext).
+	NATSSystemURL string // NATS_SYSTEM_URL
+
+	R2Endpoint   string // R2_ENDPOINT — R2 endpoint hostname (default: r2.instant.dev)
+	R2BucketName string // R2_BUCKET_NAME — shared R2 bucket name (default: instant-shared)
+	R2APIToken   string // R2_API_TOKEN — Cloudflare API token; if empty, R2 is not used
 	// Object storage backend for /storage/new (provider-agnostic).
 	//
 	// ObjectStoreBackend selects the credential-issuance strategy:
@@ -443,6 +457,9 @@ func Load() *Config {
 	cfg.NATSPublicHost = getenv("NATS_PUBLIC_HOST", "nats.instanode.dev")
 	cfg.NATSOperatorSeed = os.Getenv("NATS_OPERATOR_SEED")
 	cfg.NATSSystemAccountKey = os.Getenv("NATS_SYSTEM_ACCOUNT_PUBLIC_KEY")
+	cfg.NATSSystemUserJWT = strings.TrimSpace(os.Getenv("NATS_SYSTEM_USER_JWT"))
+	cfg.NATSSystemUserSeed = strings.TrimSpace(os.Getenv("NATS_SYSTEM_USER_SEED"))
+	cfg.NATSSystemURL = strings.TrimSpace(os.Getenv("NATS_SYSTEM_URL"))
 	cfg.NATSUseTLS = os.Getenv("NATS_USE_TLS") == "true"
 	cfg.R2Endpoint = getenv("R2_ENDPOINT", "r2.instant.dev")
 	cfg.R2BucketName = getenv("R2_BUCKET_NAME", "instant-shared")
