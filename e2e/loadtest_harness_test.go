@@ -581,16 +581,24 @@ func extractJWTLoose(note string) string {
 // teardown mechanism and the ultimate backstop.
 //
 // To NOT rely solely on TTL, the harness actively tears Lane-B resources
-// down: every anonymous provision response carries a fingerprint-scoped
-// onboarding JWT in `note`. POST /claim with that JWT moves EVERY active
-// resource for that fingerprint into a fresh throwaway team in one call;
-// each is then deletable via the authenticated DELETE. Because a Lane-B
-// burst uses a single fingerprint, one claim + a delete-sweep reclaims the
-// whole burst. If E2E_JWT_SECRET is unset (cannot mint the session JWT to
-// authorize the DELETEs) the harness falls back to the 24h TTL and says so.
+// down: every anonymous provision response carries an onboarding JWT in
+// `note`. POST /claim with that JWT moves the resources THAT JWT NAMES into a
+// fresh throwaway team; each is then deletable via the authenticated DELETE.
+// If E2E_JWT_SECRET is unset (cannot mint the session JWT to authorize the
+// DELETEs) the harness falls back to the 24h TTL and says so.
 //
-// teardownAnonymousFingerprint claims every resource on `fpJWT`'s fingerprint
-// and deletes them. Returns (claimed, deleted, ok).
+// PARTIAL SINCE 2026-08-13: this used to reclaim the WHOLE burst from one JWT,
+// because /claim swept every resource sharing the caller's fingerprint. That
+// sweep was a cross-tenant ownership hole (SHA256(/24 + ASN) buckets strangers
+// behind one NAT together) and was removed — see
+// api/internal/handlers/onboarding.go. A single captured JWT now reclaims only
+// its own token (plus anything chained onto it via X-Instant-Upgrade-Token,
+// which this concurrent burst does not thread). The remainder of the burst
+// falls back to the 24h TTL, which the caller already logs. Reclaiming the
+// full burst again would mean chaining the header through the goroutines.
+//
+// teardownAnonymousFingerprint claims the resources named by `fpJWT` and
+// deletes them. Returns (claimed, deleted, ok).
 func teardownAnonymousFingerprint(t *testing.T, fpJWT string) (claimed, deleted int, ok bool) {
 	t.Helper()
 	if fpJWT == "" {
@@ -797,12 +805,13 @@ func TestLoad_FingerprintDedup_UnderBurst(t *testing.T) {
 
 	stats := newLoadStats()
 	// fpJWT captures one onboarding JWT from a 201 response so the test can
-	// claim+delete every anonymous resource it created on this fingerprint
-	// (rather than relying purely on the 24h TTL).
+	// claim+delete the resource that JWT names (rather than relying purely on
+	// the 24h TTL). See teardownAnonymousFingerprint for why this is partial
+	// coverage of the burst since the claim-by-fingerprint fix.
 	var fpJWT string
 	var fpJWTMu sync.Mutex
 
-	// Cleanup: claim this fingerprint's burst into a throwaway team & delete.
+	// Cleanup: claim what the captured JWT names into a throwaway team & delete.
 	t.Cleanup(func() {
 		fpJWTMu.Lock()
 		jwtTok := fpJWT

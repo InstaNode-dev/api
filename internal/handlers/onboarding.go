@@ -125,11 +125,25 @@ func (h *OnboardingHandler) ClaimPreview(c *fiber.Ctx) error {
 		})
 	}
 
-	// Build deduplicated resource list — same logic as StartLanding.
+	// Build the deduplicated resource list.
+	//
+	// PREVIEW-EQUALS-CLAIM INVARIANT (2026-08-13): this loop must accept and
+	// reject exactly what Claim's transfer loop accepts and rejects, or the
+	// preview over-promises — its own bug, and the surface that made the
+	// claim-by-fingerprint hole look intentional. Both now:
+	//   - iterate ONLY claims.Tokens (no fingerprint sweep: a fingerprint is
+	//     SHA256(/24 + ASN) and buckets strangers behind one NAT together),
+	//   - skip tokens that do not parse,
+	//   - skip tokens with no resource row,
+	//   - skip resources already owned by a team (Claim cannot take those).
+	// TestClaimPreview_MatchesWhatClaimBinds pins the pair together.
 	seenTokens := map[string]bool{}
 	var resources []fiber.Map
 
 	for _, tokenStr := range claims.Tokens {
+		if seenTokens[tokenStr] {
+			continue
+		}
 		seenTokens[tokenStr] = true
 		tok, parseErr := uuid.Parse(tokenStr)
 		if parseErr != nil {
@@ -137,6 +151,11 @@ func (h *OnboardingHandler) ClaimPreview(c *fiber.Ctx) error {
 		}
 		r, lookupErr := models.GetResourceByToken(ctx, h.db, tok)
 		if lookupErr != nil {
+			continue
+		}
+		if r.TeamID.Valid {
+			// Already claimed — by this caller's own earlier claim or by
+			// someone else. Claim skips it; so must the preview.
 			continue
 		}
 		resources = append(resources, fiber.Map{
@@ -147,29 +166,6 @@ func (h *OnboardingHandler) ClaimPreview(c *fiber.Ctx) error {
 			"status":        r.Status,
 			"created_at":    r.CreatedAt,
 		})
-	}
-
-	// Also include any resources provisioned after JWT issuance for this fingerprint.
-	if claims.Fingerprint != "" {
-		fpResources, fpErr := models.GetAllActiveResourcesByFingerprint(ctx, h.db, claims.Fingerprint)
-		if fpErr != nil {
-			slog.Warn("onboarding.claim_preview.fingerprint_lookup_failed", "error", fpErr, "request_id", requestID)
-		}
-		for _, r := range fpResources {
-			tokStr := r.Token.String()
-			if seenTokens[tokStr] {
-				continue
-			}
-			seenTokens[tokStr] = true
-			resources = append(resources, fiber.Map{
-				"id":            r.ID,
-				"token":         r.Token,
-				"resource_type": r.ResourceType,
-				"tier":          r.Tier,
-				"status":        r.Status,
-				"created_at":    r.CreatedAt,
-			})
-		}
 	}
 
 	if resources == nil {
@@ -234,11 +230,17 @@ const (
 )
 
 // attachClaimedResourceToTeam links a single anonymous resource to the claiming
-// team and elevates it anonymous->free. It is the shared write path for BOTH
-// claim-time resource grabs (the JWT-listed loop and the fingerprint-discovered
-// loop) so they behave identically and observably.
+// team and elevates it anonymous->free.
 //
-// Pre-fix both call sites used `_, _ = h.db.ExecContext(...)`, swallowing any
+// It is now the platform's ONLY resource-ownership-transfer write, and it has
+// exactly ONE caller: Claim's loop over the verified JWT's `tok` array. The
+// second caller — a loop over models.GetAllActiveResourcesByFingerprint — was
+// deleted on 2026-08-13 because a fingerprint is a shared NAT bucket, not an
+// identity (see the SECURITY note in Claim). Keep it at one caller: any new
+// call site is a new answer to "who owns this resource", and the only
+// acceptable answer is "whoever presented a signed token naming it".
+//
+// Historically both call sites used `_, _ = h.db.ExecContext(...)`, swallowing any
 // error: a failed UPDATE left the resource with team_id IS NULL AFTER a
 // successful claim — an orphaned-after-claim resource with NO log and NO metric,
 // invisible to operators (the user "claimed" but their resource never attached).
@@ -461,9 +463,25 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 	}
 
 	// Transfer anonymous resources to new team.
-	// Collect all resource IDs to transfer: start from JWT-listed tokens, then
-	// augment with any resources for this fingerprint that were provisioned after
-	// the JWT was issued (e.g. DB provisioned after the onboarding JWT was created).
+	//
+	// SECURITY (2026-08-13): the ONLY source of resource IDs is the verified
+	// JWT's `tok` array. There used to be a second pass here that swept
+	// models.GetAllActiveResourcesByFingerprint(claims.Fingerprint) and
+	// attached every unclaimed match. A fingerprint is SHA256(/24 subnet +
+	// ASN) — a bucket shared by everyone behind one NAT/CGNAT range — so two
+	// strangers provisioning inside the same 24h TTL window landed in one
+	// bucket and whoever claimed first inherited the other's live database
+	// credential. Confirmed in prod: a team owned three Postgres databases it
+	// never created, one of them older than its first API call.
+	//
+	// Ownership now derives only from a capability the caller holds (the
+	// signed token it was handed at provision time). Multi-service bundling is
+	// preserved at ISSUE time instead, by chaining the prior signed token on
+	// HeaderPriorUpgradeToken — see handlers.issueOnboardingJWT. There is no
+	// fingerprint fallback here, by design.
+	//
+	// claims.Fingerprint is still read below for funnel analytics; it confers
+	// nothing.
 	claimedIDs := map[uuid.UUID]bool{}
 
 	for _, tokenStr := range claims.Tokens {
@@ -489,20 +507,7 @@ func (h *OnboardingHandler) Claim(c *fiber.Ctx) error {
 		_ = attachClaimedResourceToTeam(ctx, h.db, team.ID, resource.ID, requestID)
 	}
 
-	// Also claim any additional fingerprint resources not yet in the JWT.
-	if claims.Fingerprint != "" {
-		fpResources, fpErr := models.GetAllActiveResourcesByFingerprint(ctx, h.db, claims.Fingerprint)
-		if fpErr != nil {
-			slog.Warn("onboarding.claim.fingerprint_lookup_failed",
-				"error", fpErr, "request_id", requestID)
-		}
-		for _, r := range fpResources {
-			if claimedIDs[r.ID] || r.TeamID.Valid {
-				continue
-			}
-			_ = attachClaimedResourceToTeam(ctx, h.db, team.ID, r.ID, requestID)
-		}
-	}
+	// (No fingerprint sweep here — see the SECURITY note above.)
 
 	// "Pay from day one" — no trial, no auto-elevation. The team is created
 	// at the default plan_tier; resources keep their anonymous tier + 24h

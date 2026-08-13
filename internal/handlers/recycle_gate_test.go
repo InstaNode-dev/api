@@ -167,9 +167,12 @@ func TestRecycleGate_FiresWith402_WhenMarkerExistsAndNoActiveRow(t *testing.T) {
 	//   SELECT ... FROM resources WHERE fingerprint = $1 AND team_id IS NULL
 	//     AND status = 'active' ORDER BY created_at DESC
 	// (cross-service: any active resource for this fingerprint counts).
-	// We return zero rows. F1: the gate now mints a claim JWT, which issues a
-	// SECOND identical fingerprint lookup inside issueOnboardingJWT — expect
-	// both (each returns zero rows; sqlmock matches in order).
+	// We return zero rows. EXACTLY ONE fingerprint query is expected: the
+	// gate's own recycle check. The claim JWT the gate then mints is built
+	// from capability (this request's tokens + any chained prior token), NOT
+	// from a second fingerprint sweep — that sweep was the claim-by-
+	// fingerprint hole and was deleted (see issueOnboardingJWT). sqlmock's
+	// ExpectationsWereMet below fails if a second sweep ever comes back.
 	emptyRows := func() *sqlmock.Rows {
 		return sqlmock.NewRows([]string{
 			"id", "team_id", "token", "resource_type", "name", "connection_url",
@@ -179,9 +182,6 @@ func TestRecycleGate_FiresWith402_WhenMarkerExistsAndNoActiveRow(t *testing.T) {
 			"parent_resource_id", "created_at",
 		})
 	}
-	mock.ExpectQuery(`SELECT.*FROM resources.*fingerprint`).
-		WithArgs(fp).
-		WillReturnRows(emptyRows())
 	mock.ExpectQuery(`SELECT.*FROM resources.*fingerprint`).
 		WithArgs(fp).
 		WillReturnRows(emptyRows())
@@ -259,7 +259,7 @@ func TestRecycleGate_ClaimURL_MintFailedFallsBackToBareURL(t *testing.T) {
 	// Force the mint to fail → exercises the mint_failed arm + bare-URL fallback.
 	orig := issueOnboardingJWTFn
 	issueOnboardingJWTFn = func(
-		_ *provisionHelper, _ context.Context,
+		_ *provisionHelper, _ *fiber.Ctx,
 		_, _, _, _ string, _ []string,
 	) (string, string, error) {
 		return "", "", errors.New("simulated jwt sign failure")
@@ -310,7 +310,7 @@ func TestRecycleGate_ClaimURL_MintSucceeds_EmbedsJWT(t *testing.T) {
 
 	orig := issueOnboardingJWTFn
 	issueOnboardingJWTFn = func(
-		_ *provisionHelper, _ context.Context,
+		_ *provisionHelper, _ *fiber.Ctx,
 		_, _, _, _ string, _ []string,
 	) (string, string, error) {
 		return "minted.jwt.token", "jti-1", nil

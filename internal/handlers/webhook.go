@@ -260,7 +260,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 			return h.denyProvisionOverCap(c, fp, "webhook")
 		}
 		if err == nil {
-			jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "webhook", []string{existing.Token.String()})
+			jwtToken, jti, jwtErr := h.issueOnboardingJWT(c, fp, country, vendor, "webhook", []string{existing.Token.String()})
 			if jwtErr == nil && jti != "" {
 				if evErr := h.createOnboardingEvent(ctx, fp, jti, existing.Token); evErr != nil {
 					slog.Error("webhook.new.onboarding_event_failed_limit_path", "error", evErr, "request_id", requestID)
@@ -340,7 +340,7 @@ func (h *WebhookHandler) NewWebhook(c *fiber.Ctx) error {
 		return respondProvisionFailed(c, finErr, "Failed to persist webhook resource")
 	}
 
-	jwtToken, jti, jwtErr := h.issueOnboardingJWT(ctx, fp, country, vendor, "webhook", []string{tokenStr})
+	jwtToken, jti, jwtErr := h.issueOnboardingJWT(c, fp, country, vendor, "webhook", []string{tokenStr})
 	if jwtErr != nil {
 		slog.Error("webhook.new.jwt_issue_failed", "error", jwtErr, "request_id", requestID)
 	}
