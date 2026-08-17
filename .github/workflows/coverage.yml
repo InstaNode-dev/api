@@ -114,7 +114,7 @@ jobs:
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
           path: common
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: api/go.mod
 
@@ -159,7 +159,7 @@ jobs:
       # coverage" step above is continue-on-error, so it still produces
       # coverage.out even if a flaky test trips — the gate reads that file.
       # ------------------------------------------------------------------
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: github.event_name == 'pull_request'
         with:
           python-version: '3.12'
